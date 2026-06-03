@@ -69,3 +69,17 @@ provider_profiles:
     base_url_env: DEEPSEEK_BASE_URL
     optional_api_key: true
     optional_base_url: true
+
+  # Azure-hosted DeepSeek — separate credentials from Azure OpenAI GPT and native DeepSeek.
+  # Inactive until a route selects a deepseek_azure_* model alias.
+  # endpoint must be https://<resource>.openai.azure.com (classic) unless azure_api_mode
+  # is switched to azure_openai_v1 for /openai/v1 Foundry endpoints.
+  azure_deepseek:
+    provider: azure_openai
+    azure_api_mode: azure_deployment_chat_completions
+    endpoint_env: AZURE_DEEPSEEK_ENDPOINT
+    api_key_env: AZURE_DEEPSEEK_API_KEY
+    api_version_env: AZURE_DEEPSEEK_API_VERSION
+    optional_api_key: true
+    optional_endpoint: true
+    optional_api_version: true

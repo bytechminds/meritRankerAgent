@@ -316,6 +316,8 @@ def test_safe_metadata_passed_to_model_execution_result(tmp_path: Path) -> None:
         "provider": "gemini",
         "supports_streaming": True,
         "supports_thinking": False,
+        "supports_reasoning": False,
+        "reasoning_effort": "none",
         "timeout_seconds": 20,
     }
 

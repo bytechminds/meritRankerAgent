@@ -1380,7 +1380,14 @@ class TestProductionModelRegistry:
     def test_azure_deployment_field_set(self) -> None:
         """Active Azure models must have deployment; optional GPT-5.x may be blank."""
         optional_blank = frozenset(
-            {"openai_gpt_5_4", "openai_gpt_5_4_mini", "openai_gpt_5_5"}
+            {
+                "openai_gpt_5_4",
+                "openai_gpt_5_4_mini",
+                "openai_gpt_5_5",
+                "deepseek_azure_reasoning_generator",
+                "deepseek_azure_standard_generator",
+                "deepseek_azure_advanced_generator",
+            }
         )
         registry = self._live_registry()
         for alias, cfg in registry.model_map.items():

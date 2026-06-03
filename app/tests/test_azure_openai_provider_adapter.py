@@ -180,15 +180,16 @@ def _factory(client: FakeAzureOpenAIClient):  # noqa: ANN202
 
 
 class TestAzureOpenAIProviderAdapterCredentials:
-    def test_missing_api_key_raises_config_error(self, tmp_path: Path) -> None:
+    def test_missing_api_key_raises_provider_not_configured(self, tmp_path: Path) -> None:
         adapter = AzureOpenAIProviderAdapter()
         creds = ProviderCredentials(
             provider="azure_openai",
             endpoint="https://fake.openai.azure.com/",
             api_version="2024-02-01",
         )
-        with pytest.raises(LlmProviderConfigurationError, match="api_key"):
+        with pytest.raises(LlmProviderExecutionError) as exc_info:
             adapter.generate(request=_make_request(tmp_path), credentials=creds)
+        assert exc_info.value.failure_kind == "provider_not_configured"
 
     def test_missing_endpoint_raises_config_error(self, tmp_path: Path) -> None:
         adapter = AzureOpenAIProviderAdapter()
@@ -212,10 +213,15 @@ class TestAzureOpenAIProviderAdapterCredentials:
 
     def test_error_message_does_not_contain_key_value(self, tmp_path: Path) -> None:
         adapter = AzureOpenAIProviderAdapter()
-        creds = ProviderCredentials(provider="azure_openai")
-        with pytest.raises(LlmProviderConfigurationError) as exc_info:
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key=None,
+            endpoint="https://fake.openai.azure.com/",
+            api_version="2024-02-01",
+        )
+        with pytest.raises(LlmProviderExecutionError) as exc_info:
             adapter.generate(request=_make_request(tmp_path), credentials=creds)
-        assert "fake-azure-key" not in str(exc_info.value)
+        assert exc_info.value.failure_kind == "provider_not_configured"
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +294,9 @@ class TestAzureOpenAIProviderAdapterDeployment:
         adapter = AzureOpenAIProviderAdapter(client_factory=_factory(client))
         creds = _azure_credentials()
 
-        with pytest.raises(LlmProviderConfigurationError, match="deployment"):
+        with pytest.raises(LlmProviderExecutionError) as exc_info:
             adapter.generate(request=request, credentials=creds)
+        assert exc_info.value.failure_kind == "model_not_configured"
 
 
 # ---------------------------------------------------------------------------

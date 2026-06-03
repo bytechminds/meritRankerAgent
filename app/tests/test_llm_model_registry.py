@@ -44,14 +44,75 @@ class TestModelRegistryEnvOverrides:
         assert reg.model_map["deepseek_reasoning_generator"].model_id == "deepseek-reasoner"
         assert reg.model_map["deepseek_advanced_generator"].model_id == "deepseek-reasoner"
 
+    def test_azure_deepseek_aliases_load(self):
+        reg = LlmConfigRegistry()
+        reasoning = reg.model_map["deepseek_azure_reasoning_generator"]
+        standard = reg.model_map["deepseek_azure_standard_generator"]
+        advanced = reg.model_map["deepseek_azure_advanced_generator"]
+        assert reasoning.provider == "azure_openai"
+        assert reasoning.provider_profile == "azure_deepseek"
+        assert standard.provider_profile == "azure_deepseek"
+        assert advanced.provider_profile == "azure_deepseek"
+        assert reasoning.deployment == ""
+        assert reasoning.supports_streaming is True
+        assert reasoning.supports_thinking is False
+
+    def test_azure_deepseek_profile_loads(self):
+        reg = LlmConfigRegistry()
+        profile = reg.provider_profile_map["azure_deepseek"]
+        assert profile.provider == "azure_openai"
+        assert profile.api_key_env == "AZURE_DEEPSEEK_API_KEY"
+        assert profile.endpoint_env == "AZURE_DEEPSEEK_ENDPOINT"
+        assert profile.optional_api_key is True
+        assert profile.optional_endpoint is True
+
+    def test_azure_deepseek_deployments_from_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("AZURE_DEEPSEEK_REASONER_DEPLOYMENT", "my-deepseek-r1")
+        monkeypatch.setenv("AZURE_DEEPSEEK_CHAT_DEPLOYMENT", "my-deepseek-chat")
+        reset_registry()
+        reg = LlmConfigRegistry()
+        assert reg.model_map["deepseek_azure_reasoning_generator"].deployment == "my-deepseek-r1"
+        assert reg.model_map["deepseek_azure_standard_generator"].deployment == "my-deepseek-chat"
+
+    def test_production_routes_unchanged_no_azure_deepseek_default(self):
+        reg = LlmConfigRegistry()
+        active = reg._active_route_model_aliases()
+        assert "math_intermediate_generator" in active
+        assert "deepseek_azure_reasoning_generator" not in active
+        assert "deepseek_azure_standard_generator" not in active
+        reg.validate_real_mode_deployments()
+
+    def test_active_azure_deepseek_blank_deployment_fails_validation(self):
+        reg = LlmConfigRegistry()
+        from schemas.llm_routing import ResolvedRouteEntry
+
+        reg._route_map[("math", "generator", "default")] = ResolvedRouteEntry(
+            model="deepseek_azure_reasoning_generator",
+            prompt="subjects/math_generator.md",
+            overlays=[],
+            intent_overlays={},
+            temperature=0.15,
+            max_tokens=2600,
+            provider_options={},
+            fallback=["advanced"],
+        )
+        with pytest.raises(LlmConfigValidationError, match="empty Azure DeepSeek deployment"):
+            reg.validate_real_mode_deployments()
+
     def test_classifier_uses_safe_azure_deployment(self):
         reg = LlmConfigRegistry()
         primary = reg.model_map["doubt_solver_classifier"]
         strong = reg.model_map["doubt_solver_classifier_strong"]
         assert primary.deployment == "gpt-4.1-mini"
         assert strong.deployment == "gpt-4.1"
-        assert primary.deployment not in ("gpt-5.4-mini", "")
-        assert strong.deployment not in ("gpt-5.4", "")
+        assert primary.supports_streaming is False
+        assert strong.supports_streaming is False
+
+    def test_math_intermediate_uses_gpt_41_mini_not_gpt_41(self):
+        reg = LlmConfigRegistry()
+        cfg = reg.model_map["math_intermediate_generator"]
+        assert cfg.deployment == "gpt-4.1-mini"
+        assert cfg.deployment != "gpt-4.1"
 
     def test_active_routes_point_to_available_aliases(self):
         reg = LlmConfigRegistry()
@@ -106,3 +167,16 @@ class TestSettingsEnvVars:
         assert s.gemini_api_key == ""
         assert s.deepseek_api_key == ""
         assert s.deepseek_advanced_model == "deepseek-reasoner"
+
+    def test_azure_deepseek_settings_defaults(self, monkeypatch: pytest.MonkeyPatch):
+        import config as cfg_module
+
+        monkeypatch.delenv("AZURE_DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.delenv("AZURE_DEEPSEEK_ENDPOINT", raising=False)
+        monkeypatch.delenv("AZURE_DEEPSEEK_REASONER_DEPLOYMENT", raising=False)
+        cfg_module._settings = None
+        s = cfg_module.get_settings()
+        assert s.azure_deepseek_api_key == ""
+        assert s.azure_deepseek_endpoint == ""
+        assert s.azure_deepseek_timeout_seconds == 90
+        assert s.azure_deepseek_reasoner_deployment == ""

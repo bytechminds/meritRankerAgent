@@ -959,11 +959,11 @@ class TestSubjectDifficultyRouteAliases:
         assert route is not None
         assert route.model == "reasoning_intermediate_generator"
 
-    def test_math_intermediate_uses_safe_azure_deployment(self) -> None:
+    def test_math_intermediate_uses_gpt_41_mini(self) -> None:
         reg = LlmConfigRegistry()
         cfg = reg.model_map["math_intermediate_generator"]
-        assert cfg.deployment == "gpt-4.1"
-        assert cfg.deployment != "gpt-5.4-mini"
+        assert cfg.deployment == "gpt-4.1-mini"
+        assert cfg.deployment != "gpt-4.1"
 
     def test_active_aliases_do_not_use_unprovisioned_placeholders(self) -> None:
         reg = LlmConfigRegistry()
@@ -978,16 +978,16 @@ class TestSubjectDifficultyRouteAliases:
         for alias in active_aliases:
             cfg = reg.model_map[alias]
             deployment = cfg.deployment or cfg.model_id or ""
-            assert deployment
+            assert deployment, f"{alias} must have deployment or model_id"
             for bad in forbidden:
                 assert bad not in deployment, f"{alias} uses forbidden deployment fragment {bad!r}"
-        reg = LlmConfigRegistry()
         route = reg.get_route("reasoning", "generator", "advanced")
         assert route is not None
         assert route.model == "reasoning_advanced_generator"
         model_cfg = reg.model_map["reasoning_advanced_generator"]
         assert model_cfg.provider == "azure_openai"
-        assert model_cfg.fallback_models == ["reasoning_standard_generator"]
+        assert model_cfg.deployment == "o4-mini"
+        assert model_cfg.fallback_models == ["openai_o3", "deepseek_v4pro"]
         deepseek_cfg = reg.model_map.get("reasoning_advanced_generator_deepseek")
         assert deepseek_cfg is not None
         assert deepseek_cfg.provider == "deepseek"

@@ -139,15 +139,13 @@ class ProviderCredentialResolver:
             profile.api_key_env,
             optional=profile.optional_api_key,
         )
-        endpoint = (
-            self._secret_resolver.get_secret(profile.endpoint_env)
-            if profile.endpoint_env is not None
-            else None
+        endpoint = self._resolve_optional_secret(
+            profile.endpoint_env,
+            optional=profile.optional_endpoint,
         )
-        api_version = (
-            self._secret_resolver.get_secret(profile.api_version_env)
-            if profile.api_version_env is not None
-            else None
+        api_version = self._resolve_optional_secret(
+            profile.api_version_env,
+            optional=profile.optional_api_version,
         )
         base_url = self._resolve_optional_secret(
             profile.base_url_env,

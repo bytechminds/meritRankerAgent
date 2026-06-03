@@ -139,7 +139,19 @@ class Settings:
     azure_openai_deployment_gpt_5_4: str
     azure_openai_deployment_gpt_5_4_mini: str
     azure_openai_deployment_gpt_5_5: str
+    azure_openai_deployment_o4_mini: str
+    azure_openai_deployment_o3: str
+    azure_openai_send_reasoning_effort: bool
     deepseek_advanced_model: str
+    deepseek_v4pro_model: str
+    # Optional Azure-hosted DeepSeek (inactive unless route selects azure_deepseek alias)
+    azure_deepseek_api_key: str
+    azure_deepseek_endpoint: str
+    azure_deepseek_api_version: str
+    azure_deepseek_timeout_seconds: int
+    azure_deepseek_reasoner_deployment: str
+    azure_deepseek_chat_deployment: str
+    azure_deepseek_advanced_deployment: str
 
 
 # Module-level singleton — built once on first call to get_settings().
@@ -362,8 +374,31 @@ def get_settings() -> Settings:
                 "AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI", ""
             ),
             azure_openai_deployment_gpt_5_5=os.getenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_5", ""),
+            azure_openai_deployment_o4_mini=os.getenv(
+                "AZURE_OPENAI_DEPLOYMENT_O4_MINI", "o4-mini"
+            ),
+            azure_openai_deployment_o3=os.getenv("AZURE_OPENAI_DEPLOYMENT_O3", "o3"),
+            azure_openai_send_reasoning_effort=(
+                os.getenv("AZURE_OPENAI_SEND_REASONING_EFFORT", "false").lower() == "true"
+            ),
             deepseek_advanced_model=os.getenv(
                 "DEEPSEEK_ADVANCED_MODEL", "deepseek-reasoner"
+            ),
+            deepseek_v4pro_model=os.getenv("DEEPSEEK_V4PRO_MODEL", "deepseek-reasoner"),
+            azure_deepseek_api_key=os.getenv("AZURE_DEEPSEEK_API_KEY", ""),
+            azure_deepseek_endpoint=os.getenv("AZURE_DEEPSEEK_ENDPOINT", ""),
+            azure_deepseek_api_version=os.getenv("AZURE_DEEPSEEK_API_VERSION", ""),
+            azure_deepseek_timeout_seconds=int(
+                os.getenv("AZURE_DEEPSEEK_TIMEOUT_SECONDS", "90")
+            ),
+            azure_deepseek_reasoner_deployment=os.getenv(
+                "AZURE_DEEPSEEK_REASONER_DEPLOYMENT", ""
+            ),
+            azure_deepseek_chat_deployment=os.getenv(
+                "AZURE_DEEPSEEK_CHAT_DEPLOYMENT", ""
+            ),
+            azure_deepseek_advanced_deployment=os.getenv(
+                "AZURE_DEEPSEEK_ADVANCED_DEPLOYMENT", ""
             ),
         )
     return _settings

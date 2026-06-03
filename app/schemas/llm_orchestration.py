@@ -83,6 +83,8 @@ class ResolvedModelConfig(BaseModel):
     provider: ProviderName
     supports_streaming: bool
     supports_thinking: bool
+    supports_reasoning: bool = False
+    reasoning_effort: str = "none"
     timeout_seconds: int = Field(ge=1, le=120)
     safe_metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -98,6 +100,8 @@ class ResolvedModelConfig(BaseModel):
             "provider": self.provider,
             "supports_streaming": self.supports_streaming,
             "supports_thinking": self.supports_thinking,
+            "supports_reasoning": self.supports_reasoning,
+            "reasoning_effort": self.reasoning_effort,
             "timeout_seconds": self.timeout_seconds,
         }
         return self

@@ -70,25 +70,71 @@ Graph state unchanged: `request_id`, `query`, `classification`, `context_text`, 
 
 - **Orchestrated path** (`ENABLE_ORCHESTRATED_DOUBT_SOLVER=true`): YAML `llm_routes.yaml` + `model_registry.yaml` are primary; `LLM_ROLE_CONFIG_JSON` is **ignored**. Logs `model_config_source=yaml`.
 - **Legacy path** (`ENABLE_ORCHESTRATED_DOUBT_SOLVER=false`): `LLM_ROLE_CONFIG_JSON` supplies role → model alias (preferred) or deprecated inline provider config. Aliases validated against registry at startup when `ENABLE_REAL_LLM=true`.
-- Azure deployment names from env: `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `_GPT_4_1_MINI`, `_GPT_5_4`, `_GPT_5_4_MINI`, `_GPT_5_5`. Blank GPT-5.x env → optional aliases inactive; active-route preflight fails only for routes referencing blank deployments.
+- Azure deployment names from env: `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `_GPT_4_1_MINI`, `_O4_MINI`, `_O3`, `_GPT_5_4`, `_GPT_5_4_MINI`, `_GPT_5_5`. Blank GPT-5.x env → optional aliases inactive; active-route preflight fails only for routes referencing blank deployments.
+
+### Benchmark-based generator routing (latest)
+
+Priority: **accuracy > cost > speed > provider reliability**. Classifier routes unchanged (`doubt_solver_classifier` → GPT-4.1-mini; strong → GPT-4.1).
+
+| Route | Primary model | Model-level fallbacks |
+|---|---|---|
+| `math.generator.basic` | GPT-4.1-mini | o4-mini → native OpenAI |
+| `math.generator.intermediate` | GPT-4.1-mini | o4-mini → o3 |
+| `math.generator.advanced` | DeepSeek v4pro (`DEEPSEEK_V4PRO_MODEL`) | o3 → GPT-5.4 |
+| `reasoning.generator.basic` | GPT-4.1-mini | o4-mini |
+| `reasoning.generator.intermediate` | o4-mini | GPT-4.1-mini → DeepSeek v4pro |
+| `reasoning.generator.advanced` | o4-mini | o3 → DeepSeek v4pro |
+| `general.generator.default` / `current_affairs` | GPT-4.1-mini | GPT-4.1 (not DeepSeek/Grok/o3) |
+
+**Why GPT-4.1 is not the default solver:** benchmark showed higher token cost and occasional errors vs GPT-4.1-mini/o4-mini for quant/reasoning workloads. GPT-4.1 remains strong-classifier and general fallback only.
+
+**Optional exam-specific routes (inactive unless difficulty selected):** `math.generator.cat_advanced` (o3), `reasoning.generator.sbi_po_complex` (o3), `reasoning.generator.cat_lrdi` (o3).
+
+**Grok:** not added — no provider adapter; remains experimental/deferred until reliability tests pass.
+
+**Reasoning/thinking policy:** `supports_reasoning` + `reasoning_effort` stored in `model_registry.yaml`. Route `provider_options.thinking=true` is validated at orchestration layer only — it is **not** sent to Azure/OpenAI adapters. Payload shaping (`app/services/llm/providers/payload_shaping.py`) drops unsupported params per model capabilities.
+
+**Azure reasoning payload shaping (o4-mini, o3):**
+- Root cause of prior `unsupported_parameter` 400s: adapter sent `max_tokens` + `temperature` to Azure reasoning deployments.
+- Fix: capability-driven shaping — `token_budget_param=max_completion_tokens`, `supports_temperature=false` for Azure reasoning models (`supports_reasoning=true`).
+- Standard Azure GPT (GPT-4.1 / GPT-4.1-mini) keep `max_tokens` + `temperature`.
+- `reasoning_effort` is metadata-only unless `AZURE_OPENAI_SEND_REASONING_EFFORT=true` **and** model has `send_reasoning_effort=true` in registry.
+- DeepSeek/Gemini adapters unchanged — no Azure-specific fields leak.
+- Safe log: `llm_payload_shaped` with `token_budget_param`, `dropped_params`, `reasoning_param_sent` (no messages/bodies/keys).
+- `unsupported_parameter` provider errors are fallback-eligible (pre-first-chunk stream fallback preserved).
+
+**Streaming:** classifiers `supports_streaming=false`; generators stream when `supports_streaming=true`.
 
 
 - **Not active by default** — production routes remain Azure-first unless YAML explicitly selects a Gemini/DeepSeek alias.
 - Adapters: `GeminiProviderAdapter`, `DeepSeekProviderAdapter` in `app/services/llm/providers/openai_compatible_adapter.py` (OpenAI-compatible HTTP; no new SDK dependency).
+- **Azure-hosted DeepSeek** reuses `AzureOpenAIProviderAdapter` via separate profile `azure_deepseek` (distinct env vars from Azure GPT and native DeepSeek).
 - Registry aliases:
   - Gemini: `gemini_flash_lite_text`, `gemini_flash_text`, `gemini_image_extractor` (multimodal adapter-level only; `supports_streaming=false`)
-  - DeepSeek: `deepseek_standard_generator`, `deepseek_reasoning_generator`, `deepseek_advanced_generator`
-- Optional test routes (inactive unless selected): `general.generator.gemini_test`, `math.generator.deepseek_test`, `reasoning.generator.deepseek_test`
-- Missing API keys resolve via `optional_api_key` profiles → `provider_not_configured` (fallback-eligible when `fallback_models` configured).
+  - Native DeepSeek: `deepseek_standard_generator`, `deepseek_reasoning_generator`, `deepseek_advanced_generator`
+  - Azure-hosted DeepSeek (inactive by default): `deepseek_azure_reasoning_generator`, `deepseek_azure_standard_generator`, `deepseek_azure_advanced_generator`
+- Optional test routes (inactive unless selected): `general.generator.gemini_test`, `math.generator.deepseek_test`, `reasoning.generator.deepseek_test`, `math.generator.deepseek_azure_test`, `reasoning.generator.deepseek_azure_test`, `general.generator.deepseek_azure_test`
+- Missing API keys resolve via `optional_api_key` profiles → `provider_not_configured` (fallback-eligible when `fallback_models` configured). Blank Azure deployment → `model_not_configured` (fallback-eligible).
 - Safety blocks map to `safety_blocked` (not fallback-eligible).
 
 Env (optional — app starts without keys):
 - `GEMINI_API_KEY`, `GEMINI_BASE_URL`, `GEMINI_TIMEOUT_SECONDS`, `GEMINI_DEFAULT_MODEL`, `GEMINI_IMAGE_MODEL`, `GEMINI_TEXT_MODEL`
-- `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_TIMEOUT_SECONDS`, `DEEPSEEK_DEFAULT_MODEL`, `DEEPSEEK_REASONER_MODEL`, `DEEPSEEK_ADVANCED_MODEL`
-- `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_5`
+- Native DeepSeek: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_TIMEOUT_SECONDS`, `DEEPSEEK_DEFAULT_MODEL`, `DEEPSEEK_REASONER_MODEL`, `DEEPSEEK_ADVANCED_MODEL`
+- Azure-hosted DeepSeek: `AZURE_DEEPSEEK_API_KEY`, `AZURE_DEEPSEEK_ENDPOINT`, `AZURE_DEEPSEEK_API_VERSION`, `AZURE_DEEPSEEK_TIMEOUT_SECONDS`, `AZURE_DEEPSEEK_REASONER_DEPLOYMENT`, `AZURE_DEEPSEEK_CHAT_DEPLOYMENT`, `AZURE_DEEPSEEK_ADVANCED_DEPLOYMENT` — deployment names must match Azure portal deployment names, not public model names.
+- Azure GPT: `AZURE_OPENAI_DEPLOYMENT_GPT_4_1`, `AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI`, `AZURE_OPENAI_DEPLOYMENT_GPT_5_5`
 - `LLM_ENABLE_GEMINI_ROUTES=false`, `LLM_ENABLE_DEEPSEEK_ROUTES=false` (documentation flags; routes exist in YAML but are not production defaults)
 
-To test: set provider API key in `.env.local`, point a route `model:` field to a Gemini/DeepSeek alias (or invoke a `*_test` route).
+To test native DeepSeek or Gemini: set provider API key in `.env.local`, point a route `model:` field to the alias (or invoke a `*_test` route).
+To test Azure-hosted DeepSeek: set `AZURE_DEEPSEEK_*` env vars with real deployment names, then temporarily point a route `model:` to `deepseek_azure_*` or invoke `*.generator.deepseek_azure_test`. Production math/reasoning/general routes remain unchanged.
+
+**Env alignment (orchestrated mode):**
+- `ENABLE_ORCHESTRATED_DOUBT_SOLVER=true` → **`LLM_ROLE_CONFIG_JSON` is ignored** for generator/classifier routing.
+- Active model selection: `llm_routes.yaml` → capability alias → `model_registry.yaml` → env deployment vars.
+- Required deployment vars: `AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI`, `AZURE_OPENAI_DEPLOYMENT_O4_MINI`, `AZURE_OPENAI_DEPLOYMENT_O3`, `DEEPSEEK_V4PRO_MODEL` (optional DeepSeek key for advanced math).
+- **Azure 400 debugging:** provider logs safe fields only — `status_code`, `provider_error_code`, `provider_error_type`, `provider_error_param` (when available), `provider_error_message_short`, `deployment`, `model_alias`, `route_id` (no API key, no request body).
+- Deployment env values must match **Azure portal deployment names**, not public model IDs. If `o4-mini` 400s, verify `AZURE_OPENAI_DEPLOYMENT_O4_MINI` matches your Foundry deployment name.
+- **Streaming fallback:** primary provider failure before first chunk triggers model-level fallback; stream emits `Preparing a more reliable answer...` (no partial-chunk fallback).
+- Grok: inactive/deferred (no provider adapter).
 
 Config:
 - `CONTEXT_TOPIC_HINT_CONFIDENCE_THRESHOLD=0.85`

@@ -58,6 +58,7 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.payload_shaping import build_azure_openai_chat_completion_kwargs
 
 if TYPE_CHECKING:
     from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
@@ -71,6 +72,26 @@ logger = logging.getLogger(__name__)
 
 _V1_SUFFIX = "/openai/v1"
 _PROJECTS_SEGMENT = "/api/projects/"
+
+
+def _raise_azure_not_configured(*, model_alias: str) -> None:
+    raise LlmProviderExecutionError(
+        "azure_openai provider is not configured "
+        f"(model_alias={model_alias!r}). Set the provider credential env vars.",
+        failure_kind="provider_not_configured",
+        provider="azure_openai",
+        model_alias=model_alias,
+    )
+
+
+def _raise_azure_model_not_configured(*, model_alias: str) -> None:
+    raise LlmProviderExecutionError(
+        "Azure deployment is not configured "
+        f"(model_alias={model_alias!r}). Set the deployment env var.",
+        failure_kind="model_not_configured",
+        provider="azure_openai",
+        model_alias=model_alias,
+    )
 
 
 def _normalize_v1_base_url(url: str) -> str:
@@ -334,8 +355,8 @@ class AzureOpenAIProviderAdapter:
         from schemas.llm_orchestration import ModelExecutionResult  # noqa: PLC0415
 
         if not credentials.api_key:
-            raise LlmProviderConfigurationError(
-                "AzureOpenAIProviderAdapter requires credentials.api_key."
+            _raise_azure_not_configured(
+                model_alias=request.model_resolution.model_alias,
             )
 
         azure_api_mode = credentials.azure_api_mode or "azure_deployment_chat_completions"
@@ -347,13 +368,9 @@ class AzureOpenAIProviderAdapter:
 
         deployment = request.model_resolution.model_config.deployment
         if not deployment:
-            raise LlmProviderConfigurationError(
-                f"deployment is required for the Azure OpenAI provider adapter "
-                f"(model_alias={request.model_resolution.model_alias!r}, "
-                f"azure_api_mode={azure_api_mode!r})."
+            _raise_azure_model_not_configured(
+                model_alias=request.model_resolution.model_alias,
             )
-
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
         logger.info(
             "azure_openai_provider_adapter.generate  model_alias=%s  deployment=%s"
@@ -363,15 +380,25 @@ class AzureOpenAIProviderAdapter:
             azure_api_mode,
         )
 
+        completion_kwargs, _ = build_azure_openai_chat_completion_kwargs(
+            request=request,
+            deployment=deployment,
+            stream=False,
+        )
+
         try:
-            completion = client.chat.completions.create(
-                model=deployment,
-                messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
+            completion = client.chat.completions.create(**completion_kwargs)
         except Exception as exc:
             failure_kind = _classify_azure_openai_error(exc)
+            _log_azure_call_failure(
+                exc=exc,
+                operation="generate",
+                model_alias=request.model_resolution.model_alias,
+                deployment=deployment,
+                route_id=request.route_decision.route_id,
+                azure_api_mode=azure_api_mode,
+                failure_kind=failure_kind,
+            )
             raise LlmProviderExecutionError(
                 f"Azure OpenAI call failed for"
                 f" model_alias={request.model_resolution.model_alias!r},"
@@ -420,8 +447,8 @@ class AzureOpenAIProviderAdapter:
         Yields answer text chunks only — no prompt, messages, or provider metadata.
         """
         if not credentials.api_key:
-            raise LlmProviderConfigurationError(
-                "AzureOpenAIProviderAdapter requires credentials.api_key."
+            _raise_azure_not_configured(
+                model_alias=request.model_resolution.model_alias,
             )
 
         azure_api_mode = credentials.azure_api_mode or "azure_deployment_chat_completions"
@@ -433,13 +460,9 @@ class AzureOpenAIProviderAdapter:
 
         deployment = request.model_resolution.model_config.deployment
         if not deployment:
-            raise LlmProviderConfigurationError(
-                f"deployment is required for the Azure OpenAI provider adapter "
-                f"(model_alias={request.model_resolution.model_alias!r}, "
-                f"azure_api_mode={azure_api_mode!r})."
+            _raise_azure_model_not_configured(
+                model_alias=request.model_resolution.model_alias,
             )
-
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
         logger.info(
             "azure_openai_provider_adapter.generate_stream  model_alias=%s  deployment=%s"
@@ -449,14 +472,14 @@ class AzureOpenAIProviderAdapter:
             azure_api_mode,
         )
 
+        stream_kwargs, _ = build_azure_openai_chat_completion_kwargs(
+            request=request,
+            deployment=deployment,
+            stream=True,
+        )
+
         try:
-            stream = client.chat.completions.create(
-                model=deployment,
-                messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                stream=True,
-            )
+            stream = client.chat.completions.create(**stream_kwargs)
             finish_reason: str | None = None
             for chunk in stream:
                 if not chunk.choices:
@@ -470,6 +493,15 @@ class AzureOpenAIProviderAdapter:
             self.last_stream_finish_reason = finish_reason or "stop"
         except Exception as exc:
             failure_kind = _classify_azure_openai_error(exc)
+            _log_azure_call_failure(
+                exc=exc,
+                operation="generate_stream",
+                model_alias=request.model_resolution.model_alias,
+                deployment=deployment,
+                route_id=request.route_decision.route_id,
+                azure_api_mode=azure_api_mode,
+                failure_kind=failure_kind,
+            )
             raise LlmProviderExecutionError(
                 f"Azure OpenAI stream failed for"
                 f" model_alias={request.model_resolution.model_alias!r},"
@@ -574,6 +606,70 @@ class AzureOpenAIProviderAdapter:
 # ---------------------------------------------------------------------------
 
 
+def _azure_error_diagnostics(exc: BaseException) -> dict[str, object]:
+    """Extract safe Azure/OpenAI error fields for logging (no secrets/bodies)."""
+    status_code = getattr(exc, "status_code", None)
+    top_code = getattr(exc, "code", None)
+    body = getattr(exc, "body", None)
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_param: str | None = None
+    message_short: str | None = None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            provider_error_code = err.get("code") or top_code
+            provider_error_type = err.get("type")
+            raw_param = err.get("param")
+            if isinstance(raw_param, str) and raw_param.strip():
+                provider_error_param = raw_param.strip()[:120]
+            raw_message = err.get("message")
+            if isinstance(raw_message, str) and raw_message.strip():
+                message_short = raw_message.strip()[:200]
+    if provider_error_code is None and top_code is not None:
+        provider_error_code = str(top_code)
+    if message_short is None:
+        message_short = type(exc).__name__
+    return {
+        "status_code": status_code,
+        "provider_error_code": provider_error_code,
+        "provider_error_type": provider_error_type,
+        "provider_error_param": provider_error_param,
+        "provider_error_message_short": message_short,
+    }
+
+
+def _log_azure_call_failure(
+    *,
+    exc: BaseException,
+    operation: str,
+    model_alias: str,
+    deployment: str,
+    route_id: str,
+    azure_api_mode: str,
+    failure_kind: str,
+) -> None:
+    """Log Azure provider failure with safe diagnostic fields only."""
+    diag = _azure_error_diagnostics(exc)
+    logger.warning(
+        "azure_openai_provider_adapter.%s  failed  model_alias=%s  deployment=%s  "
+        "route_id=%s  azure_api_mode=%s  failure_kind=%s  status_code=%s  "
+        "provider_error_code=%s  provider_error_type=%s  provider_error_param=%s  "
+        "provider_error_message_short=%s",
+        operation,
+        model_alias,
+        deployment,
+        route_id,
+        azure_api_mode,
+        failure_kind,
+        diag["status_code"],
+        diag["provider_error_code"],
+        diag.get("provider_error_type"),
+        diag.get("provider_error_param"),
+        diag["provider_error_message_short"],
+    )
+
+
 def _is_deployment_or_model_config_error(exc: BaseException) -> bool:
     """Detect Azure/OpenAI errors caused by invalid or missing deployment/model."""
     body = str(getattr(exc, "body", "") or "").lower()
@@ -590,6 +686,28 @@ def _is_deployment_or_model_config_error(exc: BaseException) -> bool:
         "no such model",
     )
     return any(marker in combined for marker in markers)
+
+
+def _is_unsupported_parameter_error(exc: BaseException) -> bool:
+    """Detect Azure/OpenAI BadRequest errors caused by unsupported request params."""
+    diag = _azure_error_diagnostics(exc)
+    code = str(diag.get("provider_error_code") or "").lower()
+    if code in {"unsupported_parameter", "unsupported_value"}:
+        return True
+    param = str(diag.get("provider_error_param") or "").lower()
+    unsupported_params = (
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "logprobs",
+        "top_logprobs",
+        "logit_bias",
+        "reasoning_effort",
+        "thinking",
+    )
+    return param in unsupported_params
 
 
 def _classify_azure_openai_error(exc: BaseException) -> str:
@@ -628,6 +746,8 @@ def _classify_azure_openai_error(exc: BaseException) -> str:
         return "provider_unavailable"
 
     if isinstance(exc, _openai.BadRequestError):
+        if _is_unsupported_parameter_error(exc):
+            return "unsupported_parameter"
         if _is_deployment_or_model_config_error(exc):
             return "model_not_found"
         return "invalid_request"

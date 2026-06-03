@@ -43,6 +43,27 @@ azure_foundry_v1:
 Currently `model_registry.yaml` uses `azure_foundry_v1` for all Azure models
 because `AZURE_OPENAI_ENDPOINT` ends with `/openai/v1`.
 
+#### Azure-hosted DeepSeek profile (`azure_deepseek`)
+
+Separate from Azure GPT (`azure_foundry_v1`) and native DeepSeek (`deepseek_primary`):
+
+```yaml
+azure_deepseek:
+  provider: azure_openai
+  azure_api_mode: azure_deployment_chat_completions
+  endpoint_env: AZURE_DEEPSEEK_ENDPOINT
+  api_key_env: AZURE_DEEPSEEK_API_KEY
+  api_version_env: AZURE_DEEPSEEK_API_VERSION
+  optional_api_key: true
+  optional_endpoint: true
+  optional_api_version: true
+```
+
+Model aliases: `deepseek_azure_reasoning_generator`, `deepseek_azure_standard_generator`,
+`deepseek_azure_advanced_generator`. Deployments from `AZURE_DEEPSEEK_*_DEPLOYMENT` env
+vars. Inactive by default — optional test routes: `*.generator.deepseek_azure_test`.
+For Foundry `/openai/v1` endpoints, switch profile `azure_api_mode` to `azure_openai_v1`.
+
 **Validation:**
 - `azure_deployment_chat_completions`: rejects endpoint ending with `/openai/v1`
   or containing `/api/projects/`. Requires `api_version`.

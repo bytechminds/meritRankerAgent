@@ -37,10 +37,12 @@ ProviderFailureKind = Literal[
     "rate_limited",
     "authentication_failed",
     "provider_not_configured",
+    "model_not_configured",
     "model_not_found",
     "timeout",
     "provider_unavailable",
     "invalid_request",
+    "unsupported_parameter",
     "safety_blocked",
     "unknown_provider_error",
 ]
@@ -52,9 +54,11 @@ FALLBACK_ELIGIBLE_FAILURE_KINDS: frozenset[str] = frozenset({
     "rate_limited",
     "authentication_failed",
     "provider_not_configured",
+    "model_not_configured",
     "model_not_found",
     "timeout",
     "provider_unavailable",
+    "unsupported_parameter",
     "unknown_provider_error",
 })
 

@@ -82,6 +82,10 @@ CostTier = Literal["none", "low", "medium", "high"]
 
 CapabilityLevel = Literal["low", "medium", "high", "very_high"]
 
+ReasoningEffort = Literal["none", "low", "medium", "high"]
+
+TokenBudgetParam = Literal["max_tokens", "max_completion_tokens", "max_output_tokens"]
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -313,6 +317,57 @@ class ModelConfig(BaseModel):
     cost_tier: CostTier | None = Field(default=None)
     supports_streaming: bool = False
     supports_thinking: bool = False
+    supports_reasoning: bool = Field(
+        default=False,
+        description=(
+            "Model supports provider reasoning/thinking mode. When true, routes may "
+            "pass provider_options.thinking=true. Params are sent only when the "
+            "adapter implements reasoning for this provider."
+        ),
+    )
+    reasoning_effort: ReasoningEffort = Field(
+        default="none",
+        description=(
+            "Suggested reasoning effort for models that support reasoning. Stored as "
+            "metadata; adapters send this only when provider support is verified."
+        ),
+    )
+    token_budget_param: TokenBudgetParam = Field(
+        default="max_tokens",
+        description=(
+            "Provider API field for the route output token budget. Azure/OpenAI "
+            "reasoning models require max_completion_tokens."
+        ),
+    )
+    supports_temperature: bool = Field(
+        default=True,
+        description="When false, temperature is omitted from provider payloads.",
+    )
+    supports_top_p: bool = Field(
+        default=False,
+        description="When false, top_p is omitted from provider payloads.",
+    )
+    supports_penalties: bool = Field(
+        default=False,
+        description=(
+            "When false, presence_penalty and frequency_penalty are omitted."
+        ),
+    )
+    supports_logprobs: bool = Field(
+        default=False,
+        description="When false, logprobs, top_logprobs, and logit_bias are omitted.",
+    )
+    supports_stop: bool = Field(
+        default=True,
+        description="When false, stop sequences are omitted from provider payloads.",
+    )
+    send_reasoning_effort: bool = Field(
+        default=False,
+        description=(
+            "When true and AZURE_OPENAI_SEND_REASONING_EFFORT is enabled, adapters "
+            "may send reasoning_effort to providers that support it."
+        ),
+    )
     timeout_seconds: int = Field(ge=1, le=120)
     capabilities: dict[str, CapabilityLevel] = Field(
         default_factory=dict,
@@ -335,6 +390,13 @@ class ModelConfig(BaseModel):
                 f"ModelConfig with provider={self.provider!r} must have "
                 "either 'model_id' or 'deployment'."
             )
+        return self
+
+    @model_validator(mode="after")
+    def align_reasoning_capabilities(self) -> ModelConfig:
+        """When supports_reasoning is true, allow thinking provider option."""
+        if self.supports_reasoning and not self.supports_thinking:
+            return self.model_copy(update={"supports_thinking": True})
         return self
 
     @field_validator("fallback_models")
@@ -449,6 +511,20 @@ class ProviderProfile(BaseModel):
         description=(
             "When true, a missing or blank base_url_env resolves to base_url=None "
             "instead of raising SecretNotFoundError."
+        ),
+    )
+    optional_endpoint: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing or blank endpoint_env resolves to endpoint=None "
+            "instead of raising SecretNotFoundError. Used for optional providers."
+        ),
+    )
+    optional_api_version: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing or blank api_version_env resolves to api_version=None "
+            "instead of raising SecretNotFoundError. Used for optional providers."
         ),
     )
 

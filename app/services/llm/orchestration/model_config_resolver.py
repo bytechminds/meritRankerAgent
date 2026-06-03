@@ -52,6 +52,8 @@ class ModelConfigResolver:
             provider=model_config.provider,
             supports_streaming=model_config.supports_streaming,
             supports_thinking=model_config.supports_thinking,
+            supports_reasoning=model_config.supports_reasoning,
+            reasoning_effort=model_config.reasoning_effort,
             timeout_seconds=model_config.timeout_seconds,
         )
 
@@ -74,7 +76,10 @@ class ModelConfigResolver:
             raise ModelExecutionConfigError(
                 f"Provider option 'thinking' must be a boolean for model '{model_alias}'."
             )
-        if thinking is True and not model_config.supports_thinking:
+        supports_reasoning_mode = (
+            model_config.supports_thinking or model_config.supports_reasoning
+        )
+        if thinking is True and not supports_reasoning_mode:
             raise ModelExecutionConfigError(
                 f"Model '{model_alias}' does not support provider option 'thinking'."
             )
@@ -159,5 +164,7 @@ class ModelConfigResolver:
             provider=model_config.provider,
             supports_streaming=model_config.supports_streaming,
             supports_thinking=model_config.supports_thinking,
+            supports_reasoning=model_config.supports_reasoning,
+            reasoning_effort=model_config.reasoning_effort,
             timeout_seconds=model_config.timeout_seconds,
         )

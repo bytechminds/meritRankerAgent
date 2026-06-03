@@ -600,8 +600,21 @@ class LlmConfigRegistry:
                     )
 
     def _active_route_model_aliases(self) -> set[str]:
-        """Model aliases referenced by compiled routes (primary models only)."""
-        return {route.model for route in self._route_map.values()}
+        """Model aliases referenced by production routes (excludes optional test difficulties)."""
+        optional_test_difficulties = frozenset({
+            "gemini_test",
+            "deepseek_test",
+            "deepseek_azure_test",
+            "cat_advanced",
+            "sbi_po_complex",
+            "cat_lrdi",
+        })
+        aliases: set[str] = set()
+        for (_subject, _task_role, difficulty), route in self._route_map.items():
+            if difficulty in optional_test_difficulties:
+                continue
+            aliases.add(route.model)
+        return aliases
 
     def validate_real_mode_deployments(self) -> None:
         """Raise if any *active-route* Azure model has empty/placeholder deployment.
@@ -610,8 +623,14 @@ class LlmConfigRegistry:
         aliases (e.g. openai_gpt_5_4 when env unset) may remain inactive with
         blank deployments without blocking startup.
 
+        Active routes using ``azure_deepseek`` profile must also have non-empty
+        AZURE_DEEPSEEK_API_KEY, AZURE_DEEPSEEK_ENDPOINT, and (classic mode)
+        AZURE_DEEPSEEK_API_VERSION env vars.
+
         Security: error messages include only model alias and deployment name.
         """
+        import os  # noqa: PLC0415
+
         errors: list[str] = []
         active_aliases = self._active_route_model_aliases()
 
@@ -621,12 +640,21 @@ class LlmConfigRegistry:
                 continue
             if model_cfg.provider == "azure_openai":
                 dep = getattr(model_cfg, "deployment", None) or ""
+                profile_name = getattr(model_cfg, "provider_profile", None) or ""
                 if not dep:
-                    errors.append(
-                        f"Active route model_alias='{alias}' has empty Azure "
-                        "deployment. Set the matching AZURE_OPENAI_DEPLOYMENT_* "
-                        "env var or point the route to a working alias."
-                    )
+                    if profile_name == "azure_deepseek":
+                        errors.append(
+                            f"Active route model_alias='{alias}' has empty Azure "
+                            "DeepSeek deployment. Set the matching "
+                            "AZURE_DEEPSEEK_*_DEPLOYMENT env var or point the "
+                            "route to a working alias."
+                        )
+                    else:
+                        errors.append(
+                            f"Active route model_alias='{alias}' has empty Azure "
+                            "deployment. Set the matching AZURE_OPENAI_DEPLOYMENT_* "
+                            "env var or point the route to a working alias."
+                        )
                 elif any(
                     dep.upper().startswith(p) or p in dep.upper()
                     for p in self._PLACEHOLDER_PREFIXES
@@ -635,6 +663,17 @@ class LlmConfigRegistry:
                         f"Active route model_alias='{alias}' has placeholder "
                         "Azure deployment. Replace with a real deployment name."
                     )
+                if profile_name == "azure_deepseek":
+                    for env_var in (
+                        "AZURE_DEEPSEEK_API_KEY",
+                        "AZURE_DEEPSEEK_ENDPOINT",
+                        "AZURE_DEEPSEEK_API_VERSION",
+                    ):
+                        if not os.getenv(env_var, "").strip():
+                            errors.append(
+                                f"Active route model_alias='{alias}' uses "
+                                f"azure_deepseek profile but {env_var} is not set."
+                            )
             elif model_cfg.provider == "openai":
                 mid = getattr(model_cfg, "model_id", None) or ""
                 if any(

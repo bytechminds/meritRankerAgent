@@ -152,6 +152,8 @@ def test_safe_metadata_contains_only_allowed_keys(tmp_path: Path) -> None:
         "provider": "gemini",
         "supports_streaming": True,
         "supports_thinking": False,
+        "supports_reasoning": False,
+        "reasoning_effort": "none",
         "timeout_seconds": 20,
     }
     assert not _UNSAFE_METADATA_KEYS.intersection(resolved.safe_metadata)

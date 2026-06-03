@@ -64,10 +64,22 @@ routes:
           - levels/advanced.md
         temperature: 0.15
         max_tokens: 2600
-        provider_options:
-          thinking: true
         fallback:
           - intermediate
+          - default
+          - general_default
+          - safe_mock
+
+      # Optional CAT-level math route — inactive unless explicitly selected.
+      cat_advanced:
+        inherits: default
+        model: math_cat_advanced_generator
+        overlays:
+          - levels/advanced.md
+        temperature: 0.15
+        max_tokens: 2600
+        fallback:
+          - advanced
           - default
           - general_default
           - safe_mock
@@ -75,6 +87,18 @@ routes:
       # Optional DeepSeek test route — inactive unless explicitly selected.
       deepseek_test:
         model: deepseek_reasoning_generator
+        prompt: subjects/math_generator.md
+        temperature: 0.15
+        max_tokens: 2600
+        fallback:
+          - advanced
+          - default
+          - general_default
+          - safe_mock
+
+      # Optional Azure-hosted DeepSeek test route — inactive unless selected.
+      deepseek_azure_test:
+        model: deepseek_azure_reasoning_generator
         prompt: subjects/math_generator.md
         temperature: 0.15
         max_tokens: 2600
@@ -140,9 +164,51 @@ routes:
           - general_default
           - safe_mock
 
+      # Optional SBI PO complex route — inactive unless explicitly selected.
+      sbi_po_complex:
+        inherits: default
+        model: reasoning_sbi_po_complex_generator
+        overlays:
+          - levels/advanced.md
+        max_tokens: 3200
+        provider_options:
+          thinking: true
+        fallback:
+          - advanced
+          - default
+          - general_default
+          - safe_mock
+
+      # Optional CAT LRDI route — inactive unless explicitly selected.
+      cat_lrdi:
+        inherits: default
+        model: reasoning_cat_lrdi_generator
+        overlays:
+          - levels/advanced.md
+        max_tokens: 3200
+        provider_options:
+          thinking: true
+        fallback:
+          - advanced
+          - default
+          - general_default
+          - safe_mock
+
       # Optional DeepSeek test route — inactive unless explicitly selected.
       deepseek_test:
         model: deepseek_reasoning_generator
+        prompt: subjects/reasoning_generator.md
+        temperature: 0.15
+        max_tokens: 2600
+        fallback:
+          - advanced
+          - default
+          - general_default
+          - safe_mock
+
+      # Optional Azure-hosted DeepSeek test route — inactive unless selected.
+      deepseek_azure_test:
+        model: deepseek_azure_reasoning_generator
         prompt: subjects/reasoning_generator.md
         temperature: 0.15
         max_tokens: 2600
@@ -263,6 +329,16 @@ routes:
       # Optional Gemini test route — inactive unless explicitly selected.
       gemini_test:
         model: gemini_flash_text
+        prompt: subjects/general_generator.md
+        temperature: 0.3
+        max_tokens: 900
+        fallback:
+          - default
+          - safe_mock
+
+      # Optional Azure-hosted DeepSeek test route — inactive unless selected.
+      deepseek_azure_test:
+        model: deepseek_azure_standard_generator
         prompt: subjects/general_generator.md
         temperature: 0.3
         max_tokens: 900
