@@ -34,7 +34,9 @@ def _reset_settings() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean() -> None:
+def _clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Web/KB compatibility tests use the explicit legacy retrieval provider."""
+    monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
     _reset_settings()
     reset_context_retrieval_service()
     yield

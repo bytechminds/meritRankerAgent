@@ -45,7 +45,9 @@ def _reset_settings() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean_singletons() -> None:
+def _clean_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep Part 13.1 KB compatibility tests on their explicit legacy provider."""
+    monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
     _reset_settings()
     reset_context_retrieval_service()
     yield

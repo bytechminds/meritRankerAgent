@@ -29,6 +29,7 @@ _ALLOWED_PROMPTS: frozenset[str] = frozenset(
     {
         "query_classifier",
         "answer_generator",
+        "image_question_classifier",
     }
 )
 

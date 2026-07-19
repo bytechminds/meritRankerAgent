@@ -9,6 +9,7 @@ dependencies = [
     "boto3>=1.26",
     "langgraph>=0.2",
     "openai>=2.38.0",
+    "pillow>=12.3.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0.3",

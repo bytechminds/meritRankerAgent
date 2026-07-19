@@ -11,7 +11,11 @@ import types
 import pytest
 
 from graphs.doubt_solver_graph import OrchestratedDoubtSolverState
-from schemas.doubt_solver import DoubtSolverStreamEvent
+from schemas.doubt_solver import (
+    DoubtSolverFinalResponse,
+    DoubtSolverStreamEvent,
+    ResponseContent,
+)
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
 from services.doubt_solver.stream_labels import get_stream_label
 from services.doubt_solver.streaming_doubt_solver_service import (
@@ -42,6 +46,14 @@ _FORBIDDEN_CONTENT_SUBSTRINGS = {
     "deepseek",
     "classifier_strong",
 }
+
+
+def _complete_response() -> DoubtSolverFinalResponse:
+    return DoubtSolverFinalResponse(
+        request_id=_REQUEST_ID,
+        content=ResponseContent(value="Answer."),
+        answer="Answer.",
+    )
 
 
 def _make_adapter(
@@ -110,6 +122,7 @@ class TestStreamEventSchema:
             stage="complete",
             label="Done",
             metadata={"request_id": _REQUEST_ID},
+            response=_complete_response(),
         )
         assert event.type == "complete"
 
@@ -146,6 +159,7 @@ class TestStreamEventSchema:
                 stage="complete",
                 label="Done",
                 metadata={"prompt": "hidden"},
+                response=_complete_response(),
             )
 
 
@@ -183,10 +197,10 @@ class TestStreamingFlow:
 
         messages = " ".join(r.message for r in caplog.records)
         assert "stream_started=true" in messages
-        assert "status_emitted" in messages
+        assert "stream_status_reason" in messages
         assert "first_visible_chunk_emitted=true" in messages
         assert "stream_completed=true" in messages
-        assert "chunk_count=" in messages
+        assert "answer_chunk_emission" in messages
         assert "latency_ms=" in messages
 
     def test_thinking_before_generation(self) -> None:
@@ -267,27 +281,26 @@ class TestCarefulClassificationStreamStatus:
             events = _collect(_make_adapter("Short answer."))
 
         labels = [e.label for e in events if e.type == "status"]
-        assert "Checking the question more carefully..." in labels
-        careful_idx = labels.index("Checking the question more carefully...")
-        generating_idx = next(
-            i for i, e in enumerate(events) if e.type == "status" and e.stage == "generating"
-        )
-        assert careful_idx < generating_idx
+        assert labels.count("Understanding...") == 1
+        assert "Checking the question more carefully..." not in labels
         assert events[-1].type == "complete"
 
 
 class TestMockProviderStreaming:
     def test_deterministic_chunks_emitted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
         import config as cfg_module
 
         cfg_module._settings = None
         events = _collect(_make_adapter("12345678901234567890"))
         chunks = [e for e in events if e.type == "chunk"]
         assert len(chunks) >= 2
+        cfg_module._settings = None
 
     def test_collected_chunks_equal_final_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
         import config as cfg_module
 
         cfg_module._settings = None
@@ -295,6 +308,7 @@ class TestMockProviderStreaming:
         events = _collect(_make_adapter(content))
         reconstructed = "".join(e.content or "" for e in events if e.type == "chunk")
         assert reconstructed == content
+        cfg_module._settings = None
 
 
 class TestAzureV1StreamingAdapter:
@@ -358,9 +372,16 @@ class TestNonStreamRegression:
         )
         assert result == content
 
-    def test_graph_state_five_fields(self) -> None:
+    def test_graph_state_includes_retrieval_context(self) -> None:
         fields = set(OrchestratedDoubtSolverState.__annotations__.keys())
-        expected = {"request_id", "query", "classification", "context_text", "answer"}
+        expected = {
+            "request_id",
+            "query",
+            "classification",
+            "retrieval_context",
+            "context_text",
+            "answer",
+        }
         assert fields == expected
 
     def test_task_role_remains_generator(self) -> None:
@@ -475,7 +496,8 @@ class TestWebSearchStreamStatus:
             events = _collect(_make_adapter("Current affairs answer."))
 
         labels = [e.label for e in events if e.type == "status"]
-        assert "Checking recent information..." in labels
+        assert labels.count("Thinking...") == 1
+        assert "Checking recent information..." not in labels
 
     def test_no_web_status_when_web_not_called(self) -> None:
         events = _collect(_make_adapter())
@@ -541,10 +563,8 @@ class TestExtendedStreamStatuses:
         ):
             events = _collect(_make_adapter("Short answer."))
 
-        careful = next(
-            e for e in events if e.label == "Checking the question more carefully..."
-        )
-        assert careful.stage == "understanding"
+        stages = [e.stage for e in events if e.type == "status"]
+        assert stages.count("understanding") == 1
 
     def test_web_retry_status_at_most_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import config as cfg_module
@@ -612,10 +632,14 @@ class TestExtendedStreamStatuses:
             events = _collect(_make_adapter("Answer."))
 
         labels = [e.label for e in events if e.type == "status"]
-        assert labels.count("Looking for more reliable sources...") == 1
-        assert "Checking recent information..." in labels
+        assert labels.count("Thinking...") == 1
+        assert "Looking for more reliable sources..." not in labels
 
-    def test_generator_fallback_status(self) -> None:
+    def test_generator_fallback_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import config as cfg_module
+
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
+        cfg_module._settings = None
         executor = MockModelExecutor(
             content="Reliable streamed answer.",
             notify_fallback_on_stream=True,
@@ -624,8 +648,9 @@ class TestExtendedStreamStatuses:
         adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
         events = _collect(adapter)
         labels = [e.label for e in events if e.type == "status"]
-        assert "Preparing a more reliable answer..." in labels
-        assert labels.count("Preparing a more reliable answer...") == 1
+        assert labels.count("Explaining...") == 1
+        assert "Preparing a more reliable answer..." not in labels
+        cfg_module._settings = None
 
     def test_stream_status_no_internal_leakage(self) -> None:
         executor = MockModelExecutor(
@@ -655,7 +680,13 @@ class TestEmptyGeneratorOutputStreaming:
             yield "   "
             yield "Visible answer text."
 
-    def test_empty_chunks_are_not_emitted(self) -> None:
+    def test_nonempty_whitespace_chunks_are_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import config as cfg_module
+
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
+        cfg_module._settings = None
         events = list(
             stream_doubt_solver(
                 StreamDoubtSolverInput(request_id=_REQUEST_ID, query="A question"),
@@ -663,12 +694,21 @@ class TestEmptyGeneratorOutputStreaming:
             )
         )
         chunks = [e.content for e in events if e.type == "chunk"]
-        assert chunks == ["Visible answer text."]
+        assert chunks == ["   ", "Visible answer text."]
+        complete = events[-1]
+        assert complete.response is not None
+        assert complete.response.content.value == "   Visible answer text."
+        cfg_module._settings = None
 
     def test_first_visible_chunk_not_set_for_empty_only(
-        self, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import logging
+
+        import config as cfg_module
+
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
+        cfg_module._settings = None
 
         class _EmptyOnlyAdapter:
             def generate_stream(self, **kwargs):  # noqa: ANN003
@@ -684,13 +724,14 @@ class TestEmptyGeneratorOutputStreaming:
             )
         messages = " ".join(r.message for r in caplog.records)
         assert "first_visible_chunk_emitted=true" not in messages
+        cfg_module._settings = None
 
 
 class TestStreamingErrorHandling:
     def test_provider_stream_error_returns_safe_error_event(self) -> None:
         events = _collect(_make_adapter(raise_on_execute=RuntimeError("provider boom")))
         assert events[-1].type == "error"
-        assert events[-1].label == "Something went wrong. Please try again."
+        assert events[-1].label == "Unable to complete"
 
     def test_no_stack_trace_exposed(self) -> None:
         events = _collect(_make_adapter(raise_on_execute=RuntimeError("detailed failure")))

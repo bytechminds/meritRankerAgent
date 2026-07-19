@@ -25,9 +25,154 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2025-07-23
+**Last updated:** 2026-07-19
 
 ---
+
+## Latest Changes - Markdown Output Integrity (2026-07-19)
+
+- Streaming now preserves every non-empty provider chunk without trimming whitespace.
+  `RegistryBackedModelExecutor` buffers leading whitespace until visible text confirms a
+  non-empty stream, while orchestration and delivery retain internal and trailing spaces.
+- Verified replay precomputes Markdown-safe chunks and checks byte-for-byte reconstruction
+  before emitting any draft content. Completed responses continue to enforce
+  `response.answer == response.content.value`.
+- Replay protects fenced and inline code, links/images, tables, supported math regions,
+  HTML-like blocks, and Unicode grapheme clusters. Protected regions may exceed the target
+  replay chunk size rather than being split.
+- The existing deterministic answer-quality validator now rejects high-confidence joined
+  dates and prose labels such as `on26thNovember1949` and `Article32`, repeated/conflicting
+  answer values, invalid UTF-8, malformed links, broken fences, unbalanced math, and unsafe
+  raw HTML. Spacing checks mask LaTeX, code, URLs, links, tables, and supported notation;
+  they detect defects but do not insert spaces or rewrite symbols.
+- Serious verified-draft failures use the existing maximum-one private regeneration and
+  one revalidation. No new model call, retry loop, graph node, response schema, route,
+  retrieval, classification, Pattern, image, or frontend behavior was added.
+- The shared generator contract received two compact formatting rules for readable spacing,
+  exact symbols, and one consistent answer. Subject overlays were not duplicated or expanded.
+- Coverage includes `test_markdown_output_integrity.py` plus adaptive delivery, stream
+  lifecycle, orchestration, and model-execution boundary regressions.
+- **[AI RISK]** Deterministic checks intentionally target high-confidence corruption and do
+  not perform grammar repair or semantic equivalence proofs. Live-provider adherence and
+  broad multilingual grapheme behavior remain **[NOT VERIFIED]** outside local deterministic
+  tests.
+
+---
+
+## Latest Changes — Subject-Specific Answer Formatting
+
+Generator prompts now use one shared policy plus the existing math, reasoning, English,
+and factual-subject overlays. Every answer starts with `**Answer:**`; the generator then
+selects the smallest useful set of subject-appropriate Markdown sections. Explicit student
+instructions such as "only answer", "briefly explain", "show steps", "use shortcut", and
+"explain deeply" take priority over the default section policy.
+
+- `app/prompts/generator_answer_contract.md` defines the shared concise-answer, retrieval,
+  Pattern/SolveFlow, Markdown, and completion-marker rules.
+- `app/prompts/subjects/{math,reasoning,english,general}_generator.md` define optional
+  subject-specific headings without forcing a universal template.
+- `app/prompts/intents/solve.md` no longer reintroduces the legacy fixed
+  `Given / Approach / Steps / Final Answer` shape.
+- `app/prompts/answer_generator.md` follows the same dynamic section policy for the legacy
+  shared generator prompt.
+- `app/tests/test_subject_answer_prompt_contract.py` composes real prompts through
+  `PromptResolver` and verifies direct-answer-first guidance, optional sections, explicit
+  instruction precedence, factual fact limits, safe retrieval handling, and unchanged route
+  bindings.
+
+No model, formatter, graph, retrieval, Pattern matching, SolveFlow, streaming, route/model,
+schema, token-budget, or frontend response-contract behavior changed. Retrieved context remains
+untrusted reference material; internal Pattern and retrieval metadata remain forbidden in answers.
+
+- **[AI RISK]** Section selection is prompt-guided rather than deterministically post-validated.
+  Prompt-composition and unit coverage are complete, but live-provider adherence to concise,
+  dynamic formatting remains **[NOT VERIFIED]** until evaluated with representative questions.
+
+---
+
+## Latest Changes - Image Question Classification Entry
+
+Image-bearing requests now route through the isolated, provider-neutral image classifier before
+entering the existing post-classification doubt-solver flow. The image service returns the existing
+`QueryClassification` contract, so retrieval, planning, model routing, and answer generation remain
+modality-agnostic. Text-only requests continue to use the existing classifier unchanged.
+
+The image feature is disabled by default. When enabled it validates and normalizes inline images,
+uses one structured Gemini multimodal call, applies confidence/rejection gates, and uses bounded
+versioned in-memory caching with duplicate-call suppression. Storage keys and signed URLs fail
+closed until an approved upload resolver exists. See `skills/features/image-question-classification.md`.
+
+---
+
+## Latest Changes — S3 Vector Student Retrieval Foundation
+
+### Summary
+
+Student retrieval now defaults to `RETRIEVAL_PROVIDER=s3_vector`. It adds a typed internal
+`retrieval_context` graph field and renders an aligned `[RETRIEVAL_CONTEXT]` section into the
+existing `context_text` generator input for selected runtime-ready or pattern-assist context.
+`fresh_solve` retains its structured trace but does not add retrieval text to the generator. The
+public request and response schemas are unchanged.
+
+1. **Embedding contract** — `app/retrieval/embeddings/bedrock_titan_embedder.py` uses only
+   Bedrock Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`), normalized float vectors,
+   and exactly 1024 dimensions. Invalid embedding/index dimensions fail configuration clearly.
+2. **Direct candidate retrieval** — `app/retrieval/s3_vectors/` queries
+   `student-runtime-index` and `student-pattern-index` with approved metadata filters. S3 Vector
+   metadata is candidate-only and never final-answer authority.
+3. **DynamoDB authority and gates** — `app/retrieval/stores/` fetches the current PatternGraph /
+   SolveFlow bundle by `patternId` (overridable with `DYNAMODB_PATTERN_PK`). Runtime-ready use
+   requires approved status, `answerDataStatus=valid`, approved SolveFlow, runtime readiness,
+   student visibility, and final-answer permission. Incompatible, stale, ambiguous, or
+   inconsistent bundles fail closed.
+4. **Safe modes** — `runtime_ready` may use approved SolveFlow and answer guidance;
+   `pattern_assist` exposes PatternGraph only as a method hint and always requires a fresh solve;
+   `fresh_solve` has no retrieval authority.
+5. **Optional reranking** — `ENABLE_COLBERT_RERANK=true` enables a bounded RAGatouille rerank
+   only over S3 candidates. Missing dependency, failure, or timeout preserves original S3 order.
+6. **Legacy KB isolation** — Bedrock KB retrieval remains available only when
+   `RETRIEVAL_PROVIDER=legacy_bedrock_kb`. The default S3 Vector route does not call the KB,
+   including when a legacy retriever has been injected for a test.
+
+### Files and Coverage
+
+| File | Responsibility |
+|---|---|
+| `app/retrieval/models.py` | Typed S3 candidate, DynamoDB bundle, trace, gate, and retrieval-context contracts |
+| `app/retrieval/retrieval_service.py` | Embed, query, DynamoDB validation, graph gate, fallback, and safe logs |
+| `app/retrieval/embeddings/` | Titan V2 query embedding interface and adapter |
+| `app/retrieval/s3_vectors/` | Direct S3 Vector filters, client, and candidate mapping |
+| `app/retrieval/stores/` | DynamoDB PatternGraph/SolveFlow source-of-truth access |
+| `app/retrieval/rerankers/` | No-op and bounded optional ColBERT rerankers |
+| `app/retrieval/context/data_context_builder.py` | Generator-safe retrieval-context rendering |
+| `app/services/context_retrieval/context_retrieval_service.py` | Default S3 Vector graph-facing selection with explicit legacy KB mode |
+| `app/tests/test_student_retrieval.py` | Titan dimensions, runtime-ready, pattern-assist, stale metadata, blocked states, rendering, KB exclusion, and rerank timeout |
+
+### Config / Env
+
+- `RETRIEVAL_PROVIDER=s3_vector` (default), `S3_VECTOR_BUCKET_NAME`,
+  `S3_VECTOR_RUNTIME_INDEX_NAME=student-runtime-index`,
+  `S3_VECTOR_PATTERN_INDEX_NAME=student-pattern-index`, `S3_VECTOR_REGION`
+- `BEDROCK_EMBEDDING_PROVIDER=bedrock`,
+  `BEDROCK_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0`,
+  `BEDROCK_EMBEDDING_DIMENSIONS=1024`, `BEDROCK_EMBEDDING_NORMALIZE=true`,
+  `BEDROCK_EMBEDDING_REGION=ap-southeast-2`
+- `S3_VECTOR_DIMENSIONS=1024`, `S3_VECTOR_DISTANCE_METRIC=cosine`,
+  `DYNAMODB_PATTERN_TABLE`, `DYNAMODB_PATTERN_PK=patternId`
+- `ENABLE_COLBERT_RERANK=false`, `COLBERT_MODEL_NAME`, `COLBERT_TOP_K=10`,
+  `RETRIEVAL_CACHE_TTL_SECONDS=21600`, `RETRIEVAL_MAX_LATENCY_MS=800`
+
+### Known Limitations
+
+- **[NOT VERIFIED]** Live Bedrock Titan, S3 Vector `QueryVectors`, DynamoDB permissions, and
+  index/schema compatibility require an AWS integration environment; offline unit tests use fakes.
+- **[PERFORMANCE RISK]** ColBERT model loading is optional and bounded by the retrieval latency
+  budget; production capacity and cold-start cost are not yet measured.
+- **[AI RISK]** Retrieved PatternGraph content is untrusted contextual data. It is rendered in a
+  delimited retrieval section and must not be treated as instructions.
+- **[AUTH TODO]** Student identity is not used to scope retrieval access.
+- **[DEFER]** Vector ingestion/index construction, distributed cache invalidation, and a live
+  retrieval observability dashboard are outside this change.
 
 ## Latest Changes — Part 13.1 Context Retrieval + RAG Correctness Fix
 
@@ -180,6 +325,83 @@ Config:
 - Logs: `answer_generation_budget`, `answer_completion`, `answer_quality_validation`, `answer_quality_rewrite` (no full answer/prompt).
 - Stream path buffers when validation enabled, then yields finalized text (event contract unchanged).
 
+### Adaptive Verified Streaming (latest)
+
+- `AnswerDeliveryPolicy` is an isolated, provider-neutral pre-token decision boundary.
+  `adaptive` is default and permits `live_stream` only for an explicitly approved
+  low-risk profile; all other decisions use `verified_replay`.
+- Decision signals are limited to safe classification, image, retrieval, difficulty,
+  current-fact, and known fallback/review state. The policy does not inspect prompts,
+  context, messages, secrets, or provider payloads.
+- Verified delivery calls the existing complete-answer orchestration path, reuses the
+  deterministic answer-quality validator/rewrite mechanism, validates privately, and
+  permits at most one bounded private regeneration. Draft content is never emitted.
+- Live delivery forwards provider chunks only for the approved profile. A provider
+  failure after visible output is terminal; `RegistryBackedModelExecutor` does not
+  begin a fallback stream that could duplicate or restart the answer.
+- `DoubtSolverStreamEvent` remains `status|chunk|complete|error`. Completed streams
+  now carry `DoubtSolverFinalResponse(schema_version="1", status="completed",
+  content={format:"markdown", value}, answer)`; `answer` is preserved as the
+  compatibility projection.
+- Verified replay uses whole Markdown lines/blocks, preserving fenced code and
+  Mermaid, tables, image/link syntax, and LaTex delimiters without arbitrary splits.
+- Statuses include `understanding`, `thinking`, `retrieving`, `generating`,
+  `verifying`, and `finalizing`. Logs contain request ID, delivery strategy, risk,
+  reason codes, and timing only; no draft, prompt, query, context, credentials, or
+  provider payload is logged.
+- Config: `ANSWER_DELIVERY_POLICY=adaptive`,
+  `ANSWER_LIVE_STREAM_MIN_CLASSIFIER_CONFIDENCE=0.93`,
+  `ANSWER_LIVE_STREAM_MIN_IMAGE_CONFIDENCE=0.90`,
+  `ANSWER_LIVE_STREAM_MIN_PATTERN_CONFIDENCE=0.90`,
+  `ANSWER_LIVE_STREAM_MAX_DIFFICULTY=basic`, `ANSWER_VERIFIER_ENABLED=true`,
+  `ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS=1`, and `ANSWER_REPLAY_MAX_CHUNK_CHARS=600`.
+  `always_live` is blocked in production unless
+  `ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION=true` is explicitly set.
+- Coverage: `test_answer_delivery_policy.py`, `test_adaptive_verified_streaming.py`,
+  updated stream/schema/config tests, and model-executor regression coverage for
+  no fallback after visible chunks.
+- **[NOT VERIFIED]** Invocation cancellation is cooperative at phase and replay
+  boundaries. An already in-flight synchronous provider SDK call cannot be cancelled
+  until the provider adapter exposes cancellation support.
+- **[DEFER]** Provider-specific cancellation adapters, semantic verifier models,
+  pacing controls, and policy telemetry backends.
+
+### AgentCore Stream Lifecycle Hardening (2026-07-17)
+
+- `stream_events_as_sse()` is the single transport boundary for orchestrated streams.
+  It preserves `status|chunk|complete|error`, frames JSON as UTF-8 SSE, and sends raw
+  `: heartbeat` comments at `ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS` while no
+  application event is available.
+- Every accepted stream now ends with exactly one `complete`, one controlled `error`,
+  or confirmed cancellation/disconnect. A source iterator that returns or raises before
+  a terminal event is converted to a safe terminal error while the transport is writable.
+- Starlette cancellation marks the shared request token as `client_disconnected`, stops
+  future replay/provider output, prevents completion, and records `stream_closed` with a
+  stable terminal reason. Heartbeat write cancellation follows the same path.
+- Errors before content are retryable controlled failures. Errors after visible live
+  content use `ANSWER_PARTIAL_STREAM_FAILED`, are not retryable in-place, and never
+  restart provider fallback.
+- Verified generation checks cancellation before and after generation, verification,
+  repair, and replay boundaries. Private drafts remain unexposed.
+- Markdown replay now uses a bounded protected-region scanner for `\\[...\\]`,
+  `\\(...\\)`, `$$...$$`, safely matched `$...$`, fenced code/Mermaid, links, images,
+  approved HTML-like blocks, and tables. Protected blocks may exceed the target size.
+- Lifecycle logs include `stream_started`, `status_sent`, `heartbeat_sent`,
+  `first_chunk_sent`, `chunk_sent`, verification/repair/replay start and completion,
+  `complete_sent`, `error_sent`, `client_disconnected`, `request_cancelled`, and
+  `stream_closed`; no answer, query, prompt, context, provider payload, or secret is logged.
+- `[LIMITATION]` Sync provider SDK work cannot be force-stopped. Disconnect marks the
+  request cancelled immediately and suppresses/discards later output, but compute and
+  resource release can be delayed until the in-flight call returns.
+- Coverage: `test_stream_lifecycle.py`, updated adaptive/orchestrated stream tests,
+  configuration validation, and AgentCore `/invocations` Response-passthrough coverage.
+- Local AgentCore HTTP dry-run verified a canonical successful stream and a timed curl
+  abort after status events. The abort logged `client_disconnected` and
+  `stream_closed terminal_reason=client_disconnected` with no later transport output.
+- `[NOT VERIFIED]` Manual frontend abort behavior against the separate MeritRanker UI.
+- `[NOT VERIFIED]` Live provider disconnect during an in-flight SDK call in deployed
+  AgentCore; local transport cancellation and output suppression are covered.
+
 ### KB context formatting fallback (latest)
 
 - `SolutionBriefBuilder` uses safe metadata helpers (`safe_str`, `safe_list`, `normalize_metadata_key`) so optional/sparse KB metadata never drops selected context.
@@ -330,8 +552,9 @@ Unchanged — exactly 5 fields: `request_id`, `query`, `classification`,
 
 ### AgentCore runtime streaming
 
-**VERIFIED** — `BedrockAgentCoreApp` accepts a sync generator from `@app.entrypoint`
-and returns `text/event-stream` SSE (`inspect.isgenerator` path in SDK).
+**VERIFIED** — `BedrockAgentCoreApp` passes the application `StreamingResponse`
+through unchanged. The application transport wrapper emits `text/event-stream`, raw
+heartbeat comments, controlled terminal events, and receives ASGI cancellation on abort.
 
 `stream=false` (default) uses the existing non-streaming `invoke()` graph path
 unchanged.
@@ -344,7 +567,9 @@ unchanged.
 
 ### Deferred / not verified
 
-- `[NOT VERIFIED]` AgentCore HTTP E2E with `stream=true` over live `agentcore dev`.
+- Local AgentCore HTTP E2E with `stream=true` is verified with the controlled mock
+  executor for successful completion and client abort. Live-provider E2E remains
+  `[NOT VERIFIED]`.
 - `[NOT VERIFIED]` Real Azure/OpenAI streaming with live credentials in CI.
 
 ---

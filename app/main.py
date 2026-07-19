@@ -26,23 +26,32 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterator
-from typing import Any
 
 from bedrock_agentcore import BedrockAgentCoreApp
 from pydantic import ValidationError
+from starlette.responses import Response, StreamingResponse
 
 from config import ConfigurationError, get_settings
 from graphs.demo_graph import build_demo_graph
 from graphs.doubt_solver_graph import (
     build_doubt_solver_graph,
     build_orchestrated_doubt_solver_graph,
+    map_to_orchestrated_classification,
+)
+from graphs.image_question_classifier_node import (
+    ImageClassifierNodeInput,
+    image_classifier_node,
 )
 from logging_config import configure_logging
 from schemas.doubt_solver import DoubtSolverRequest
+from schemas.image_question_classification import ImageClassificationStatus
 from schemas.request import AgentRequest
 from schemas.response import AgentResponse
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
+from services.doubt_solver.stream_transport import (
+    StreamCancellation,
+    stream_events_as_sse,
+)
 from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
@@ -60,6 +69,14 @@ logger = logging.getLogger(__name__)
 # Build graphs once at startup — compilation is not free.
 graph = build_demo_graph()
 doubt_solver_graph = build_doubt_solver_graph()
+
+image_question_classifier = None
+if settings.image_classifier_enabled:
+    from services.image_question_classification.factory import (  # noqa: PLC0415
+        build_image_question_classifier,
+    )
+
+    image_question_classifier = build_image_question_classifier(settings)
 
 # Orchestrated graph — only built when ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.
 # Default is false; existing tests are unaffected.
@@ -168,7 +185,7 @@ logger.info(
 
 
 @app.entrypoint
-def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
+def invoke(payload: dict) -> dict | Response:
     """Handle a single invocation request.
 
     Args:
@@ -186,11 +203,74 @@ def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
         if mode == "doubt_solver":
             ds_request = DoubtSolverRequest.model_validate(payload)
             logger.info(
-                "request_id=%s  user_id=%s  mode=doubt_solver  query_len=%d — invoke started",
+                "request_id=%s  user_id=%s  mode=doubt_solver  query_len=%d "
+                "has_image=%s — invoke started",
                 request_id,
                 ds_request.user_id,
-                len(ds_request.query),
+                len(ds_request.query or ""),
+                ds_request.image is not None,
             )
+
+            query = ds_request.query or ""
+            entry_classification = None
+            source_modality = "text"
+            image_confidence: float | None = None
+            image_uncertain = False
+            classifier_confidence: float | None = None
+            classifier_fallback = False
+            if ds_request.image is not None:
+                source_modality = "image"
+                if image_question_classifier is None:
+                    return {
+                        "success": False,
+                        "answer": (
+                            "Image questions are not enabled. Please enter the question as text."
+                        ),
+                        "request_id": request_id,
+                        "mode": "doubt_solver",
+                        "image_classification_status": (
+                            ImageClassificationStatus.REJECTED_UNSUPPORTED_IMAGE.value
+                        ),
+                    }
+                image_result = image_classifier_node(
+                    ImageClassifierNodeInput(
+                        request_id=request_id,
+                        image=ds_request.image,
+                        instruction=ds_request.query,
+                    ),
+                    classifier=image_question_classifier,
+                )
+                if image_result.status != ImageClassificationStatus.CLASSIFIED:
+                    return {
+                        "success": False,
+                        "answer": image_result.user_message or "The image could not be processed.",
+                        "request_id": request_id,
+                        "mode": "doubt_solver",
+                        "image_classification_status": image_result.status.value,
+                    }
+                if image_result.classification is None or not image_result.normalized_query:
+                    return {
+                        "success": False,
+                        "answer": "The image could not be processed.",
+                        "request_id": request_id,
+                        "mode": "doubt_solver",
+                        "image_classification_status": (
+                            ImageClassificationStatus.REJECTED_UNREADABLE_IMAGE.value
+                        ),
+                    }
+                query = image_result.normalized_query
+                entry_classification = image_result.classification
+                image_metadata = image_result.image_parse_metadata
+                image_confidence = min(
+                    image_metadata.extraction_confidence,
+                    image_metadata.classification_confidence,
+                )
+                image_uncertain = bool(image_metadata.warnings) or (
+                    image_metadata.has_visual
+                    and image_metadata.visual_context.confidence < image_confidence
+                )
+                classifier_confidence = entry_classification.confidence
+                classifier_fallback = entry_classification.classification_source == "fallback"
 
             # Orchestrated path — ENABLE_ORCHESTRATED_DOUBT_SOLVER=true
             if (
@@ -211,22 +291,60 @@ def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
                         request_id,
                     )
 
-                    def _stream_events() -> Iterator[dict[str, Any]]:
-                        for event in stream_doubt_solver(
-                            StreamDoubtSolverInput(
-                                request_id=request_id,
-                                query=ds_request.query,
+                    mapped_classification = (
+                        map_to_orchestrated_classification(
+                            entry_classification,
+                            query=query,
+                            request_id=request_id,
+                        )
+                        if entry_classification is not None
+                        else None
+                    )
+                    cancellation = StreamCancellation()
+                    events = stream_doubt_solver(
+                        StreamDoubtSolverInput(
+                            request_id=request_id,
+                            query=query,
+                            classification=mapped_classification,
+                            source_modality=source_modality,
+                            image_confidence=image_confidence,
+                            image_uncertain=image_uncertain,
+                            classifier_confidence=classifier_confidence,
+                            classifier_fallback=classifier_fallback,
+                            should_cancel=cancellation.is_cancelled,
+                            cancellation_reason=lambda: cancellation.reason,
+                        ),
+                        adapter=orchestrated_adapter,
+                    )
+                    return StreamingResponse(
+                        stream_events_as_sse(
+                            events,
+                            request_id=request_id,
+                            cancellation=cancellation,
+                            heartbeat_interval_seconds=(
+                                get_settings().answer_stream_heartbeat_interval_seconds
                             ),
-                            adapter=orchestrated_adapter,
-                        ):
-                            yield event.model_dump(mode="json")
-
-                    return _stream_events()
+                        ),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
 
                 orchestrated_input = {
                     "request_id": request_id,
-                    "query": ds_request.query,
-                    "classification": None,
+                    "query": query,
+                    "classification": (
+                        map_to_orchestrated_classification(
+                            entry_classification,
+                            query=query,
+                            request_id=request_id,
+                        )
+                        if entry_classification is not None
+                        else None
+                    ),
+                    "retrieval_context": {},
                     "context_text": "",
                     "answer": None,
                 }
@@ -236,21 +354,31 @@ def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
                     request_id,
                 )
                 return {
+                    "schema_version": "1",
+                    "status": "completed",
                     "success": True,
                     "request_id": request_id,
                     "mode": "doubt_solver",
                     "answer": orchestrated_result.get("answer") or "",
+                    "content": {
+                        "format": "markdown",
+                        "value": orchestrated_result.get("answer") or "",
+                    },
                     "classification": orchestrated_result.get("classification"),
                 }
 
             # Legacy path — ENABLE_ORCHESTRATED_DOUBT_SOLVER=false (default)
             graph_input = {
                 "request_id": request_id,
-                "query": ds_request.query,
+                "query": query,
                 "user_id": ds_request.user_id,
                 "mode": ds_request.mode,
                 "language": ds_request.language,
-                "classification": None,
+                "classification": (
+                    entry_classification.model_dump()
+                    if entry_classification is not None
+                    else None
+                ),
                 "answer": None,
                 "answer_source": None,
                 "is_truncated": False,
@@ -264,6 +392,7 @@ def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
                 "used_retrieval": False,
                 "context_used": False,
                 "service_error": False,
+                "retrieval_context": None,
             }
             result = doubt_solver_graph.invoke(graph_input)
             logger.info("request_id=%s — invoke succeeded (doubt_solver)", request_id)
@@ -297,19 +426,23 @@ def invoke(payload: dict) -> dict | Iterator[dict[str, Any]]:
         return response.model_dump()
 
     except ValidationError as exc:
-        logger.warning("request_id=%s — validation error: %s", request_id, exc)
+        logger.warning(
+            "request_id=%s — validation error  error_count=%d",
+            request_id,
+            exc.error_count(),
+        )
         return {
             "success": False,
-            "answer": f"Validation error: {exc}",
+            "answer": "Validation error: request payload is invalid.",
             "request_id": request_id,
             "mode": payload.get("mode", "demo"),
         }
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("request_id=%s — unexpected error", request_id)
         return {
             "success": False,
-            "answer": f"Internal error: {exc}",
+            "answer": "Internal error: request failed safely.",
             "request_id": request_id,
             "mode": payload.get("mode", "demo"),
         }

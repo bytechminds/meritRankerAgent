@@ -29,6 +29,7 @@ if a fact is unknown.
 |---|---|---|
 | `demo-agent.md` | Local demo — AgentCore + LangGraph + Pydantic foundation | Local Demo |
 | `doubt-solver.md` | Student doubt solving and tutoring workflow | Planned |
+| `image-question-classification.md` | Image extraction and classification entry path | Partially Implemented |
 
 ---
 

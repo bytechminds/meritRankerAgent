@@ -55,3 +55,13 @@ def get_bedrock_agent_runtime_client(region_name: str | None = None) -> Any:
 def get_dynamodb_client(region_name: str | None = None) -> Any:
     """Return a cached ``dynamodb`` boto3 low-level client."""
     return _get_or_create_client("dynamodb", region_name)
+
+
+def get_bedrock_runtime_client(region_name: str | None = None) -> Any:
+    """Return a cached ``bedrock-runtime`` boto3 low-level client."""
+    return _get_or_create_client("bedrock-runtime", region_name)
+
+
+def get_s3_vectors_client(region_name: str | None = None) -> Any:
+    """Return a cached ``s3vectors`` boto3 low-level client."""
+    return _get_or_create_client("s3vectors", region_name)

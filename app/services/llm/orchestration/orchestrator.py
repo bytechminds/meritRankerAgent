@@ -597,6 +597,7 @@ class LlmOrchestrator:
         context: str | None = None,
         on_before_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
+        verify_before_stream: bool = True,
     ) -> Iterator[str]:
         """Run orchestration and yield answer text chunks from the model executor."""
         if not query or not query.strip():
@@ -637,7 +638,9 @@ class LlmOrchestrator:
         continuation_attempts = 0
         finish_reason: str | None = None
         streamed_parts: list[str] = []
-        buffer_for_quality = is_generator and quality_policy.validation_enabled
+        buffer_for_quality = (
+            verify_before_stream and is_generator and quality_policy.validation_enabled
+        )
         visible_emitted = False
 
         chunk_count = 0
@@ -653,15 +656,17 @@ class LlmOrchestrator:
                     clean = marker_filter.feed(chunk)
                 else:
                     clean = chunk
-                if clean and clean.strip():
-                    visible_emitted = True
+                if clean:
+                    if clean.strip():
+                        visible_emitted = True
                     streamed_parts.append(clean)
                     if not buffer_for_quality:
                         yield clean
             if marker_filter is not None:
                 tail = marker_filter.flush()
-                if tail and tail.strip():
-                    visible_emitted = True
+                if tail:
+                    if tail.strip():
+                        visible_emitted = True
                     streamed_parts.append(tail)
                     if not buffer_for_quality:
                         yield tail
@@ -669,13 +674,11 @@ class LlmOrchestrator:
         except ProviderExecutionError as exc:
             if is_generator and not visible_emitted:
                 logger.warning(
-                    "llm_orchestrator.generate_stream  all_attempts_empty  route_id=%s  "
-                    "model=%s — emitting safe failure message",
+                    "llm_orchestrator.generate_stream  all_attempts_failed  route_id=%s  "
+                    "model=%s",
                     route_decision.route_id,
                     route_decision.model,
                 )
-                yield generation_failure_message()
-                return
             raise LlmExecutionError(
                 f"Model stream failed for route '{route_decision.route_id}': "
                 f"{type(exc).__name__}"
@@ -698,10 +701,12 @@ class LlmOrchestrator:
                 finish_reason or "none",
             )
             if is_generator:
-                yield generation_failure_message()
-                return
+                raise LlmExecutionError(
+                    f"Model stream returned no visible output for route "
+                    f"'{route_decision.route_id}'."
+                )
         provider_hint = "mock" if isinstance(self._model_executor, MockModelExecutor) else None
-        if should_run_continuation(
+        if (not visible_emitted or buffer_for_quality) and should_run_continuation(
             partial_content,
             finish_reason,
             policy,
@@ -735,14 +740,16 @@ class LlmOrchestrator:
                 ):
                     chunk_count += 1
                     clean = cont_filter.feed(chunk)
-                    if clean and clean.strip():
-                        visible_emitted = True
+                    if clean:
+                        if clean.strip():
+                            visible_emitted = True
                         streamed_parts.append(clean)
                         if not buffer_for_quality:
                             yield clean
                 cont_tail = cont_filter.flush()
-                if cont_tail and cont_tail.strip():
-                    visible_emitted = True
+                if cont_tail:
+                    if cont_tail.strip():
+                        visible_emitted = True
                     streamed_parts.append(cont_tail)
                     if not buffer_for_quality:
                         yield cont_tail
@@ -759,7 +766,7 @@ class LlmOrchestrator:
 
         if is_generator:
             raw_content = "".join(streamed_parts)
-            if quality_policy.validation_enabled:
+            if verify_before_stream and quality_policy.validation_enabled:
                 final_content, _rewrite_used = self._finalize_generator_content(
                     request_id=route_request.request_id,
                     content=raw_content,

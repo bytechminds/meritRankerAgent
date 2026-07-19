@@ -54,6 +54,15 @@ def _reset_settings() -> None:
     cfg_module._settings = None
 
 
+@pytest.fixture(autouse=True)
+def _use_legacy_kb_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Part 9 integration coverage remains on the explicit legacy provider."""
+    monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
+    _reset_settings()
+    yield
+    _reset_settings()
+
+
 def _make_graph_input(query: str = "Explain what percentage means") -> dict:
     """Return a fully initialised graph state dict (all Part 9 fields included)."""
     return {

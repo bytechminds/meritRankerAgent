@@ -345,11 +345,21 @@ class RegistryBackedModelExecutor:
         primary_failure_kind: str | None = None
         self.last_stream_finish_reason = None
         visible_chunk_count = 0
+        leading_chunks: list[str] = []
         try:
             for chunk in self._provider_executor.execute_stream(primary_request):
-                if _is_visible_text(chunk):
+                if not chunk:
+                    continue
+                if visible_chunk_count == 0 and not _is_visible_text(chunk):
+                    leading_chunks.append(chunk)
+                    continue
+                if visible_chunk_count == 0:
+                    visible_chunk_count = 1
+                    yield from leading_chunks
+                    leading_chunks.clear()
+                elif _is_visible_text(chunk):
                     visible_chunk_count += 1
-                    yield chunk
+                yield chunk
             self.last_stream_finish_reason = getattr(
                 self._provider_executor, "last_stream_finish_reason", "stop"
             )
@@ -373,6 +383,11 @@ class RegistryBackedModelExecutor:
                 )
             return
         except LlmProviderExecutionError as exc:
+            if visible_chunk_count > 0:
+                raise ProviderExecutionError(
+                    f"Provider stream failed after visible output for model "
+                    f"'{primary_alias}': {type(exc).__name__}"
+                ) from exc
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
                 raise ProviderExecutionError(
                     f"Provider stream failed for model '{primary_alias}' "
@@ -388,6 +403,11 @@ class RegistryBackedModelExecutor:
         except ProviderExecutionError:
             raise
         except Exception as exc:
+            if visible_chunk_count > 0:
+                raise ProviderExecutionError(
+                    f"Provider executor stream failed after visible output for model "
+                    f"'{primary_alias}': {type(exc).__name__}"
+                ) from exc
             raise ProviderExecutionError(
                 f"Provider executor stream failed for model '{primary_alias}': "
                 f"{type(exc).__name__}"
@@ -436,10 +456,20 @@ class RegistryBackedModelExecutor:
             try:
                 fallback_visible = 0
                 if hasattr(self._provider_executor, "execute_stream"):
+                    fallback_leading_chunks: list[str] = []
                     for chunk in self._provider_executor.execute_stream(fallback_request):
-                        if _is_visible_text(chunk):
+                        if not chunk:
+                            continue
+                        if fallback_visible == 0 and not _is_visible_text(chunk):
+                            fallback_leading_chunks.append(chunk)
+                            continue
+                        if fallback_visible == 0:
+                            fallback_visible = 1
+                            yield from fallback_leading_chunks
+                            fallback_leading_chunks.clear()
+                        elif _is_visible_text(chunk):
                             fallback_visible += 1
-                            yield chunk
+                        yield chunk
                     self.last_stream_finish_reason = getattr(
                         self._provider_executor, "last_stream_finish_reason", "stop"
                     )
@@ -465,6 +495,11 @@ class RegistryBackedModelExecutor:
                 )
                 return
             except LlmProviderExecutionError as exc:
+                if fallback_visible > 0:
+                    raise ProviderExecutionError(
+                        f"Fallback provider stream failed after visible output for model "
+                        f"'{fallback_alias}': {type(exc).__name__}"
+                    ) from exc
                 logger.warning(
                     "registry_backed_model_executor.execute_stream  fallback_failed  "
                     "fallback_alias=%s  failure_kind=%s",
@@ -472,6 +507,11 @@ class RegistryBackedModelExecutor:
                     exc.failure_kind,
                 )
             except Exception as exc:
+                if fallback_visible > 0:
+                    raise ProviderExecutionError(
+                        f"Fallback provider executor stream failed after visible output for "
+                        f"model '{fallback_alias}': {type(exc).__name__}"
+                    ) from exc
                 logger.warning(
                     "registry_backed_model_executor.execute_stream  fallback_error  "
                     "fallback_alias=%s  error=%s",

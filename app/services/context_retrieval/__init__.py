@@ -1,9 +1,9 @@
 """
-Context retrieval package (Part 13.1).
+Context retrieval package.
 
 Graph-facing entry point:
     services.context_retrieval.context_retrieval_service.ContextRetrievalService
 
-Bedrock KB retrieval, decision policy, reranking, and cache placeholder (deferred) live here.
-DynamoDB, web search, and planner are deferred.
+S3 Vector student retrieval is the default graph-facing path. Bedrock KB support remains
+available only under the explicit legacy retrieval provider.
 """

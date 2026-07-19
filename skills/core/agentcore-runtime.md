@@ -78,7 +78,7 @@ from bedrock_agentcore import BedrockAgentCoreApp
 app = BedrockAgentCoreApp()
 
 @app.entrypoint
-def invoke(payload: dict) -> dict:
+def invoke(payload: dict) -> dict | Response:
     # 1. Validate payload with AgentRequest (Pydantic)
     # 2. Build graph state
     # 3. Invoke graph
@@ -91,6 +91,10 @@ if __name__ == "__main__":
 
 - `main.py` must remain thin: logging setup, graph build, entrypoint decorator, done.
 - All business logic belongs in `graphs/`, `services/`, or `tools/`.
+- Orchestrated streaming returns a Starlette `StreamingResponse`, which AgentCore passes
+  through directly. `stream_events_as_sse()` owns UTF-8 SSE framing, heartbeat comments,
+  disconnect cancellation, and terminal enforcement. Application events remain
+  `status|chunk|complete|error`.
 
 ---
 

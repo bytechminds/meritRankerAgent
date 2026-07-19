@@ -398,24 +398,24 @@ class TestOrchestratorEmptyStream:
         def execute(self, *, route_decision, messages):  # noqa: ANN001
             raise AssertionError("not used")
 
-    def test_empty_stream_yields_safe_failure_message(
+    def test_empty_stream_raises_controlled_execution_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from services.doubt_solver.answer_quality import GENERATION_FAILURE_MESSAGE
+        from services.llm.orchestration.errors import LlmExecutionError
 
         monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
         cfg_module._settings = None
         orchestrator = LlmOrchestrator(model_executor=self._EmptyStreamExecutor())
-        chunks = list(
-            orchestrator.generate_stream(
-                route_request=RouteRequest(
-                    request_id="empty-stream-1",
-                    subject="reasoning",
-                    task_role="generator",
-                    difficulty="advanced",
-                    intent="solve",
-                ),
-                query="A reasoning puzzle",
+        with pytest.raises(LlmExecutionError, match="no visible output"):
+            list(
+                orchestrator.generate_stream(
+                    route_request=RouteRequest(
+                        request_id="empty-stream-1",
+                        subject="reasoning",
+                        task_role="generator",
+                        difficulty="advanced",
+                        intent="solve",
+                    ),
+                    query="A reasoning puzzle",
+                )
             )
-        )
-        assert chunks == [GENERATION_FAILURE_MESSAGE]

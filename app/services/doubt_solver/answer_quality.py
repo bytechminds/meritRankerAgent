@@ -10,6 +10,7 @@ from typing import Literal
 
 from config import Settings, get_settings
 from schemas.llm import LlmMessage
+from services.doubt_solver.markdown_replay import iter_markdown_segments
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,10 @@ GENERATION_FAILURE_MESSAGE = (
 
 REWRITE_USER_PROMPT = (
     "Rewrite the answer into the required compact format. Keep only the final clean "
-    "solution. Do not show failed attempts. Use valid Markdown. Use \\(...\\) and "
-    "\\[...\\] only for math. Do not use $ or $$. Keep it concise. "
+    "solution with one consistent answer. Preserve normal prose spacing and every "
+    "number, unit, punctuation mark, and math, statistics, or chemistry symbol. Do not "
+    "show failed attempts. Use valid Markdown. Use \\(...\\) and \\[...\\] only for "
+    "math. Do not use $ or $$. Keep it concise. "
     "End with <ANSWER_DONE>."
 )
 
@@ -48,9 +51,26 @@ _HTML_TAG_PATTERN = re.compile(r"<\s*[a-zA-Z][^>]*>")
 _DOLLAR_INLINE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", re.DOTALL)
 _DOLLAR_DISPLAY = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _QUAD_DOLLAR = re.compile(r"\${4,}")
-_FINAL_ANSWER_HEADER = re.compile(
-    r"(?im)^\s*\*{0,2}\s*final answer\s*:?\s*\*{0,2}\s*$"
+_ANSWER_HEADING_LINE = re.compile(
+    r"(?im)^\s*\*{0,2}\s*(?:final\s+)?answer\s*:?\s*\*{0,2}"
+    r"\s*(?P<value>[^\n]*)$"
 )
+_URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+_JOINED_MONTH_DATE = re.compile(
+    r"(?i)\b(?:"
+    r"(?:on|from|since|until)\d{1,2}(?:st|nd|rd|th)?(?:january|february|march|"
+    r"april|may|june|july|august|september|october|november|december)(?:\d{2,4})?"
+    r"|"
+    r"\d{1,2}(?:st|nd|rd|th)?(?:january|february|march|april|may|june|july|"
+    r"august|september|october|november|december)(?:\d{2,4})?"
+    r"|(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\d{2,4}"
+    r")\b"
+)
+_JOINED_PROSE_NUMBER = re.compile(
+    r"(?i)\b(?:on|from|since|until|article|section|rule|chapter|option)\d+\b"
+)
+_FENCE_LINE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 _NUMBERED_STEP = re.compile(r"(?m)^\s*\d+\.\s+")
 _DISPLAY_MATH = re.compile(r"\\\[.*?\\\]", re.DOTALL)
 _INCOMPLETE_ENDINGS = re.compile(
@@ -95,20 +115,96 @@ class AnswerQualityResult:
 
 
 def detect_final_answer(content: str) -> bool:
-    """Return True when a Final Answer section or line is present."""
+    """Return True when an Answer or Final Answer section is present."""
     if not content or not content.strip():
         return False
-    if _FINAL_ANSWER_HEADER.search(content):
-        return True
-    if re.search(r"(?i)final answer\s*:", content):
-        return True
-    return False
+    return _ANSWER_HEADING_LINE.search(content) is not None
 
 
 def count_final_answer_sections(content: str) -> int:
-    headers = _FINAL_ANSWER_HEADER.findall(content)
-    inline = re.findall(r"(?i)final answer\s*:", content)
-    return max(len(headers), len(inline))
+    return len(_ANSWER_HEADING_LINE.findall(content))
+
+
+def _answer_heading_values(content: str) -> list[str]:
+    values: list[str] = []
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        match = _ANSWER_HEADING_LINE.fullmatch(line)
+        if match is None:
+            continue
+        value = match.group("value").strip()
+        if not value:
+            for following in lines[index + 1 :]:
+                candidate = following.strip()
+                if candidate:
+                    value = candidate
+                    break
+        if value:
+            values.append(re.sub(r"\s+", " ", value).casefold())
+    return values
+
+
+def _mask_spacing_protected_regions(content: str) -> str:
+    parts: list[str] = []
+    for segment, protected in iter_markdown_segments(content):
+        if protected:
+            parts.append("".join("\n" if char == "\n" else " " for char in segment))
+        else:
+            parts.append(segment)
+    plain = "".join(parts)
+    return _URL_PATTERN.sub(lambda match: " " * len(match.group(0)), plain)
+
+
+def _has_unclosed_fence(content: str) -> bool:
+    opening_char: str | None = None
+    opening_length = 0
+    for line in content.splitlines():
+        match = _FENCE_LINE.match(line)
+        if match is None:
+            continue
+        marker = match.group(1)
+        if opening_char is None:
+            opening_char = marker[0]
+            opening_length = len(marker)
+        elif marker[0] == opening_char and len(marker) >= opening_length:
+            opening_char = None
+            opening_length = 0
+    return opening_char is not None
+
+
+def _has_malformed_markdown_link(content: str) -> bool:
+    cursor = 0
+    while cursor < len(content):
+        bracket_start = content.find("[", cursor)
+        if bracket_start < 0:
+            return False
+        bracket_end = content.find("]", bracket_start + 1)
+        if bracket_end < 0:
+            return False
+        if bracket_end + 1 >= len(content) or content[bracket_end + 1] != "(":
+            cursor = bracket_end + 1
+            continue
+        depth = 1
+        link_cursor = bracket_end + 2
+        while link_cursor < len(content) and depth:
+            if content[link_cursor] == "(" and not _is_escaped(content, link_cursor):
+                depth += 1
+            elif content[link_cursor] == ")" and not _is_escaped(content, link_cursor):
+                depth -= 1
+            link_cursor += 1
+        if depth:
+            return True
+        cursor = link_cursor
+    return False
+
+
+def _is_escaped(content: str, index: int) -> bool:
+    slashes = 0
+    index -= 1
+    while index >= 0 and content[index] == "\\":
+        slashes += 1
+        index -= 1
+    return slashes % 2 == 1
 
 
 def validate_answer_quality(
@@ -126,6 +222,14 @@ def validate_answer_quality(
             is_valid=False,
             severity="error",
             reason_codes=["empty_answer"],
+        )
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        return AnswerQualityResult(
+            is_valid=False,
+            severity="unsafe",
+            reason_codes=["invalid_utf8"],
         )
     if not pol.validation_enabled:
         return AnswerQualityResult(is_valid=True, severity="clean", reason_codes=[])
@@ -156,8 +260,14 @@ def validate_answer_quality(
     if _count_unbalanced(content, r"\[", r"\]"):
         _flag("math_unbalanced_display", "rewrite_required")
 
-    if content.count("```") % 2 != 0:
+    if (
+        _has_unclosed_fence(content)
+        or content.count("```") % 2 != 0
+        or content.count("~~~") % 2 != 0
+    ):
         _flag("markdown_unclosed_fence", "rewrite_required")
+    if _has_malformed_markdown_link(check_content):
+        _flag("markdown_malformed_link", "rewrite_required")
 
     if _RAW_HTML_PATTERN.search(check_content):
         _flag("raw_html_script", "unsafe")
@@ -181,6 +291,15 @@ def validate_answer_quality(
 
     if count_final_answer_sections(content) > 1:
         _flag("duplicate_final_answer", "rewrite_required")
+        answer_values = set(_answer_heading_values(content))
+        if len(answer_values) > 1:
+            _flag("conflicting_answer_values", "rewrite_required")
+
+    spacing_content = _mask_spacing_protected_regions(check_content)
+    if _JOINED_MONTH_DATE.search(spacing_content):
+        _flag("joined_date_tokens", "rewrite_required")
+    if _JOINED_PROSE_NUMBER.search(spacing_content):
+        _flag("suspicious_word_number_join", "rewrite_required")
 
     if content.count(pol.completion_marker) > 1:
         _flag("duplicate_completion_marker", "minor")
@@ -260,7 +379,7 @@ def apply_safe_sanitizer(content: str, *, marker: str) -> str:
 
 def strip_duplicate_final_answer_section(content: str) -> str:
     """Remove a repeated Final Answer block if duplicated verbatim."""
-    matches = list(_FINAL_ANSWER_HEADER.finditer(content))
+    matches = list(_ANSWER_HEADING_LINE.finditer(content))
     if len(matches) < 2:
         return content
     first_start = matches[0].start()

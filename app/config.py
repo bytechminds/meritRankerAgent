@@ -60,6 +60,28 @@ class Settings:
     bedrock_kb_region: str  # empty string means "use AWS_REGION or boto3 default"
     bedrock_kb_max_results: int
     bedrock_kb_min_score: float | None  # None means "no minimum threshold"
+    # Student S3 Vector retrieval
+    retrieval_provider: str
+    s3_vector_bucket_name: str
+    s3_vector_runtime_index_name: str
+    s3_vector_pattern_index_name: str
+    s3_vector_region: str
+    s3_vector_top_k_runtime: int
+    s3_vector_top_k_pattern: int
+    s3_vector_dimensions: int
+    s3_vector_distance_metric: str
+    enable_colbert_rerank: bool
+    colbert_top_k: int
+    colbert_model_name: str
+    retrieval_cache_ttl_seconds: int
+    retrieval_max_latency_ms: int
+    dynamodb_pattern_pk: str
+    # Query embedding contract for S3 Vector retrieval
+    bedrock_embedding_provider: str
+    bedrock_embedding_model_id: str
+    bedrock_embedding_dimensions: int
+    bedrock_embedding_normalize: bool
+    bedrock_embedding_region: str
     # DynamoDB record fetch
     enable_dynamodb_fetch: bool
     dynamodb_question_table: str
@@ -117,6 +139,17 @@ class Settings:
     answer_quality_max_visible_steps: int
     answer_quality_max_display_math_blocks: int
     answer_quality_max_math_line_chars: int
+    # Adaptive verified streaming / answer delivery
+    answer_delivery_policy: str
+    answer_live_stream_min_classifier_confidence: float
+    answer_live_stream_min_image_confidence: float
+    answer_live_stream_min_pattern_confidence: float
+    answer_live_stream_max_difficulty: str
+    answer_verifier_enabled: bool
+    answer_verifier_max_repair_attempts: int
+    answer_replay_max_chunk_chars: int
+    answer_stream_heartbeat_interval_seconds: float
+    answer_allow_always_live_in_production: bool
     # Optional Gemini provider (not required at startup)
     gemini_api_key: str
     gemini_base_url: str
@@ -124,6 +157,17 @@ class Settings:
     gemini_default_model: str
     gemini_image_model: str
     gemini_text_model: str
+    # Image-question classification (isolated multimodal entry path)
+    image_classifier_enabled: bool
+    image_classifier_provider: str
+    image_classifier_model: str
+    image_classifier_api_key: str
+    image_classifier_timeout_ms: int
+    image_classifier_max_image_bytes: int
+    image_classifier_max_output_tokens: int
+    image_classifier_cache_ttl_seconds: int
+    image_classifier_min_confidence: float
+    image_classifier_max_dimension: int
     # Optional DeepSeek provider (not required at startup)
     deepseek_api_key: str
     deepseek_base_url: str
@@ -213,6 +257,163 @@ def get_settings() -> Settings:
     """
     global _settings
     if _settings is None:
+        retrieval_provider = os.getenv("RETRIEVAL_PROVIDER", "s3_vector").strip().lower()
+        embedding_provider = os.getenv("BEDROCK_EMBEDDING_PROVIDER", "bedrock").strip().lower()
+        embedding_model_id = os.getenv(
+            "BEDROCK_EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0"
+        ).strip()
+        embedding_dimensions = int(os.getenv("BEDROCK_EMBEDDING_DIMENSIONS", "1024"))
+        s3_vector_dimensions = int(os.getenv("S3_VECTOR_DIMENSIONS", "1024"))
+        if retrieval_provider not in {"s3_vector", "legacy_bedrock_kb"}:
+            raise ConfigurationError(
+                "RETRIEVAL_PROVIDER must be 's3_vector' or 'legacy_bedrock_kb'."
+            )
+        if retrieval_provider == "s3_vector":
+            if embedding_provider != "bedrock":
+                raise ConfigurationError(
+                    "BEDROCK_EMBEDDING_PROVIDER must be 'bedrock' for S3 Vector retrieval."
+                )
+            if embedding_model_id != "amazon.titan-embed-text-v2:0":
+                raise ConfigurationError(
+                    "BEDROCK_EMBEDDING_MODEL_ID must be 'amazon.titan-embed-text-v2:0' "
+                    "for S3 Vector retrieval."
+                )
+            if embedding_dimensions != 1024 or s3_vector_dimensions != 1024:
+                raise ConfigurationError(
+                    "S3 Vector retrieval requires BEDROCK_EMBEDDING_DIMENSIONS and "
+                    "S3_VECTOR_DIMENSIONS to both equal 1024."
+                )
+            if os.getenv("S3_VECTOR_DISTANCE_METRIC", "cosine").strip().lower() != "cosine":
+                raise ConfigurationError("S3_VECTOR_DISTANCE_METRIC must be 'cosine'.")
+        image_classifier_enabled = (
+            os.getenv("IMAGE_CLASSIFIER_ENABLED", "false").lower() == "true"
+        )
+        image_classifier_provider = os.getenv("IMAGE_CLASSIFIER_PROVIDER", "gemini").strip()
+        image_classifier_model = os.getenv(
+            "IMAGE_CLASSIFIER_MODEL", "gemini-3.1-flash-lite"
+        ).strip()
+        image_classifier_api_key = os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+        if image_classifier_enabled:
+            image_classifier_timeout_ms = int(
+                os.getenv("IMAGE_CLASSIFIER_TIMEOUT_MS", "15000")
+            )
+            image_classifier_max_image_bytes = int(
+                os.getenv("IMAGE_CLASSIFIER_MAX_IMAGE_BYTES", "8388608")
+            )
+            image_classifier_max_output_tokens = int(
+                os.getenv("IMAGE_CLASSIFIER_MAX_OUTPUT_TOKENS", "1400")
+            )
+            image_classifier_cache_ttl_seconds = int(
+                os.getenv("IMAGE_CLASSIFIER_CACHE_TTL_SECONDS", "300")
+            )
+            image_classifier_min_confidence = float(
+                os.getenv("IMAGE_CLASSIFIER_MIN_CONFIDENCE", "0.65")
+            )
+            image_classifier_max_dimension = int(
+                os.getenv("IMAGE_CLASSIFIER_MAX_DIMENSION", "2400")
+            )
+        else:
+            image_classifier_timeout_ms = 15000
+            image_classifier_max_image_bytes = 8_388_608
+            image_classifier_max_output_tokens = 1400
+            image_classifier_cache_ttl_seconds = 300
+            image_classifier_min_confidence = 0.65
+            image_classifier_max_dimension = 2400
+        if image_classifier_enabled:
+            if image_classifier_provider != "gemini":
+                raise ConfigurationError(
+                    "IMAGE_CLASSIFIER_PROVIDER must be 'gemini' when image "
+                    "classification is enabled."
+                )
+            if not image_classifier_model:
+                raise ConfigurationError(
+                    "IMAGE_CLASSIFIER_MODEL is required when image classification is enabled."
+                )
+            if not image_classifier_api_key:
+                raise ConfigurationError(
+                    "GOOGLE_GEMINI_API_KEY is required when image classification is enabled."
+                )
+        positive_image_values = {
+            "IMAGE_CLASSIFIER_TIMEOUT_MS": image_classifier_timeout_ms,
+            "IMAGE_CLASSIFIER_MAX_IMAGE_BYTES": image_classifier_max_image_bytes,
+            "IMAGE_CLASSIFIER_MAX_OUTPUT_TOKENS": image_classifier_max_output_tokens,
+            "IMAGE_CLASSIFIER_MAX_DIMENSION": image_classifier_max_dimension,
+        }
+        if image_classifier_enabled:
+            for name, value in positive_image_values.items():
+                if value <= 0:
+                    raise ConfigurationError(f"{name} must be greater than zero.")
+            if image_classifier_cache_ttl_seconds < 0:
+                raise ConfigurationError(
+                    "IMAGE_CLASSIFIER_CACHE_TTL_SECONDS cannot be negative."
+                )
+            if not 0.0 <= image_classifier_min_confidence <= 1.0:
+                raise ConfigurationError(
+                    "IMAGE_CLASSIFIER_MIN_CONFIDENCE must be between 0.0 and 1.0."
+                )
+
+        answer_delivery_policy = os.getenv("ANSWER_DELIVERY_POLICY", "adaptive").strip()
+        if answer_delivery_policy not in {"always_verified", "adaptive", "always_live"}:
+            raise ConfigurationError(
+                "ANSWER_DELIVERY_POLICY must be 'always_verified', 'adaptive', or 'always_live'."
+            )
+        answer_live_stream_min_classifier_confidence = _parse_confidence_threshold(
+            os.getenv("ANSWER_LIVE_STREAM_MIN_CLASSIFIER_CONFIDENCE", ""),
+            default=0.93,
+        )
+        answer_live_stream_min_image_confidence = _parse_confidence_threshold(
+            os.getenv("ANSWER_LIVE_STREAM_MIN_IMAGE_CONFIDENCE", ""),
+            default=0.90,
+        )
+        answer_live_stream_min_pattern_confidence = _parse_confidence_threshold(
+            os.getenv("ANSWER_LIVE_STREAM_MIN_PATTERN_CONFIDENCE", ""),
+            default=0.90,
+        )
+        answer_live_stream_max_difficulty = os.getenv(
+            "ANSWER_LIVE_STREAM_MAX_DIFFICULTY", "basic"
+        ).strip()
+        if answer_live_stream_max_difficulty not in {
+            "default",
+            "basic",
+            "intermediate",
+            "advanced",
+        }:
+            raise ConfigurationError(
+                "ANSWER_LIVE_STREAM_MAX_DIFFICULTY must be a supported route difficulty."
+            )
+        answer_verifier_max_repair_attempts = int(
+            os.getenv("ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS", "1")
+        )
+        if answer_verifier_max_repair_attempts not in {0, 1}:
+            raise ConfigurationError(
+                "ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS must be 0 or 1."
+            )
+        answer_replay_max_chunk_chars = int(
+            os.getenv("ANSWER_REPLAY_MAX_CHUNK_CHARS", "600")
+        )
+        if answer_replay_max_chunk_chars <= 0:
+            raise ConfigurationError("ANSWER_REPLAY_MAX_CHUNK_CHARS must be greater than zero.")
+        answer_stream_heartbeat_interval_seconds = float(
+            os.getenv("ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS", "10")
+        )
+        if answer_stream_heartbeat_interval_seconds <= 0:
+            raise ConfigurationError(
+                "ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS must be greater than zero."
+            )
+        answer_allow_always_live_in_production = (
+            os.getenv("ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION", "false").lower()
+            == "true"
+        )
+        if (
+            os.getenv("APP_ENV", "local").strip().lower() == "production"
+            and answer_delivery_policy == "always_live"
+            and not answer_allow_always_live_in_production
+        ):
+            raise ConfigurationError(
+                "ANSWER_DELIVERY_POLICY=always_live is blocked in production unless "
+                "ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION=true."
+            )
+
         _settings = Settings(
             app_env=os.getenv("APP_ENV", "local"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -235,6 +436,38 @@ def get_settings() -> Settings:
             bedrock_kb_min_score=_parse_optional_float(
                 os.getenv("BEDROCK_KB_MIN_SCORE", "")
             ),
+            retrieval_provider=retrieval_provider,
+            s3_vector_bucket_name=os.getenv("S3_VECTOR_BUCKET_NAME", "").strip(),
+            s3_vector_runtime_index_name=os.getenv(
+                "S3_VECTOR_RUNTIME_INDEX_NAME", "student-runtime-index"
+            ).strip(),
+            s3_vector_pattern_index_name=os.getenv(
+                "S3_VECTOR_PATTERN_INDEX_NAME", "student-pattern-index"
+            ).strip(),
+            s3_vector_region=os.getenv("S3_VECTOR_REGION", os.getenv("AWS_REGION", "")).strip(),
+            s3_vector_top_k_runtime=int(os.getenv("S3_VECTOR_TOP_K_RUNTIME", "20")),
+            s3_vector_top_k_pattern=int(os.getenv("S3_VECTOR_TOP_K_PATTERN", "40")),
+            s3_vector_dimensions=s3_vector_dimensions,
+            s3_vector_distance_metric=os.getenv("S3_VECTOR_DISTANCE_METRIC", "cosine").strip(),
+            enable_colbert_rerank=(
+                os.getenv("ENABLE_COLBERT_RERANK", "false").lower() == "true"
+            ),
+            colbert_top_k=int(os.getenv("COLBERT_TOP_K", "10")),
+            colbert_model_name=os.getenv("COLBERT_MODEL_NAME", "").strip(),
+            retrieval_cache_ttl_seconds=int(
+                os.getenv("RETRIEVAL_CACHE_TTL_SECONDS", "21600")
+            ),
+            retrieval_max_latency_ms=int(os.getenv("RETRIEVAL_MAX_LATENCY_MS", "800")),
+            dynamodb_pattern_pk=os.getenv("DYNAMODB_PATTERN_PK", "patternId").strip(),
+            bedrock_embedding_provider=embedding_provider,
+            bedrock_embedding_model_id=embedding_model_id,
+            bedrock_embedding_dimensions=embedding_dimensions,
+            bedrock_embedding_normalize=(
+                os.getenv("BEDROCK_EMBEDDING_NORMALIZE", "true").lower() == "true"
+            ),
+            bedrock_embedding_region=os.getenv(
+                "BEDROCK_EMBEDDING_REGION", os.getenv("AWS_REGION", "")
+            ).strip(),
             enable_dynamodb_fetch=os.getenv("ENABLE_DYNAMODB_FETCH", "false").lower() == "true",
             dynamodb_question_table=os.getenv("DYNAMODB_QUESTION_TABLE", ""),
             dynamodb_pattern_table=os.getenv("DYNAMODB_PATTERN_TABLE", ""),
@@ -346,12 +579,44 @@ def get_settings() -> Settings:
             answer_quality_max_math_line_chars=int(
                 os.getenv("ANSWER_QUALITY_MAX_MATH_LINE_CHARS", "300")
             ),
+            answer_delivery_policy=answer_delivery_policy,
+            answer_live_stream_min_classifier_confidence=(
+                answer_live_stream_min_classifier_confidence
+            ),
+            answer_live_stream_min_image_confidence=(
+                answer_live_stream_min_image_confidence
+            ),
+            answer_live_stream_min_pattern_confidence=(
+                answer_live_stream_min_pattern_confidence
+            ),
+            answer_live_stream_max_difficulty=answer_live_stream_max_difficulty,
+            answer_verifier_enabled=(
+                os.getenv("ANSWER_VERIFIER_ENABLED", "true").lower() == "true"
+            ),
+            answer_verifier_max_repair_attempts=answer_verifier_max_repair_attempts,
+            answer_replay_max_chunk_chars=answer_replay_max_chunk_chars,
+            answer_stream_heartbeat_interval_seconds=(
+                answer_stream_heartbeat_interval_seconds
+            ),
+            answer_allow_always_live_in_production=(
+                answer_allow_always_live_in_production
+            ),
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             gemini_base_url=os.getenv("GEMINI_BASE_URL", ""),
             gemini_timeout_seconds=int(os.getenv("GEMINI_TIMEOUT_SECONDS", "30")),
             gemini_default_model=os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash-lite"),
             gemini_image_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-lite"),
             gemini_text_model=os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"),
+            image_classifier_enabled=image_classifier_enabled,
+            image_classifier_provider=image_classifier_provider,
+            image_classifier_model=image_classifier_model,
+            image_classifier_api_key=image_classifier_api_key,
+            image_classifier_timeout_ms=image_classifier_timeout_ms,
+            image_classifier_max_image_bytes=image_classifier_max_image_bytes,
+            image_classifier_max_output_tokens=image_classifier_max_output_tokens,
+            image_classifier_cache_ttl_seconds=image_classifier_cache_ttl_seconds,
+            image_classifier_min_confidence=image_classifier_min_confidence,
+            image_classifier_max_dimension=image_classifier_max_dimension,
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", ""),
             deepseek_timeout_seconds=int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60")),

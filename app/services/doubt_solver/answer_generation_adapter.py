@@ -94,6 +94,7 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         on_before_generator_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
+        verify_before_stream: bool = True,
     ) -> Iterator[str]:
         """Yield answer text chunks from the orchestrator stream path.
 
@@ -128,4 +129,5 @@ class AnswerGenerationAdapter:
             context=context_text if context_text else None,
             on_before_fallback=on_before_generator_fallback,
             on_before_continuation=on_before_continuation,
+            verify_before_stream=verify_before_stream,
         )

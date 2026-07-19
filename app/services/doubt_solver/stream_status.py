@@ -13,11 +13,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StreamStatusTracker:
-    """Emit student-facing status events at most once per label per request."""
+    """Emit each lifecycle stage at most once per request."""
 
     request_id: str
     pending_events: list[DoubtSolverStreamEvent] = field(default_factory=list)
     _emitted_labels: set[str] = field(default_factory=set)
+    _emitted_stages: set[str] = field(default_factory=set)
 
     def emit_direct(
         self,
@@ -27,7 +28,7 @@ class StreamStatusTracker:
         reason_code: str,
     ) -> DoubtSolverStreamEvent | None:
         """Emit immediately (not queued) if this label has not been emitted yet."""
-        if label in self._emitted_labels:
+        if stage in self._emitted_stages:
             logger.info(
                 "stream_status_reason  request_id=%s  status_label=%s  "
                 "reason_code=%s  emitted=false",
@@ -38,6 +39,7 @@ class StreamStatusTracker:
             return None
 
         self._emitted_labels.add(label)
+        self._emitted_stages.add(stage)
         logger.info(
             "stream_status_reason  request_id=%s  status_label=%s  "
             "reason_code=%s  emitted=true",
@@ -60,7 +62,7 @@ class StreamStatusTracker:
         reason_code: str,
     ) -> None:
         """Queue a status event if this label has not been emitted yet."""
-        if label in self._emitted_labels:
+        if stage in self._emitted_stages:
             logger.info(
                 "stream_status_reason  request_id=%s  status_label=%s  "
                 "reason_code=%s  emitted=false",
@@ -71,6 +73,7 @@ class StreamStatusTracker:
             return
 
         self._emitted_labels.add(label)
+        self._emitted_stages.add(stage)
         logger.info(
             "stream_status_reason  request_id=%s  status_label=%s  "
             "reason_code=%s  emitted=true",

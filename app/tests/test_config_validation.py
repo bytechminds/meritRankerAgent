@@ -164,6 +164,7 @@ class TestKbConfigValidation:
             KnowledgeBaseConfigurationError,
         )
 
+        monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
         monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
         monkeypatch.setenv("BEDROCK_KB_ID", "fake-id")
         _reset_settings()
@@ -243,6 +244,7 @@ class TestDynamoDbConfigValidation:
         from schemas.retrieval import KnowledgeBaseResult, RetrievalResponse  # noqa: PLC0415
         from services.dynamodb_service import DynamoDbConfigurationError  # noqa: PLC0415
 
+        monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
         monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
         monkeypatch.setenv("BEDROCK_KB_ID", "fake-id")
         monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "true")
@@ -339,6 +341,44 @@ class TestDefaultConfigNoErrors:
         settings = cfg_module.get_settings()
         assert settings.doubt_solver_max_context_chars == 6000
         assert settings.doubt_solver_max_context_chars > 0
+
+
+class TestAnswerDeliveryConfig:
+    def test_stream_heartbeat_interval_is_configurable(self, monkeypatch) -> None:
+        monkeypatch.setenv("ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS", "2.5")
+        _reset_settings()
+
+        assert cfg_module.get_settings().answer_stream_heartbeat_interval_seconds == 2.5
+
+    def test_stream_heartbeat_interval_must_be_positive(self, monkeypatch) -> None:
+        monkeypatch.setenv("ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS", "0")
+        _reset_settings()
+
+        with pytest.raises(
+            cfg_module.ConfigurationError,
+            match="ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS",
+        ):
+            cfg_module.get_settings()
+
+    def test_always_live_is_blocked_in_production_without_explicit_approval(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
+        monkeypatch.setenv("ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION", "false")
+        _reset_settings()
+
+        with pytest.raises(cfg_module.ConfigurationError, match="always_live is blocked"):
+            cfg_module.get_settings()
+
+    def test_always_live_requires_explicit_production_approval(self, monkeypatch) -> None:
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
+        monkeypatch.setenv("ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION", "true")
+        _reset_settings()
+
+        assert cfg_module.get_settings().answer_delivery_policy == "always_live"
+        _reset_settings()
 
     def test_invalid_integer_env_var_raises_value_error(self, monkeypatch):
         """A non-integer value for DOUBT_SOLVER_MAX_CONTEXT_CHARS raises ValueError.

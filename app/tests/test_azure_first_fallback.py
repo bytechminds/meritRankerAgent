@@ -1228,12 +1228,19 @@ class TestGenerateNodeProviderFailureHandling:
         assert "azure_fast" not in answer
         assert "openai_native_fallback" not in answer
 
-    def test_graph_state_unchanged_after_provider_failure(self) -> None:
-        """OrchestratedDoubtSolverState must still have exactly 5 fields."""
+    def test_graph_state_has_internal_retrieval_context_after_provider_failure(self) -> None:
+        """OrchestratedDoubtSolverState retains the internal retrieval contract."""
         from graphs.doubt_solver_graph import OrchestratedDoubtSolverState  # noqa: PLC0415
 
         fields = set(OrchestratedDoubtSolverState.__annotations__.keys())
-        assert fields == {"request_id", "query", "classification", "context_text", "answer"}, (
+        assert fields == {
+            "request_id",
+            "query",
+            "classification",
+            "retrieval_context",
+            "context_text",
+            "answer",
+        }, (
             f"OrchestratedDoubtSolverState fields changed: {fields}"
         )
 
@@ -1434,12 +1441,19 @@ class TestRegressionGuards:
         assert result.content == "Primary answer."
         assert fake_executor.call_log == ["azure_fast"]
 
-    def test_graph_state_exactly_5_fields(self) -> None:
-        """OrchestratedDoubtSolverState must remain exactly 5 fields."""
+    def test_graph_state_includes_internal_retrieval_context(self) -> None:
+        """OrchestratedDoubtSolverState must retain exactly six declared fields."""
         from graphs.doubt_solver_graph import OrchestratedDoubtSolverState  # noqa: PLC0415
 
         fields = set(OrchestratedDoubtSolverState.__annotations__.keys())
-        assert fields == {"request_id", "query", "classification", "context_text", "answer"}
+        assert fields == {
+            "request_id",
+            "query",
+            "classification",
+            "retrieval_context",
+            "context_text",
+            "answer",
+        }
 
 
 def _executor_pair_simple(

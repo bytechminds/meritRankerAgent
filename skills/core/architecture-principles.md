@@ -167,3 +167,6 @@ Every integration point should be swappable without touching the graph:
 - `2025-05-20` — Use TypedDict for LangGraph internal state; Pydantic only at API boundary.
   Rationale: LangGraph's reducer/checkpointer is most reliable with plain dicts; avoids
   serialisation surprises when adding persistence later.
+- `2026-07-15` — Use S3 Vectors for student retrieval candidates and DynamoDB PatternGraph
+  bundles as final authority. Rationale: vector metadata is stale-prone and cannot grant
+  student final-answer authority without the current approved runtime bundle.

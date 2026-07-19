@@ -351,6 +351,7 @@ class TestTimeSpeedDistanceSolutionBriefPath:
     def test_compose_uses_solution_brief_for_if_query(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
         monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "true")
         cfg_module._settings = None
         retriever = MagicMock()

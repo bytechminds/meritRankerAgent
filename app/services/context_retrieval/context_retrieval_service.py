@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import get_settings
+from retrieval.context.data_context_builder import render_retrieval_context
+from retrieval.retrieval_service import StudentRetrievalService
 from services.context_retrieval.bedrock_kb_retriever import BedrockKnowledgeBaseRetriever
 from services.context_retrieval.context_models import (
     ContextRetrievalDecision,
@@ -671,10 +673,12 @@ class ContextRetrievalService:
         kb_retriever: BedrockKnowledgeBaseRetriever | None = None,
         web_search_tool: WebSearchTool | None = None,
         brief_builder: SolutionBriefBuilder | None = None,
+        student_retrieval_service: StudentRetrievalService | None = None,
     ) -> None:
         self._kb_retriever = kb_retriever or BedrockKnowledgeBaseRetriever()
         self._web_search_tool = web_search_tool or WebSearchTool()
         self._brief_builder = brief_builder or SolutionBriefBuilder()
+        self._student_retrieval_service = student_retrieval_service or StudentRetrievalService()
 
     def retrieve_context(
         self,
@@ -685,6 +689,9 @@ class ContextRetrievalService:
         on_web_search_weak_context: Callable[[], None] | None = None,
     ) -> ContextRetrievalResult:
         settings = get_settings()
+        if settings.retrieval_provider == "s3_vector":
+            return self._retrieve_s3_vector_context(request)
+
         web_decision = evaluate_web_search_decision(request, settings)
         logger.info(
             "web_search_decision  request_id=%s  need_web_search=%s  reason=%s  "
@@ -723,6 +730,22 @@ class ContextRetrievalService:
             if web_result.context_text:
                 return web_result
         return kb_result
+
+    def _retrieve_s3_vector_context(
+        self,
+        request: ContextRetrievalRequest,
+    ) -> ContextRetrievalResult:
+        """Use S3 Vectors as the only student PatternGraph retrieval provider."""
+        retrieval_context = self._student_retrieval_service.retrieve(request)
+        context_text = render_retrieval_context(retrieval_context)
+        retrieval_used = retrieval_context.mode != "fresh_solve"
+        return ContextRetrievalResult(
+            context_text=context_text,
+            item_count=1 if retrieval_used else 0,
+            retrieval_used=retrieval_used,
+            reason=retrieval_context.retrieval_trace.fallback_reason or retrieval_context.mode,
+            retrieval_context=retrieval_context,
+        )
 
     def _retrieve_direct_web_context(
         self,

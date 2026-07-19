@@ -14,6 +14,7 @@ import pytest
 
 from schemas.llm import LlmMessage
 from schemas.llm_routing import FallbackAttempt, RouteDecision, RouteRequest
+from services.llm.providers.errors import LlmProviderExecutionError
 from services.llm_orchestration.config_registry import LlmConfigRegistry
 from services.llm_orchestration.errors import (
     ModelConfigResolutionError,
@@ -608,3 +609,70 @@ class TestEmptyStreamFallback:
                     messages=_messages(),
                 )
             )
+
+    def test_stream_preserves_leading_internal_and_trailing_whitespace(
+        self, tmp_path: Path
+    ) -> None:
+        class _WhitespaceProvider:
+            last_stream_finish_reason = "stop"
+
+            def execute_stream(self, request):  # noqa: ANN001
+                del request
+                yield "  "
+                yield "Adopted on "
+                yield " "
+                yield "26 November 1949"
+                yield "\n"
+
+            def execute(self, request):  # noqa: ANN001
+                raise AssertionError("execute should not be called")
+
+        executor = RegistryBackedModelExecutor(
+            provider_executor=_WhitespaceProvider(),
+            model_config_resolver=ModelConfigResolver(registry=_registry(tmp_path)),
+        )
+
+        chunks = list(
+            executor.execute_stream(
+                route_decision=_route_decision(model="gemini_flash_light"),
+                messages=_messages(),
+            )
+        )
+
+        assert chunks == ["  ", "Adopted on ", " ", "26 November 1949", "\n"]
+        assert "".join(chunks) == "  Adopted on  26 November 1949\n"
+
+
+def test_stream_failure_after_visible_chunk_does_not_start_fallback(tmp_path: Path) -> None:
+    class _PartialFailureProvider:
+        def __init__(self) -> None:
+            self.aliases: list[str] = []
+
+        def execute_stream(self, request):  # noqa: ANN001
+            self.aliases.append(request.model_resolution.model_alias)
+            yield "partial output"
+            raise LlmProviderExecutionError(
+                "safe timeout",
+                failure_kind="timeout",
+                provider="gemini",
+                model_alias=request.model_resolution.model_alias,
+            )
+
+        def execute(self, request):  # noqa: ANN001
+            raise AssertionError("stream test must not call execute")
+
+    provider = _PartialFailureProvider()
+    executor = RegistryBackedModelExecutor(
+        provider_executor=provider,
+        model_config_resolver=ModelConfigResolver(registry=_registry(tmp_path)),
+    )
+
+    with pytest.raises(ProviderExecutionError, match="after visible output"):
+        list(
+            executor.execute_stream(
+                route_decision=_route_decision(model="gemini_flash_light"),
+                messages=_messages(),
+            )
+        )
+
+    assert provider.aliases == ["gemini_flash_light"]

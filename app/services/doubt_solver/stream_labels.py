@@ -18,8 +18,10 @@ _GENERATING_LABELS: dict[str, str] = {
 
 _STAGE_LABELS: dict[str, str] = {
     "understanding": "Understanding...",
+    "retrieving": "Retrieving context...",
     "thinking": "Thinking...",
     "finalizing": "Finalizing...",
+    "verifying": "Verifying answer...",
     "complete": "Done",
     "error": "Something went wrong. Please try again.",
 }

@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from retrieval.models import StudentRetrievalContext
+
 ContextSourceType = Literal["bedrock_kb", "none"]
 PatternHintStrength = Literal["weak", "medium", "strong"]
 
@@ -96,3 +98,6 @@ class ContextRetrievalResult(BaseModel):
     item_count: int = Field(default=0, ge=0)
     retrieval_used: bool = False
     reason: str = Field(default="", max_length=256)
+    retrieval_context: StudentRetrievalContext = Field(
+        default_factory=StudentRetrievalContext.fresh_solve
+    )

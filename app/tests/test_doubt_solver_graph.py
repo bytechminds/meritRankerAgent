@@ -26,6 +26,15 @@ def _reset_settings():
     cfg_module._settings = None
 
 
+@pytest.fixture(autouse=True)
+def _use_legacy_kb_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Part 9 graph tests exercise the explicitly retained legacy KB provider."""
+    monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
+    _reset_settings()
+    yield
+    _reset_settings()
+
+
 def _make_state(query: str = "What is 20% of 500?", **overrides) -> dict:
     base = {
         "request_id": "test-req-id",
@@ -782,4 +791,3 @@ class TestPart9NeedsReviewWithServiceError:
 
         # "Solve" keyword → confidence=0.75 (≥ 0.6), source=mock, not truncated, no error.
         assert result["response"]["needs_review"] is False
-

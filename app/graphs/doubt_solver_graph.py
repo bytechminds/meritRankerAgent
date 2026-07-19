@@ -83,6 +83,7 @@ class DoubtSolverGraphState(TypedDict):
     used_retrieval: bool              # True if KB returned ≥1 result
     context_used: bool                # True if context was passed to answer generator
     service_error: bool               # True if KB or DynamoDB service error occurred
+    retrieval_context: dict | None    # internal S3 Vector retrieval contract
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +93,12 @@ class DoubtSolverGraphState(TypedDict):
 
 def classify_query_node(state: DoubtSolverGraphState) -> dict:
     """Call the classifier service and write the result to state."""
-    classification: QueryClassification = classify_query(state["query"])
+    existing = state.get("classification")
+    classification = (
+        QueryClassification.model_validate(existing)
+        if existing is not None
+        else classify_query(state["query"])
+    )
     logger.debug(
         "request_id=%s  classify_query  intent=%s  confidence=%.2f",
         state["request_id"],
@@ -141,6 +147,11 @@ def retrieve_kb_context_node(state: DoubtSolverGraphState) -> dict:
     - Sets service_error=True so build_response marks needs_review.
     - Continues with empty KB results.
     """
+    from config import get_settings  # noqa: PLC0415
+
+    if get_settings().retrieval_provider == "s3_vector":
+        return _retrieve_s3_vector_context_node(state)
+
     if not state.get("should_retrieve"):
         return {"kb_results": None, "used_retrieval": False}
 
@@ -169,6 +180,51 @@ def retrieve_kb_context_node(state: DoubtSolverGraphState) -> dict:
         return {"kb_results": None, "used_retrieval": False, "service_error": True}
 
 
+def _retrieve_s3_vector_context_node(state: DoubtSolverGraphState) -> dict:
+    """Run the approved S3 Vector student retrieval path for the legacy graph."""
+    from retrieval.context.data_context_builder import render_retrieval_context  # noqa: PLC0415
+    from retrieval.retrieval_service import StudentRetrievalService  # noqa: PLC0415
+    from services.context_retrieval.context_models import ContextRetrievalRequest  # noqa: PLC0415
+
+    classification_dict = state.get("classification") or {}
+    request = ContextRetrievalRequest(
+        request_id=state["request_id"],
+        query=state.get("query", ""),
+        subject=str(classification_dict.get("subject", "general")),
+        intent=_legacy_intent_for_retrieval(str(classification_dict.get("intent", "explain"))),
+        difficulty=str(classification_dict.get("difficulty", "default")),
+        confidence=classification_dict.get("confidence"),
+        topic=classification_dict.get("topic"),
+        topic_confidence=classification_dict.get("topic_confidence"),
+        pattern_topic_candidate=classification_dict.get("pattern_topic_candidate"),
+        pattern_family_candidate=classification_dict.get("pattern_family_candidate"),
+        retrieval_tags=classification_dict.get("retrieval_tags") or [],
+    )
+    retrieval_context = StudentRetrievalService().retrieve(request)
+    context_text = render_retrieval_context(retrieval_context)
+    retrieval_used = retrieval_context.mode != "fresh_solve"
+    return {
+        "kb_results": None,
+        "dynamodb_records": None,
+        "answer_context": context_text or None,
+        "context_source_count": 1 if retrieval_used else 0,
+        "used_retrieval": retrieval_used,
+        "context_used": bool(context_text),
+        "retrieval_context": retrieval_context.model_dump(by_alias=True),
+    }
+
+
+def _legacy_intent_for_retrieval(intent: str) -> str:
+    """Map the legacy classifier intent enum to the retrieval gate vocabulary."""
+    return {
+        "solve_question": "solve",
+        "explain_concept": "explain",
+        "explain_option": "explain",
+        "practice_question": "practice",
+        "visualize_question": "visualize",
+    }.get(intent, "explain")
+
+
 def fetch_dynamodb_records_node(state: DoubtSolverGraphState) -> dict:
     """Fetch DynamoDB question records referenced by KB results.
 
@@ -186,6 +242,9 @@ def fetch_dynamodb_records_node(state: DoubtSolverGraphState) -> dict:
     """
     # Deferred import — ensures dotenv has loaded before config is read.
     from config import get_settings  # noqa: PLC0415
+
+    if get_settings().retrieval_provider == "s3_vector":
+        return {"dynamodb_records": None}
 
     if not get_settings().enable_dynamodb_fetch:
         return {"dynamodb_records": None}
@@ -225,6 +284,16 @@ def build_answer_context_node(state: DoubtSolverGraphState) -> dict:
     Calls context_builder_service which handles truncation and safety labelling.
     Sets context_used=True only when the context string is non-empty.
     """
+    from config import get_settings  # noqa: PLC0415
+
+    if get_settings().retrieval_provider == "s3_vector":
+        context = state.get("answer_context") or ""
+        return {
+            "answer_context": context or None,
+            "context_source_count": state.get("context_source_count") or 0,
+            "context_used": bool(context),
+        }
+
     classification_dict = state.get("classification") or {}
     classification = QueryClassification.model_validate(classification_dict)
 
@@ -367,6 +436,7 @@ def build_doubt_solver_graph():
             "used_retrieval": False,
             "context_used": False,
             "service_error": False,
+            "retrieval_context": None,
         })
         print(result["response"]["answer"])
         print(result["response"]["used_retrieval"])
@@ -404,8 +474,8 @@ def build_doubt_solver_graph():
 #     ──► generate      (LlmOrchestrator via AnswerGenerationAdapter)
 #     ──► END
 #
-# State: OrchestratedDoubtSolverState (5 fields only — request_id, query,
-#        classification, context_text, answer)
+# State: OrchestratedDoubtSolverState (request_id, query, classification,
+#        retrieval_context, context_text, answer)
 #
 # Guard: this code path is only active when
 #        ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.  Default is false.
@@ -428,6 +498,7 @@ class OrchestratedDoubtSolverState(TypedDict):
     request_id: str
     query: str
     classification: dict | None   # serialised DoubtSolverClassification
+    retrieval_context: dict       # structured internal student retrieval context
     context_text: str             # compact context string (may be "")
     answer: str | None
 
@@ -512,6 +583,16 @@ def _map_to_orchestrated_classification(
     )
 
 
+def map_to_orchestrated_classification(
+    raw: QueryClassification,
+    *,
+    query: str,
+    request_id: str,
+) -> dict:
+    """Public boundary for mapping either text or image classification downstream."""
+    return _map_to_orchestrated_classification(raw, query=query, request_id=request_id)
+
+
 # ---------------------------------------------------------------------------
 # Node 1: classify
 # ---------------------------------------------------------------------------
@@ -527,16 +608,37 @@ def orchestrated_classify_query(
 
     Shared by the orchestrated classify graph node and streaming service.
     """
+    classification, _confidence, _fallback = (
+        orchestrated_classify_query_with_delivery_signals(
+            query,
+            request_id=request_id,
+            on_before_strong_classifier=on_before_strong_classifier,
+        )
+    )
+    return classification
+
+
+def orchestrated_classify_query_with_delivery_signals(
+    query: str,
+    request_id: str = "",
+    *,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+) -> tuple[dict, float | None, bool]:
+    """Return graph-safe classification plus streaming-only delivery signals."""
     try:
         raw: QueryClassification = classify_query(
             query,
             request_id=request_id or None,
             on_before_strong_classifier=on_before_strong_classifier,
         )
-        return _map_to_orchestrated_classification(
-            raw,
-            query=query,
-            request_id=request_id,
+        return (
+            _map_to_orchestrated_classification(
+                raw,
+                query=query,
+                request_id=request_id,
+            ),
+            raw.confidence,
+            raw.classification_source == "fallback",
         )
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -544,10 +646,14 @@ def orchestrated_classify_query(
             request_id,
         )
         classification_dict = _ORCHESTRATED_FALLBACK_CLASSIFICATION.copy()
-        return apply_classification_policy(
-            query,
-            classification_dict,
-            request_id=request_id,
+        return (
+            apply_classification_policy(
+                query,
+                classification_dict,
+                request_id=request_id,
+            ),
+            None,
+            True,
         )
 
 
@@ -568,10 +674,12 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
     - Call any provider.
     - Use model_id / provider / deployment.
     """
-    classification_dict = orchestrated_classify_query(
-        state["query"],
-        request_id=state.get("request_id", ""),
-    )
+    classification_dict = state.get("classification")
+    if classification_dict is None:
+        classification_dict = orchestrated_classify_query(
+            state["query"],
+            request_id=state.get("request_id", ""),
+        )
 
     logger.debug(
         "request_id=%s  orchestrated_classify  subject=%s  intent=%s  difficulty=%s  "
@@ -604,7 +712,14 @@ def _orchestrated_collect_context_node(
     """
     query: str = state.get("query", "")
     if not query:
-        return {"context_text": ""}
+        from retrieval.models import StudentRetrievalContext  # noqa: PLC0415
+
+        return {
+            "context_text": "",
+            "retrieval_context": StudentRetrievalContext.fresh_solve(
+                "empty_query"
+            ).model_dump(by_alias=True),
+        }
 
     classification_dict = state.get("classification") or {}
 
@@ -635,7 +750,10 @@ def _orchestrated_collect_context_node(
             len(context_text),
             result.reason,
         )
-        return {"context_text": context_text}
+        return {
+            "context_text": context_text,
+            "retrieval_context": result.retrieval_context.model_dump(by_alias=True),
+        }
 
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -650,7 +768,14 @@ def _orchestrated_collect_context_node(
             state.get("request_id", ""),
             exc_info=True,
         )
-        return {"context_text": ""}
+        from retrieval.models import StudentRetrievalContext  # noqa: PLC0415
+
+        return {
+            "context_text": "",
+            "retrieval_context": StudentRetrievalContext.fresh_solve(
+                "retrieval_error"
+            ).model_dump(by_alias=True),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +798,7 @@ def build_orchestrated_doubt_solver_graph(adapter):
         START → classify → collect_context → generate → END
 
     State:
-        OrchestratedDoubtSolverState — 5 fields only.
+        OrchestratedDoubtSolverState — retrieval_context remains internal to the graph.
         No plan, no response, no sources, no route_decision.
 
     Guard:
@@ -751,4 +876,3 @@ def build_orchestrated_doubt_solver_graph(adapter):
     builder.add_edge("generate", END)
 
     return builder.compile()
-

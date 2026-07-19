@@ -33,6 +33,17 @@ from graphs.doubt_solver_graph import (
 )
 from schemas.doubt_solver import QueryClassification
 
+
+@pytest.fixture(autouse=True)
+def _use_legacy_kb_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Historical KB-flow tests use the explicit legacy retrieval provider."""
+    monkeypatch.setenv("RETRIEVAL_PROVIDER", "legacy_bedrock_kb")
+    import config as cfg_module  # noqa: PLC0415
+
+    cfg_module._settings = None
+    yield
+    cfg_module._settings = None
+
 # ---------------------------------------------------------------------------
 # Fake AnswerGenerationAdapter — records call kwargs, returns fixed content
 # ---------------------------------------------------------------------------
@@ -437,7 +448,7 @@ class TestOrchestratedCollectContextNode:
         result = _orchestrated_collect_context_node(state)
         assert len(result["context_text"]) > 0
         assert "[Relevant KB Context]" in result["context_text"]
-        assert set(result.keys()) == {"context_text"}
+        assert set(result.keys()) == {"context_text", "retrieval_context"}
 
 
 # ===========================================================================
@@ -567,8 +578,8 @@ class TestOrchestratedGraphFlow:
         result = graph.invoke(_minimal_state(query=q))
         assert result["query"] == q
 
-    def test_full_flow_state_has_five_fields_max(self) -> None:
-        """Final state must not accumulate extra keys beyond the 5 declared."""
+    def test_full_flow_state_has_retrieval_context_field(self) -> None:
+        """Final state retains the structured internal retrieval contract."""
         adapter = _FakeAdapter()
         graph = build_orchestrated_doubt_solver_graph(adapter)
         result = graph.invoke(_minimal_state())
@@ -577,6 +588,7 @@ class TestOrchestratedGraphFlow:
             "query",
             "classification",
             "context_text",
+            "retrieval_context",
             "answer",
         }
 

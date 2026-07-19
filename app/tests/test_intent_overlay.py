@@ -373,16 +373,17 @@ def test_map_to_orchestrated_classification_normalizes_intent(
 
 
 # ---------------------------------------------------------------------------
-# Test 23: OrchestratedDoubtSolverState has exactly 5 fields
+# Test 23: OrchestratedDoubtSolverState includes retrieval_context
 # ---------------------------------------------------------------------------
 
 
-def test_orchestrated_state_has_exactly_5_fields() -> None:
+def test_orchestrated_state_has_internal_retrieval_context() -> None:
     annotations = OrchestratedDoubtSolverState.__annotations__
     assert set(annotations.keys()) == {
         "request_id",
         "query",
         "classification",
+        "retrieval_context",
         "context_text",
         "answer",
     }, f"State fields changed: {set(annotations.keys())}"

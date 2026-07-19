@@ -1,7 +1,7 @@
 # Backend Environment Variables — Doubt Solver
 
 > **File:** `docs/dev/backend-env.md`
-> **Updated:** 2026-05-24
+> **Updated:** 2026-07-16
 > **Related:** `app/.env.local.example`, `app/config.py`, `skills/features/doubt-solver.md`
 
 This document is the canonical reference for every environment variable used by the
@@ -115,6 +115,36 @@ Missing `OPENAI_API_KEY` when `provider=openai` → `LlmConfigurationError` at c
 | `BEDROCK_KB_MAX_RESULTS` | `5` | optional | `1`–`20` (integer) | Max KB results per query |
 | `BEDROCK_KB_MIN_SCORE` | _(empty — no threshold)_ | optional | `0.7` (float 0–1) | Minimum similarity score filter. Leave empty to return all results |
 
+### Image-question classification
+
+| Variable | Default | Required for | Format / example | Notes |
+|---|---|---|---|---|
+| `IMAGE_CLASSIFIER_ENABLED` | `false` | image questions | `true` / `false` | Disabled image requests return a controlled unsupported state; text requests are unchanged |
+| `IMAGE_CLASSIFIER_PROVIDER` | `gemini` | image questions | `gemini` | Provider selection behind the provider-neutral interface |
+| `IMAGE_CLASSIFIER_MODEL` | `gemini-3.1-flash-lite` | image questions | stable model ID | No preview identifier |
+| `GOOGLE_GEMINI_API_KEY` | _(empty)_ | enabled image questions | secret | Required at startup only when enabled; never expose to clients |
+| `IMAGE_CLASSIFIER_TIMEOUT_MS` | `15000` | optional | positive integer | Provider request and single-flight wait budget |
+| `IMAGE_CLASSIFIER_MAX_IMAGE_BYTES` | `8388608` | optional | positive integer | Pre-provider payload limit |
+| `IMAGE_CLASSIFIER_MAX_OUTPUT_TOKENS` | `1400` | optional | positive integer | Structured extraction/classification output cap |
+| `IMAGE_CLASSIFIER_CACHE_TTL_SECONDS` | `300` | optional | integer >= 0 | Bounded process-local deterministic-result cache; zero disables it |
+| `IMAGE_CLASSIFIER_MIN_CONFIDENCE` | `0.65` | optional | float 0–1 | Minimum extraction/classification confidence |
+| `IMAGE_CLASSIFIER_MAX_DIMENSION` | `2400` | optional | positive integer | Oversized images are resized proportionally with high-quality resampling |
+
+### Adaptive verified streaming
+
+| Variable | Default | Required for | Format / example | Notes |
+|---|---|---|---|---|
+| `ANSWER_DELIVERY_POLICY` | `adaptive` | orchestrated streams | `always_verified` / `adaptive` / `always_live` | `adaptive` streams live only for an approved low-risk profile; otherwise it verifies and replays |
+| `ANSWER_LIVE_STREAM_MIN_CLASSIFIER_CONFIDENCE` | `0.93` | optional | float 0-1 | Minimum classifier confidence for adaptive live delivery |
+| `ANSWER_LIVE_STREAM_MIN_IMAGE_CONFIDENCE` | `0.90` | optional | float 0-1 | Minimum image extraction/classification confidence for adaptive live delivery |
+| `ANSWER_LIVE_STREAM_MIN_PATTERN_CONFIDENCE` | `0.90` | optional | float 0-1 | Minimum confidence when approved runtime retrieval is used |
+| `ANSWER_LIVE_STREAM_MAX_DIFFICULTY` | `basic` | optional | supported route difficulty | Highest difficulty eligible for adaptive live delivery |
+| `ANSWER_VERIFIER_ENABLED` | `true` | verified replay | `true` / `false` | Runs the existing deterministic answer-quality approval gate before replay |
+| `ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS` | `1` | verified replay | `0` / `1` | Bounded private regeneration limit; draft output is never streamed |
+| `ANSWER_REPLAY_MAX_CHUNK_CHARS` | `600` | verified replay | positive integer | Target size only; Markdown-safe blocks can be larger |
+| `ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS` | `10` | streaming transport | positive float | Emits private-content-free SSE comments while the application event iterator is idle |
+| `ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION` | `false` | production `always_live` | `true` / `false` | Explicit production approval guard; required when `APP_ENV=production` and policy is `always_live` |
+
 ### DynamoDB record fetch
 
 | Variable | Default | Required for | Format / example | Notes |
@@ -171,6 +201,9 @@ This table documents exactly what happens when a required variable is missing or
 | `ENABLE_DYNAMODB_FETCH=true` + missing `DYNAMODB_PATTERN_TABLE` | `DynamoDbConfigurationError`: "DYNAMODB_PATTERN_TABLE" | Hard error at pattern fetch call time |
 | `DOUBT_SOLVER_MAX_CONTEXT_CHARS=not-a-number` | `ValueError` from `int()` at settings load | Fast-fail at startup |
 | `BEDROCK_KB_MAX_RESULTS=not-a-number` | `ValueError` from `int()` at settings load | Fast-fail at startup |
+| `IMAGE_CLASSIFIER_ENABLED=true` + missing `GOOGLE_GEMINI_API_KEY` | `ConfigurationError` naming the missing variable | Fast-fail at startup |
+| `IMAGE_CLASSIFIER_ENABLED=true` + unsupported provider or invalid limits | `ConfigurationError` / `ValueError` | Fast-fail at startup |
+| `APP_ENV=production` + `ANSWER_DELIVERY_POLICY=always_live` without approval | `ConfigurationError` | Fast-fail at startup |
 
 **Graph behaviour on service errors:**
 When `KnowledgeBaseConfigurationError`, `KnowledgeBaseServiceError`, `DynamoDbConfigurationError`,
@@ -279,7 +312,9 @@ The following have not been manually verified end-to-end:
 - `[NOT VERIFIED]` Real Bedrock KB retrieval results shape (schema assumes Bedrock API v2024+)
 - `[NOT VERIFIED]` Real DynamoDB table schema (`question_id` as primary key is assumed)
 - `[NOT VERIFIED]` AWS IAM permissions needed for KB + DynamoDB read access
-- `[NOT VERIFIED]` AgentCore HTTP streaming with chunked responses
+- AgentCore HTTP streaming is locally verified with the controlled mock executor for
+  canonical completion and client-abort cancellation. Live-provider HTTP streaming
+  remains `[NOT VERIFIED]`.
 - `[NOT VERIFIED]` AWS SSO / named profile credential chain in `agentcore dev` context
 
 ---

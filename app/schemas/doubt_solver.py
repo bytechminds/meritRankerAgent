@@ -21,6 +21,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from schemas.image_input import ImageInput
+
 
 def _normalize_retrieval_tags(raw_tags: Any, *, max_tags: int = 10) -> list[str]:
     if raw_tags is None:
@@ -52,11 +54,15 @@ class DoubtSolverRequest(BaseModel):
     """Validated inbound payload for a doubt solver request."""
 
     mode: Literal["doubt_solver"]
-    query: str = Field(
-        ...,
+    query: str | None = Field(
+        default=None,
         min_length=1,
         max_length=5000,
-        description="The student's question or doubt.",
+        description="The student's text question or instruction for an attached image.",
+    )
+    image: ImageInput | None = Field(
+        default=None,
+        description="Optional image containing the source question.",
     )
     user_id: str = Field(
         default="local-user",
@@ -77,19 +83,32 @@ class DoubtSolverRequest(BaseModel):
 
     model_config = {"str_strip_whitespace": True}
 
+    @model_validator(mode="after")
+    def _require_query_or_image(self) -> DoubtSolverRequest:
+        if self.query is None and self.image is None:
+            raise ValueError("Either query or image is required.")
+        return self
+
+
+QueryIntent = Literal[
+    "solve_question",
+    "explain_concept",
+    "explain_option",
+    "general_doubt",
+    "practice_question",
+    "visualize_question",
+    "unknown",
+]
+ResponseStyle = Literal["step_by_step", "short_answer", "simple_explanation"]
+QueryDifficulty = Literal["default", "basic", "intermediate", "advanced"]
+RetrievalNeed = Literal["none", "concept_context", "similar_question", "unknown"]
+ClassificationSource = Literal["deterministic", "llm", "fallback"]
+
 
 class QueryClassification(BaseModel):
     """Structured output from the query classifier service."""
 
-    intent: Literal[
-        "solve_question",
-        "explain_concept",
-        "explain_option",
-        "general_doubt",
-        "practice_question",
-        "visualize_question",
-        "unknown",
-    ] = Field(description="Detected intent of the student query.")
+    intent: QueryIntent = Field(description="Detected intent of the student query.")
     subject: str = Field(
         default="unknown",
         description="Detected subject area (e.g. 'math', 'reasoning').",
@@ -119,7 +138,7 @@ class QueryClassification(BaseModel):
         max_length=12,
         description="Compact normalized tags for KB rerank signals (not strict filters).",
     )
-    response_style: Literal["step_by_step", "short_answer", "simple_explanation"] = Field(
+    response_style: ResponseStyle = Field(
         default="step_by_step",
         description="Preferred response style for this intent.",
     )
@@ -129,15 +148,15 @@ class QueryClassification(BaseModel):
         le=1.0,
         description="Classifier confidence score.",
     )
-    difficulty: Literal["default", "basic", "intermediate", "advanced"] = Field(
+    difficulty: QueryDifficulty = Field(
         default="default",
         description="Detected difficulty level of the query.",
     )
-    retrieval_need: Literal["none", "concept_context", "similar_question", "unknown"] = Field(
+    retrieval_need: RetrievalNeed = Field(
         default="unknown",
         description="Whether retrieval context would improve the answer.",
     )
-    classification_source: Literal["deterministic", "llm", "fallback"] = Field(
+    classification_source: ClassificationSource = Field(
         default="deterministic",
         description="Which path produced this classification.",
     )
@@ -197,9 +216,18 @@ class AnswerOutput(BaseModel):
     )
 
 
+class ResponseContent(BaseModel):
+    """Canonical answer content shared by final and streamed responses."""
+
+    format: Literal["markdown"] = "markdown"
+    value: str = Field(min_length=1, max_length=8000)
+
+
 class DoubtSolverResponse(BaseModel):
     """Serialised outbound payload for a doubt solver response."""
 
+    schema_version: Literal["1"] = "1"
+    status: Literal["completed"] = "completed"
     success: bool = Field(description="True when an answer was produced.")
     request_id: str = Field(description="UUID assigned at the entrypoint.")
     mode: Literal["doubt_solver"]
@@ -232,6 +260,21 @@ class DoubtSolverResponse(BaseModel):
         default=False,
         description="True when retrieved context was included in the answer generation prompt.",
     )
+    content: ResponseContent | None = Field(
+        default=None,
+        description=(
+            "Canonical Markdown response content. `answer` remains its compatibility "
+            "projection."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _project_answer_to_content(self) -> DoubtSolverResponse:
+        if self.content is None:
+            self.content = ResponseContent(value=self.answer)
+        elif self.content.value != self.answer:
+            raise ValueError("content.value must match answer")
+        return self
 
 
 class DoubtSolverState(BaseModel):
@@ -343,6 +386,22 @@ _FORBIDDEN_STREAM_METADATA_KEYS: frozenset[str] = frozenset(
 )
 
 
+class DoubtSolverFinalResponse(BaseModel):
+    """Authoritative final response emitted by a completed answer stream."""
+
+    schema_version: Literal["1"] = "1"
+    request_id: str = Field(min_length=1)
+    status: Literal["completed"] = "completed"
+    content: ResponseContent
+    answer: str = Field(min_length=1, max_length=8000)
+
+    @model_validator(mode="after")
+    def _project_content_to_answer(self) -> DoubtSolverFinalResponse:
+        if self.answer != self.content.value:
+            raise ValueError("answer must match content.value")
+        return self
+
+
 class DoubtSolverStreamEvent(BaseModel):
     """A single event in an orchestrated Doubt Solver streaming response.
 
@@ -386,11 +445,24 @@ class DoubtSolverStreamEvent(BaseModel):
             "Must not contain secrets, prompt text, context, or provider details."
         ),
     )
+    response: DoubtSolverFinalResponse | None = Field(
+        default=None,
+        description="Authoritative final response, present only on complete events.",
+    )
 
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
     def _validate_event_shape(self) -> DoubtSolverStreamEvent:
+        for key in self.metadata:
+            if key.lower() in _FORBIDDEN_STREAM_METADATA_KEYS:
+                raise ValueError(
+                    f"metadata must not contain forbidden key: {key!r}"
+                )
+
+        if self.type != "complete" and self.response is not None:
+            raise ValueError("response is only allowed on complete events")
+
         if self.type == "chunk":
             if self.content is None:
                 raise ValueError("chunk event must have content")
@@ -401,12 +473,9 @@ class DoubtSolverStreamEvent(BaseModel):
             if not self.label:
                 raise ValueError("error event must have a safe label/message")
         elif self.type == "complete":
-            pass
-
-        for key in self.metadata:
-            if key.lower() in _FORBIDDEN_STREAM_METADATA_KEYS:
-                raise ValueError(
-                    f"metadata must not contain forbidden key: {key!r}"
-                )
+            if self.response is None:
+                raise ValueError("complete event must have response")
+            if self.response.request_id != self.request_id:
+                raise ValueError("complete response request_id must match event request_id")
 
         return self
