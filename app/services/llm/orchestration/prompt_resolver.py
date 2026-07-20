@@ -41,6 +41,10 @@ from pydantic import BaseModel
 
 from schemas.llm import LlmMessage
 from schemas.llm_routing import RouteDecision
+from services.doubt_solver.exam_response_profile import (
+    ExamResponseProfileResolver,
+    get_exam_response_profile_resolver,
+)
 from services.llm.orchestration.errors import (
     PromptNotFoundError,
     PromptPathError,
@@ -85,9 +89,18 @@ class PromptResolver:
                      ``Path`` for test isolation (e.g. ``tmp_path``).
     """
 
-    def __init__(self, prompt_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        prompt_root: Path | None = None,
+        exam_profile_resolver: ExamResponseProfileResolver | None = None,
+    ) -> None:
         self._prompt_root: Path = (prompt_root or DEFAULT_PROMPT_ROOT).resolve()
         self._cache: dict[str, str] = {}
+        self._exam_profile_resolver = (
+            exam_profile_resolver
+            if exam_profile_resolver is not None
+            else get_exam_response_profile_resolver()
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,6 +112,7 @@ class PromptResolver:
         query: str,
         classification: Any | None = None,
         context: str | None = None,
+        request_id: str = "",
     ) -> list[LlmMessage]:
         """Build and return exactly two LlmMessage objects.
 
@@ -155,6 +169,15 @@ class PromptResolver:
         )
 
         system_content = self._build_system_prompt(route_decision.prompt, overlay_paths)
+        if route_decision.task_role == "generator" and route_decision.exam:
+            exam_profile = self._exam_profile_resolver.resolve(
+                route_decision.exam,
+                route_decision.exam_stage,
+                request_id=request_id,
+            )
+            system_content = _SECTION_SEP.join(
+                (system_content, exam_profile.compact_instruction)
+            )
         user_content = self._build_user_message(
             query=query,
             route_decision=route_decision,
@@ -281,7 +304,7 @@ class PromptResolver:
         Args:
             query: The student's question.
             route_decision: Used to extract route summary (subject, task_role,
-                            difficulty, intent, exam).
+                            difficulty and intent).
             classification: Classification object or dict; only allowlisted
                             fields are included.
             context: Retrieved context string; truncated to MAX_CONTEXT_CHARS.
@@ -302,8 +325,6 @@ class PromptResolver:
         ]
         if route_decision.intent:
             route_lines.append(f"- intent: {route_decision.intent}")
-        if route_decision.exam:
-            route_lines.append(f"- exam: {route_decision.exam}")
         parts.append("Route:\n" + "\n".join(route_lines))
 
         # --- Classification summary (allowlisted fields only) ---
@@ -399,6 +420,7 @@ def resolve_prompts(
     query: str,
     classification: Any | None = None,
     context: str | None = None,
+    request_id: str = "",
 ) -> list[LlmMessage]:
     """Module-level convenience wrapper around the singleton PromptResolver.
 
@@ -409,4 +431,5 @@ def resolve_prompts(
         query=query,
         classification=classification,
         context=context,
+        request_id=request_id,
     )

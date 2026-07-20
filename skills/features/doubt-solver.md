@@ -25,7 +25,48 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-07-19
+**Last updated:** 2026-07-20
+
+---
+
+## Latest Changes - Compact Exam-Aware Answer Response Profiles (2026-07-20)
+
+- A single versioned `app/config/exam_response_profiles.yaml` now defines 12 broad
+  answer-presentation families, 90 canonical exam mappings, approved aliases, compact
+  exam exceptions, and supported stage exceptions. The repository had no existing
+  canonical exam-family catalog to reuse, so this file is the static catalog authority
+  for this feature. Unsupported state-specific IDs use `GENERAL_GOVT`.
+- `ExamResponseProfileResolver` validates and loads the YAML once per process, normalizes
+  identifiers and approved stage aliases, and builds a deterministic instruction capped
+  at 260 characters. It performs no provider, LLM, database, environment, retrieval, or
+  profile lookup.
+- The runtime currently has no authenticated session/profile selected-exam source and no
+  intentional application default exam. Optional `DoubtSolverRequest.exam_id` and
+  `exam_stage` values are therefore the only production input. They are carried through
+  LangGraph run configuration, not graph state or response data. Missing input preserves
+  the previous prompt exactly; unknown explicit input resolves safely to the generic
+  family.
+- `PromptResolver` appends the resolved instruction once to generator system messages.
+  Legacy generation uses the same resolver, while answer continuation and deterministic
+  rewrite retain the original generator messages. Classifiers, image processing,
+  retrieval, embeddings, routing, Pattern/SolveFlow, and unrelated prompts receive no
+  exam-response guidance. Streaming and non-streaming public response schemas are
+  unchanged.
+- One compact global prompt rule keeps correctness, trusted evidence, explicit student
+  instructions, and subject policy authoritative. The profile can alter presentation or
+  method preference only; it cannot invent facts, formulas, shortcuts, Patterns, traps,
+  trends, or exam claims.
+- No extra model call, feature environment variable, graph node, model-route change,
+  provider change, PYQ/syllabus data, difficulty control, database placeholder, response
+  field, Markdown behavior, image behavior, or frontend behavior was added. Future
+  database-derived exam-pattern context remains a separate deferred input.
+- Tests cover catalog validation, aliases, stages, fallback, limits, cache behavior,
+  prompt composition, continuation/rewrite preservation, legacy/orchestrated parity,
+  graph-state isolation, safe logs, and representative regressions.
+- **[AI RISK]** Live-provider adherence to presentation guidance and upstream
+  frontend/session population of `exam_id` remain **[NOT VERIFIED]**. The initial static
+  catalog is based on the approved starter scope because no repository catalog existed;
+  newly supported exams require an explicit reviewed mapping or safe generic fallback.
 
 ---
 

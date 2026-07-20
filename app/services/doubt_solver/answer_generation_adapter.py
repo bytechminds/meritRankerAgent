@@ -49,6 +49,8 @@ class AnswerGenerationAdapter:
         difficulty: str,
         context: str,
         web_search_reason: str | None = None,
+        exam_id: str | None = None,
+        exam_stage: str | None = None,
     ) -> str:
         """Build a RouteRequest and call the orchestrator."""
         route_subject = resolve_generator_route_subject(
@@ -62,6 +64,8 @@ class AnswerGenerationAdapter:
             task_role="generator",
             difficulty=difficulty,
             intent=intent,
+            exam=exam_id,
+            exam_stage=exam_stage,
         )
 
         result = self._orchestrator.generate(
@@ -92,6 +96,8 @@ class AnswerGenerationAdapter:
         difficulty: str,
         context_text: str,
         web_search_reason: str | None = None,
+        exam_id: str | None = None,
+        exam_stage: str | None = None,
         on_before_generator_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
         verify_before_stream: bool = True,
@@ -112,6 +118,8 @@ class AnswerGenerationAdapter:
             task_role="generator",
             difficulty=difficulty,
             intent=intent,
+            exam=exam_id,
+            exam_stage=exam_stage,
         )
 
         logger.info(

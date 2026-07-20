@@ -48,6 +48,10 @@ from schemas.image_question_classification import ImageClassificationStatus
 from schemas.request import AgentRequest
 from schemas.response import AgentResponse
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
+from services.doubt_solver.exam_response_profile import (
+    ExamResponseProfileConfigError,
+    get_exam_response_profile_resolver,
+)
 from services.doubt_solver.stream_transport import (
     StreamCancellation,
     stream_events_as_sse,
@@ -63,6 +67,10 @@ from services.doubt_solver.streaming_doubt_solver_service import (
 
 settings = get_settings()
 configure_logging(settings.log_level)
+try:
+    get_exam_response_profile_resolver()
+except ExamResponseProfileConfigError as exc:
+    raise ConfigurationError(str(exc)) from exc
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +220,12 @@ def invoke(payload: dict) -> dict | Response:
             )
 
             query = ds_request.query or ""
+            graph_config = {
+                "configurable": {
+                    "exam_id": ds_request.exam_id,
+                    "exam_stage": ds_request.exam_stage,
+                }
+            }
             entry_classification = None
             source_modality = "text"
             image_confidence: float | None = None
@@ -311,6 +325,8 @@ def invoke(payload: dict) -> dict | Response:
                             image_uncertain=image_uncertain,
                             classifier_confidence=classifier_confidence,
                             classifier_fallback=classifier_fallback,
+                            exam_id=ds_request.exam_id,
+                            exam_stage=ds_request.exam_stage,
                             should_cancel=cancellation.is_cancelled,
                             cancellation_reason=lambda: cancellation.reason,
                         ),
@@ -348,7 +364,10 @@ def invoke(payload: dict) -> dict | Response:
                     "context_text": "",
                     "answer": None,
                 }
-                orchestrated_result = orchestrated_doubt_solver_graph.invoke(orchestrated_input)
+                orchestrated_result = orchestrated_doubt_solver_graph.invoke(
+                    orchestrated_input,
+                    config=graph_config,
+                )
                 logger.info(
                     "request_id=%s — invoke succeeded (doubt_solver_orchestrated)",
                     request_id,
@@ -394,7 +413,7 @@ def invoke(payload: dict) -> dict | Response:
                 "service_error": False,
                 "retrieval_context": None,
             }
-            result = doubt_solver_graph.invoke(graph_input)
+            result = doubt_solver_graph.invoke(graph_input, config=graph_config)
             logger.info("request_id=%s — invoke succeeded (doubt_solver)", request_id)
             return result["response"]
 

@@ -110,6 +110,10 @@ def _build_answer_messages(
     query: str,
     classification: QueryClassification,
     context: str | None = None,
+    *,
+    exam_id: str | None = None,
+    exam_stage: str | None = None,
+    request_id: str = "",
 ) -> list:
     """Build the message list for the answer generator LLM call.
 
@@ -124,9 +128,19 @@ def _build_answer_messages(
     """
     # Deferred imports — only active on LLM path.
     from schemas.llm import LlmMessage  # noqa: PLC0415
+    from services.doubt_solver.exam_response_profile import (  # noqa: PLC0415
+        get_exam_response_profile_resolver,
+    )
     from services.prompt_loader import load_prompt  # noqa: PLC0415
 
     system_prompt = load_prompt("answer_generator")
+    if exam_id:
+        exam_profile = get_exam_response_profile_resolver().resolve(
+            exam_id,
+            exam_stage,
+            request_id=request_id,
+        )
+        system_prompt = f"{system_prompt}\n\n---\n\n{exam_profile.compact_instruction}"
 
     # Build a brief, safe classification summary for the user turn.
     # Do not include classification_source or retrieval_need (internal fields).
@@ -162,7 +176,13 @@ def _build_answer_messages(
 
 
 def _generate_with_llm(
-    query: str, classification: QueryClassification, context: str | None = None
+    query: str,
+    classification: QueryClassification,
+    context: str | None = None,
+    *,
+    exam_id: str | None = None,
+    exam_stage: str | None = None,
+    request_id: str = "",
 ) -> AnswerOutput:
     """Call model_router and return a validated AnswerOutput.
 
@@ -173,7 +193,14 @@ def _generate_with_llm(
     # Deferred import — ensures dotenv loaded before config is read.
     from services import model_router  # noqa: PLC0415
 
-    messages = _build_answer_messages(query, classification, context=context)
+    messages = _build_answer_messages(
+        query,
+        classification,
+        context=context,
+        exam_id=exam_id,
+        exam_stage=exam_stage,
+        request_id=request_id,
+    )
     response = model_router.generate(_GENERATOR_ROLE, messages)
 
     # [AI RISK] Model output is untrusted text — strip and cap length before use.
@@ -203,6 +230,10 @@ def generate_answer(
     query: str,
     classification: QueryClassification,
     context: str | None = None,
+    *,
+    exam_id: str | None = None,
+    exam_stage: str | None = None,
+    request_id: str = "",
 ) -> AnswerOutput:
     """Generate a tutoring answer, dispatching to LLM or mock based on config.
 
@@ -251,7 +282,14 @@ def generate_answer(
         return output
 
     try:
-        output = _generate_with_llm(query, classification, context=context)
+        output = _generate_with_llm(
+            query,
+            classification,
+            context=context,
+            exam_id=exam_id,
+            exam_stage=exam_stage,
+            request_id=request_id,
+        )
     except Exception as exc:  # noqa: BLE001
         # Log safe warning — exc may contain partial model output; never log query.
         logger.warning("Answer generator LLM call failed — falling back to mock: %s", exc)

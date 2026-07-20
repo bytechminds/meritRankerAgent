@@ -268,6 +268,7 @@ def _build_decision(
         difficulty=difficulty,
         intent=request.intent,
         exam=request.exam,
+        exam_stage=request.exam_stage,
         model=route.model,
         prompt=route.prompt,
         overlays=list(route.overlays),

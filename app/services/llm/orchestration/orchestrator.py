@@ -438,6 +438,7 @@ class LlmOrchestrator:
             query,
             classification,
             context,
+            request_id=route_request.request_id,
         )
 
         context_chars = len(context) if context else 0
@@ -614,6 +615,7 @@ class LlmOrchestrator:
             query,
             classification,
             context,
+            request_id=route_request.request_id,
         )
 
         context_chars = len(context) if context else 0

@@ -52,6 +52,8 @@ class StreamDoubtSolverInput:
     image_uncertain: bool = False
     classifier_confidence: float | None = None
     classifier_fallback: bool = False
+    exam_id: str | None = None
+    exam_stage: str | None = None
     should_cancel: Callable[[], bool] | None = None
     cancellation_reason: Callable[[], str | None] | None = None
 
@@ -256,6 +258,8 @@ def _iter_stream_doubt_solver(
                     reason_code="answer_continuation",
                 ),
                 verify_before_stream=False,
+                exam_id=input.exam_id,
+                exam_stage=input.exam_stage,
             ):
                 yield from emit_pending_statuses()
                 if _cancelled(input):
@@ -309,6 +313,8 @@ def _iter_stream_doubt_solver(
                     if classification_dict.get("web_search_reason")
                     else None
                 ),
+                exam_id=input.exam_id,
+                exam_stage=input.exam_stage,
             )
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -373,6 +379,8 @@ def _iter_stream_doubt_solver(
                             if classification_dict.get("web_search_reason")
                             else None
                         ),
+                        exam_id=input.exam_id,
+                        exam_stage=input.exam_stage,
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(

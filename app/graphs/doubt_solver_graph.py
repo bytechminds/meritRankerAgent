@@ -31,6 +31,7 @@ import logging
 from collections.abc import Callable
 from typing import TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from schemas.doubt_solver import (
@@ -329,7 +330,19 @@ def build_answer_context_node(state: DoubtSolverGraphState) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def generate_answer_node(state: DoubtSolverGraphState) -> dict:
+def _exam_response_context(config: RunnableConfig | None) -> dict[str, str]:
+    configurable = (config or {}).get("configurable") or {}
+    return {
+        key: value
+        for key in ("exam_id", "exam_stage")
+        if isinstance((value := configurable.get(key)), str) and value.strip()
+    }
+
+
+def generate_answer_node(
+    state: DoubtSolverGraphState,
+    config: RunnableConfig,
+) -> dict:
     """Call the answer generator service and write the result to state.
 
     Passes the bounded context string (if any) to the generator.
@@ -339,7 +352,15 @@ def generate_answer_node(state: DoubtSolverGraphState) -> dict:
     classification = QueryClassification.model_validate(state.get("classification") or {})
     # Convert empty string to None so generate_answer treats it as no context.
     context = state.get("answer_context") or None
-    output = generate_answer(state["query"], classification, context=context)
+    exam_context = _exam_response_context(config)
+    if exam_context:
+        exam_context["request_id"] = state.get("request_id", "")
+    output = generate_answer(
+        state["query"],
+        classification,
+        context=context,
+        **exam_context,
+    )
     logger.debug(
         "request_id=%s  generate_answer  source=%s  answer_len=%d  truncated=%s",
         state.get("request_id", ""),
@@ -805,7 +826,10 @@ def build_orchestrated_doubt_solver_graph(adapter):
         Only call when ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.
         Default path is build_doubt_solver_graph().
     """
-    def _generate_node(state: OrchestratedDoubtSolverState) -> dict:
+    def _generate_node(
+        state: OrchestratedDoubtSolverState,
+        config: RunnableConfig,
+    ) -> dict:
         """Call AnswerGenerationAdapter and write answer string to state.
 
         Handles controlled provider failures by returning a safe user-facing
@@ -839,6 +863,7 @@ def build_orchestrated_doubt_solver_graph(adapter):
                 web_search_reason=str(classification_dict.get("web_search_reason"))
                 if classification_dict.get("web_search_reason")
                 else None,
+                **_exam_response_context(config),
             )
         except ProviderExecutionError as exc:
             # Controlled provider failure — all fallbacks exhausted.

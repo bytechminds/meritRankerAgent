@@ -640,6 +640,7 @@ class RouteRequest(BaseModel):
     )
     intent: str | None = Field(default=None, max_length=128)
     exam: str | None = Field(default=None, max_length=128)
+    exam_stage: str | None = Field(default=None, max_length=64)
 
     model_config = {"str_strip_whitespace": True}
 
@@ -682,6 +683,7 @@ class RouteDecision(BaseModel):
     difficulty: str
     intent: str | None = None
     exam: str | None = None
+    exam_stage: str | None = None
     model: str = Field(description="Model alias (not the actual provider model_id).")
     prompt: str = Field(description="Relative prompt file path.")
     overlays: list[str] = Field(default_factory=list)

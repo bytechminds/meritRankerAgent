@@ -74,6 +74,18 @@ class DoubtSolverRequest(BaseModel):
         default="en",
         description="Preferred response language.",
     )
+    exam_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Optional selected exam identifier used only for answer presentation.",
+    )
+    exam_stage: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="Optional selected exam stage used only for answer presentation.",
+    )
     stream: bool = Field(
         default=False,
         description="Request a streaming response with student-friendly status "
