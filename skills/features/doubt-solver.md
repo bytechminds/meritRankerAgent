@@ -14,7 +14,10 @@ This is not the final advanced tutoring system. This feature context defines the
 
 ## Current Status
 
-Status: **Local Demo — orchestrated doubt solver active (`ENABLE_ORCHESTRATED_DOUBT_SOLVER=true`). Azure OpenAI v1 primary, native OpenAI fallback, intent overlays, difficulty routing, backend streaming. Legacy 7-node graph + `model_router` path preserved when orchestrated flag is false. AgentCore HTTP E2E with live credentials still [NOT VERIFIED].**
+Status: **Dev deployed — bounded AgentCore Memory-first follow-up understanding and DynamoDB
+fallback are active. The exact percentage follow-up and independent-query isolation pass in Dev.
+The deployed generator remains mock, actor identity is not yet bound to a trusted runtime
+principal, and multi-account deployment remains [NOT VERIFIED].**
 
 The four V1 planning documents are complete and implementation is done:
 
@@ -25,7 +28,172 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-07-20
+**Last updated:** 2026-07-23
+
+---
+
+## Latest Changes - Conversation Understanding Hardening (2026-07-23)
+
+- Every normal text doubt-solver request loads at most two completed turns from AgentCore Memory
+  before the final relation decision. DynamoDB is queried only after a controlled empty or failed
+  Memory result.
+- Typed relation and selection output links assistant-action, previous-turn, clarification,
+  continuation, correction, regeneration, pronoun, numeric, formula, option, substantive semantic,
+  ambiguity-margin, and recency signals to one bounded turn. Generic action words cannot bind an
+  unrelated self-contained question. Independent questions discard loaded context.
+- Contextual requests are rewritten into standalone academic queries before classification.
+  Unresolved requests return controlled clarification before retrieval or generation.
+- Dev live verification passed for `how did u calculated 75%`: the previous percentage turn was
+  selected, the resolved query contained only the academic topic and referenced value, and
+  classification returned `requires_recent_conversation=false`.
+- Direct inspection confirmed `source=agentcore_memory`, `memory_status=succeeded`, and
+  `dynamodb_status=not_attempted`. The final fresh-session CloudWatch request completed in 192 ms.
+- An unrelated contextual-looking acceleration question in the same conversation remained
+  independent. The deployed answer source is still mock, so a complete live provider-generated
+  tutoring explanation remains **[NOT VERIFIED]**.
+- AgentCore and DynamoDB transport exceptions produce typed context outcomes. Memory transport
+  failure proceeds to fallback; DynamoDB transport failure remains controlled.
+
+---
+
+## Latest Changes - Agent Observability and Clean Logging (2026-07-23)
+
+- Active streaming and non-streaming doubt-solver requests emit a bounded lifecycle, classification,
+  follow-up, retrieval, generation, quality, and persistence event sequence through the shared
+  `app/observability/` package.
+- Request, trace, conversation, turn, and request-type context is request-local. Streaming and
+  persistence worker threads explicitly copy context; terminal cleanup prevents cross-request
+  leakage.
+- Every consumed stream and non-streaming invocation emits one immutable execution summary.
+  Summaries contain decisions, statuses, and durations only; no question, prompt, answer, context,
+  retrieved text, image, credential, or provider payload is logged.
+- Public JSON/SSE schemas, graph topology, prompts, routing, fallback, verification, retries, and
+  persistence eligibility are unchanged. Deployed CloudWatch and custom span visibility remain
+  **[NOT VERIFIED]** pending the operator steps in `skills/features/agent-observability.md`.
+
+---
+
+## Latest Changes - Persistence and Follow-Up Reliability Fix (2026-07-22)
+
+- Accepted authoritative answers now return explicit history, session, and memory write outcomes.
+  History precedes ConversationSession, Memory remains independent, retries are transient-only and
+  bounded, and the public streaming `complete` event follows persistence coordination.
+- Failed-quality, empty, language-noncompliant, cancelled, non-finalized, and clarification-only
+  results are skipped with a typed reason. Verification failure remains a terminal error, not a
+  successful completed assistant turn.
+- Recent-context loading reports memory-first versus DynamoDB-fallback source and safe diagnostic
+  reasons. Independent Memory and DynamoDB reason fields retain exact empty, permission,
+  configuration, query, malformed/incomplete, and actor/conversation isolation outcomes. Actor and
+  conversation mismatches cannot enter prompt context. Two turns remain the default; a third is
+  consulted only after resolver low confidence.
+- Unresolved follow-ups bypass the strong classifier. After context resolution, the standalone query
+  enters the existing classifier, retrieval, and generation path.
+- Non-streaming graph results retain the backend-decided `standalone` or `follow_up` request type.
+  Generator observability is emitted from the actual execution result, including safe route, role,
+  alias, provider, deployment, and fallback provenance; classifier aliases and path labels cannot
+  replace it.
+- Duplicate/conflicting-answer checks now compare repeated explicit `Final Answer` conclusions only.
+  Intermediate values, relationship terms, rejected options, formulas, and ordinary explanatory
+  `Answer` headings do not become competing conclusions.
+- Rewrite parsing records provider-empty, parse-failed, marker-missing-but-complete,
+  quality-still-failed, and accepted outcomes. A complete markerless rewrite still passes the normal
+  final-answer and quality checks; empty or malformed output remains rejected. One rewrite maximum is
+  unchanged.
+- Read-only Dev smoke confirms the fixed SSM parameters, both DynamoDB tables, both conversation
+  indexes, and the exact-conversation query are available. This historical statement is superseded
+  by the deployed Memory-first evidence above.
+
+---
+
+## Latest Changes - Conversation History and Short-Term Memory (2026-07-22)
+
+- `DoubtSolverRequest` requires opaque `conversation_id` and `turn_id` values. The frontend
+  keeps one conversation ID until chat clear, creates one turn ID per submitted message, and
+  uses UUIDs so AgentCore session/client-token constraints are satisfied. It reuses that turn ID
+  for transport fallback and explicit retry. Intentional regenerate is a new logical turn.
+- `resolve_actor_id()` remains the sole identity boundary. The validated compatibility
+  `user_id` maps to AgentCore `actorId`; `conversation_id` maps to `sessionId`. No AWS account,
+  memory ID, resource name, actor ID, or IAM input is accepted from the frontend.
+- The existing Amplify `ConversationHistory` model remains the authoritative completed-turn
+  table. It keeps primary key `id=turn_id` and GSI `getByUserId(userId, createdAt)`. New fields
+  store original query, final answer, conversation, exam, language, subject/topic, quality,
+  regeneration, and creation time. Writes use `attribute_not_exists(id)` and verify identity
+  plus query before treating a conflict as idempotent success.
+- Amplify publishes generated table name and ARN under
+  `/meritranker/agent-runtime/v1/conversation-history/{table-name,table-arn}`. The runtime loads
+  both once per warm process. Production startup fails if required configuration is absent;
+  local/test execution degrades without persistence.
+- AgentCore owns one strategy-free short-term memory with 30-day raw-event retention. Each
+  completed turn creates one USER/ASSISTANT event with `clientToken=turn_id`. IAM is narrowed
+  to `CreateEvent` and `ListEvents` on that memory ARN. Memory reads validate actor/session,
+  roles, pagination, timestamps, and deduplicate by the newest turn event.
+- Every normal doubt-solver request prefetches the latest two completed turns from AgentCore
+  Memory before its final conversation-relation decision. Empty or controlled Memory failure uses
+  the exact-conversation DynamoDB fallback. A typed relation result separates context availability
+  from relevance, selects the referenced turn using explicit references, numeric/entity overlap,
+  bounded semantic token overlap, confidence, and recency, and discards unrelated history.
+- Contextual input is resolved before academic classification and existing retrieval/generation.
+  Unresolved contextual input returns a controlled clarification and cannot enter generic
+  generation. Deterministic English/Hindi/Hinglish and typo signals remain safety hints, not the
+  sole relevance decision.
+- Substantive academic concepts, formulas, numbers, percentages, currency values, options, named
+  relationships, and ambiguity margin establish relevance. Generic action-word overlap cannot
+  contaminate a new self-contained topic.
+- Recent context is capped at 6,000 characters, prioritizes newest turns, preserves user queries,
+  bounds long answer bodies, and is labelled untrusted. `PromptResolver` injects it exactly once;
+  current exam/language policy remains authoritative.
+- Only `FinalAnswerResult.content` with non-empty content, accepted quality status, and language
+  compliance is eligible. DynamoDB and memory writes run concurrently with bounded SDK timeouts
+  and one transient-only retry. Persistence failure never replaces a valid student answer.
+- Start-of-request DynamoDB replay returns an existing matching authoritative answer without
+  classifier, retrieval, model, verifier, DynamoDB write, or AgentCore event work. Identity or
+  query reuse conflicts fail safely.
+- Conversation summary, learner profile, long-term memory strategies, Redis, semantic cache,
+  cross-conversation search, recommendations, and JWT infrastructure remain deferred.
+- Orchestrated JSON and streaming paths perform follow-up resolution. The legacy compatibility
+  path blocks unresolved context-dependent input and returns clarification without calling its
+  older direct generator boundary.
+- Offline unit/integration and CDK assertions cover request validation, isolation, replay,
+  fallback, ordering, caps, prompt composition, persistence eligibility, retries, and
+  least-privilege policies. SSM existence and live DynamoDB/Memory create-list-delete smoke are
+  **[NOT VERIFIED]** until both infrastructure repositories are deployed to a non-production account.
+- Final local validation: the equivalent Ruff plus full pytest gate passed with 2,210 tests and one credential-gated live
+  image test skipped; `agentcore validate` passed; CDK format/build and both IAM synthesis tests
+  passed. The Dev target is configured; this reliability fix does not deploy resources.
+
+---
+
+## Latest Changes - Request Context and Final-Answer Foundation (2026-07-22)
+
+- `DoubtSolverRequest.language` now normalizes `english`, `hinglish`, `hindi`, and
+  migration aliases `en`/`hi` once at validation. Omission defaults to canonical English
+  for compatibility and is metered safely at the entrypoint.
+- `resolve_actor_id()` is the only payload identity seam. It currently returns the
+  validated compatibility `user_id`; this value is not production-trusted. Inspection
+  found no validated JWT subject or authenticated principal in the current
+  `BedrockAgentCoreApp` invocation, so authentication infrastructure was not added.
+- Existing graph state now carries immutable request-scoped `actor_id`, `original_query`,
+  `exam_id`, `exam_stage`, and canonical `language`. This supersedes historical exact
+  state-field-count statements below. `actor_id` is never added to prompts.
+- `PromptResolver` remains the sole final model-facing composition boundary. Generator
+  system content receives the existing exam policy and exactly one compact language
+  policy. Classifier, retrieval, planner, PatternGraph, SolveFlow, and web-search queries
+  are unchanged.
+- `FinalAnswerResult(content, quality_status, was_regenerated, language_compliant)` is the
+  immutable internal authority for generator completion. Orchestrated, legacy, verified
+  replay, and live-stream paths construct it before response completion. It is excluded
+  from public model serialization, preserving existing JSON and SSE fields.
+- Verified replay finalizes privately before chunks are emitted. Live streaming preserves
+  existing immediate chunk delivery and performs deterministic finalization after the
+  complete draft is assembled; therefore emitted live chunks can already have been seen
+  when `language_compliant=false`. The complete response content is the only future
+  persistence boundary; chunks must never be persisted as answers.
+- Language compliance checks detect only obvious script mismatch and reuse the existing
+  bounded rewrite path in non-stream generation. They do not claim grammar, factual, or
+  semantic verification and do not alter formulas, symbols, units, option labels, code,
+  URLs, or retrieval queries.
+- This foundation was subsequently extended by the conversation-history section above. It did
+  not itself add summaries, learner profile, Redis, semantic cache, or JWT infrastructure.
 
 ---
 
@@ -42,8 +210,8 @@ The four V1 planning documents are complete and implementation is done:
   profile lookup.
 - The runtime currently has no authenticated session/profile selected-exam source and no
   intentional application default exam. Optional `DoubtSolverRequest.exam_id` and
-  `exam_stage` values are therefore the only production input. They are carried through
-  LangGraph run configuration, not graph state or response data. Missing input preserves
+  `exam_stage` values are therefore the only production input. They are carried in the
+  immutable request-scoped graph state and are not response data. Missing input preserves
   the previous prompt exactly; unknown explicit input resolves safely to the generic
   family.
 - `PromptResolver` appends the resolved instruction once to generator system messages.
@@ -651,6 +819,9 @@ unaffected.
 
 ### V1 graph invariants
 
+This historical V1 section is superseded where it conflicts with the current conversation,
+streaming, difficulty, and final-answer sections above.
+
 - State contains ONLY: `request_id`, `query`, `classification`, `context_text`, `answer`.
 - Nodes must NOT write: `plan`, `response`, `route_decision`, `messages`, `raw_provider_response`, `kb_results`, `dynamodb_records`, `used_retrieval`, `answer_source`.
 - Graph nodes must NOT import: `model_id`, `deployment`, `provider`, `api_key_env`.
@@ -672,7 +843,7 @@ unaffected.
 - `[DEFER]` Planner node (determines task role before generate).
 - `[DEFER]` Verifier node (reviews answer before returning).
 - `[DEFER]` Streaming path.
-- `[DEFER]` Memory / multi-turn context.
+- `[IMPLEMENTED LATER]` Memory / multi-turn context; see the current section above.
 - `[DEFER]` Difficulty classification (V1 always uses `"default"`).
 - `[DEFER]` V1 response schema in `main.py` (currently returns plain dict).
 - `[NOT VERIFIED]` AgentCore HTTP E2E with V2 flag enabled.

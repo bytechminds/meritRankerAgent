@@ -7,6 +7,7 @@ Student-friendly orchestrated doubt solver streaming tests.
 from __future__ import annotations
 
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -192,7 +193,7 @@ class TestStreamingFlow:
     def test_stream_lifecycle_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         import logging
 
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             _collect(_make_adapter("Short answer."))
 
         messages = " ".join(r.message for r in caplog.records)
@@ -202,6 +203,21 @@ class TestStreamingFlow:
         assert "stream_completed=true" in messages
         assert "answer_chunk_emission" in messages
         assert "latency_ms=" in messages
+        structured = [
+            r.observability_event
+            for r in caplog.records
+            if hasattr(r, "observability_event")
+        ]
+        assert len(
+            [event for event in structured if event["level"] == "INFO"]
+        ) <= 15
+        assert (
+            sum(
+                event["event"] == "request_execution_summary"
+                for event in structured
+            )
+            == 1
+        )
 
     def test_thinking_before_generation(self) -> None:
         events = _collect(_make_adapter())
@@ -224,6 +240,36 @@ class TestStreamingFlow:
         events = _collect(_make_adapter())
         assert events[-1].type == "complete"
         assert events[-1].label == "Done"
+
+    def test_persistence_finishes_before_public_complete_event(self) -> None:
+        timeline: list[str] = []
+        persistence = MagicMock()
+        persistence.persist_completed_turn.side_effect = lambda *args, **kwargs: (
+            timeline.append("persistence_finished")
+        )
+        events = stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                actor_id="student-1",
+                conversation_id="conversation-1",
+                turn_id="turn-1",
+                query="Explain percentages",
+                original_query="Explain percentages",
+            ),
+            adapter=_make_adapter("**Final Answer:** 25%"),
+            conversation_persistence=persistence,
+        )
+
+        for event in events:
+            if event.type == "complete":
+                timeline.append("public_complete")
+
+        assert timeline == ["persistence_finished", "public_complete"]
+        persistence.persist_completed_turn.assert_called_once()
+        assert (
+            persistence.persist_completed_turn.call_args.kwargs["request_id"]
+            == _REQUEST_ID
+        )
 
     def test_chunk_content_is_provider_chunk_content(self) -> None:
         content = "Let the cost price be ₹100. Marked price = ₹140."
@@ -255,7 +301,7 @@ class TestCarefulClassificationStreamStatus:
             "graphs.doubt_solver_graph.classify_query",
             return_value=high_conf,
         ):
-            events = _collect(_make_adapter("Short answer."))
+            events = _collect(_make_adapter("**Final Answer:** Short answer."))
         labels = [e.label for e in events if e.type == "status"]
         assert labels.count("Checking the question more carefully...") == 0
 
@@ -278,7 +324,7 @@ class TestCarefulClassificationStreamStatus:
             "graphs.doubt_solver_graph.classify_query",
             side_effect=_classify_with_hook,
         ):
-            events = _collect(_make_adapter("Short answer."))
+            events = _collect(_make_adapter("**Final Answer:** Short answer."))
 
         labels = [e.label for e in events if e.type == "status"]
         assert labels.count("Understanding...") == 1
@@ -377,10 +423,20 @@ class TestNonStreamRegression:
         expected = {
             "request_id",
             "query",
+            "original_query",
+            "actor_id",
+            "conversation_id",
+            "turn_id",
+            "language",
+            "exam_id",
+            "exam_stage",
             "classification",
             "retrieval_context",
             "context_text",
             "answer",
+            "final_answer",
+            "conversation_context",
+            "conversation_relation",
         }
         assert fields == expected
 

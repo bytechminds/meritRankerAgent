@@ -154,7 +154,7 @@ def _log_continuation_decision(
     policy: AnswerCompletionPolicy,
 ) -> None:
     """Emit safe continuation decision diagnostics. Never logs content."""
-    logger.info(
+    logger.debug(
         "answer_continuation_decision  base_answer_present=%s  finish_reason=%s  "
         "final_answer_detected=%s  marker_found=%s  continuation_allowed=%s  reason=%s",
         base_answer_present,
@@ -235,7 +235,7 @@ def log_answer_generation_budget(
     max_output_tokens: int,
     context_chars: int,
 ) -> None:
-    logger.info(
+    logger.debug(
         "answer_generation_budget  request_id=%s  route_id=%s  subject=%s  "
         "difficulty=%s  intent=%s  max_output_tokens=%d  context_chars=%d",
         request_id,
@@ -260,7 +260,7 @@ def log_answer_completion(
     output_chars: int,
     marker_missing_but_answer_complete: bool = False,
 ) -> None:
-    logger.info(
+    logger.debug(
         "answer_completion  request_id=%s  finish_reason=%s  "
         "completion_marker_found=%s  final_answer_detected=%s  "
         "continuation_used=%s  continuation_attempts=%d  rewrite_used=%s  "

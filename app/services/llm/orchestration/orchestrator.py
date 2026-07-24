@@ -37,6 +37,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from config import get_settings
+from schemas.doubt_solver import FinalAnswerResult
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, OrchestrationResult
 from schemas.llm_routing import RouteDecision, RouteRequest
@@ -61,11 +62,13 @@ from services.doubt_solver.answer_quality import (
     generation_failure_message,
     log_answer_quality_rewrite,
     log_answer_quality_validation,
+    parse_rewrite_output,
     plain_text_fallback,
     rewrite_max_tokens,
     strip_duplicate_final_answer_section,
     validate_answer_quality,
 )
+from services.doubt_solver.final_answer import build_final_answer_result
 from services.llm.orchestration.errors import (
     LlmExecutionError,
     LlmOrchestrationError,
@@ -261,9 +264,10 @@ class LlmOrchestrator:
         messages: list[LlmMessage],
         continuation_used: bool,
         continuation_attempts: int,
-    ) -> tuple[str, bool]:
+    ) -> FinalAnswerResult:
         """Validate, optionally rewrite, sanitize, and strip completion marker."""
         rewrite_used = False
+        was_regenerated = False
         working = strip_duplicate_final_answer_section(content)
         marker_found = has_completion_marker(working, policy.marker)
         answer_complete = detect_final_answer(working)
@@ -280,6 +284,7 @@ class LlmOrchestrator:
             subject=route_decision.subject,
             difficulty=route_decision.difficulty,
             intent=route_request.intent,
+            language=route_request.language,
             policy=quality_policy,
         )
         if quality.severity == "error":
@@ -294,7 +299,11 @@ class LlmOrchestrator:
                 rewrite_required=False,
                 sanitized=False,
             )
-            return generation_failure_message(), False
+            return build_final_answer_result(
+                content=generation_failure_message(route_request.language),
+                language=route_request.language,
+                quality_status="failed_quality_gate",
+            )
         rewrite_required = quality.severity in ("rewrite_required", "unsafe")
         log_answer_quality_validation(
             request_id=request_id,
@@ -331,40 +340,63 @@ class LlmOrchestrator:
                     route_decision=rewrite_route,
                     messages=rewrite_messages,
                 )
-                working = rewrite_result.content
-                finish_reason = rewrite_result.finish_reason
-                quality = validate_answer_quality(
-                    working,
-                    subject=route_decision.subject,
-                    difficulty=route_decision.difficulty,
-                    intent=route_request.intent,
-                    policy=quality_policy,
-                )
-                log_answer_quality_rewrite(
-                    request_id=request_id,
-                    used=True,
-                    attempt_count=1,
-                    success=quality.severity in ("clean", "minor"),
-                    final_output_chars=len(working),
-                )
-            except (LlmOrchestrationError, Exception):
+            except Exception:  # noqa: BLE001
                 log_answer_quality_rewrite(
                     request_id=request_id,
                     used=True,
                     attempt_count=1,
                     success=False,
                     final_output_chars=0,
+                    outcome="provider_failure",
                 )
-                working = apply_safe_sanitizer(working, marker=policy.marker)
-                if not detect_final_answer(working):
-                    working = plain_text_fallback(subject=route_decision.subject)
+            else:
+                candidate, parse_outcome = parse_rewrite_output(
+                    rewrite_result.content,
+                    marker=policy.marker,
+                )
+                if candidate is None:
+                    log_answer_quality_rewrite(
+                        request_id=request_id,
+                        used=True,
+                        attempt_count=1,
+                        success=False,
+                        final_output_chars=len(rewrite_result.content),
+                        outcome=parse_outcome,
+                    )
+                else:
+                    candidate_quality = validate_answer_quality(
+                        candidate,
+                        subject=route_decision.subject,
+                        difficulty=route_decision.difficulty,
+                        intent=route_request.intent,
+                        language=route_request.language,
+                        policy=quality_policy,
+                    )
+                    accepted = candidate_quality.severity in ("clean", "minor")
+                    working = candidate
+                    quality = candidate_quality
+                    finish_reason = rewrite_result.finish_reason
+                    was_regenerated = accepted
+                    log_answer_quality_rewrite(
+                        request_id=request_id,
+                        used=True,
+                        attempt_count=1,
+                        success=accepted,
+                        final_output_chars=len(candidate),
+                        outcome=(
+                            parse_outcome if accepted else "quality_still_failed"
+                        ),
+                    )
         elif quality.sanitized_text is not None:
             working = quality.sanitized_text
 
         if quality.severity in ("rewrite_required", "unsafe") and not rewrite_used:
             working = apply_safe_sanitizer(working, marker=policy.marker)
             if not detect_final_answer(working):
-                working = plain_text_fallback(subject=route_decision.subject)
+                working = plain_text_fallback(
+                    subject=route_decision.subject,
+                    language=route_request.language,
+                )
 
         marker_found = has_completion_marker(working, policy.marker)
         answer_complete = detect_final_answer(working)
@@ -382,7 +414,24 @@ class LlmOrchestrator:
                 working, policy
             ),
         )
-        return final_content, rewrite_used
+        final_quality = validate_answer_quality(
+            final_content,
+            subject=route_decision.subject,
+            difficulty=route_decision.difficulty,
+            intent=route_request.intent,
+            language=route_request.language,
+            policy=quality_policy,
+        )
+        return build_final_answer_result(
+            content=final_content,
+            language=route_request.language,
+            quality_status=(
+                "passed_quality_gate"
+                if final_quality.is_valid
+                else "failed_quality_gate"
+            ),
+            was_regenerated=was_regenerated,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -395,6 +444,7 @@ class LlmOrchestrator:
         query: str,
         classification: Any | None = None,
         context: str | None = None,
+        conversation_context: str | None = None,
     ) -> OrchestrationResult:
         """Run the full orchestration pipeline and return a safe result.
 
@@ -438,6 +488,7 @@ class LlmOrchestrator:
             query,
             classification,
             context,
+            conversation_context=conversation_context,
             request_id=route_request.request_id,
         )
 
@@ -518,10 +569,10 @@ class LlmOrchestrator:
             content = content + cont_result.content
             finish_reason = cont_result.finish_reason
 
-        rewrite_used = False
+        final_answer: FinalAnswerResult | None = None
         if is_generator:
             if quality_policy.validation_enabled:
-                final_content, rewrite_used = self._finalize_generator_content(
+                final_answer = self._finalize_generator_content(
                     request_id=route_request.request_id,
                     content=content,
                     finish_reason=finish_reason,
@@ -533,11 +584,17 @@ class LlmOrchestrator:
                     continuation_used=continuation_used,
                     continuation_attempts=continuation_attempts,
                 )
+                final_content = final_answer.content
             else:
                 marker_found = has_completion_marker(content, policy.marker)
                 final_content = strip_completion_marker(content, policy.marker)
                 if not final_content.strip():
-                    final_content = generation_failure_message()
+                    final_content = generation_failure_message(route_request.language)
+                final_answer = build_final_answer_result(
+                    content=final_content,
+                    language=route_request.language,
+                    quality_status="checked",
+                )
                 log_answer_completion(
                     request_id=route_request.request_id,
                     finish_reason=finish_reason,
@@ -563,7 +620,8 @@ class LlmOrchestrator:
         logger.info(
             "llm_orchestrator.generate  request_id=%s  route_id=%s  subject=%s  "
             "task_role=%s  difficulty=%s  model=%s  model_config_source=yaml  "
-            "fallback_used=%s  latency_ms=%d",
+            "fallback_used=%s  latency_ms=%d  quality_status=%s  "
+            "was_regenerated=%s  language_compliant=%s",
             route_request.request_id,
             route_decision.route_id,
             route_decision.subject,
@@ -572,6 +630,9 @@ class LlmOrchestrator:
             route_decision.model,
             execution_result.fallback_used,
             elapsed_ms,
+            final_answer.quality_status if final_answer else "checked",
+            final_answer.was_regenerated if final_answer else False,
+            final_answer.language_compliant if final_answer else True,
         )
 
         # --- 7. Build OrchestrationResult ----------------------------------
@@ -587,6 +648,12 @@ class LlmOrchestrator:
             latency_ms=execution_result.latency_ms,
             answer_source=answer_source,
             metadata={},
+            final_answer=final_answer,
+            execution_deployment=(
+                str(execution_result.metadata.get("deployment"))
+                if execution_result.metadata.get("deployment")
+                else None
+            ),
         )
 
     def generate_stream(
@@ -596,6 +663,7 @@ class LlmOrchestrator:
         query: str,
         classification: Any | None = None,
         context: str | None = None,
+        conversation_context: str | None = None,
         on_before_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
         verify_before_stream: bool = True,
@@ -615,6 +683,7 @@ class LlmOrchestrator:
             query,
             classification,
             context,
+            conversation_context=conversation_context,
             request_id=route_request.request_id,
         )
 
@@ -769,7 +838,7 @@ class LlmOrchestrator:
         if is_generator:
             raw_content = "".join(streamed_parts)
             if verify_before_stream and quality_policy.validation_enabled:
-                final_content, _rewrite_used = self._finalize_generator_content(
+                final_answer = self._finalize_generator_content(
                     request_id=route_request.request_id,
                     content=raw_content,
                     finish_reason=finish_reason,
@@ -782,10 +851,10 @@ class LlmOrchestrator:
                     continuation_attempts=continuation_attempts,
                 )
                 if buffer_for_quality:
-                    if final_content.strip():
-                        yield final_content
+                    if final_answer.content.strip():
+                        yield final_answer.content
                     else:
-                        yield generation_failure_message()
+                        yield generation_failure_message(route_request.language)
             else:
                 final_content = strip_completion_marker(raw_content, policy.marker)
                 log_answer_completion(

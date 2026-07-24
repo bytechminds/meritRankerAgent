@@ -67,6 +67,10 @@ class _FakeAdapter:
         difficulty: str,
         context: str,
         web_search_reason: str | None = None,
+        exam_id: str | None = None,
+        exam_stage: str | None = None,
+        language: str = "english",
+        conversation_context: str | None = None,
     ) -> str:
         self.call_count += 1
         self.last_kwargs = {
@@ -77,6 +81,10 @@ class _FakeAdapter:
             "difficulty": difficulty,
             "context": context,
             "web_search_reason": web_search_reason,
+            "exam_id": exam_id,
+            "exam_stage": exam_stage,
+            "language": language,
+            "conversation_context": conversation_context,
         }
         return self._content
 
@@ -95,10 +103,20 @@ def _minimal_state(
 ) -> OrchestratedDoubtSolverState:
     return {
         "request_id": request_id,
+        "actor_id": "student-1",
+        "conversation_id": "conversation-1",
+        "turn_id": "turn-1",
         "query": query,
+        "original_query": query,
+        "language": "english",
+        "exam_id": None,
+        "exam_stage": None,
         "classification": classification,
+        "retrieval_context": {},
         "context_text": context_text,
         "answer": answer,
+        "final_answer": None,
+        "conversation_context": "",
     }
 
 
@@ -586,10 +604,19 @@ class TestOrchestratedGraphFlow:
         assert set(result.keys()) == {
             "request_id",
             "query",
+            "original_query",
+            "actor_id",
+            "conversation_id",
+            "turn_id",
+            "language",
+            "exam_id",
+            "exam_stage",
             "classification",
             "context_text",
             "retrieval_context",
             "answer",
+            "final_answer",
+            "conversation_context",
         }
 
     def test_full_flow_classification_is_dict(self) -> None:
@@ -614,15 +641,21 @@ class TestOrchestratedGraphFlow:
         assert "verifier" not in node_names
         assert "verify" not in node_names
 
-    def test_full_flow_has_exactly_three_non_boundary_nodes(self) -> None:
-        """classify + collect_context + generate only (no extra nodes)."""
+    def test_full_flow_has_expected_non_boundary_nodes(self) -> None:
+        """Follow-up preparation precedes existing retrieval and generation nodes."""
         adapter = _FakeAdapter()
         graph = build_orchestrated_doubt_solver_graph(adapter)
         node_names = {
             n for n in graph.get_graph().nodes.keys()
             if n not in ("__start__", "__end__")
         }
-        assert node_names == {"classify", "collect_context", "generate"}
+        assert node_names == {
+            "understand_conversation",
+            "classify",
+            "prepare_follow_up",
+            "collect_context",
+            "generate",
+        }
 
     def test_full_flow_adapter_called_exactly_once(self) -> None:
         adapter = _FakeAdapter()

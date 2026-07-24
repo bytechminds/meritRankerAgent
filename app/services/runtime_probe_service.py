@@ -73,6 +73,8 @@ def build_doubt_solver_smoke_payload() -> dict:
         "mode": "doubt_solver",
         "query": _SMOKE_QUERY,
         "user_id": "local-smoke",
+        "conversation_id": "local-smoke-conversation",
+        "turn_id": "local-smoke-turn",
         "language": "en",
     }
 

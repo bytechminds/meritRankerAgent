@@ -48,6 +48,7 @@ def pytest_configure(config: pytest.Config) -> None:  # noqa: ARG001
     ``get_settings()`` always re-reads the active env.
     """
     os.environ.setdefault("ENABLE_REAL_LLM", "false")
+    os.environ.setdefault("APP_ENV", "test")
     os.environ.setdefault("ENABLE_KB_RETRIEVAL", "false")
     os.environ.setdefault("ENABLE_DYNAMODB_FETCH", "false")
     os.environ.setdefault("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "false")
@@ -72,6 +73,7 @@ def _unit_test_env_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     import config as cfg_module  # noqa: PLC0415
 
     monkeypatch.setenv("ENABLE_REAL_LLM", "false")
+    monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "false")
     monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "false")
     monkeypatch.setenv("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "false")

@@ -43,6 +43,12 @@ class Settings:
 
     app_env: str
     log_level: str
+    agent_log_format: str
+    agent_log_file_enabled: bool
+    agent_log_file_path: str
+    agent_local_log_content: str
+    agent_detailed_logs: bool
+    agent_observability_enabled: bool
     model_provider: str
     # LLM routing
     enable_real_llm: bool
@@ -414,9 +420,39 @@ def get_settings() -> Settings:
                 "ANSWER_ALLOW_ALWAYS_LIVE_IN_PRODUCTION=true."
             )
 
+        current_app_env = os.getenv("APP_ENV", "local").strip().lower()
+        agent_local_log_content = os.getenv(
+            "AGENT_LOCAL_LOG_CONTENT",
+            "off" if current_app_env == "production" else "preview",
+        ).strip().lower()
+        if agent_local_log_content not in {"off", "preview", "full"}:
+            raise ConfigurationError(
+                "AGENT_LOCAL_LOG_CONTENT must be 'off', 'preview', or 'full'."
+            )
+        if current_app_env == "production":
+            agent_local_log_content = "off"
+
         _settings = Settings(
             app_env=os.getenv("APP_ENV", "local"),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            log_level=os.getenv("AGENT_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")),
+            agent_log_format=os.getenv("AGENT_LOG_FORMAT", "").strip(),
+            agent_log_file_enabled=(
+                os.getenv(
+                    "AGENT_LOG_FILE_ENABLED",
+                    "false"
+                    if os.getenv("APP_ENV", "local").strip().lower() == "production"
+                    else "true",
+                ).lower()
+                == "true"
+            ),
+            agent_log_file_path=str(Path(__file__).parent / ".logs" / "agent-runtime.log"),
+            agent_local_log_content=agent_local_log_content,
+            agent_detailed_logs=(
+                os.getenv("AGENT_DETAILED_LOGS", "false").lower() == "true"
+            ),
+            agent_observability_enabled=(
+                os.getenv("AGENT_OBSERVABILITY_ENABLED", "true").lower() == "true"
+            ),
             model_provider=os.getenv("MODEL_PROVIDER", "mock"),
             enable_real_llm=os.getenv("ENABLE_REAL_LLM", "false").lower() == "true",
             llm_default_provider=os.getenv("LLM_DEFAULT_PROVIDER", "mock"),

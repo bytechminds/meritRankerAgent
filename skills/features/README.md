@@ -29,7 +29,9 @@ if a fact is unknown.
 |---|---|---|
 | `demo-agent.md` | Local demo — AgentCore + LangGraph + Pydantic foundation | Local Demo |
 | `doubt-solver.md` | Student doubt solving and tutoring workflow | Planned |
+| `conversation-history.md` | Completed turns, session metadata, and read contracts | In Progress |
 | `image-question-classification.md` | Image extraction and classification entry path | Partially Implemented |
+| `agent-observability.md` | Structured events, request summaries, local inspection, and tracing | In Progress |
 
 ---
 

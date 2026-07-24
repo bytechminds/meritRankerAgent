@@ -152,7 +152,7 @@ Every integration point should be swappable without touching the graph:
 | Prompt text | `prompts/` |
 | Data contracts | `schemas/` |
 | Settings | `config.py` |
-| Logging setup | `logging_config.py` |
+| Logging setup | `logging_config.py` facade + `observability/` implementation |
 | Tests | `tests/` |
 | Deploy config | `agentcore/` |
 | Agent guidance | `skills/` |

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -33,6 +34,53 @@ logger = logging.getLogger(__name__)
 
 _CLASSIFIER_ROLE = "doubt_solver_classifier"
 _CLASSIFIER_STRONG_TASK_ROLE = "classifier_strong"
+
+_FOLLOW_UP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^why did you\b", re.IGNORECASE),
+    re.compile(r"^explain (?:the )?(?:second|third|last|previous) step\b", re.IGNORECASE),
+    re.compile(r"^(?:please )?use another method\b", re.IGNORECASE),
+    re.compile(r"^(?:please )?continue (?:from )?(?:above|there|the previous)\b", re.IGNORECASE),
+    re.compile(r"^what about option [A-Z0-9]+\b", re.IGNORECASE),
+    re.compile(r"^(?:give|create) (?:me )?\w+ more questions? like (?:that|this)\b", re.IGNORECASE),
+    re.compile(r"^(?:can you )?(?:simplify|shorten) (?:that|the) explanation\b", re.IGNORECASE),
+    re.compile(r"^explain (?:it|that)\??$", re.IGNORECASE),
+    re.compile(r"\bwhat formula (?:did )?you (?:use|apply|applied)\b", re.IGNORECASE),
+    re.compile(r"\bhow did you get\s+\S+", re.IGNORECASE),
+    re.compile(r"\bexplain (?:that|this) step\b", re.IGNORECASE),
+    re.compile(r"\b(?:previous|last) (?:answer|question|pattern)\b", re.IGNORECASE),
+    re.compile(r"\b(?:that|this) (?:formula|step|option|answer)\b", re.IGNORECASE),
+    re.compile(r"\bwhy (?:this|that) option\b", re.IGNORECASE),
+    re.compile(r"\bhow was (?:this|that|it) calculated\b", re.IGNORECASE),
+    re.compile(r"\bwhich operation did you (?:use|apply)\b", re.IGNORECASE),
+    re.compile(r"\bwhat was the pattern\b", re.IGNORECASE),
+    re.compile(r"(?:पिछला|पिछले|आखिरी) (?:सवाल|उत्तर|चरण)", re.IGNORECASE),
+    re.compile(r"(?:यह|वह|इस|उस) (?:सूत्र|चरण|विकल्प)", re.IGNORECASE),
+    re.compile(r"\b(?:pichla|pichhle|last) (?:sawal|question|answer|step)\b", re.IGNORECASE),
+    re.compile(r"\b(?:yeh|woh|is|us) (?:formula|step|option)\b", re.IGNORECASE),
+    re.compile(r"\bkaise (?:mila|nikala|calculate kiya)\b", re.IGNORECASE),
+    re.compile(
+        r"\bhow\s+(?:did\s+)?(?:you|u)\s+"
+        r"(?:calculate|calculated|get|got)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:why\s+[$₹€£]?\s*\d+(?:\.\d+)?\s*(?:%|percent)?|"
+        r"why\s+option\s+[A-D1-4])\??$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:aapne\s+.*(?:kaise|kyu|nikala|lagaya|calculate)|"
+        r"\d+(?:\.\d+)?\s*(?:%|percent)?\s+kaise\s+nikala|"
+        r"(?:ye|yeh)\s+value\s+kahan\s+se\s+aayi)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def requires_recent_conversation(query: str) -> bool:
+    """Return true only for high-confidence conversational references."""
+    normalized = " ".join(query.strip().split())
+    return any(pattern.search(normalized) for pattern in _FOLLOW_UP_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -897,6 +945,7 @@ def _build_query_classification(
         need_web_search=parsed.need_web_search,
         web_search_reason=parsed.web_search_reason,
         web_search_query=parsed.web_search_query,
+        requires_recent_conversation=parsed.requires_recent_conversation,
         classification_source=classification_source or parsed.classification_source,  # type: ignore[arg-type]
     )
 
@@ -971,6 +1020,7 @@ def _classify_deterministic(query: str) -> QueryClassification:
         response_style=response_style,  # type: ignore[arg-type]
         confidence=confidence,
         classification_source="deterministic",
+        requires_recent_conversation=requires_recent_conversation(query),
     )
     logger.debug(
         "deterministic_classifier  intent=%s  subject=%s  difficulty=%s  confidence=%.2f",
@@ -1055,7 +1105,14 @@ def _classify_with_llm_orchestrated(
         context=None,
     )
 
-    return _parse_classifier_orchestrated_content(result.content, route_id=route_id)
+    classification = _parse_classifier_orchestrated_content(
+        result.content, route_id=route_id
+    )
+    if requires_recent_conversation(query) and not classification.requires_recent_conversation:
+        classification = classification.model_copy(
+            update={"requires_recent_conversation": True}
+        )
+    return classification
 
 
 def _deterministic_classifier_fallback(
@@ -1141,6 +1198,25 @@ def _classify_with_llm_orchestrated_or_fallback(
                 _rid,
             )
             return _deterministic_classifier_fallback(query, strong_classifier_used=True)
+
+    if primary.requires_recent_conversation:
+        duration_ms = (time.perf_counter() - t_start) * 1000
+        _log_classifier_fallback_decision(
+            request_id=_rid,
+            reason="follow_up_context_required",
+            fallback_used=False,
+            strong_classifier_used=False,
+        )
+        logger.info(
+            "orchestrated_classifier request_id=%s follow_up_context_required=true "
+            "fallback_used=false strong_classifier_used=false duration_ms=%.2f",
+            _rid,
+            duration_ms,
+        )
+        return ClassifierRunResult(
+            classification=primary,
+            strong_classifier_used=False,
+        )
 
     needs_strong = (
         primary.confidence < threshold
@@ -1240,7 +1316,10 @@ def _classify_with_llm(query: str) -> QueryClassification:
     raw_dict, _recovered = parse_classifier_json_strict(response.content)
     classification = QueryClassification.model_validate(raw_dict)
 
-    return _build_query_classification(classification, classification_source="llm")
+    result = _build_query_classification(classification, classification_source="llm")
+    if requires_recent_conversation(query) and not result.requires_recent_conversation:
+        result = result.model_copy(update={"requires_recent_conversation": True})
+    return result
 
 
 def _classify_with_llm_or_fallback(query: str) -> QueryClassification:

@@ -223,18 +223,35 @@ def _build_classifier(
 
 class TestRequestContract:
     def test_text_only_request_is_unchanged(self) -> None:
-        request = DoubtSolverRequest(mode="doubt_solver", query="Explain ratio")
+        request = DoubtSolverRequest(
+            mode="doubt_solver",
+            query="Explain ratio",
+            user_id="local-user",
+            conversation_id="conversation-1",
+            turn_id="turn-1",
+        )
         assert request.query == "Explain ratio"
         assert request.image is None
 
     def test_image_only_request_is_valid(self) -> None:
-        request = DoubtSolverRequest(mode="doubt_solver", image=_image_input())
+        request = DoubtSolverRequest(
+            mode="doubt_solver",
+            image=_image_input(),
+            user_id="local-user",
+            conversation_id="conversation-1",
+            turn_id="turn-1",
+        )
         assert request.query is None
         assert request.image is not None
 
     def test_missing_query_and_image_is_invalid(self) -> None:
         with pytest.raises(ValidationError, match="Either query or image"):
-            DoubtSolverRequest(mode="doubt_solver")
+            DoubtSolverRequest(
+                mode="doubt_solver",
+                user_id="local-user",
+                conversation_id="conversation-1",
+                turn_id="turn-1",
+            )
 
     def test_image_requires_exactly_one_payload_source(self) -> None:
         with pytest.raises(ValidationError, match="exactly one"):

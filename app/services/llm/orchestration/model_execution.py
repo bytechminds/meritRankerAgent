@@ -10,13 +10,17 @@ import logging
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from observability import update_request_summary
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import (
     ModelExecutionResult,
     ProviderExecutionRequest,
 )
 from schemas.llm_routing import RouteDecision
-from services.llm.orchestration.errors import ProviderExecutionError
+from services.llm.orchestration.errors import (
+    ModelExecutionConfigError,
+    ProviderExecutionError,
+)
 from services.llm.orchestration.model_config_resolver import ModelConfigResolver
 from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
@@ -33,6 +37,16 @@ logger = logging.getLogger(__name__)
 def _is_visible_text(chunk: str) -> bool:
     """True when a stream chunk contains user-visible answer text."""
     return bool(chunk and chunk.strip())
+
+
+def _validate_model_role(
+    route_decision: RouteDecision, *, allowed_task_roles: list[str]
+) -> None:
+    if allowed_task_roles and route_decision.task_role not in allowed_task_roles:
+        raise ModelExecutionConfigError(
+            f"Model alias '{route_decision.model}' is not allowed for task role "
+            f"'{route_decision.task_role}'."
+        )
 
 
 def _log_generation_empty_output(
@@ -149,6 +163,10 @@ class RegistryBackedModelExecutor:
     ) -> ModelExecutionResult:
         primary_alias = route_decision.model
         model_resolution = self._model_config_resolver.resolve(route_decision)
+        _validate_model_role(
+            route_decision,
+            allowed_task_roles=list(model_resolution.model_config.allowed_task_roles),
+        )
         self._model_config_resolver.validate_provider_options(
             provider_options=route_decision.provider_options,
             model_config=model_resolution.model_config,
@@ -163,7 +181,7 @@ class RegistryBackedModelExecutor:
             provider_options=dict(route_decision.provider_options),
         )
 
-        logger.info(
+        logger.debug(
             "registry_backed_model_executor.execute  model_alias=%s  provider=%s  "
             "supports_streaming=%s  supports_thinking=%s  timeout_seconds=%d",
             model_resolution.safe_metadata["model_alias"],
@@ -193,6 +211,11 @@ class RegistryBackedModelExecutor:
                     failure_kind="empty_answer",
                     provider=model_resolution.provider,
                     model_alias=primary_alias,
+                )
+            if route_decision.task_role == "generator":
+                update_request_summary(
+                    generation_route=route_decision.route_id,
+                    generation_model=model_resolution.model_alias,
                 )
             return raw_result
         except LlmProviderExecutionError as exc:
@@ -237,6 +260,12 @@ class RegistryBackedModelExecutor:
                 )
                 attempted.append(fallback_alias)
                 continue
+            _validate_model_role(
+                route_decision,
+                allowed_task_roles=list(
+                    fallback_resolution.model_config.allowed_task_roles
+                ),
+            )
 
             fallback_request = ProviderExecutionRequest(
                 route_decision=route_decision,
@@ -247,7 +276,7 @@ class RegistryBackedModelExecutor:
                 provider_options={},  # strip thinking/stream options for fallback
             )
 
-            logger.info(
+            logger.debug(
                 "registry_backed_model_executor.execute  trying_fallback  "
                 "fallback_alias=%s  provider=%s",
                 fallback_alias,
@@ -280,13 +309,18 @@ class RegistryBackedModelExecutor:
                         "failure_kind": primary_failure_kind,
                     },
                 )
-                logger.info(
+                logger.debug(
                     "registry_backed_model_executor.execute  fallback_succeeded  "
                     "fallback_alias=%s  provider=%s  failure_kind=%s",
                     fallback_alias,
                     raw_result.provider,
                     primary_failure_kind,
                 )
+                if route_decision.task_role == "generator":
+                    update_request_summary(
+                        generation_route=route_decision.route_id,
+                        generation_model=fallback_alias,
+                    )
                 return result
             except LlmProviderExecutionError as exc:
                 attempted.append(fallback_alias)
@@ -322,6 +356,10 @@ class RegistryBackedModelExecutor:
         """Resolve model metadata and stream answer text chunks from the provider."""
         primary_alias = route_decision.model
         model_resolution = self._model_config_resolver.resolve(route_decision)
+        _validate_model_role(
+            route_decision,
+            allowed_task_roles=list(model_resolution.model_config.allowed_task_roles),
+        )
         self._model_config_resolver.validate_provider_options(
             provider_options=route_decision.provider_options,
             model_config=model_resolution.model_config,
@@ -336,7 +374,7 @@ class RegistryBackedModelExecutor:
             provider_options=dict(route_decision.provider_options),
         )
 
-        logger.info(
+        logger.debug(
             "registry_backed_model_executor.execute_stream  model_alias=%s  provider=%s",
             model_resolution.safe_metadata["model_alias"],
             model_resolution.safe_metadata["provider"],
@@ -380,6 +418,11 @@ class RegistryBackedModelExecutor:
                     failure_kind="empty_stream",
                     provider=model_resolution.provider,
                     model_alias=primary_alias,
+                )
+            if route_decision.task_role == "generator":
+                update_request_summary(
+                    generation_route=route_decision.route_id,
+                    generation_model=model_resolution.model_alias,
                 )
             return
         except LlmProviderExecutionError as exc:
@@ -435,6 +478,12 @@ class RegistryBackedModelExecutor:
                 )
                 attempted.append(fallback_alias)
                 continue
+            _validate_model_role(
+                route_decision,
+                allowed_task_roles=list(
+                    fallback_resolution.model_config.allowed_task_roles
+                ),
+            )
 
             fallback_request = ProviderExecutionRequest(
                 route_decision=route_decision,
@@ -446,7 +495,7 @@ class RegistryBackedModelExecutor:
             )
             attempted.append(fallback_alias)
 
-            logger.info(
+            logger.debug(
                 "registry_backed_model_executor.execute_stream  trying_fallback  "
                 "fallback_alias=%s  provider=%s",
                 fallback_alias,
@@ -486,13 +535,18 @@ class RegistryBackedModelExecutor:
                         fallback_alias,
                     )
                     continue
-                logger.info(
+                logger.debug(
                     "registry_backed_model_executor.execute_stream  fallback_succeeded  "
                     "fallback_alias=%s  provider=%s  failure_kind=%s",
                     fallback_alias,
                     fallback_resolution.provider,
                     primary_failure_kind,
                 )
+                if route_decision.task_role == "generator":
+                    update_request_summary(
+                        generation_route=route_decision.route_id,
+                        generation_model=fallback_alias,
+                    )
                 return
             except LlmProviderExecutionError as exc:
                 if fallback_visible > 0:
@@ -587,7 +641,7 @@ class ProviderAdapterExecutor:
 
         adapter = self._provider_factory.get_provider(request.model_resolution.provider)
 
-        logger.info(
+        logger.debug(
             "provider_adapter_executor.execute  model_alias=%s  provider=%s",
             request.model_resolution.model_alias,
             request.model_resolution.provider,
@@ -602,7 +656,7 @@ class ProviderAdapterExecutor:
 
         adapter = self._provider_factory.get_provider(request.model_resolution.provider)
 
-        logger.info(
+        logger.debug(
             "provider_adapter_executor.execute_stream  model_alias=%s  provider=%s",
             request.model_resolution.model_alias,
             request.model_resolution.provider,

@@ -65,7 +65,13 @@ _FORBIDDEN_RESPONSE_KEYS = {
     "user_prompt",
 }
 
-_DOUBT_SOLVER_PAYLOAD = {"mode": "doubt_solver", "query": "What is 20% of 500?"}
+_DOUBT_SOLVER_PAYLOAD = {
+    "mode": "doubt_solver",
+    "query": "What is 20% of 500?",
+    "user_id": "local-user",
+    "conversation_id": "conversation-entrypoint",
+    "turn_id": "turn-entrypoint",
+}
 
 
 # Sentinel prefix used to locate the result JSON in stdout, which also

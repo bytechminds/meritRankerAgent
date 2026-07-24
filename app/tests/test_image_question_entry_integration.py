@@ -17,6 +17,12 @@ from schemas.image_question_classification import (
     ImageParseMetadata,
 )
 
+_REQUEST_IDS = {
+    "user_id": "local-user",
+    "conversation_id": "conversation-image-entry",
+    "turn_id": "turn-image-entry",
+}
+
 
 def _encoded_image() -> str:
     output = io.BytesIO()
@@ -60,6 +66,7 @@ def test_disabled_image_request_returns_controlled_unsupported_state(monkeypatch
     result = main.invoke(
         {
             "mode": "doubt_solver",
+            **_REQUEST_IDS,
             "image": {
                 "source": "upload",
                 "mimeType": "image/png",
@@ -83,6 +90,7 @@ def test_image_classification_flows_into_existing_downstream_graph(monkeypatch) 
     result = main.invoke(
         {
             "mode": "doubt_solver",
+            **_REQUEST_IDS,
             "query": "Solve this question only",
             "image": {
                 "source": "camera",
@@ -105,7 +113,9 @@ def test_text_request_does_not_call_image_classifier(monkeypatch) -> None:
             raise AssertionError("image classifier must not run for text requests")
 
     monkeypatch.setattr(main, "image_question_classifier", FailingImageClassifier())
-    result = main.invoke({"mode": "doubt_solver", "query": "Explain ratio"})
+    result = main.invoke(
+        {"mode": "doubt_solver", "query": "Explain ratio", **_REQUEST_IDS}
+    )
     assert result["success"] is True
     assert result["classification"] is not None
 
@@ -128,6 +138,7 @@ def test_image_rejection_never_reaches_downstream_graph(monkeypatch) -> None:
     result = main.invoke(
         {
             "mode": "doubt_solver",
+            **_REQUEST_IDS,
             "image": {
                 "source": "screenshot",
                 "mimeType": "image/png",

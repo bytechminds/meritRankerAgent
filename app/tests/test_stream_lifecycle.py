@@ -356,7 +356,7 @@ def test_client_disconnect_cancels_worker_and_logs_reason(
         with pytest.raises(asyncio.CancelledError):
             await pending
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         asyncio.run(disconnect())
 
     assert cancellation.reason == "client_disconnected"
@@ -514,8 +514,20 @@ def test_agentcore_invocations_preserves_event_contract(
 
     import main
 
-    def stream_source(input, *, adapter) -> Iterator[DoubtSolverStreamEvent]:
-        del adapter
+    def stream_source(
+        input,
+        *,
+        adapter,
+        conversation_persistence=None,
+        follow_up_resolver=None,
+        conversation_understanding=None,
+    ) -> Iterator[DoubtSolverStreamEvent]:
+        del (
+            adapter,
+            conversation_persistence,
+            follow_up_resolver,
+            conversation_understanding,
+        )
         response = DoubtSolverFinalResponse(
             request_id=input.request_id,
             content=ResponseContent(value=_ANSWER),
@@ -559,6 +571,9 @@ def test_agentcore_invocations_preserves_event_contract(
             json={
                 "mode": "doubt_solver",
                 "query": "What is 20 percent of 100?",
+                "user_id": "local-user",
+                "conversation_id": "conversation-stream-lifecycle",
+                "turn_id": "turn-stream-lifecycle",
                 "stream": True,
             },
         )

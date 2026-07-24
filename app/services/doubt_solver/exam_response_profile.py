@@ -120,7 +120,7 @@ class ExamResponseProfileResolver:
             source=source,
             version=self._config.version,
         )
-        logger.info(
+        logger.debug(
             "exam_response_profile_resolved request_id=%s canonical_exam_id=%s "
             "exam_family=%s stage=%s alias_applied=%s exam_override_applied=%s "
             "stage_override_applied=%s compact_instruction_chars=%d "

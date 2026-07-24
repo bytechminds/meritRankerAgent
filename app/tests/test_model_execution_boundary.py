@@ -185,6 +185,53 @@ def test_registry_backed_executor_builds_provider_execution_request(
     assert fake.last_request.model_resolution.provider == "gemini"
 
 
+def test_generator_route_rejects_classifier_only_model_alias(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    model = registry.get_model("gemini_flash_light")
+    assert model is not None
+    model.allowed_task_roles.append("classifier")
+    fake = FakeProviderExecutor(content="must not run")
+    executor = RegistryBackedModelExecutor(
+        provider_executor=fake,
+        model_config_resolver=ModelConfigResolver(registry=registry),
+    )
+    decision = _route_decision(model="gemini_flash_light")
+
+    with pytest.raises(ModelExecutionConfigError, match="not allowed"):
+        executor.execute(route_decision=decision, messages=_messages())
+
+    assert fake.call_count == 0
+
+
+def test_generator_route_rejects_classifier_only_fallback_alias(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    fallback = registry.get_model("safe_mock")
+    assert fallback is not None
+    fallback.allowed_task_roles.append("classifier")
+    provider = FakeProviderExecutor(
+        raise_on_execute=LlmProviderExecutionError(
+            "safe timeout",
+            failure_kind="timeout",
+            provider="gemini",
+            model_alias="gemini_flash_light",
+        )
+    )
+    executor = RegistryBackedModelExecutor(
+        provider_executor=provider,
+        model_config_resolver=ModelConfigResolver(registry=registry),
+    )
+
+    with pytest.raises(ModelExecutionConfigError, match="not allowed"):
+        executor.execute(
+            route_decision=_route_decision(model="gemini_flash_light"),
+            messages=_messages(),
+        )
+
+    assert provider.call_count == 1
+
+
 def test_provider_execution_request_contains_internal_messages(
     tmp_path: Path,
 ) -> None:
@@ -330,7 +377,7 @@ def test_executor_logs_only_safe_metadata(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     executor, _ = _executor_pair(tmp_path)
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
 
     executor.execute(route_decision=_route_decision(), messages=_messages())
 

@@ -75,13 +75,59 @@ def test_serious_formatting_defects_are_rejected(
 
 def test_conflicting_answer_values_are_rejected(policy: AnswerQualityPolicy) -> None:
     result = _validate(
-        "**Answer:** 7%\n\n**Answer:** 70%\n<ANSWER_DONE>",
+        "**Final Answer:** 7%\n\n**Final Answer:** 70%\n<ANSWER_DONE>",
         policy,
     )
 
     assert not result.is_valid
     assert "duplicate_final_answer" in result.reason_codes
     assert "conflicting_answer_values" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "The triangle rows use 2, 4, and 8.\n\n"
+            "**Answer:** The missing number is 16.\n<ANSWER_DONE>"
+        ),
+        (
+            "A is B's brother and B is C's mother.\n\n"
+            "**Final Answer:** A is C's maternal uncle.\n<ANSWER_DONE>"
+        ),
+        (
+            "Option A gives 12 and option B gives 18, so both are rejected.\n\n"
+            "**Answer:** Option C is correct.\n<ANSWER_DONE>"
+        ),
+        (
+            r"First \(x + 3 = 9\), so \(x = 6\). Then \(2x = 12\)." "\n\n"
+            r"**Final Answer:** \(12\)" "\n<ANSWER_DONE>"
+        ),
+        (
+            "**Answer:** Eliminate options A and B.\n\n"
+            "**Final Answer:** Option C is correct.\n<ANSWER_DONE>"
+        ),
+    ],
+)
+def test_intermediate_reasoning_is_not_a_conflicting_final_answer(
+    content: str, policy: AnswerQualityPolicy
+) -> None:
+    result = _validate(content, policy)
+
+    assert "duplicate_final_answer" not in result.reason_codes
+    assert "conflicting_answer_values" not in result.reason_codes
+
+
+def test_duplicate_explicit_final_answer_blocks_are_rejected(
+    policy: AnswerQualityPolicy,
+) -> None:
+    result = _validate(
+        "**Final Answer:** Option C\n\n**Final Answer:** Option C\n<ANSWER_DONE>",
+        policy,
+    )
+
+    assert "duplicate_final_answer" in result.reason_codes
+    assert "conflicting_answer_values" not in result.reason_codes
 
 
 def test_single_consistent_percentage_is_clean(policy: AnswerQualityPolicy) -> None:

@@ -395,7 +395,7 @@ def test_adapter_carries_exam_without_changing_route_selection() -> None:
     assert orchestrator.route_request.difficulty == "default"
 
 
-def test_legacy_graph_passes_run_config_exam_without_state_drift(
+def test_legacy_graph_passes_state_exam_without_reconstruction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -414,27 +414,28 @@ def test_legacy_graph_passes_run_config_exam_without_state_drift(
     state = {
         "request_id": "request-legacy",
         "query": "Question",
+        "language": "english",
+        "exam_id": "SSC_CGL",
+        "exam_stage": "TIER_2",
         "classification": QueryClassification(
             intent="solve_question", confidence=0.99
         ).model_dump(),
         "answer_context": None,
     }
 
-    graph_module.generate_answer_node(
-        state,  # type: ignore[arg-type]
-        {"configurable": {"exam_id": "SSC_CGL", "exam_stage": "TIER_2"}},
-    )
+    graph_module.generate_answer_node(state)  # type: ignore[arg-type]
 
     assert captured == {
         "exam_id": "SSC_CGL",
         "exam_stage": "TIER_2",
+        "language": "english",
         "request_id": "request-legacy",
     }
-    assert "exam_id" not in state
-    assert "exam_stage" not in state
+    assert state["exam_id"] == "SSC_CGL"
+    assert state["exam_stage"] == "TIER_2"
 
 
-def test_orchestrated_graph_passes_run_config_exam_without_state_drift() -> None:
+def test_orchestrated_graph_passes_state_exam_without_reconstruction() -> None:
     class _Adapter:
         def __init__(self) -> None:
             self.kwargs: dict[str, Any] = {}
@@ -447,7 +448,12 @@ def test_orchestrated_graph_passes_run_config_exam_without_state_drift() -> None
     graph = graph_module.build_orchestrated_doubt_solver_graph(adapter)
     state = {
         "request_id": "request-orchestrated",
+        "actor_id": "student-1",
         "query": "Question",
+        "original_query": "Question",
+        "language": "english",
+        "exam_id": "UPSC_CSE",
+        "exam_stage": "PRELIMS",
         "classification": {
             "subject": "math",
             "intent": "solve",
@@ -459,18 +465,13 @@ def test_orchestrated_graph_passes_run_config_exam_without_state_drift() -> None
         "answer": None,
     }
 
-    result = graph.invoke(
-        state,
-        config={
-            "configurable": {"exam_id": "UPSC_CSE", "exam_stage": "PRELIMS"}
-        },
-    )
+    result = graph.invoke(state)
 
     assert adapter.kwargs["exam_id"] == "UPSC_CSE"
     assert adapter.kwargs["exam_stage"] == "PRELIMS"
     assert result["answer"] == "Answer"
-    assert "exam_id" not in result
-    assert "exam_stage" not in result
+    assert result["exam_id"] == "UPSC_CSE"
+    assert result["exam_stage"] == "PRELIMS"
 
 
 def test_full_isolated_orchestrated_flow_applies_profile_safely(
@@ -511,7 +512,12 @@ def test_full_isolated_orchestrated_flow_applies_profile_safely(
     result = graph.invoke(
         {
             "request_id": "isolated-exam-flow",
+            "actor_id": "student-1",
             "query": "What is 20% of 50?",
+            "original_query": "What is 20% of 50?",
+            "language": "english",
+            "exam_id": "SSC_CGL",
+            "exam_stage": None,
             "classification": {
                 "subject": "math",
                 "intent": "solve",
@@ -522,7 +528,6 @@ def test_full_isolated_orchestrated_flow_applies_profile_safely(
             "context_text": "",
             "answer": None,
         },
-        config={"configurable": {"exam_id": "SSC_CGL"}},
     )
 
     assert result["answer"] == "**Answer:** 10"
@@ -531,17 +536,25 @@ def test_full_isolated_orchestrated_flow_applies_profile_safely(
     prompt = "\n".join(message.content for message in executor.last_messages)
     assert prompt.count("Exam response guidance:") == 1
     assert "SSC_CGL" not in prompt
-    assert "exam_id" not in result
-    assert "exam_stage" not in result
+    assert result["exam_id"] == "SSC_CGL"
+    assert result["exam_stage"] is None
 
 
-def test_request_schema_additions_are_optional_and_response_neutral() -> None:
-    baseline = DoubtSolverRequest(mode="doubt_solver", query="Question")
+def test_exam_request_fields_are_optional_and_response_neutral() -> None:
+    request_ids = {
+        "user_id": "local-user",
+        "conversation_id": "conversation-1",
+        "turn_id": "turn-1",
+    }
+    baseline = DoubtSolverRequest(
+        mode="doubt_solver", query="Question", **request_ids
+    )
     selected = DoubtSolverRequest(
         mode="doubt_solver",
         query="Question",
         exam_id="SSC_CGL",
         exam_stage="TIER_2",
+        **request_ids,
     )
 
     assert baseline.exam_id is None
@@ -564,7 +577,7 @@ def test_resolution_log_contains_only_safe_profile_metadata(
 ) -> None:
     secret_text = "do-not-log-this-guidance"
     with caplog.at_level(
-        logging.INFO,
+        logging.DEBUG,
         logger="services.doubt_solver.exam_response_profile",
     ):
         result = resolver.resolve("SSC_CGL", "TIER_2", request_id="safe-request")

@@ -83,10 +83,16 @@ Example shape (illustration only — output raw JSON, not fenced):
   "reasoning_summary": "<short string or null>",
   "need_web_search": <true or false>,
   "web_search_reason": "<enum-like string or null>",
-  "web_search_query": "<concise search query or null>"
+  "web_search_query": "<concise search query or null>",
+  "requires_recent_conversation": <true or false>
 }
 
 ## Allowed Values
+
+**requires_recent_conversation** — default `false`. Set `true` only when the current
+query cannot be reliably understood without recent completed turns, such as references
+to a previous step, option, method, explanation, or “above”. Do not classify a query as
+context-dependent merely because it is short. Do not infer or include conversation history.
 
 **intent** — pick exactly one:
 - `solve_question` — numerical solution, calculation, or which option is correct

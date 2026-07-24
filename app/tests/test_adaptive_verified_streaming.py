@@ -8,6 +8,7 @@ import pytest
 
 import config as cfg_module
 import services.doubt_solver.streaming_doubt_solver_service as streaming_module
+from schemas.doubt_solver import CanonicalLanguage
 from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
@@ -38,15 +39,19 @@ class _FakeAdapter:
         self.stream_error = stream_error
         self.stream_calls = 0
         self.generate_calls = 0
+        self.last_stream_kwargs: dict[str, object] = {}
+        self.last_generate_kwargs: dict[str, object] = {}
 
-    def generate_stream(self, **_: object) -> Iterator[str]:
+    def generate_stream(self, **kwargs: object) -> Iterator[str]:
         self.stream_calls += 1
+        self.last_stream_kwargs = kwargs
         yield from self.stream_chunks
         if self.stream_error is not None:
             raise self.stream_error
 
-    def generate(self, **_: object) -> str:
+    def generate(self, **kwargs: object) -> str:
         self.generate_calls += 1
+        self.last_generate_kwargs = kwargs
         if not self.generated_answers:
             raise AssertionError("unexpected generation")
         return self.generated_answers.pop(0)
@@ -79,12 +84,14 @@ def _events(
     *,
     classification: dict | None = None,
     should_cancel=None,
+    language: CanonicalLanguage = "english",
 ) -> list:
     return list(
         stream_doubt_solver(
             StreamDoubtSolverInput(
                 request_id=_REQUEST_ID,
                 query="What is 20 percent of 100?",
+                language=language,
                 classification=classification or dict(_CLASSIFICATION),
                 classifier_confidence=(classification or _CLASSIFICATION).get(
                     "classifier_confidence"
@@ -118,8 +125,38 @@ def test_low_risk_request_streams_live_and_final_response_is_canonical(
     assert complete.response.schema_version == "1"
     assert complete.response.content.format == "markdown"
     assert complete.response.content.value == chunks
+    assert complete.response.final_answer is not None
+    assert complete.response.final_answer.content == chunks
+    assert "final_answer" not in complete.response.model_dump()
     assert complete.response.answer == chunks
     assert "provider" not in str(complete.metadata).lower()
+
+
+def test_language_reaches_live_stream_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "adaptive")
+    adapter = _FakeAdapter(stream_chunks=["**Answer:** Sahi option B hai."])
+
+    _events(adapter, language="hinglish")
+
+    assert adapter.last_stream_kwargs["language"] == "hinglish"
+
+
+def test_language_reaches_verified_replay_generation() -> None:
+    adapter = _FakeAdapter(
+        generated_answers=["**Final Answer:**\nसही विकल्प B है क्योंकि वेग स्थिर है।"]
+    )
+    classification = dict(_CLASSIFICATION)
+    classification["classifier_confidence"] = 0.2
+    classification["classification_source"] = "fallback"
+
+    events = _events(adapter, language="hindi", classification=classification)
+
+    assert adapter.last_generate_kwargs["language"] == "hindi"
+    assert events[-1].response is not None
+    assert events[-1].response.final_answer is not None
+    assert events[-1].response.final_answer.language_compliant is True
 
 
 def test_live_stream_preserves_spaces_at_chunk_boundaries(
@@ -198,7 +235,7 @@ def test_conflicting_percentage_is_repaired_once_and_never_replayed(
     corrected = "**Answer:** 70%"
     adapter = _FakeAdapter(
         generated_answers=[
-            "**Answer:** 7%\n\n**Answer:** 70%",
+            "**Final Answer:** 7%\n\n**Final Answer:** 70%",
             corrected,
         ]
     )

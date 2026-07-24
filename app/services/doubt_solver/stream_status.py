@@ -29,7 +29,7 @@ class StreamStatusTracker:
     ) -> DoubtSolverStreamEvent | None:
         """Emit immediately (not queued) if this label has not been emitted yet."""
         if stage in self._emitted_stages:
-            logger.info(
+            logger.debug(
                 "stream_status_reason  request_id=%s  status_label=%s  "
                 "reason_code=%s  emitted=false",
                 self.request_id,
@@ -40,7 +40,7 @@ class StreamStatusTracker:
 
         self._emitted_labels.add(label)
         self._emitted_stages.add(stage)
-        logger.info(
+        logger.debug(
             "stream_status_reason  request_id=%s  status_label=%s  "
             "reason_code=%s  emitted=true",
             self.request_id,
@@ -63,7 +63,7 @@ class StreamStatusTracker:
     ) -> None:
         """Queue a status event if this label has not been emitted yet."""
         if stage in self._emitted_stages:
-            logger.info(
+            logger.debug(
                 "stream_status_reason  request_id=%s  status_label=%s  "
                 "reason_code=%s  emitted=false",
                 self.request_id,
@@ -74,7 +74,7 @@ class StreamStatusTracker:
 
         self._emitted_labels.add(label)
         self._emitted_stages.add(stage)
-        logger.info(
+        logger.debug(
             "stream_status_reason  request_id=%s  status_label=%s  "
             "reason_code=%s  emitted=true",
             self.request_id,

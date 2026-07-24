@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 import config as cfg_module
-from graphs.doubt_solver_graph import build_doubt_solver_graph
+from graphs.doubt_solver_graph import build_doubt_solver_graph, generate_answer_node
 from schemas.doubt_solver import QueryClassification
 from services.answer_generator_service import generate_answer
 from services.query_classifier_service import classify_query
@@ -301,6 +301,25 @@ class TestAnswerSourceAndTruncation:
         result = ds_graph.invoke(_make_state("Solve this: x + 1 = 5"))
         assert result["response"]["needs_review"] is False
 
+    def test_legacy_context_required_guard_blocks_generator(self, monkeypatch):
+        import graphs.doubt_solver_graph as graph_module
+
+        classification = classify_query("what formula you applied?").model_copy(
+            update={"requires_recent_conversation": True}
+        )
+        generator = pytest.fail
+        monkeypatch.setattr(graph_module, "generate_answer", generator)
+
+        result = generate_answer_node(
+            _make_state(
+                "what formula you applied?",
+                classification=classification.model_dump(),
+            )
+        )
+
+        assert result["final_answer"]["quality_status"] == "failed_quality_gate"
+        assert result["answer_source"] == "fallback"
+
     def test_needs_review_true_when_fallback_source(self, monkeypatch):
         """answer_source=fallback forces needs_review=True regardless of confidence."""
         import graphs.doubt_solver_graph as graph_module
@@ -308,7 +327,7 @@ class TestAnswerSourceAndTruncation:
 
         ds_graph = build_doubt_solver_graph()
 
-        def _fake_generate(query, classification, context=None):
+        def _fake_generate(query, classification, context=None, **_):
             return AnswerOutput(
                 content="Fallback answer content.",
                 answer_source="fallback",
@@ -327,7 +346,7 @@ class TestAnswerSourceAndTruncation:
 
         ds_graph = build_doubt_solver_graph()
 
-        def _fake_generate(query, classification, context=None):
+        def _fake_generate(query, classification, context=None, **_):
             return AnswerOutput(
                 content="A" * 100,  # short but is_truncated=True
                 answer_source="llm",
@@ -351,7 +370,7 @@ class TestAnswerSourceAndTruncation:
 
         ds_graph = build_doubt_solver_graph()
 
-        def _fake_generate(query, classification, context=None):
+        def _fake_generate(query, classification, context=None, **_):
             return AnswerOutput(
                 content="LLM answer here.",
                 answer_source="llm",
@@ -369,7 +388,7 @@ class TestAnswerSourceAndTruncation:
 
         ds_graph = build_doubt_solver_graph()
 
-        def _fake_generate(query, classification, context=None):
+        def _fake_generate(query, classification, context=None, **_):
             return AnswerOutput(
                 content="Truncated answer.",
                 answer_source="llm",
@@ -472,7 +491,7 @@ class TestPart9KbRetrieval:
 
         captured_context: list = []
 
-        def _spy_generate(query, classification, context=None):
+        def _spy_generate(query, classification, context=None, **_):
             captured_context.append(context)
             from schemas.doubt_solver import AnswerOutput
 

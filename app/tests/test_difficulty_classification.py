@@ -444,7 +444,10 @@ def test_advanced_difficulty_signal_in_solve_query() -> None:
 def test_orchestrated_state_has_internal_retrieval_context() -> None:
     annotations = OrchestratedDoubtSolverState.__annotations__
     assert set(annotations.keys()) == {
-        "request_id", "query", "classification", "retrieval_context", "context_text", "answer",
+        "request_id", "query", "original_query", "actor_id", "conversation_id", "turn_id",
+        "language", "exam_id",
+        "exam_stage", "classification", "retrieval_context", "context_text", "answer",
+        "final_answer", "conversation_context", "conversation_relation",
     }
 
 

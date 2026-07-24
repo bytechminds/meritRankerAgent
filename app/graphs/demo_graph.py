@@ -55,9 +55,9 @@ class DemoGraphState(TypedDict):
 def start_node(state: DemoGraphState) -> dict:
     """Log request metadata and pass state through unchanged."""
     logger.info(
-        "request_id=%s  user_id=%s  mode=%s  — graph started",
+        "request_id=%s actor_id_present=%s mode=%s — graph started",
         state["request_id"],
-        state["user_id"],
+        bool(state["user_id"]),
         state["mode"],
     )
     # Return empty dict — nothing to change, just logging.

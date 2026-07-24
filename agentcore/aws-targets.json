@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "name": "Dev",
+    "description": "MeritRanker non-production deployment",
+    "account": "661012794182",
+    "region": "ap-south-1"
+  }
+]

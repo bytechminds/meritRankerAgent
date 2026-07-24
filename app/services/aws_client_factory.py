@@ -16,6 +16,7 @@ import threading
 from typing import Any
 
 import boto3
+from botocore.config import Config
 
 # Per-service, per-region cache protected by a lock.
 # Key format: "<service>::<region_or___default__>"
@@ -23,6 +24,11 @@ import boto3
 # sharing the same region (e.g. bedrock-agent-runtime and dynamodb).
 _lock = threading.Lock()
 _clients: dict[str, Any] = {}
+_CONVERSATION_AWS_CONFIG = Config(
+    connect_timeout=1,
+    read_timeout=1,
+    retries={"max_attempts": 1, "mode": "standard"},
+)
 
 
 def _get_or_create_client(service: str, region_name: str | None) -> Any:
@@ -65,3 +71,38 @@ def get_bedrock_runtime_client(region_name: str | None = None) -> Any:
 def get_s3_vectors_client(region_name: str | None = None) -> Any:
     """Return a cached ``s3vectors`` boto3 low-level client."""
     return _get_or_create_client("s3vectors", region_name)
+
+
+def get_ssm_client(region_name: str | None = None) -> Any:
+    """Return a cached ``ssm`` client."""
+    return _get_or_create_client("ssm", region_name)
+
+
+def get_bedrock_agentcore_client(region_name: str | None = None) -> Any:
+    """Return a cached ``bedrock-agentcore`` control-plane data client."""
+    cache_key = f"bedrock-agentcore-conversation::{region_name or '__default__'}"
+    with _lock:
+        if cache_key not in _clients:
+            kwargs: dict[str, Any] = {
+                "service_name": "bedrock-agentcore",
+                "config": _CONVERSATION_AWS_CONFIG,
+            }
+            if region_name:
+                kwargs["region_name"] = region_name
+            _clients[cache_key] = boto3.client(**kwargs)
+        return _clients[cache_key]
+
+
+def get_conversation_dynamodb_client(region_name: str | None = None) -> Any:
+    """Return a bounded-timeout DynamoDB client for conversation persistence."""
+    cache_key = f"dynamodb-conversation::{region_name or '__default__'}"
+    with _lock:
+        if cache_key not in _clients:
+            kwargs: dict[str, Any] = {
+                "service_name": "dynamodb",
+                "config": _CONVERSATION_AWS_CONFIG,
+            }
+            if region_name:
+                kwargs["region_name"] = region_name
+            _clients[cache_key] = boto3.client(**kwargs)
+        return _clients[cache_key]

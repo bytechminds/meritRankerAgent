@@ -14,11 +14,20 @@
       "entrypoint": "main.py",
       "codeLocation": "app/",
       "runtimeVersion": "PYTHON_3_14",
+      "instrumentation": {
+        "enableOtel": true
+      },
       "networkMode": "PUBLIC",
       "protocol": "HTTP"
     }
   ],
-  "memories": [],
+  "memories": [
+    {
+      "name": "meritranker_short_term_memory",
+      "eventExpiryDuration": 30,
+      "strategies": []
+    }
+  ],
   "credentials": [],
   "evaluators": [],
   "onlineEvalConfigs": [],

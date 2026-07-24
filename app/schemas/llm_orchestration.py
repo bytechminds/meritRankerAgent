@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from schemas.doubt_solver import FinalAnswerResult
 from schemas.llm import LlmMessage
 from schemas.llm_routing import ModelConfig, ProviderName, ProviderProfile, RouteDecision
 
@@ -242,6 +243,8 @@ class OrchestrationResult(BaseModel):
     latency_ms: int | None = None
     answer_source: Literal["llm", "mock", "fallback"]
     metadata: dict[str, Any] = Field(default_factory=dict)
+    final_answer: FinalAnswerResult | None = Field(default=None, exclude=True)
+    execution_deployment: str | None = Field(default=None, exclude=True)
 
     model_config = {"frozen": False}
 

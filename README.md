@@ -46,6 +46,7 @@ MeritRanker Agent Python packages these concerns into replaceable services, Lang
 |---|---|
 | **Education AI agent workflows** | LangGraph graphs with explicit state (`request_id`, `query`, `classification`, `retrieval_context`, `context_text`, `answer`) |
 | **Doubt-solving flow** | Classify student queries, select approved retrieval context when configured, generate subject-aware explanations |
+| **Conversation continuity** | Idempotent completed-turn history in DynamoDB plus bounded AgentCore short-term context for follow-ups |
 | **Image-question entry** | Validate and normalize an uploaded question image, then extract and classify it through an isolated multimodal boundary |
 | **Structured reasoning steps** | Prompt templates and generator contracts for math, reasoning, and general subjects |
 | **Practice guidance** | Intent overlays (solve, explain, practice, visualize) and difficulty-aware routing |
@@ -140,6 +141,117 @@ future output and are logged as `client_disconnected`. An already in-flight sync
 provider call may continue computing until the SDK call returns; its result is discarded
 and never replayed after cancellation.
 
+### Conversation History and Follow-ups
+
+Doubt-solver requests require frontend-stable `conversation_id` and `turn_id` values. The
+student client generates UUIDs; retry reuses the same turn UUID while deliberate regenerate
+creates a new one.
+DynamoDB is authoritative for completed history and retry replay. AgentCore Memory retains
+raw completed user/assistant event pairs for 30 days and supplies the latest two turns by
+default, with a hard maximum of three after a controlled resolution ambiguity. Every normal
+doubt-solver request now performs this bounded Memory-first prefetch before its final
+independent/follow-up decision. Context availability and context relevance are separate: unrelated
+history is discarded and never enters generation.
+
+Conversation relationship classification returns a typed relation, confidence, decision source,
+matched signals, and selected turn. It combines bounded deterministic reference signals with
+numeric/entity overlap, substantive academic-concept overlap, ambiguity margin, and recency across
+the latest two completed turns. Generic action words cannot establish relevance to an unrelated
+topic. Formula symbols, named concepts, percentages, numbers, currency values, option labels, and
+step references are preserved in the standalone resolution. Follow-ups are resolved
+into standalone academic queries, reclassified, and then sent through
+the existing retrieval and generation flow. Recent turns enter `PromptResolver` once as bounded,
+explicitly untrusted reference data. Current request exam and language values remain authoritative.
+Only a language-compliant `FinalAnswerResult` with an accepted quality status is persisted; stream
+chunks, prompts, retrieval payloads, and failed clarification results are never history records.
+An unresolved contextual request returns one controlled clarification before academic
+classification or generation. The strong academic classifier is available only after recent
+context resolves the query into standalone form.
+
+History and AgentCore Memory writes run concurrently; ConversationSession create/update runs only
+after history succeeds. The terminal SSE `complete` event is emitted after the bounded persistence
+coordination returns, so an immediate follow-up can use DynamoDB when Memory is unavailable. One
+safe `conversation_persistence_result` event records typed history, session, and memory outcomes
+without question, answer, prompt, context, token, or credential content.
+
+AgentCore Memory configuration is independent of DynamoDB. If Memory is not configured, history
+and session remain active, no Memory client is created, and follow-ups use the exact-conversation
+DynamoDB fallback. AgentCore and DynamoDB transport failures are normalized into controlled source
+outcomes. Deterministic English/Hindi/Hinglish reference signals, typo variants, and
+numeric/entity linking are safety evidence rather than the sole relevance decision; classifier
+subject and intent remain authoritative after resolution.
+
+### Agent observability
+
+The runtime now uses a shared observability package for request-scoped structured events,
+immutable execution summaries, safe context propagation, and optional OpenTelemetry spans.
+Local development defaults to concise console output plus one rotating, human-readable
+`app/.logs/agent-runtime.log`. Each terminal request is appended as one atomic block, so concurrent
+requests do not interleave. Production forces structured JSON stdout and disables local files.
+`AGENT_LOCAL_LOG_CONTENT=off|preview|full` controls local query, fetched-turn, selected-turn,
+resolved-query, and response diagnostics; local defaults to `preview` and production forcibly
+behaves as `off`, even if an environment variable requests content.
+Every terminal block includes explicit history, session, and Memory persistence outcomes.
+
+```bash
+cd app
+uv run python tools/inspect_agent_logs.py --latest
+uv run python tools/inspect_agent_logs.py --failures
+uv run python tools/inspect_agent_logs.py --request-id <request-id>
+```
+
+Structured logs contain identifiers, decisions, durations, statuses, and bounded error codes only.
+They exclude student questions, prompts, answers, recent conversation text, retrieved content,
+images, credentials, secrets, and raw provider payloads. AgentCore OpenTelemetry instrumentation is
+enabled in runtime configuration and degrades to a no-op when the API is unavailable. CloudWatch
+Transaction Search, runtime log delivery, deployed trace visibility, retention, and alarms require
+operator setup and remain **[NOT VERIFIED]** locally. See
+`skills/features/agent-observability.md` for event fields, Logs Insights queries, privacy rules,
+and exact production actions.
+
+Failed local request blocks include the full trace ID plus bounded stage, error code, and exception
+class when available. Exception messages and stack traces are intentionally excluded from the
+readable file because they may contain private request or provider content.
+
+The Amplify deployment publishes the generated `ConversationHistory` table identity at:
+
+```text
+/meritranker/agent-runtime/v1/conversation-history/table-name
+/meritranker/agent-runtime/v1/conversation-history/table-arn
+/meritranker/agent-runtime/v1/conversation-session/table-name
+/meritranker/agent-runtime/v1/conversation-session/table-arn
+```
+
+The AgentCore deployment creates one target-scoped short-term Memory with 30-day raw-event
+retention and no long-term strategies, then injects its generated ID through
+`MEMORY_MERITRANKER_SHORT_TERM_MEMORY_ID`. AWS Memory names use underscores because the service
+rejects hyphens. The Runtime role receives only `CreateEvent` and `ListEvents` on that exact Memory
+ARN. Runtime CodeZip staging excludes `.env`, `.env.*`, tests, caches, and logs before packaging;
+secrets must be delivered through a managed runtime mechanism, never bundled source files.
+
+The Dev stack is deployed in `ap-south-1`: Memory is `ACTIVE`, Runtime is `READY`, and startup
+reports `history=true session=true memory=true`. A live accepted turn wrote History, Session, and
+Memory successfully. A controlled Memory timeout used the live DynamoDB fallback, and live
+actor/session partition checks prevented cross-user and cross-conversation reads.
+
+The deployed Memory-first path passes the exact two-turn smoke. After a percentage question,
+`how did u calculated 75%` selected the prior turn, resolved to a standalone percentage
+explanation, reclassified with `requires_recent_conversation=false`, and completed successfully.
+Direct inspection reported `source=agentcore_memory` and `dynamodb_attempted=false`; an unrelated
+question in the same conversation preserved its current query and discarded history.
+
+The Dev Runtime still generates mock answers because managed provider-secret delivery is not
+configured. Production therefore remains blocked until provider credentials are supplied
+securely, the same live flow produces a semantically complete tutoring answer, and actor identity
+is derived from a verified runtime principal rather than request payload compatibility data.
+Conversation summary, learner profile, long-term memory strategies, Redis, semantic cache, and
+cross-conversation retrieval are not implemented.
+
+Answer-quality conflict checks compare only repeated explicit `Final Answer` conclusions. Numbers,
+relationships, rejected options, and other intermediate reasoning under ordinary `Answer` sections
+do not create false conflicts. A single rewrite is accepted without `<ANSWER_DONE>` when it still
+contains a complete explicit answer and passes the normal quality gate.
+
 ---
 
 ## Installation
@@ -207,9 +319,20 @@ curl -X POST http://localhost:8080/invocations \
     "mode": "doubt_solver",
     "query": "What is the formula for calculating percentage increase?",
     "user_id": "local-dev",
-    "language": "en"
+    "conversation_id": "local-dev-conversation",
+    "turn_id": "local-dev-turn-1",
+    "language": "english"
   }'
 ```
+
+`language` accepts canonical `english`, `hinglish`, and `hindi`. Legacy `en` and
+`hi` values are normalized at request validation, and omission currently defaults to
+`english` for client compatibility. Language and exam selections affect generator
+presentation only; classifier and retrieval inputs are unchanged.
+
+Every answer path creates an internal immutable final-answer result before response completion.
+The public response schema is unchanged; the request contract now requires conversation and turn
+IDs. Redis, semantic cache, summaries, and long-term learner memory remain deferred.
 
 Mock mode (`ENABLE_REAL_LLM=false`, the default) returns deterministic placeholder answers without calling external providers.
 

@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Literal
 
@@ -143,8 +144,8 @@ async def stream_events_as_sse(
     output: queue.Queue[object] = queue.Queue(maxsize=1)
     worker_stop = threading.Event()
     worker = threading.Thread(
-        target=_run_worker,
-        args=(events, output, cancellation, worker_stop),
+        target=copy_context().run,
+        args=(_run_worker, events, output, cancellation, worker_stop),
         name=f"stream-{request_id[:12]}",
         daemon=True,
     )
@@ -159,12 +160,12 @@ async def stream_events_as_sse(
     current_stage = "started"
     pending_get: asyncio.Future[object] | None = None
 
-    logger.info("stream_started request_id=%s stage=started", request_id)
+    logger.debug("stream_started request_id=%s stage=started", request_id)
     try:
         while not terminal_sent:
             if cancellation.is_cancelled():
                 terminal_reason = cancellation.reason or "user_cancelled"
-                logger.info(
+                logger.debug(
                     "request_cancelled request_id=%s stage=%s terminal_reason=%s",
                     request_id,
                     current_stage,
@@ -185,7 +186,7 @@ async def stream_events_as_sse(
                 if cancellation.is_cancelled() or terminal_sent:
                     continue
                 heartbeat_count += 1
-                logger.info(
+                logger.debug(
                     "heartbeat_sent request_id=%s stage=%s sequence=%d elapsed_ms=%d",
                     request_id,
                     current_stage,
@@ -265,7 +266,7 @@ async def stream_events_as_sse(
             if event.stage:
                 current_stage = event.stage
             if event.type == "status":
-                logger.info(
+                logger.debug(
                     "status_sent request_id=%s stage=%s event_type=status sequence=%d",
                     request_id,
                     current_stage,
@@ -274,14 +275,14 @@ async def stream_events_as_sse(
             elif event.type == "chunk":
                 chunk_count += 1
                 if not visible:
-                    logger.info(
+                    logger.debug(
                         "first_chunk_sent request_id=%s stage=%s event_type=chunk sequence=%d",
                         request_id,
                         current_stage,
                         sequence,
                     )
                 visible = True
-                logger.info(
+                logger.debug(
                     "chunk_sent request_id=%s stage=%s event_type=chunk sequence=%d chunk_count=%d",
                     request_id,
                     current_stage,
@@ -289,13 +290,13 @@ async def stream_events_as_sse(
                     chunk_count,
                 )
             elif event.type == "complete":
-                logger.info(
+                logger.debug(
                     "complete_sent request_id=%s stage=complete event_type=complete sequence=%d",
                     request_id,
                     sequence,
                 )
             else:
-                logger.info(
+                logger.debug(
                     "error_sent request_id=%s stage=failed event_type=error sequence=%d "
                     "terminal_reason=%s",
                     request_id,
@@ -307,7 +308,7 @@ async def stream_events_as_sse(
         if not terminal_sent:
             cancellation.cancel("client_disconnected")
             terminal_reason = "client_disconnected"
-            logger.info(
+            logger.debug(
                 "client_disconnected request_id=%s stage=%s terminal_reason=%s",
                 request_id,
                 current_stage,
@@ -318,7 +319,7 @@ async def stream_events_as_sse(
         if not terminal_sent:
             cancellation.cancel("client_disconnected")
             terminal_reason = "client_disconnected"
-            logger.info(
+            logger.debug(
                 "client_disconnected request_id=%s stage=%s terminal_reason=%s",
                 request_id,
                 current_stage,
@@ -328,7 +329,7 @@ async def stream_events_as_sse(
     except (BrokenPipeError, ConnectionError):
         cancellation.cancel("client_disconnected")
         terminal_reason = "transport_failed"
-        logger.info(
+        logger.debug(
             "client_disconnected request_id=%s stage=%s terminal_reason=%s",
             request_id,
             current_stage,
@@ -339,7 +340,7 @@ async def stream_events_as_sse(
         worker_stop.set()
         if terminal_reason is None and cancellation.is_cancelled():
             terminal_reason = cancellation.reason
-        logger.info(
+        logger.debug(
             "stream_closed request_id=%s stage=%s terminal_reason=%s chunk_count=%d "
             "heartbeat_count=%d elapsed_ms=%d",
             request_id,

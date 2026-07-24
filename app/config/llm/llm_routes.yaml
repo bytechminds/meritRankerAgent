@@ -271,6 +271,14 @@ routes:
           - safe_mock
 
   general:
+    follow_up_resolver:
+      default:
+        model: doubt_solver_classifier
+        prompt: follow_up_query_resolver.md
+        temperature: 0.0
+        max_tokens: 220
+        fallback: []
+
     classifier:
       default:
         model: doubt_solver_classifier

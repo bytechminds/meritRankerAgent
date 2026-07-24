@@ -1,3 +1,22 @@
 {
-  "targets": {}
+  "targets": {
+    "Dev": {
+      "resources": {
+        "runtimes": {
+          "runtime": {
+            "runtimeId": "meritRankerTutor_runtime-3v90Ye7yXf",
+            "runtimeArn": "arn:aws:bedrock-agentcore:ap-south-1:661012794182:runtime/meritRankerTutor_runtime-3v90Ye7yXf",
+            "roleArn": "arn:aws:iam::661012794182:role/AgentCore-meritRankerTuto-ApplicationAgentRuntimeEx-3zcDKrPykxk1"
+          }
+        },
+        "memories": {
+          "meritranker_short_term_memory": {
+            "memoryId": "meritranker_short_term_memory_dev-o6OMV5AZR0",
+            "memoryArn": "arn:aws:bedrock-agentcore:ap-south-1:661012794182:memory/meritranker_short_term_memory_dev-o6OMV5AZR0"
+          }
+        },
+        "stackName": "AgentCore-meritRankerTutor-Dev"
+      }
+    }
+  }
 }

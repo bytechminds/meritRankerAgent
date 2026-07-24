@@ -588,6 +588,7 @@ models:
       To enable GPT-5.4-mini: set env and point this alias to openai_gpt_5_4_mini.
     provider: azure_openai
     provider_profile: azure_foundry_v1
+    allowed_task_roles: [classifier, follow_up_resolver]
     deployment: gpt-4.1-mini
     supports_streaming: false
     supports_thinking: false
@@ -599,6 +600,7 @@ models:
     description: Native OpenAI fallback for doubt solver classifier.
     provider: openai
     provider_profile: openai_primary
+    allowed_task_roles: [classifier, classifier_strong, follow_up_resolver]
     model_id: gpt-4.1-mini
     supports_streaming: false
     supports_thinking: false
@@ -610,6 +612,7 @@ models:
       AZURE_OPENAI_DEPLOYMENT_GPT_4_1 until GPT-5.4 is provisioned.
     provider: azure_openai
     provider_profile: azure_foundry_v1
+    allowed_task_roles: [classifier_strong]
     deployment: gpt-4.1
     supports_streaming: false
     supports_thinking: false

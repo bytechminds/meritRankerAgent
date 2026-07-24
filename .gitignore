@@ -57,6 +57,8 @@ agentcore/.cli/logs/
 
 # Local development data
 local-data/
+.logs/
+app/.logs/
 
 # Cursor / local agent assets (optional local paths)
 .cursor/projects/

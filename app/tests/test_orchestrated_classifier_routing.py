@@ -758,6 +758,28 @@ def _llm_classification(confidence: float) -> QueryClassification:
 
 
 class TestClassifierConfidenceFallback:
+    def test_follow_up_skips_strong_classifier_until_context_resolution(self) -> None:
+        primary = _llm_classification(0.30).model_copy(
+            update={"requires_recent_conversation": True}
+        )
+        calls: list[str] = []
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            return_value=primary,
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "What was the pattern in the last one?",
+                request_id="req-follow-up",
+                on_before_strong_classifier=lambda: calls.append("hook"),
+            )
+
+        assert mock_classify.call_count == 1
+        assert run.classification.requires_recent_conversation is True
+        assert run.strong_classifier_used is False
+        assert calls == []
+
     def test_low_confidence_triggers_strong_classifier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

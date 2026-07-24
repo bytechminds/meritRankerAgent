@@ -77,6 +77,8 @@ def _run_import_subprocess(
     script = textwrap.dedent(f"""\
         import sys, json
         sys.path.insert(0, {str(APP_DIR)!r})
+        import services.conversation.bootstrap as conversation_bootstrap
+        conversation_bootstrap.build_conversation_persistence_service = lambda: None
         import main  # triggers module-level graph construction
         print({_IMPORT_OK_SENTINEL!r} + json.dumps({{"app_env": main.settings.app_env}}))
     """)

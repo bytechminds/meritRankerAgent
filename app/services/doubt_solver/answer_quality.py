@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from config import Settings, get_settings
+from observability import log_event, update_request_summary
+from schemas.doubt_solver import CanonicalLanguage
 from schemas.llm import LlmMessage
+from services.doubt_solver.language_policy import is_language_compliant
 from services.doubt_solver.markdown_replay import iter_markdown_segments
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,7 @@ _DOLLAR_INLINE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", re.DOTALL)
 _DOLLAR_DISPLAY = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _QUAD_DOLLAR = re.compile(r"\${4,}")
 _ANSWER_HEADING_LINE = re.compile(
-    r"(?im)^\s*\*{0,2}\s*(?:final\s+)?answer\s*:?\s*\*{0,2}"
+    r"(?im)^\s*\*{0,2}\s*(?P<label>(?:final\s+)?answer)\s*:?\s*\*{0,2}"
     r"\s*(?P<value>[^\n]*)$"
 )
 _URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
@@ -112,6 +115,7 @@ class AnswerQualityResult:
     severity: Severity
     reason_codes: list[str]
     sanitized_text: str | None = None
+    language_compliant: bool = True
 
 
 def detect_final_answer(content: str) -> bool:
@@ -125,12 +129,12 @@ def count_final_answer_sections(content: str) -> int:
     return len(_ANSWER_HEADING_LINE.findall(content))
 
 
-def _answer_heading_values(content: str) -> list[str]:
+def _explicit_final_answer_values(content: str) -> list[str]:
     values: list[str] = []
     lines = content.splitlines()
     for index, line in enumerate(lines):
         match = _ANSWER_HEADING_LINE.fullmatch(line)
-        if match is None:
+        if match is None or not match.group("label").casefold().startswith("final"):
             continue
         value = match.group("value").strip()
         if not value:
@@ -213,6 +217,7 @@ def validate_answer_quality(
     subject: str,
     difficulty: str,
     intent: str | None,
+    language: CanonicalLanguage = "english",
     policy: AnswerQualityPolicy | None = None,
 ) -> AnswerQualityResult:
     """Run deterministic checks on generator output (before marker strip)."""
@@ -231,8 +236,14 @@ def validate_answer_quality(
             severity="unsafe",
             reason_codes=["invalid_utf8"],
         )
+    language_compliant = is_language_compliant(content, language)
     if not pol.validation_enabled:
-        return AnswerQualityResult(is_valid=True, severity="clean", reason_codes=[])
+        return AnswerQualityResult(
+            is_valid=language_compliant,
+            severity="clean" if language_compliant else "rewrite_required",
+            reason_codes=[] if language_compliant else ["language_mismatch"],
+            language_compliant=language_compliant,
+        )
 
     reasons: list[str] = []
     severity: Severity = "clean"
@@ -247,6 +258,9 @@ def validate_answer_quality(
             severity = "rewrite_required"
         elif level == "minor" and severity == "clean":
             severity = "minor"
+
+    if not language_compliant:
+        _flag("language_mismatch", "rewrite_required")
 
     if _QUAD_DOLLAR.search(content):
         _flag("math_quad_dollar", "rewrite_required")
@@ -289,9 +303,12 @@ def validate_answer_quality(
         if phrase in lowered:
             _flag(f"bad_phrase_{phrase.replace(' ', '_')}", "rewrite_required")
 
-    if count_final_answer_sections(content) > 1:
+    explicit_final_values = _explicit_final_answer_values(content)
+    if count_final_answer_sections(content) > 1 and len(explicit_final_values) <= 1:
+        logger.info("quality_false_positive_regression count=1")
+    if len(explicit_final_values) > 1:
         _flag("duplicate_final_answer", "rewrite_required")
-        answer_values = set(_answer_heading_values(content))
+        answer_values = set(explicit_final_values)
         if len(answer_values) > 1:
             _flag("conflicting_answer_values", "rewrite_required")
 
@@ -335,6 +352,7 @@ def validate_answer_quality(
         severity=severity,
         reason_codes=reasons,
         sanitized_text=sanitized,
+        language_compliant=language_compliant,
     )
 
 
@@ -379,7 +397,11 @@ def apply_safe_sanitizer(content: str, *, marker: str) -> str:
 
 def strip_duplicate_final_answer_section(content: str) -> str:
     """Remove a repeated Final Answer block if duplicated verbatim."""
-    matches = list(_ANSWER_HEADING_LINE.finditer(content))
+    matches = [
+        match
+        for match in _ANSWER_HEADING_LINE.finditer(content)
+        if match.group("label").casefold().startswith("final")
+    ]
     if len(matches) < 2:
         return content
     first_start = matches[0].start()
@@ -389,6 +411,20 @@ def strip_duplicate_final_answer_section(content: str) -> str:
     if tail.strip() == first_block.strip():
         return content[:second_start].rstrip()
     return content
+
+
+def parse_rewrite_output(content: str, *, marker: str) -> tuple[str | None, str]:
+    """Return a usable rewrite and a safe parse outcome."""
+    if not content or not content.strip():
+        return None, "provider_empty"
+    marker_found = marker in content
+    candidate = apply_safe_sanitizer(content, marker=marker)
+    if not candidate or not detect_final_answer(candidate):
+        logger.warning("rewrite_parse_failure metric_count=1 outcome=parse_failed")
+        return None, "parse_failed"
+    if not marker_found:
+        return candidate, "marker_missing_but_complete"
+    return candidate, "rewrite_accepted"
 
 
 def build_rewrite_messages(
@@ -411,7 +447,13 @@ def rewrite_max_tokens(*, difficulty: str, route_subject: str) -> int:
     return 500
 
 
-def plain_text_fallback(*, subject: str) -> str:
+def plain_text_fallback(
+    *, subject: str, language: CanonicalLanguage = "english"
+) -> str:
+    if language == "hindi":
+        return "उत्तर को विश्वसनीय रूप से तैयार नहीं किया जा सका। कृपया फिर प्रयास करें।"
+    if language == "hinglish":
+        return "Answer reliably format nahi ho saka. Please dobara try karein."
     return (
         "A compact answer could not be formatted reliably. "
         "Please try asking again with a shorter question."
@@ -420,8 +462,14 @@ def plain_text_fallback(*, subject: str) -> str:
     )
 
 
-def generation_failure_message() -> str:
+def generation_failure_message(
+    language: CanonicalLanguage = "english",
+) -> str:
     """Safe user-facing message when all generation attempts fail or return empty."""
+    if language == "hindi":
+        return "इस प्रश्न का विश्वसनीय उत्तर तैयार नहीं हो सका। कृपया फिर प्रयास करें।"
+    if language == "hinglish":
+        return "Is question ka reliable answer generate nahi ho saka. Please dobara try karein."
     return GENERATION_FAILURE_MESSAGE
 
 
@@ -442,7 +490,7 @@ def log_answer_quality_validation(
     rewrite_required: bool,
     sanitized: bool,
 ) -> None:
-    logger.info(
+    logger.debug(
         "answer_quality_validation  request_id=%s  route_id=%s  subject=%s  "
         "difficulty=%s  intent=%s  is_valid=%s  severity=%s  reasons_count=%d  "
         "reason_codes=%s  output_chars=%d  rewrite_required=%s  sanitized=%s  "
@@ -470,15 +518,32 @@ def log_answer_quality_rewrite(
     attempt_count: int,
     success: bool,
     final_output_chars: int,
+    outcome: str,
 ) -> None:
-    logger.info(
+    logger.debug(
         "answer_quality_rewrite  request_id=%s  used=%s  attempt_count=%d  "
-        "success=%s  final_output_chars=%d",
+        "success=%s  final_output_chars=%d  outcome=%s",
         request_id,
         used,
         attempt_count,
         success,
         final_output_chars,
+        outcome,
+    )
+    update_request_summary(rewrite_attempted=used)
+    log_event(
+        "quality_rewrite_completed",
+        component="doubt_solver.quality",
+        stage="validate_quality",
+        status="completed" if success else "failed",
+        error_code=None if success else "QUALITY_REWRITE_FAILED",
+        details={
+            "used": used,
+            "attempt_count": attempt_count,
+            "success": success,
+            "outcome": outcome,
+        },
+        level=logging.INFO if success else logging.WARNING,
     )
 
 

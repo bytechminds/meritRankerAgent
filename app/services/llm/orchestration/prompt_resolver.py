@@ -39,12 +39,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from schemas.doubt_solver import CanonicalLanguage
 from schemas.llm import LlmMessage
 from schemas.llm_routing import RouteDecision
 from services.doubt_solver.exam_response_profile import (
     ExamResponseProfileResolver,
     get_exam_response_profile_resolver,
 )
+from services.doubt_solver.language_policy import LanguagePolicyResolver
 from services.llm.orchestration.errors import (
     PromptNotFoundError,
     PromptPathError,
@@ -93,6 +95,7 @@ class PromptResolver:
         self,
         prompt_root: Path | None = None,
         exam_profile_resolver: ExamResponseProfileResolver | None = None,
+        language_policy_resolver: LanguagePolicyResolver | None = None,
     ) -> None:
         self._prompt_root: Path = (prompt_root or DEFAULT_PROMPT_ROOT).resolve()
         self._cache: dict[str, str] = {}
@@ -100,6 +103,9 @@ class PromptResolver:
             exam_profile_resolver
             if exam_profile_resolver is not None
             else get_exam_response_profile_resolver()
+        )
+        self._language_policy_resolver = (
+            language_policy_resolver or LanguagePolicyResolver()
         )
 
     # ------------------------------------------------------------------
@@ -112,6 +118,7 @@ class PromptResolver:
         query: str,
         classification: Any | None = None,
         context: str | None = None,
+        conversation_context: str | None = None,
         request_id: str = "",
     ) -> list[LlmMessage]:
         """Build and return exactly two LlmMessage objects.
@@ -169,26 +176,52 @@ class PromptResolver:
         )
 
         system_content = self._build_system_prompt(route_decision.prompt, overlay_paths)
-        if route_decision.task_role == "generator" and route_decision.exam:
-            exam_profile = self._exam_profile_resolver.resolve(
-                route_decision.exam,
-                route_decision.exam_stage,
-                request_id=request_id,
-            )
-            system_content = _SECTION_SEP.join(
-                (system_content, exam_profile.compact_instruction)
-            )
+        system_content = self.compose_generator_system_prompt(
+            system_content,
+            task_role=route_decision.task_role,
+            exam_id=route_decision.exam,
+            exam_stage=route_decision.exam_stage,
+            language=route_decision.language,
+            request_id=request_id,
+        )
         user_content = self._build_user_message(
             query=query,
             route_decision=route_decision,
             classification=classification,
             context=context,
+            conversation_context=conversation_context,
         )
 
         return [
             LlmMessage(role="system", content=system_content),
             LlmMessage(role="user", content=user_content),
         ]
+
+    def compose_generator_system_prompt(
+        self,
+        system_content: str,
+        *,
+        task_role: str,
+        exam_id: str | None,
+        exam_stage: str | None,
+        language: CanonicalLanguage,
+        request_id: str = "",
+    ) -> str:
+        """Append dynamic answer policies exactly once for generator calls."""
+        if task_role != "generator":
+            return system_content
+
+        sections = [system_content]
+        if exam_id:
+            exam_profile = self._exam_profile_resolver.resolve(
+                exam_id,
+                exam_stage,
+                request_id=request_id,
+            )
+            sections.append(exam_profile.compact_instruction)
+        language_policy = self._language_policy_resolver.resolve(language)
+        sections.append(language_policy.instruction)
+        return _SECTION_SEP.join(sections)
 
     # ------------------------------------------------------------------
     # Internal helpers — prompt loading
@@ -295,6 +328,7 @@ class PromptResolver:
         route_decision: RouteDecision,
         classification: Any | None,
         context: str | None,
+        conversation_context: str | None,
     ) -> str:
         """Compose the user message from query, route summary, classification, and context.
 
@@ -339,6 +373,9 @@ class PromptResolver:
                 parts.append("Classification:\n" + "\n".join(cls_lines))
 
         # --- Retrieved context (in user message only) ---
+        if conversation_context:
+            parts.append(conversation_context[:MAX_CONTEXT_CHARS])
+
         if context is not None:
             safe_context = context
             truncated = len(context) > MAX_CONTEXT_CHARS

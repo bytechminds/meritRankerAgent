@@ -44,8 +44,13 @@ mock LLM provider.  No AWS credentials, no API keys required.
 
 | Variable | Default | Required for | Format / example | Notes |
 |---|---|---|---|---|
-| `APP_ENV` | `local` | all modes | `local` / `staging` / `production` | Tag only — does not change behaviour |
-| `LOG_LEVEL` | `INFO` | all modes | `DEBUG` / `INFO` / `WARNING` / `ERROR` | Python logging level |
+| `APP_ENV` | `local` | all modes | `local` / `staging` / `production` | Environment tag; `production` also forces JSON stdout and disables local log files |
+| `LOG_LEVEL` | `INFO` | all modes | `DEBUG` / `INFO` / `WARNING` / `ERROR` | Backward-compatible Python logging level |
+| `AGENT_LOG_LEVEL` | `LOG_LEVEL` | all modes | `DEBUG` / `INFO` / `WARNING` / `ERROR` | Preferred agent logging level |
+| `AGENT_LOG_FORMAT` | local: `pretty_and_json_file`; production: `json` | all modes | `pretty` / `json` / `pretty_and_json_file` | Production always uses JSON |
+| `AGENT_LOG_FILE_ENABLED` | local: `true`; production: `false` | local only | `true` / `false` | Ignored and disabled in production |
+| `AGENT_DETAILED_LOGS` | `false` | local diagnostics | `true` / `false` | Adds bounded safe detail fields to pretty events |
+| `AGENT_OBSERVABILITY_ENABLED` | `true` | all modes | `true` / `false` | Enables optional application spans; safe no-op without OpenTelemetry |
 | `MODEL_PROVIDER` | `mock` | all modes | `mock` | Legacy field — not used for routing; kept for compatibility |
 
 ### LLM routing
@@ -322,10 +327,13 @@ The following have not been manually verified end-to-end:
 ## Security notes
 
 1. `app/.env.local` is in `.gitignore` — confirmed in root `.gitignore` lines 26–28.
-2. `app/.env.local.example` contains **only** empty values and placeholder comments.
+2. `app/.env.local.example` contains non-secret local defaults and empty secret placeholders.
 3. The `azure_openai_provider.py` and `openai_provider.py` log `role` and `model_label`
    only — never API keys or endpoints.
 4. `bedrock_kb_service.py` and `dynamodb_service.py` never log retrieved content.
 5. `_sanitise_metadata()` in `streaming_adapter.py` enforces an allowlist
    (`_SAFE_METADATA_KEYS`) so secrets never enter `StreamEvent.metadata`.
 6. boto3 uses the standard credential chain — no credentials are hardcoded anywhere.
+`AGENT_LOCAL_LOG_CONTENT` accepts `off` or `preview`. Local development defaults to `preview`;
+production always behaves as `off`. Preview content is bounded and written only to
+`app/.logs/agent-runtime.log`.

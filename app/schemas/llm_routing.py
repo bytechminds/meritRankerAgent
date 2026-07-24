@@ -36,6 +36,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from schemas.doubt_solver import CanonicalLanguage
+
 # ---------------------------------------------------------------------------
 # Enums (plain str subclasses, not Enum, to keep them JSON-serializable and
 # Pydantic-friendly without extra wrappers)
@@ -67,6 +69,7 @@ AzureApiMode = Literal["azure_deployment_chat_completions", "azure_openai_v1"]
 TaskRole = Literal[
     "classifier",
     "classifier_strong",
+    "follow_up_resolver",
     "planner",
     "generator",
     "formatter",
@@ -304,6 +307,10 @@ class ModelConfig(BaseModel):
 
     provider: ProviderName
     provider_profile: str = Field(min_length=1)
+    allowed_task_roles: list[TaskRole] = Field(
+        default_factory=list,
+        description="Optional execution roles allowed to use this model alias.",
+    )
     model_id: str | None = Field(
         default=None, description="Provider model ID (required unless provider=mock)."
     )
@@ -641,6 +648,7 @@ class RouteRequest(BaseModel):
     intent: str | None = Field(default=None, max_length=128)
     exam: str | None = Field(default=None, max_length=128)
     exam_stage: str | None = Field(default=None, max_length=64)
+    language: CanonicalLanguage = "english"
 
     model_config = {"str_strip_whitespace": True}
 
@@ -684,6 +692,7 @@ class RouteDecision(BaseModel):
     intent: str | None = None
     exam: str | None = None
     exam_stage: str | None = None
+    language: CanonicalLanguage = "english"
     model: str = Field(description="Model alias (not the actual provider model_id).")
     prompt: str = Field(description="Relative prompt file path.")
     overlays: list[str] = Field(default_factory=list)

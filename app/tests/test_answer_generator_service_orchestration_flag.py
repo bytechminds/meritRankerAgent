@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -202,6 +203,31 @@ class TestAnswerGenerationAdapter:
         assert len(captured_requests) == 1
         assert captured_requests[0].task_role == "generator"
 
+    def test_adapter_logs_actual_generator_execution_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import services.doubt_solver.answer_generation_adapter as adapter_module
+
+        adapter, _ = _make_test_adapter(tmp_path, content="Answer text.")
+        event = MagicMock()
+        monkeypatch.setattr(adapter_module, "log_event", event)
+
+        adapter.generate(
+            request_id="req-001",
+            query="What is 2+2?",
+            subject="math",
+            intent="solve",
+            difficulty="default",
+            context="",
+        )
+
+        details = event.call_args.kwargs["details"]
+        assert event.call_args.args == ("generation_completed",)
+        assert details["route_id"] == "math.generator.default"
+        assert details["task_role"] == "generator"
+        assert details["model_alias"] == "safe_mock"
+        assert details["provider"] == "mock"
+
     def test_adapter_does_not_pass_model_id_to_route_request(
         self, tmp_path: Path
     ) -> None:
@@ -280,7 +306,15 @@ class TestAnswerGenerationAdapter:
 
         calls: list[dict[str, Any]] = []
 
-        def _patched_generate(self, *, route_request, query, classification=None, context=None):
+        def _patched_generate(
+            self,
+            *,
+            route_request,
+            query,
+            classification=None,
+            context=None,
+            conversation_context=None,
+        ):
             calls.append({"context": context})
             return original_generate(
                 self,
@@ -288,6 +322,7 @@ class TestAnswerGenerationAdapter:
                 query=query,
                 classification=classification,
                 context=context,
+                conversation_context=conversation_context,
             )
 
         orchestrator.generate = lambda **kw: _patched_generate(orchestrator, **kw)

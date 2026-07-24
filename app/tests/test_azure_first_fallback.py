@@ -1236,10 +1236,20 @@ class TestGenerateNodeProviderFailureHandling:
         assert fields == {
             "request_id",
             "query",
+            "original_query",
+            "actor_id",
+            "conversation_id",
+            "turn_id",
+            "language",
+            "exam_id",
+            "exam_stage",
             "classification",
             "retrieval_context",
             "context_text",
             "answer",
+            "final_answer",
+            "conversation_context",
+            "conversation_relation",
         }, (
             f"OrchestratedDoubtSolverState fields changed: {fields}"
         )
@@ -1442,17 +1452,27 @@ class TestRegressionGuards:
         assert fake_executor.call_log == ["azure_fast"]
 
     def test_graph_state_includes_internal_retrieval_context(self) -> None:
-        """OrchestratedDoubtSolverState must retain exactly six declared fields."""
+        """Orchestrated state retains request context and answer boundaries."""
         from graphs.doubt_solver_graph import OrchestratedDoubtSolverState  # noqa: PLC0415
 
         fields = set(OrchestratedDoubtSolverState.__annotations__.keys())
         assert fields == {
             "request_id",
             "query",
+            "original_query",
+            "actor_id",
+            "conversation_id",
+            "turn_id",
+            "language",
+            "exam_id",
+            "exam_stage",
             "classification",
             "retrieval_context",
             "context_text",
             "answer",
+            "final_answer",
+            "conversation_context",
+            "conversation_relation",
         }
 
 

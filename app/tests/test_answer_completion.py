@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import config as cfg_module
 from schemas.llm import LlmMessage
+from schemas.llm_orchestration import ModelExecutionResult
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_completion import (
     AnswerCompletionPolicy,
@@ -326,6 +329,88 @@ class TestOrchestratorContinuation:
         assert call["n"] == 2
         assert "$" not in result.content
         assert "15" in result.content
+
+    def test_complete_rewrite_without_marker_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        outputs = iter(
+            [
+                "Actually check setup. **Final Answer:** $15$ km/h <ANSWER_DONE>",
+                r"**Final Answer:** \(15\) km/h",
+            ]
+        )
+
+        class _Executor:
+            last_stream_finish_reason = "stop"
+
+            def execute(self, *, route_decision, messages):
+                return ModelExecutionResult(
+                    content=next(outputs),
+                    model=route_decision.model,
+                    finish_reason="stop",
+                )
+
+        result = LlmOrchestrator(model_executor=_Executor()).generate(
+            route_request=RouteRequest(
+                request_id="rw-missing-marker",
+                subject="math",
+                task_role="generator",
+                difficulty="intermediate",
+                intent="solve",
+            ),
+            query="speed",
+        )
+
+        assert result.content == r"**Final Answer:** \(15\) km/h"
+        assert result.final_answer is not None
+        assert result.final_answer.quality_status == "passed_quality_gate"
+        assert any(
+            getattr(record, "observability_event", {}).get("details", {}).get("outcome")
+            == "marker_missing_but_complete"
+            for record in caplog.records
+        )
+
+    def test_empty_rewrite_fails_safely(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        outputs = iter(["Actually. **Final Answer:** $15$ <ANSWER_DONE>", " "])
+
+        class _Executor:
+            last_stream_finish_reason = "stop"
+
+            def execute(self, *, route_decision, messages):
+                return ModelExecutionResult(
+                    content=next(outputs),
+                    model=route_decision.model,
+                    finish_reason="stop",
+                )
+
+        result = LlmOrchestrator(model_executor=_Executor()).generate(
+            route_request=RouteRequest(
+                request_id="rw-empty",
+                subject="math",
+                task_role="generator",
+                difficulty="intermediate",
+                intent="solve",
+            ),
+            query="speed",
+        )
+
+        assert result.final_answer is not None
+        assert result.final_answer.quality_status == "failed_quality_gate"
+        assert any(
+            getattr(record, "observability_event", {}).get("details", {}).get("outcome")
+            == "provider_empty"
+            for record in caplog.records
+        )
 
 
 class TestCompletionRouteGating:

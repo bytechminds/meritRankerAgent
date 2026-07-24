@@ -32,7 +32,7 @@ import json
 import logging
 import time
 
-from schemas.doubt_solver import AnswerOutput, QueryClassification
+from schemas.doubt_solver import AnswerOutput, CanonicalLanguage, QueryClassification
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,7 @@ def _build_answer_messages(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> list:
     """Build the message list for the answer generator LLM call.
@@ -128,19 +129,20 @@ def _build_answer_messages(
     """
     # Deferred imports — only active on LLM path.
     from schemas.llm import LlmMessage  # noqa: PLC0415
-    from services.doubt_solver.exam_response_profile import (  # noqa: PLC0415
-        get_exam_response_profile_resolver,
+    from services.llm.orchestration.prompt_resolver import (  # noqa: PLC0415
+        get_prompt_resolver,
     )
     from services.prompt_loader import load_prompt  # noqa: PLC0415
 
     system_prompt = load_prompt("answer_generator")
-    if exam_id:
-        exam_profile = get_exam_response_profile_resolver().resolve(
-            exam_id,
-            exam_stage,
-            request_id=request_id,
-        )
-        system_prompt = f"{system_prompt}\n\n---\n\n{exam_profile.compact_instruction}"
+    system_prompt = get_prompt_resolver().compose_generator_system_prompt(
+        system_prompt,
+        task_role="generator",
+        exam_id=exam_id,
+        exam_stage=exam_stage,
+        language=language,
+        request_id=request_id,
+    )
 
     # Build a brief, safe classification summary for the user turn.
     # Do not include classification_source or retrieval_need (internal fields).
@@ -182,6 +184,7 @@ def _generate_with_llm(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> AnswerOutput:
     """Call model_router and return a validated AnswerOutput.
@@ -199,6 +202,7 @@ def _generate_with_llm(
         context=context,
         exam_id=exam_id,
         exam_stage=exam_stage,
+        language=language,
         request_id=request_id,
     )
     response = model_router.generate(_GENERATOR_ROLE, messages)
@@ -233,6 +237,7 @@ def generate_answer(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> AnswerOutput:
     """Generate a tutoring answer, dispatching to LLM or mock based on config.
@@ -288,6 +293,7 @@ def generate_answer(
             context=context,
             exam_id=exam_id,
             exam_stage=exam_stage,
+            language=language,
             request_id=request_id,
         )
     except Exception as exc:  # noqa: BLE001

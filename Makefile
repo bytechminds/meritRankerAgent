@@ -78,7 +78,7 @@ smoke-doubt-solver:
 	@echo ">>> Requires: make dev running in a separate terminal"
 	@curl -s -X POST $(AGENTCORE_LOCAL_URL) \
 	  -H "Content-Type: application/json" \
-	  -d '{"mode":"doubt_solver","query":"A shopkeeper marks goods 40% above cost price and gives a 20% discount. Find the profit or loss percentage. Show step-by-step working.","user_id":"local-smoke","language":"en"}' \
+	  -d '{"mode":"doubt_solver","query":"A shopkeeper marks goods 40% above cost price and gives a 20% discount. Find the profit or loss percentage. Show step-by-step working.","user_id":"local-smoke","conversation_id":"local-smoke-conversation","turn_id":"local-smoke-turn-1","language":"en"}' \
 	  | python3 -m json.tool || echo ">>> [FAILED] Is make dev running? Check the port in agentcore dev --logs output."
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ smoke-doubt-solver-real-llm:
 	@echo ">>>   (or OPENAI_API_KEY if using openai provider)"
 	@curl -s -X POST $(AGENTCORE_LOCAL_URL) \
 	  -H "Content-Type: application/json" \
-	  -d '{"mode":"doubt_solver","query":"A train travels 240 km at a uniform speed. If the speed had been 8 km/h more, it would have taken 1 hour less. Find the speed of the train.","user_id":"local-smoke-llm","language":"en"}' \
+	  -d '{"mode":"doubt_solver","query":"A train travels 240 km at a uniform speed. If the speed had been 8 km/h more, it would have taken 1 hour less. Find the speed of the train.","user_id":"local-smoke-llm","conversation_id":"local-smoke-llm-conversation","turn_id":"local-smoke-llm-turn-1","language":"en"}' \
 	  | python3 -m json.tool || echo ">>> [FAILED] Is make dev running with ENABLE_REAL_LLM=true?"
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ smoke-doubt-solver-with-retrieval:
 	@echo ">>>   Optional: ENABLE_DYNAMODB_FETCH, DYNAMODB_QUESTION_TABLE"
 	@curl -s -X POST $(AGENTCORE_LOCAL_URL) \
 	  -H "Content-Type: application/json" \
-	  -d '{"mode":"doubt_solver","query":"Explain the concept of percentage and how it relates to ratios.","user_id":"local-smoke-retrieval","language":"en"}' \
+	  -d '{"mode":"doubt_solver","query":"Explain the concept of percentage and how it relates to ratios.","user_id":"local-smoke-retrieval","conversation_id":"local-smoke-retrieval-conversation","turn_id":"local-smoke-retrieval-turn-1","language":"en"}' \
 	  | python3 -m json.tool || echo ">>> [FAILED] Is make dev running with ENABLE_KB_RETRIEVAL=true?"
 
 # ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ smoke-doubt-solver-combined:
 	@echo ">>>   ENABLE_DYNAMODB_FETCH, DYNAMODB_QUESTION_TABLE, AWS_REGION"
 	@curl -s -X POST $(AGENTCORE_LOCAL_URL) \
 	  -H "Content-Type: application/json" \
-	  -d '{"mode":"doubt_solver","query":"A student scored 72 out of 90 in mathematics. What is the percentage score and how does it compare to a passing score of 75%?","user_id":"local-smoke-combined","language":"en"}' \
+	  -d '{"mode":"doubt_solver","query":"A student scored 72 out of 90 in mathematics. What is the percentage score and how does it compare to a passing score of 75%?","user_id":"local-smoke-combined","conversation_id":"local-smoke-combined-conversation","turn_id":"local-smoke-combined-turn-1","language":"en"}' \
 	  | python3 -m json.tool || echo ">>> [FAILED] Is make dev running with all required env vars set?"
 
 # ---------------------------------------------------------------------------

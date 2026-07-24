@@ -24,8 +24,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 
+from observability import log_event
+from schemas.doubt_solver import CanonicalLanguage, FinalAnswerResult
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_completion import resolve_generator_route_subject
+from services.doubt_solver.final_answer import build_final_answer_result
 from services.llm.orchestration.orchestrator import LlmOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -51,7 +54,39 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         exam_id: str | None = None,
         exam_stage: str | None = None,
+        language: CanonicalLanguage = "english",
+        conversation_context: str | None = None,
     ) -> str:
+        """Return the authoritative answer content for compatibility callers."""
+        return self.generate_final(
+            request_id=request_id,
+            query=query,
+            subject=subject,
+            intent=intent,
+            difficulty=difficulty,
+            context=context,
+            web_search_reason=web_search_reason,
+            exam_id=exam_id,
+            exam_stage=exam_stage,
+            language=language,
+            conversation_context=conversation_context,
+        ).content
+
+    def generate_final(
+        self,
+        *,
+        request_id: str,
+        query: str,
+        subject: str,
+        intent: str,
+        difficulty: str,
+        context: str,
+        web_search_reason: str | None = None,
+        exam_id: str | None = None,
+        exam_stage: str | None = None,
+        language: CanonicalLanguage = "english",
+        conversation_context: str | None = None,
+    ) -> FinalAnswerResult:
         """Build a RouteRequest and call the orchestrator."""
         route_subject = resolve_generator_route_subject(
             subject=subject,
@@ -66,15 +101,17 @@ class AnswerGenerationAdapter:
             intent=intent,
             exam=exam_id,
             exam_stage=exam_stage,
+            language=language,
         )
 
         result = self._orchestrator.generate(
             route_request=route_request,
             query=query,
             context=context if context else None,
+            conversation_context=conversation_context,
         )
 
-        logger.info(
+        logger.debug(
             "answer_generation_adapter.generate  request_id=%s  subject=%s  "
             "difficulty=%s  intent=%s  model=%s",
             request_id,
@@ -83,8 +120,32 @@ class AnswerGenerationAdapter:
             intent,
             result.model,
         )
+        route_decision = getattr(result, "route_decision", None)
+        if route_decision is not None:
+            log_event(
+                "generation_completed",
+                component="doubt_solver.generator",
+                stage="generate",
+                status="completed",
+                duration_ms=getattr(result, "latency_ms", None),
+                details={
+                    "route_id": route_decision.route_id,
+                    "task_role": route_decision.task_role,
+                    "model_alias": result.model,
+                    "provider": result.provider,
+                    "deployment": getattr(result, "execution_deployment", None),
+                    "fallback_used": getattr(result, "fallback_used", False),
+                },
+            )
 
-        return result.content
+        final_answer = getattr(result, "final_answer", None)
+        if final_answer is not None:
+            return final_answer
+        return build_final_answer_result(
+            content=result.content,
+            language=language,
+            quality_status="checked",
+        )
 
     def generate_stream(
         self,
@@ -98,6 +159,8 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         exam_id: str | None = None,
         exam_stage: str | None = None,
+        language: CanonicalLanguage = "english",
+        conversation_context: str | None = None,
         on_before_generator_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
         verify_before_stream: bool = True,
@@ -120,9 +183,10 @@ class AnswerGenerationAdapter:
             intent=intent,
             exam=exam_id,
             exam_stage=exam_stage,
+            language=language,
         )
 
-        logger.info(
+        logger.debug(
             "answer_generation_adapter.generate_stream  request_id=%s  subject=%s  "
             "difficulty=%s  intent=%s  stream_started=true",
             request_id,
@@ -135,6 +199,7 @@ class AnswerGenerationAdapter:
             route_request=route_request,
             query=query,
             context=context_text if context_text else None,
+            conversation_context=conversation_context,
             on_before_fallback=on_before_generator_fallback,
             on_before_continuation=on_before_continuation,
             verify_before_stream=verify_before_stream,

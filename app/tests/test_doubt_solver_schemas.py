@@ -18,17 +18,25 @@ from schemas.doubt_solver import (
     QueryClassification,
 )
 
+_REQUEST_IDS = {
+    "user_id": "local-user",
+    "conversation_id": "conversation-1",
+    "turn_id": "turn-1",
+}
+
 
 class TestDoubtSolverRequest:
     def test_valid_request(self):
-        req = DoubtSolverRequest(mode="doubt_solver", query="What is 20% of 500?")
+        req = DoubtSolverRequest(
+            mode="doubt_solver", query="What is 20% of 500?", **_REQUEST_IDS
+        )
         assert req.query == "What is 20% of 500?"
         assert req.mode == "doubt_solver"
         assert req.user_id == "local-user"
-        assert req.language == "en"
+        assert req.language == "english"
 
     def test_query_whitespace_stripped(self):
-        req = DoubtSolverRequest(mode="doubt_solver", query="  hello  ")
+        req = DoubtSolverRequest(mode="doubt_solver", query="  hello  ", **_REQUEST_IDS)
         assert req.query == "hello"
 
     def test_empty_query_rejected(self):
@@ -40,7 +48,7 @@ class TestDoubtSolverRequest:
             DoubtSolverRequest(mode="doubt_solver", query="   ")
 
     def test_query_at_max_length_accepted(self):
-        req = DoubtSolverRequest(mode="doubt_solver", query="a" * 5000)
+        req = DoubtSolverRequest(mode="doubt_solver", query="a" * 5000, **_REQUEST_IDS)
         assert len(req.query) == 5000
 
     def test_query_over_max_length_rejected(self):
@@ -52,12 +60,14 @@ class TestDoubtSolverRequest:
             DoubtSolverRequest(mode="demo", query="hello")  # type: ignore[arg-type]
 
     def test_language_default(self):
-        req = DoubtSolverRequest(mode="doubt_solver", query="hello")
-        assert req.language == "en"
+        req = DoubtSolverRequest(mode="doubt_solver", query="hello", **_REQUEST_IDS)
+        assert req.language == "english"
 
     def test_language_hi_accepted(self):
-        req = DoubtSolverRequest(mode="doubt_solver", query="hello", language="hi")
-        assert req.language == "hi"
+        req = DoubtSolverRequest(
+            mode="doubt_solver", query="hello", language="hi", **_REQUEST_IDS
+        )
+        assert req.language == "hindi"
 
     def test_invalid_language_rejected(self):
         with pytest.raises(ValidationError):
@@ -136,7 +146,9 @@ class TestDoubtSolverResponse:
 
 class TestDoubtSolverState:
     def _make_request(self) -> DoubtSolverRequest:
-        return DoubtSolverRequest(mode="doubt_solver", query="Explain ratio")
+        return DoubtSolverRequest(
+            mode="doubt_solver", query="Explain ratio", **_REQUEST_IDS
+        )
 
     def test_valid_state(self):
         req = self._make_request()

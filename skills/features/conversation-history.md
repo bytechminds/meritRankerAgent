@@ -1,0 +1,183 @@
+# Conversation History
+
+## Status
+
+Dev infrastructure, persistence, Memory-first selection, exact two-turn follow-up resolution, and
+independent-query isolation are live verified. Semantically complete live tutoring output remains
+blocked by the deployed mock provider configuration.
+
+## Current behavior
+
+Persistable finalized turns are stored in the Amplify-generated `ConversationHistory` table and in
+AgentCore short-term memory. DynamoDB recent-context fallback queries the
+`ConversationHistoryByConversation` GSI by `conversationId`, applies actor isolation, requests newest
+items first, and returns bounded chronological context.
+
+After history persistence succeeds, `ConversationSessionRepository.upsert_from_completed_turn()`
+creates or updates the corresponding lightweight session in the generated `ConversationSession`
+table. First create writes the conversation ID, actor ID, deterministic query title,
+`lastActivityAt`, Amplify timestamp attributes, and typename. Later updates only advance
+`lastActivityAt`; title is immutable and activity cannot move backward.
+
+Title generation normalizes whitespace, removes control characters, preserves Unicode, caps output
+at 60 code points with an ellipsis, and uses `New conversation` only when no usable query remains.
+No model call is made.
+
+Each persistence decision returns a typed `ConversationPersistenceResult` with independent history,
+session, and memory statuses. Accepted statuses are explicitly limited to `checked` and
+`passed_quality_gate`; empty, language-noncompliant, failed-quality, cancelled, non-finalized, and
+clarification-only outputs are skipped. One safe structured summary is logged per decision.
+
+The shared observability layer also emits typed persistence completion, skip, or partial-failure
+events and updates the request execution summary with history, session, and memory statuses.
+Recent-context loading emits source, usable-turn count, latency, fallback, and controlled failure
+reason only. Persistence worker threads explicitly copy request context. Questions, answers,
+formatted recent context, memory event payloads, and DynamoDB item bodies are never telemetry.
+
+## Configuration
+
+The existing process-cached SSM loader reads history and session table names and ARNs in one
+`GetParameters` request. The runtime bootstrap builds available repositories with the shared cached
+DynamoDB client. AWS Region is validated before SSM access. The Memory ID is independent and
+optional: when absent, history and session remain active, no AgentCore client is constructed, and
+Memory reads/writes return controlled `not_configured`/`failed_configuration` outcomes. No second
+config loader, per-request SSM read, or graph-level DynamoDB call exists.
+
+The AgentCore CDK stack creates one target-scoped short-term Memory with 30-day raw-event retention
+and no long-term strategies. Its AWS-compatible physical name is
+`meritranker_short_term_memory_<target>`; the service schema does not permit the requested hyphenated
+form. The generated Memory ID is injected into the Runtime with
+`MEMORY_MERITRANKER_SHORT_TERM_MEMORY_ID`, creating an implicit CloudFormation dependency.
+Staging and production receive independent resources when their deployment targets are configured;
+only Dev is currently configured and deployed.
+
+The installed AgentCore alpha CodeZip packager copies source files without honoring `.gitignore`.
+The CDK app therefore stages a deployment-only source tree under `agentcore/.cache`, excluding all
+`.env` variants, tests, caches, bytecode, and logs. Contract tests cover this exclusion. The
+runtime package includes AWS Distro for OpenTelemetry because the enabled instrumentation entrypoint
+requires `opentelemetry-instrument`.
+
+## Reliability
+
+History and memory persistence are independent and may execute concurrently. History must succeed
+or be an idempotent replay before session persistence is attempted. Each component retries once only
+for recognized transient AWS/network failures. A remaining partial failure is reported explicitly
+without replacing an accepted answer. Memory success with history failure emits a degraded-consistency
+metric. Equal timestamp retries are no-ops. Cross-actor conversation ID collisions raise a repository
+conflict. Streaming emits public `complete` only after persistence coordination returns.
+The persistence deadline bounds request coordination, not an already-running synchronous AWS SDK
+call. A timed-out worker is marked `failed_transient`, may finish later, and is never treated as
+confirmed persistence for the terminal result.
+
+Recent context uses a typed load result with source `agentcore_memory`, `dynamodb_fallback`, or
+`none`, plus `memory_attempted`, `memory_status`, `memory_event_count`, `dynamodb_attempted`,
+`dynamodb_status`, `dynamodb_item_count`, bounded turns, usable count, latency, and a safe failure
+reason. Separate `memory_failure_reason` and `dynamodb_failure_reason` fields preserve both store
+outcomes when fallback also fails. Memory distinguishes not configured, resource missing,
+permission denied, timeout, no events, malformed events, actor/session mismatch, and no completed
+turns. DynamoDB distinguishes not configured, permission denied, query failure, no items,
+actor/conversation mismatch, and no completed turns. DynamoDB fallback remains an
+exact-conversation GSI query and validates actor and conversation identity before returning data.
+
+Every normal doubt-solver request now loads a maximum of two completed turns before the final
+conversation-relation decision. AgentCore Memory remains primary; empty, unavailable, malformed,
+or rejected Memory results use the exact-conversation DynamoDB fallback. Context availability is
+separate from relevance, so independent requests discard fetched history and inject no
+conversation context.
+
+`ConversationRelation` records independent, follow-up, continuation, correction, clarification,
+regeneration, or ambiguous decisions with confidence, source, matched signals, and referenced
+turn. Selection combines explicit references, English/Hindi/Hinglish typo-tolerant assistant-action
+signals, bounded numeric/entity overlap, substantive academic-concept overlap, ambiguity margin,
+and recency across the latest two turns. Generic action words cannot bind a self-contained new topic
+to unrelated history. Formula symbols and named concepts are rendered naturally in the standalone
+resolution. Academic subject and intent classification runs on the resolved query. Unresolved
+contextual input returns clarification before academic classification or generation and is excluded
+from persistence.
+
+AgentCore Memory and DynamoDB transport exceptions are normalized into typed, content-free
+failures. Memory transport failure proceeds to DynamoDB; DynamoDB transport failure returns a
+controlled unavailable-context result rather than escaping the boundary.
+
+The readable local log records Memory and DynamoDB attempts, statuses, counts, returned turn IDs,
+latencies, relation, selection, and resolution. Preview mode bounds each fetched user text to 250
+characters and assistant text to 400 characters. Full mode is local-only. Production forcibly
+disables all content previews. Streaming records one readable generation completion per model
+execution; the separate answer-delivery milestone is structured-only.
+
+## IAM
+
+History access is scoped to its exact table and `ConversationHistoryByConversation` index with
+`GetItem`, `PutItem`, and `Query`. Session access is scoped to its exact table with `GetItem`,
+`PutItem`, and `UpdateItem`. SSM access is scoped to the four exact history/session parameters.
+There is no `dynamodb:*`, wildcard resource, session `Query`, or SQS path.
+The deployed Dev role was also inspected directly and contains exactly
+`bedrock-agentcore:CreateEvent` and `bedrock-agentcore:ListEvents` on the deployed Memory ARN.
+
+## Unchanged boundaries
+
+Public request, JSON, and SSE schemas; retrieval; prompts; language policy; and AgentCore Memory
+resource design are unchanged. No cross-conversation retrieval, summaries, or long-term memory was
+added.
+
+The current compatibility actor seam still uses the validated request `user_id`; binding it to a
+trusted AgentCore/Cognito principal is deferred and is a production release blocker. Live
+actor/session partition checks prove that correctly resolved User A and User B cannot read each
+other's events, but they do not make caller-controlled identity trustworthy. DynamoDB history
+retention/deletion policy is also infrastructure-owned and remains **[NOT VERIFIED]** in this
+runtime change.
+
+## Validation
+
+- Conversation-understanding tests cover the reported percentage typo, English/Hindi/Hinglish
+  variants, numeric selection across two turns, unrelated questions, no-history clarification,
+  streaming generation, persistence, and readable-log ordering.
+- Python Ruff: passed for all changed Python files.
+- AgentCore CDK TypeScript build: passed.
+- AgentCore policy/source-staging synthesis tests: 3 passed.
+- Earlier full-gate counts are superseded by the final gate below.
+- `agentcore validate`: passed.
+- Read-only Dev smoke: all four fixed SSM parameters exist; ConversationHistory,
+  ConversationSession, `ConversationHistoryByConversation`, and `ConversationSessionByUser` are
+  active; an exact-conversation GSI query succeeded.
+- Dev CloudFormation stack `AgentCore-meritRankerTutor-Dev` is `CREATE_COMPLETE`.
+- Dev Memory `meritranker_short_term_memory_dev` is `ACTIVE`, has 30-day expiration, and has no
+  strategies. Runtime is `READY` and its control-plane configuration contains the generated Memory
+  ID.
+- A live Simple Interest request logged History `succeeded`, Session `succeeded`, and Memory
+  `succeeded`; direct content-free inspection found one valid USER/ASSISTANT event with the expected
+  actor, session, and turn token.
+- A controlled Memory timeout used the live exact-conversation DynamoDB GSI and returned
+  `source=dynamodb_fallback`, one usable item.
+- A content-free live `ListEvents` check through `ConversationPersistenceService` returned
+  `source=agentcore_memory`, one usable turn, `dynamodb_status=not_attempted`, and zero history
+  repository calls.
+- Live User A/User B checks returned one own event each and zero events for both guessed
+  cross-user/cross-conversation combinations.
+- Final full Python gate: Ruff passed; pytest 2,255 passed and one credential-gated test skipped.
+- Final deployed Runtime-version-9 smoke used a fresh AgentCore session and conversation
+  `f1d17cf5-dba1-46a5-9008-0795aff15451`. The first percentage request and exact
+  `how did u calculated 75%` follow-up both returned HTTP 200 and `success=true`.
+- The follow-up selected the previous percentage turn and resolved to
+  `Explain how or why the referenced value or result 75% is obtained in: percentage.` Academic
+  classification then returned `subject=math`, `topic=PERCENTAGE`, and
+  `requires_recent_conversation=false`.
+- CloudWatch recorded context load 81 ms, relation and selection stages, resolution 0 ms,
+  generation 7 ms, persistence 87 ms, and total 192 ms for the follow-up.
+- Direct content-free inspection returned `source=agentcore_memory`, two completed pairs,
+  `memory_status=succeeded`, and `dynamodb_status=not_attempted`.
+- An unrelated Rajasthan-capital request in the same conversation remained independent,
+  preserved the submitted query, and returned `requires_recent_conversation=false`.
+- `How did you calculate acceleration from force and mass?` also remained independent after the
+  percentage history, despite its contextual-looking wording.
+- The deployed generator remains `answer_source=mock`; a semantically complete percentage
+  explanation from the real provider remains **[NOT VERIFIED]**.
+
+## Deployment security incident
+
+During the first deployment attempt, the upstream alpha CodeZip packager included `app/.env.local`.
+The runtime failed before creation, and the subsequent in-progress stack was stopped before Runtime
+creation. Both affected S3 asset hashes, their retained object versions, and delete markers were
+permanently removed. The clean artifact was inspected before successful redeployment and contains
+no `.env*` or log files. Credentials that were present in `app/.env.local` at the time of upload
+must still be rotated as a precaution.

@@ -19,9 +19,19 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from schemas.image_input import ImageInput
+
+CanonicalLanguage = Literal["english", "hinglish", "hindi"]
+QualityStatus = Literal["checked", "passed_quality_gate", "failed_quality_gate"]
+_LANGUAGE_ALIASES: dict[str, CanonicalLanguage] = {
+    "en": "english",
+    "english": "english",
+    "hi": "hindi",
+    "hindi": "hindi",
+    "hinglish": "hinglish",
+}
 
 
 def _normalize_retrieval_tags(raw_tags: Any, *, max_tags: int = 10) -> list[str]:
@@ -65,13 +75,23 @@ class DoubtSolverRequest(BaseModel):
         description="Optional image containing the source question.",
     )
     user_id: str = Field(
-        default="local-user",
         min_length=1,
         max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_/-]*(?::[A-Za-z0-9_/-]+)*$",
         description="Caller identifier — used for tracing.",
     )
-    language: Literal["en", "hi", "hinglish"] = Field(
-        default="en",
+    conversation_id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    turn_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    language: CanonicalLanguage = Field(
+        default="english",
         description="Preferred response language.",
     )
     exam_id: str | None = Field(
@@ -93,7 +113,17 @@ class DoubtSolverRequest(BaseModel):
                     "orchestrated graph path.",
     )
 
-    model_config = {"str_strip_whitespace": True}
+    model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
+
+    @field_validator("language", mode="before")
+    @classmethod
+    def _normalize_language(cls, value: Any) -> CanonicalLanguage:
+        if not isinstance(value, str):
+            raise ValueError("language must be a supported string")
+        normalized = _LANGUAGE_ALIASES.get(value.strip().lower())
+        if normalized is None:
+            raise ValueError("language must be english, hinglish, or hindi")
+        return normalized
 
     @model_validator(mode="after")
     def _require_query_or_image(self) -> DoubtSolverRequest:
@@ -191,6 +221,10 @@ class QueryClassification(BaseModel):
         max_length=256,
         description="Concise web search query without personal data (internal only).",
     )
+    requires_recent_conversation: bool = Field(
+        default=False,
+        description="True only when recent completed turns are required to understand the query.",
+    )
 
     @field_validator("retrieval_tags", mode="before")
     @classmethod
@@ -233,6 +267,17 @@ class ResponseContent(BaseModel):
 
     format: Literal["markdown"] = "markdown"
     value: str = Field(min_length=1, max_length=8000)
+
+
+class FinalAnswerResult(BaseModel):
+    """Internal authoritative answer produced before response delivery."""
+
+    model_config = ConfigDict(frozen=True)
+
+    content: str = Field(min_length=1, max_length=8000)
+    quality_status: QualityStatus
+    was_regenerated: bool = False
+    language_compliant: bool
 
 
 class DoubtSolverResponse(BaseModel):
@@ -338,6 +383,7 @@ class DoubtSolverClassification(BaseModel):
     intent: str = Field(default="explain")
     difficulty: str = Field(default="default")
     retrieval_required: bool = Field(default=False)
+    requires_recent_conversation: bool = Field(default=False)
     topic: str | None = Field(
         default=None,
         max_length=256,
@@ -406,11 +452,14 @@ class DoubtSolverFinalResponse(BaseModel):
     status: Literal["completed"] = "completed"
     content: ResponseContent
     answer: str = Field(min_length=1, max_length=8000)
+    final_answer: FinalAnswerResult | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def _project_content_to_answer(self) -> DoubtSolverFinalResponse:
         if self.answer != self.content.value:
             raise ValueError("answer must match content.value")
+        if self.final_answer is not None and self.answer != self.final_answer.content:
+            raise ValueError("answer must match final_answer.content")
         return self
 
 

@@ -16,44 +16,57 @@ from __future__ import annotations
 import main
 
 
+def _doubt_solver_payload(query: str | None = None, **values) -> dict:
+    payload = {
+        "mode": "doubt_solver",
+        "user_id": "local-user",
+        "conversation_id": "conversation-main-routing",
+        "turn_id": "turn-main-routing",
+        **values,
+    }
+    if query is not None:
+        payload["query"] = query
+    return payload
+
+
 class TestDoubtSolverRouting:
     def test_doubt_solver_mode_returns_success(self):
-        payload = {"mode": "doubt_solver", "query": "Explain what ratio means"}
+        payload = _doubt_solver_payload("Explain what ratio means")
         result = main.invoke(payload)
         assert result["success"] is True
         assert result["mode"] == "doubt_solver"
 
     def test_doubt_solver_mode_returns_answer(self):
-        payload = {"mode": "doubt_solver", "query": "Solve this: 2x = 10"}
+        payload = _doubt_solver_payload("Solve this: 2x = 10")
         result = main.invoke(payload)
         assert result["answer"]
         assert len(result["answer"]) > 0
 
     def test_doubt_solver_mode_returns_classification(self):
-        payload = {"mode": "doubt_solver", "query": "Explain the concept of percentage"}
+        payload = _doubt_solver_payload("Explain the concept of percentage")
         result = main.invoke(payload)
         assert "classification" in result
         assert result["classification"] is not None
 
     def test_doubt_solver_mode_returns_request_id(self):
-        payload = {"mode": "doubt_solver", "query": "What is profit margin?"}
+        payload = _doubt_solver_payload("What is profit margin?")
         result = main.invoke(payload)
         assert "request_id" in result
         assert result["request_id"]
 
     def test_doubt_solver_empty_query_returns_error(self):
-        payload = {"mode": "doubt_solver", "query": ""}
+        payload = _doubt_solver_payload("")
         result = main.invoke(payload)
         assert result["success"] is False
         assert "Validation error" in result["answer"]
 
     def test_doubt_solver_missing_query_returns_error(self):
-        payload = {"mode": "doubt_solver"}
+        payload = _doubt_solver_payload()
         result = main.invoke(payload)
         assert result["success"] is False
 
     def test_doubt_solver_invalid_language_returns_error(self):
-        payload = {"mode": "doubt_solver", "query": "What is ratio?", "language": "fr"}
+        payload = _doubt_solver_payload("What is ratio?", language="fr")
         result = main.invoke(payload)
         assert result["success"] is False
 
@@ -93,13 +106,13 @@ class TestDoubtSolverPart4Fields:
     """
 
     def test_response_contains_answer_source(self):
-        payload = {"mode": "doubt_solver", "query": "What is a fraction?"}
+        payload = _doubt_solver_payload("What is a fraction?")
         result = main.invoke(payload)
         assert result["success"] is True
         assert "answer_source" in result
 
     def test_answer_source_is_valid_literal(self):
-        payload = {"mode": "doubt_solver", "query": "Explain the concept of ratio"}
+        payload = _doubt_solver_payload("Explain the concept of ratio")
         result = main.invoke(payload)
         assert result["success"] is True
         assert result["answer_source"] in {"mock", "llm", "fallback"}
@@ -115,7 +128,7 @@ class TestDoubtSolverPart4Fields:
         # Reset the module-level singleton so env var is re-read.
         cfg_module._settings = None
         try:
-            payload = {"mode": "doubt_solver", "query": "Define denominator"}
+            payload = _doubt_solver_payload("Define denominator")
             result = main.invoke(payload)
             assert result["success"] is True
             assert result["answer_source"] == "mock"
@@ -127,26 +140,26 @@ class TestDoubtSolverPart4Fields:
             cfg_module._settings = None
 
     def test_response_contains_is_truncated(self):
-        payload = {"mode": "doubt_solver", "query": "What is HCF?"}
+        payload = _doubt_solver_payload("What is HCF?")
         result = main.invoke(payload)
         assert result["success"] is True
         assert "is_truncated" in result
 
     def test_is_truncated_is_bool(self):
-        payload = {"mode": "doubt_solver", "query": "Explain percentage calculation"}
+        payload = _doubt_solver_payload("Explain percentage calculation")
         result = main.invoke(payload)
         assert result["success"] is True
         assert isinstance(result["is_truncated"], bool)
 
     def test_is_truncated_false_for_short_answer(self):
         """Mock answers are short — is_truncated must be False."""
-        payload = {"mode": "doubt_solver", "query": "What is LCM?"}
+        payload = _doubt_solver_payload("What is LCM?")
         result = main.invoke(payload)
         assert result["success"] is True
         assert result["is_truncated"] is False
 
     def test_needs_review_is_present(self):
-        payload = {"mode": "doubt_solver", "query": "Solve for x: 3x + 5 = 14"}
+        payload = _doubt_solver_payload("Solve for x: 3x + 5 = 14")
         result = main.invoke(payload)
         assert result["success"] is True
         assert "needs_review" in result
@@ -158,7 +171,7 @@ class TestDoubtSolverPart4Fields:
             "success", "request_id", "mode", "answer", "classification",
             "needs_review", "answer_source", "is_truncated",
         }
-        payload = {"mode": "doubt_solver", "query": "What is a prime number?"}
+        payload = _doubt_solver_payload("What is a prime number?")
         result = main.invoke(payload)
         assert result["success"] is True
         missing = required_fields - result.keys()
@@ -168,7 +181,7 @@ class TestDoubtSolverPart4Fields:
         """request_id in response must be a non-empty UUID string."""
         import uuid  # noqa: PLC0415
 
-        payload = {"mode": "doubt_solver", "query": "Explain decimals"}
+        payload = _doubt_solver_payload("Explain decimals")
         result = main.invoke(payload)
         assert result["success"] is True
         # Validate it parses as a UUID (raises ValueError if not)
@@ -177,7 +190,7 @@ class TestDoubtSolverPart4Fields:
 
     def test_classification_has_intent_and_confidence(self):
         """classification sub-object must include intent and confidence."""
-        payload = {"mode": "doubt_solver", "query": "What is simple interest?"}
+        payload = _doubt_solver_payload("What is simple interest?")
         result = main.invoke(payload)
         assert result["success"] is True
         cls = result["classification"]

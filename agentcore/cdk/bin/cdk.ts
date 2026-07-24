@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AgentCoreStack } from '../lib/cdk-stack';
+import { prepareRuntimeSources } from '../lib/runtime-source';
 import { ConfigIO, type AwsDeploymentTarget } from '@aws/agentcore-cdk';
 import { App, type Environment } from 'aws-cdk-lib';
 import * as path from 'path';
@@ -26,6 +27,7 @@ async function main() {
   const configIO = new ConfigIO({ baseDir: configRoot });
 
   const spec = await configIO.readProjectSpec();
+  const deploymentSpec = prepareRuntimeSources(spec, configRoot);
   const targets = await configIO.readAWSDeploymentTargets();
 
   // Extract MCP configuration from project spec.
@@ -58,7 +60,7 @@ async function main() {
 
   for (const target of targets) {
     const env = toEnvironment(target);
-    const stackName = toStackName(spec.name, target.name);
+    const stackName = toStackName(deploymentSpec.name, target.name);
 
     // Extract credentials from deployed state for this target
     const targetState = (deployedState as Record<string, unknown>)?.targets as
@@ -70,13 +72,14 @@ async function main() {
       | undefined;
 
     new AgentCoreStack(app, stackName, {
-      spec,
+      spec: deploymentSpec,
+      deploymentEnvironment: target.name,
       mcpSpec,
       credentials,
       env,
       description: `AgentCore stack for ${spec.name} deployed to ${target.name} (${target.region})`,
       tags: {
-        'agentcore:project-name': spec.name,
+        'agentcore:project-name': deploymentSpec.name,
         'agentcore:target-name': target.name,
       },
     });

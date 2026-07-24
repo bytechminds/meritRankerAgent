@@ -280,7 +280,7 @@ class TestPipelineWithFakeKB:
 
         captured_context: list[str | None] = []
 
-        def _spy_generate(query, classification, context=None):
+        def _spy_generate(query, classification, context=None, **_):
             captured_context.append(context)
             return AnswerOutput(content="Answer.", answer_source="mock", is_truncated=False)
 
@@ -484,6 +484,8 @@ class TestMainInvokeIntegration:
                 "mode": "doubt_solver",
                 "query": "Explain what ratio means",
                 "user_id": "test-user",
+                "conversation_id": "conversation-1",
+                "turn_id": "turn-1",
                 "language": "en",
             }
         )
@@ -498,6 +500,8 @@ class TestMainInvokeIntegration:
                 "mode": "doubt_solver",
                 "query": "Solve: 3x = 9",
                 "user_id": "test-user",
+                "conversation_id": "conversation-1",
+                "turn_id": "turn-2",
             }
         )
         assert result["success"] is True
@@ -509,7 +513,13 @@ class TestMainInvokeIntegration:
         import main  # noqa: PLC0415
 
         result = main.invoke(
-            {"mode": "doubt_solver", "query": "Explain percentage", "user_id": "u1"}
+            {
+                "mode": "doubt_solver",
+                "query": "Explain percentage",
+                "user_id": "u1",
+                "conversation_id": "conversation-1",
+                "turn_id": "turn-3",
+            }
         )
         assert result["used_retrieval"] is False
         assert result["context_used"] is False

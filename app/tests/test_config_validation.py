@@ -32,6 +32,28 @@ def _reset_settings() -> None:
     cfg_module._settings = None
 
 
+def test_local_log_content_supports_full_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "local")
+    monkeypatch.setenv("AGENT_LOCAL_LOG_CONTENT", "full")
+    monkeypatch.setenv("IMAGE_CLASSIFIER_ENABLED", "false")
+    _reset_settings()
+
+    assert cfg_module.get_settings().agent_local_log_content == "full"
+    _reset_settings()
+
+
+def test_production_forces_local_log_content_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AGENT_LOCAL_LOG_CONTENT", "full")
+    monkeypatch.setenv("IMAGE_CLASSIFIER_ENABLED", "false")
+    _reset_settings()
+
+    assert cfg_module.get_settings().agent_local_log_content == "off"
+    _reset_settings()
+
+
 # ---------------------------------------------------------------------------
 # LLM configuration errors
 # ---------------------------------------------------------------------------
