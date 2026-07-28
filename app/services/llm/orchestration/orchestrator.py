@@ -37,6 +37,11 @@ from collections.abc import Callable, Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from config import get_settings
+from observability import (
+    bind_llm_attempt_type,
+    count_generator_calls,
+    current_llm_attempt_type,
+)
 from schemas.doubt_solver import FinalAnswerResult
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, OrchestrationResult
@@ -255,6 +260,7 @@ class LlmOrchestrator:
         self,
         *,
         request_id: str,
+        query: str,
         content: str,
         finish_reason: str | None,
         policy: AnswerCompletionPolicy,
@@ -284,6 +290,7 @@ class LlmOrchestrator:
             subject=route_decision.subject,
             difficulty=route_decision.difficulty,
             intent=route_request.intent,
+            query=query,
             language=route_request.language,
             policy=quality_policy,
         )
@@ -321,6 +328,8 @@ class LlmOrchestrator:
             rewrite_required
             and quality_policy.rewrite_enabled
             and quality_policy.max_rewrite_attempts >= 1
+            and continuation_attempts == 0
+            and max(count_generator_calls(), 1) < 2
         ):
             rewrite_used = True
             rewrite_route = route_decision.model_copy(
@@ -336,10 +345,11 @@ class LlmOrchestrator:
                 draft_answer=working,
             )
             try:
-                rewrite_result = self._model_executor.execute(
-                    route_decision=rewrite_route,
-                    messages=rewrite_messages,
-                )
+                with bind_llm_attempt_type("rewrite"):
+                    rewrite_result = self._model_executor.execute(
+                        route_decision=rewrite_route,
+                        messages=rewrite_messages,
+                    )
             except Exception:  # noqa: BLE001
                 log_answer_quality_rewrite(
                     request_id=request_id,
@@ -369,6 +379,7 @@ class LlmOrchestrator:
                         subject=route_decision.subject,
                         difficulty=route_decision.difficulty,
                         intent=route_request.intent,
+                        query=query,
                         language=route_request.language,
                         policy=quality_policy,
                     )
@@ -419,9 +430,12 @@ class LlmOrchestrator:
             subject=route_decision.subject,
             difficulty=route_decision.difficulty,
             intent=route_request.intent,
+            query=query,
             language=route_request.language,
             policy=quality_policy,
         )
+        if not final_quality.language_compliant:
+            final_content = generation_failure_message(route_request.language)
         return build_final_answer_result(
             content=final_content,
             language=route_request.language,
@@ -513,10 +527,11 @@ class LlmOrchestrator:
 
         # --- 4. Model execution -------------------------------------------
         try:
-            execution_result: ModelExecutionResult = self._model_executor.execute(
-                route_decision=route_decision,
-                messages=messages,
-            )
+            with bind_llm_attempt_type(current_llm_attempt_type()):
+                execution_result: ModelExecutionResult = self._model_executor.execute(
+                    route_decision=route_decision,
+                    messages=messages,
+                )
         except LlmOrchestrationError:
             # Controlled orchestration-layer errors bubble unchanged.
             raise
@@ -538,7 +553,7 @@ class LlmOrchestrator:
             provider=execution_result.provider,
             task_role=route_decision.task_role,
             route_id=route_decision.route_id,
-        ):
+        ) and max(count_generator_calls(), 1) < 2:
             continuation_attempts = 1
             continuation_used = True
             cont_route = route_decision.model_copy(
@@ -555,10 +570,11 @@ class LlmOrchestrator:
                 policy=policy,
             )
             try:
-                cont_result = self._model_executor.execute(
-                    route_decision=cont_route,
-                    messages=cont_messages,
-                )
+                with bind_llm_attempt_type("continuation"):
+                    cont_result = self._model_executor.execute(
+                        route_decision=cont_route,
+                        messages=cont_messages,
+                    )
             except LlmOrchestrationError:
                 raise
             except Exception as exc:
@@ -574,6 +590,7 @@ class LlmOrchestrator:
             if quality_policy.validation_enabled:
                 final_answer = self._finalize_generator_content(
                     request_id=route_request.request_id,
+                    query=query,
                     content=content,
                     finish_reason=finish_reason,
                     policy=policy,
@@ -645,6 +662,10 @@ class LlmOrchestrator:
             finish_reason=finish_reason,
             input_tokens=execution_result.input_tokens,
             output_tokens=execution_result.output_tokens,
+            total_tokens=execution_result.total_tokens,
+            cached_input_tokens=execution_result.cached_input_tokens,
+            reasoning_tokens=execution_result.reasoning_tokens,
+            usage_source=execution_result.usage_source,
             latency_ms=execution_result.latency_ms,
             answer_source=answer_source,
             metadata={},
@@ -717,22 +738,23 @@ class LlmOrchestrator:
         chunk_count = 0
         marker_filter = StreamingMarkerFilter(policy.marker) if is_generator else None
         try:
-            for chunk in self._model_executor.execute_stream(
-                route_decision=route_decision,
-                messages=messages,
-                on_before_fallback=on_before_fallback,
-            ):
-                chunk_count += 1
-                if marker_filter is not None:
-                    clean = marker_filter.feed(chunk)
-                else:
-                    clean = chunk
-                if clean:
-                    if clean.strip():
-                        visible_emitted = True
-                    streamed_parts.append(clean)
-                    if not buffer_for_quality:
-                        yield clean
+            with bind_llm_attempt_type(current_llm_attempt_type()):
+                for chunk in self._model_executor.execute_stream(
+                    route_decision=route_decision,
+                    messages=messages,
+                    on_before_fallback=on_before_fallback,
+                ):
+                    chunk_count += 1
+                    if marker_filter is not None:
+                        clean = marker_filter.feed(chunk)
+                    else:
+                        clean = chunk
+                    if clean:
+                        if clean.strip():
+                            visible_emitted = True
+                        streamed_parts.append(clean)
+                        if not buffer_for_quality:
+                            yield clean
             if marker_filter is not None:
                 tail = marker_filter.flush()
                 if tail:
@@ -777,13 +799,17 @@ class LlmOrchestrator:
                     f"'{route_decision.route_id}'."
                 )
         provider_hint = "mock" if isinstance(self._model_executor, MockModelExecutor) else None
-        if (not visible_emitted or buffer_for_quality) and should_run_continuation(
+        if (
+            (not visible_emitted or buffer_for_quality)
+            and should_run_continuation(
             partial_content,
             finish_reason,
             policy,
             provider=provider_hint,
             task_role=route_decision.task_role,
             route_id=route_decision.route_id,
+            )
+            and max(count_generator_calls(), 1) < 2
         ):
             continuation_attempts = 1
             continuation_used = True
@@ -804,19 +830,20 @@ class LlmOrchestrator:
             )
             cont_filter = StreamingMarkerFilter(policy.marker)
             try:
-                for chunk in self._model_executor.execute_stream(
-                    route_decision=cont_route,
-                    messages=cont_messages,
-                    on_before_fallback=None,
-                ):
-                    chunk_count += 1
-                    clean = cont_filter.feed(chunk)
-                    if clean:
-                        if clean.strip():
-                            visible_emitted = True
-                        streamed_parts.append(clean)
-                        if not buffer_for_quality:
-                            yield clean
+                with bind_llm_attempt_type("continuation"):
+                    for chunk in self._model_executor.execute_stream(
+                        route_decision=cont_route,
+                        messages=cont_messages,
+                        on_before_fallback=None,
+                    ):
+                        chunk_count += 1
+                        clean = cont_filter.feed(chunk)
+                        if clean:
+                            if clean.strip():
+                                visible_emitted = True
+                            streamed_parts.append(clean)
+                            if not buffer_for_quality:
+                                yield clean
                 cont_tail = cont_filter.flush()
                 if cont_tail:
                     if cont_tail.strip():
@@ -840,6 +867,7 @@ class LlmOrchestrator:
             if verify_before_stream and quality_policy.validation_enabled:
                 final_answer = self._finalize_generator_content(
                     request_id=route_request.request_id,
+                    query=query,
                     content=raw_content,
                     finish_reason=finish_reason,
                     policy=policy,

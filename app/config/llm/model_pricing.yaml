@@ -1,0 +1,25 @@
+# Manually reviewed, versioned pricing inputs for local cost estimates.
+# Provider invoices remain authoritative. Add an entry only after the price for
+# the exact provider/model or Azure deployment has been verified.
+
+pricing_version: "2026-07-27-reviewed"
+currency: USD
+models:
+  - provider: openai
+    model_or_deployment: gpt-4.1-mini
+    input_cost_per_million_tokens: 0.40
+    output_cost_per_million_tokens: 1.60
+    cached_input_cost_per_million_tokens: 0.10
+    effective_from: "2026-07-27"
+  - provider: openai
+    model_or_deployment: gpt-4.1
+    input_cost_per_million_tokens: 2.00
+    output_cost_per_million_tokens: 8.00
+    cached_input_cost_per_million_tokens: 0.50
+    effective_from: "2026-07-27"
+  - provider: gemini
+    model_or_deployment: gemini-3.1-flash-lite
+    input_cost_per_million_tokens: 0.25
+    output_cost_per_million_tokens: 1.50
+    cached_input_cost_per_million_tokens: 0.025
+    effective_from: "2026-07-27"

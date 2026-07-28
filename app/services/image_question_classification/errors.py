@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from schemas.llm_usage import ProviderTokenUsage
+
 
 class ImageClassificationError(Exception):
     """Base class for controlled image-classification errors."""
@@ -17,6 +19,15 @@ class ImageReferenceUnavailableError(InvalidImageError):
 
 class ImageProviderError(ImageClassificationError):
     """Base class for provider failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_usage: ProviderTokenUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_usage = provider_usage
 
 
 class ImageProviderTemporaryError(ImageProviderError):

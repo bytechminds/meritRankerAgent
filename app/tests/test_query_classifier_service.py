@@ -24,9 +24,13 @@ import pytest
 from pydantic import ValidationError
 
 import config as cfg_module
+import services.query_classifier_service as classifier_service
+from schemas.conversation import ConversationCandidateCard
 from schemas.doubt_solver import QueryClassification
 from services.query_classifier_service import (
     _CLASSIFIER_ROLE,
+    _build_classifier_input,
+    _classifier_prompt_character_budget,
     _classify_deterministic,
     _load_classifier_prompt,
     apply_classification_policy,
@@ -976,16 +980,17 @@ class TestClassificationSanity:
 
 
 class TestClassifierModelRouting:
-    def test_primary_classifier_uses_safe_gpt_41_mini(self) -> None:
+    def test_primary_classifier_uses_native_gemini_flash_lite(self) -> None:
         from services.llm.orchestration.config_registry import LlmConfigRegistry
 
         reg = LlmConfigRegistry()
-        cfg = reg.model_map["doubt_solver_classifier"]
-        assert cfg.deployment == "gpt-4.1-mini"
-        assert cfg.deployment != "gpt-5.4-mini"
+        cfg = reg.model_map["doubt_solver_classifier_gemini"]
+        assert cfg.provider == "gemini"
+        assert cfg.model_id == "gemini-3.1-flash-lite"
+        assert not cfg.fallback_models
         route = reg.get_route("general", "classifier", "default")
         assert route is not None
-        assert route.model == "doubt_solver_classifier"
+        assert route.model == "doubt_solver_classifier_gemini"
 
     def test_strong_classifier_uses_safe_gpt_41(self) -> None:
         from services.llm.orchestration.config_registry import LlmConfigRegistry
@@ -1006,3 +1011,273 @@ class TestClassifierModelRouting:
         strong = reg.get_route("general", "classifier_strong", "default")
         assert primary is not None and primary.max_tokens == 650
         assert strong is not None and strong.max_tokens == 800
+
+
+def test_incomplete_topic_solve_conflict_invokes_strong_classifier_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    primary = QueryClassification(
+        intent="solve_question",
+        subject="math",
+        confidence=0.96,
+        relation="NEW_QUESTION",
+        requested_action="ANSWER_CURRENT",
+    )
+    strong = QueryClassification(
+        intent="explain_concept",
+        subject="general",
+        confidence=0.95,
+        relation="NEW_QUESTION",
+        requested_action="ANSWER_CURRENT",
+    )
+
+    def classify_once(
+        query: str,
+        _request_id: str | None = None,
+        *,
+        task_role: str,
+        candidate_turn_ids: tuple[str, ...] = (),
+        context_gate: str,
+        **_: object,
+    ) -> QueryClassification:
+        calls.append(task_role)
+        result = primary if task_role == "classifier" else strong
+        return classifier_service._validate_conversation_contract(
+            result,
+            query=query,
+            candidate_turn_ids=candidate_turn_ids,
+            context_gate=context_gate,
+        )
+
+    monkeypatch.setattr(
+        classifier_service,
+        "_classify_with_llm_orchestrated",
+        classify_once,
+    )
+
+    result = classifier_service._classify_with_llm_orchestrated_or_fallback(
+        "acid-water solution",
+        request_id="topic-phrase",
+        context_gate="UNCERTAIN",
+    )
+
+    assert calls == ["classifier", "classifier_strong"]
+    assert result.strong_classifier_used is True
+    assert result.classification.intent == "explain_concept"
+    assert result.classification.relation == "NEW_QUESTION"
+
+
+def test_classifier_prompt_defines_uncertain_topic_phrase_policy() -> None:
+    prompt = _load_classifier_prompt()
+
+    assert "not a numerical problem" in prompt
+    assert "Numeric, percentage, option, or topic overlap by itself" in prompt
+    assert "Do not force a fresh solve" in prompt
+    assert "newest supplied substantive turn" in prompt
+
+
+def test_classifier_base_prompt_is_materially_below_observed_baseline() -> None:
+    prompt = _load_classifier_prompt()
+
+    assert len(prompt) <= 12_000
+    assert len(prompt) <= int(19_085 * 0.75)
+
+
+def test_classifier_prompt_preserves_compaction_and_clarifies_rank_confidence() -> None:
+    prompt = _load_classifier_prompt()
+
+    assert "rank/order and relative positions" in prompt
+    assert "Ordinal rank/order or relative-position counting" in prompt
+    assert "Confidence is routing/classification certainty" in prompt
+    assert "not answer certainty" in prompt
+    assert len(prompt) <= int(9_596 * 1.05)
+
+
+@pytest.mark.parametrize(
+    ("query", "context_gate"),
+    (
+        ("Explain photosynthesis.", "CONTEXT_NOT_NEEDED"),
+        ("Did he introduce any reforms?", "CONTEXT_REQUIRED"),
+        ("Your answer is wrong.", "CONTEXT_REQUIRED"),
+        ("Provide current affairs questions for July 2026.", "CONTEXT_NOT_NEEDED"),
+        ("Give me five similar questions.", "CONTEXT_REQUIRED"),
+        ("yeh percentage kaise nikala?", "CONTEXT_REQUIRED"),
+    ),
+)
+def test_classifier_prompt_budget_covers_required_scenarios(
+    query: str,
+    context_gate: str,
+) -> None:
+    candidates = (
+        "[RECENT_CANDIDATES_UNTRUSTED_DATA]\n"
+        "<candidate turn_id='turn-1'>\n"
+        "question_preview: Explain Akbar's reign.\n"
+        "answer_clue: Akbar introduced administrative and revenue reforms.\n"
+        "subject: general\n"
+        "topic: Mughal history\n"
+        "</candidate>\n"
+        "[/RECENT_CANDIDATES_UNTRUSTED_DATA]"
+        if context_gate != "CONTEXT_NOT_NEEDED"
+        else None
+    )
+
+    budget = _classifier_prompt_character_budget(
+        query=query,
+        conversation_candidates=candidates,
+        context_gate=context_gate,
+    )
+
+    assert budget["total_chars"] <= 13_000
+    assert budget["query_chars"] == len(query)
+    assert budget["candidate_context_chars"] == len(candidates or "")
+
+
+def test_standalone_classifier_input_omits_candidate_placeholder() -> None:
+    classifier_input = _build_classifier_input(
+        "Explain photosynthesis.",
+        conversation_candidates=None,
+        context_gate="CONTEXT_NOT_NEEDED",
+    )
+
+    assert "RECENT_CANDIDATES" not in classifier_input
+    assert "CONTEXT_NOT_NEEDED" in classifier_input
+
+
+def test_strong_classifier_adds_only_compact_rejection_summary() -> None:
+    primary = QueryClassification(
+        intent="explain_concept",
+        subject="general",
+        confidence=0.80,
+        relation="NEW_QUESTION",
+        requested_action="ANSWER_CURRENT",
+    )
+    base = _build_classifier_input(
+        "Explain photosynthesis.",
+        conversation_candidates=None,
+        context_gate="CONTEXT_NOT_NEEDED",
+    )
+    strong = _build_classifier_input(
+        "Explain photosynthesis.",
+        conversation_candidates=None,
+        context_gate="CONTEXT_NOT_NEEDED",
+        primary_result=primary,
+        conflict_reason="primary_low_confidence",
+    )
+
+    assert len(strong) - len(base) < 400
+    assert "PRIMARY_CLASSIFIER_RESULT_REJECTED" in strong
+
+
+def test_generic_resolve_rejects_an_older_selected_turn() -> None:
+    classification = QueryClassification(
+        intent="solve_question",
+        subject="math",
+        confidence=0.95,
+        relation="RESOLVE_AGAIN",
+        selected_turn_id="older-turn",
+        requested_action="RESOLVE_FROM_SCRATCH",
+    )
+
+    with pytest.raises(
+        classifier_service.ConversationClassificationConflict,
+        match="generic_latest_reference_selected_older_turn",
+    ):
+        classifier_service._validate_conversation_contract(
+            classification,
+            query="Again wrong, solve it from scratch.",
+            candidate_turn_ids=("older-turn", "latest-turn"),
+            context_gate="CONTEXT_REQUIRED",
+        )
+
+
+def test_short_correction_phrase_may_keep_solve_intent() -> None:
+    classification = QueryClassification(
+        intent="solve_question",
+        subject="math",
+        confidence=0.95,
+        relation="CORRECTION",
+        selected_turn_id="latest-turn",
+        requested_action="VERIFY_AND_CORRECT",
+    )
+
+    result = classifier_service._validate_conversation_contract(
+        classification,
+        query="Your answer is wrong.",
+        candidate_turn_ids=("latest-turn",),
+        context_gate="CONTEXT_REQUIRED",
+    )
+
+    assert result.intent == "solve_question"
+    assert result.relation == "CORRECTION"
+
+
+def test_generic_resolve_accepts_newest_hygienic_turn_despite_reference_scoring() -> None:
+    card = ConversationCandidateCard(
+        turn_id="latest-turn",
+        question_preview="Solve 2x + 5 = 15.",
+        answer_clue="Subtract 5 and divide by 2 to obtain x = 5.",
+        subject="math",
+        topic="Algebra",
+        difficulty="basic",
+    )
+    classification = QueryClassification(
+        intent="solve_question",
+        subject="math",
+        confidence=0.93,
+        relation="RESOLVE_AGAIN",
+        selected_turn_id=card.turn_id,
+        requested_action="RESOLVE_FROM_SCRATCH",
+    )
+
+    result = classifier_service._validate_conversation_contract(
+        classification,
+        query="The previous answer is wrong; solve again from scratch.",
+        candidate_cards=(card,),
+        candidate_turn_ids=(card.turn_id,),
+        context_gate="CONTEXT_REQUIRED",
+    )
+
+    assert result.relation == "RESOLVE_AGAIN"
+    assert result.selected_turn_id == card.turn_id
+    assert result.requested_action == "RESOLVE_FROM_SCRATCH"
+
+
+def test_deterministic_failure_fallback_keeps_clear_correction_on_latest_turn() -> None:
+    result = classifier_service._deterministic_classifier_fallback(
+        "Your answer is wrong.",
+        strong_classifier_used=True,
+        context_gate="CONTEXT_REQUIRED",
+        candidate_turn_ids=("older-turn", "latest-turn"),
+    )
+
+    assert result.strong_classifier_used is True
+    assert result.classification.relation == "CORRECTION"
+    assert result.classification.requested_action == "VERIFY_AND_CORRECT"
+    assert result.classification.selected_turn_id == "latest-turn"
+
+
+def test_deterministic_failure_fallback_keeps_clear_required_follow_up() -> None:
+    result = classifier_service._deterministic_classifier_fallback(
+        "Highlight the water-acid solution.",
+        strong_classifier_used=True,
+        context_gate="CONTEXT_REQUIRED",
+        candidate_turn_ids=("older-turn", "latest-turn"),
+    )
+
+    assert result.classification.relation == "FOLLOW_UP"
+    assert result.classification.requested_action == "EXPLAIN_PREVIOUS"
+    assert result.classification.selected_turn_id == "latest-turn"
+
+
+def test_deterministic_failure_fallback_clarifies_uncertain_topic_phrase() -> None:
+    result = classifier_service._deterministic_classifier_fallback(
+        "water acid solution",
+        strong_classifier_used=True,
+        context_gate="UNCERTAIN",
+        candidate_turn_ids=("candidate-turn",),
+    )
+
+    assert result.classification.relation == "AMBIGUOUS"
+    assert result.classification.requested_action == "ASK_CLARIFICATION"
+    assert result.classification.selected_turn_id is None

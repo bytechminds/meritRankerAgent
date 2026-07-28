@@ -14,7 +14,12 @@ from services.llm.orchestration.errors import (
     ModelExecutionConfigError,
 )
 
-_SUPPORTED_PROVIDER_OPTIONS: frozenset[str] = frozenset({"thinking", "stream"})
+_SUPPORTED_PROVIDER_OPTIONS: frozenset[str] = frozenset(
+    {"thinking", "stream", "reasoning_effort"}
+)
+_SUPPORTED_REASONING_EFFORTS: frozenset[str] = frozenset(
+    {"low", "medium", "high"}
+)
 
 
 class ModelConfigResolver:
@@ -89,6 +94,22 @@ class ModelConfigResolver:
             raise ModelExecutionConfigError(
                 f"Provider option 'stream' must be a boolean for model '{model_alias}'."
             )
+
+        reasoning_effort = provider_options.get("reasoning_effort")
+        if reasoning_effort is not None:
+            if (
+                not isinstance(reasoning_effort, str)
+                or reasoning_effort not in _SUPPORTED_REASONING_EFFORTS
+            ):
+                raise ModelExecutionConfigError(
+                    "Provider option 'reasoning_effort' must be one of "
+                    f"{sorted(_SUPPORTED_REASONING_EFFORTS)} for model '{model_alias}'."
+                )
+            if not model_config.supports_reasoning:
+                raise ModelExecutionConfigError(
+                    f"Model '{model_alias}' does not support provider option "
+                    "'reasoning_effort'."
+                )
 
     def _resolve_model_config(self, model_alias: str) -> ModelConfig:
         model_config = self._registry.get_model(model_alias)

@@ -77,6 +77,26 @@ def test_adaptive_policy_requires_verified_replay_for_uncertain_image() -> None:
     assert "image_uncertain" in decision.reason_codes
 
 
+def test_non_english_streams_are_verified_before_any_answer_chunk() -> None:
+    for language in ("hindi", "hinglish"):
+        decision = _adaptive_policy().decide(_signals(language=language))
+
+        assert decision.strategy == "verified_replay"
+        assert decision.reason_codes == ("language_verification_required",)
+
+
+def test_always_live_does_not_bypass_non_english_language_verification() -> None:
+    policy = AnswerDeliveryPolicy(
+        mode="always_live",
+        min_classifier_confidence=0.0,
+        min_image_confidence=0.0,
+        min_pattern_confidence=0.0,
+        max_live_difficulty="advanced",
+    )
+
+    assert policy.decide(_signals(language="hindi")).strategy == "verified_replay"
+
+
 def test_adaptive_policy_requires_runtime_ready_retrieval_for_live_delivery() -> None:
     decision = _adaptive_policy().decide(
         _signals(
@@ -108,6 +128,10 @@ def test_explicit_policy_modes_are_deterministic() -> None:
 
     assert always_verified.decide(_signals()).strategy == "verified_replay"
     assert always_live.decide(_signals(classifier_fallback=True)).strategy == "live_stream"
+    assert (
+        always_live.decide(_signals(current_fact_dependency=True)).strategy
+        == "verified_replay"
+    )
 
 
 def test_markdown_replay_keeps_protected_blocks_whole() -> None:

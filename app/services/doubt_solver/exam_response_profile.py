@@ -1,4 +1,4 @@
-"""Cached deterministic resolver for compact exam response guidance."""
+"""Cached deterministic resolver for compact exam-response category guidance."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from pydantic import ValidationError
 
 from schemas.exam_response_profiles import (
     ExamResponseProfilesConfig,
+    ResolutionProvenance,
     ResolvedExamResponseProfile,
+    ResponseCategory,
     build_compact_instruction,
     normalize_profile_id,
 )
@@ -41,8 +43,8 @@ class ExamResponseProfileResolver:
         self._config = self._load_config(self._config_path)
         self._exam_to_family = {
             exam: family
-            for family, exams in self._config.exam_mappings.items()
-            for exam in exams
+            for family, mapping in self._config.family_mappings.items()
+            for exam in mapping.exams
         }
 
     @property
@@ -63,7 +65,7 @@ class ExamResponseProfileResolver:
 
         if normalized_exam is None:
             canonical_exam = None
-            family = self._config.fallback_family
+            family = None
             source = "missing_fallback"
             fallback_used = True
         else:
@@ -74,28 +76,41 @@ class ExamResponseProfileResolver:
             family = self._exam_to_family.get(canonical_exam)
             if family is None:
                 canonical_exam = None
-                family = self._config.fallback_family
                 source = "unknown_fallback"
                 fallback_used = True
             else:
                 source = "alias" if alias_applied else "canonical"
 
-        family_response = self._config.families[family].response
-        exam_override = (
-            self._config.exam_overrides.get(canonical_exam)
-            if canonical_exam is not None and not fallback_used
-            else None
-        )
-        stage_override = (
-            self._config.stage_overrides.get(canonical_exam, {}).get(normalized_stage)
-            if canonical_exam is not None and normalized_stage is not None and not fallback_used
-            else None
-        )
+        category: ResponseCategory = self._config.default_category
+        optional_override: str | None = None
+        provenance: ResolutionProvenance = "default"
+        if canonical_exam is not None and family is not None:
+            category = self._config.family_mappings[family].category
+            provenance = "family"
+            mapping = self._config.exam_mappings.get(canonical_exam)
+            if mapping is not None:
+                if mapping.category is not None:
+                    category = mapping.category
+                optional_override = mapping.append_guide
+                if mapping.category is not None or mapping.append_guide is not None:
+                    provenance = "exam"
+                stage_mapping = (
+                    mapping.stage_overrides.get(normalized_stage)
+                    if normalized_stage is not None
+                    else None
+                )
+                if stage_mapping is not None:
+                    if stage_mapping.category is not None:
+                        category = stage_mapping.category
+                    if stage_mapping.append_guide is not None:
+                        optional_override = stage_mapping.append_guide
+                    provenance = "exam_stage"
+
+        category_guide = self._config.categories[category].guide
         compact_instruction = build_compact_instruction(
             [
-                part
-                for part in (family_response, exam_override, stage_override)
-                if part is not None
+                category_guide,
+                *([optional_override] if optional_override else []),
             ]
         )
         if len(compact_instruction) > self._config.limits.max_resolved_context_chars:
@@ -108,32 +123,31 @@ class ExamResponseProfileResolver:
             canonical_exam_id=canonical_exam,
             exam_family=family,
             stage=normalized_stage,
-            family_response=family_response,
-            exam_override=exam_override,
-            stage_override=stage_override,
+            response_category=category,
+            category_guide=category_guide,
+            optional_override=optional_override,
             compact_instruction=compact_instruction,
-            override_applied=exam_override is not None or stage_override is not None,
+            provenance=provenance,
             alias_applied=alias_applied,
-            exam_override_applied=exam_override is not None,
-            stage_override_applied=stage_override is not None,
             fallback_used=fallback_used,
             source=source,
-            version=self._config.version,
+            schema_version=self._config.schema_version,
         )
         logger.debug(
             "exam_response_profile_resolved request_id=%s canonical_exam_id=%s "
-            "exam_family=%s stage=%s alias_applied=%s exam_override_applied=%s "
-            "stage_override_applied=%s compact_instruction_chars=%d "
-            "profile_version=%d fallback_used=%s",
+            "exam_family=%s stage=%s response_category=%s provenance=%s "
+            "alias_applied=%s optional_override_applied=%s "
+            "compact_instruction_chars=%d profile_schema_version=%d fallback_used=%s",
             request_id,
             result.canonical_exam_id or "",
-            result.exam_family,
+            result.exam_family or "",
             result.stage or "",
+            result.response_category,
+            result.provenance,
             result.alias_applied,
-            result.exam_override_applied,
-            result.stage_override_applied,
+            result.optional_override is not None,
             len(result.compact_instruction),
-            result.version,
+            result.schema_version,
             result.fallback_used,
         )
         return result
@@ -161,8 +175,7 @@ class ExamResponseProfileResolver:
             return ExamResponseProfilesConfig.model_validate(raw)
         except ValidationError as exc:
             details = "; ".join(
-                f"{'.'.join(str(part) for part in error['loc']) or 'config'}: "
-                f"{error['msg']}"
+                f"{'.'.join(str(part) for part in error['loc']) or 'config'}: {error['msg']}"
                 for error in exc.errors(include_input=False)[:5]
             )
             raise ExamResponseProfileConfigError(

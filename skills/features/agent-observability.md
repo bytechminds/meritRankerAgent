@@ -5,6 +5,84 @@
 Implemented locally. AgentCore runtime export, CloudWatch log delivery, custom span visibility, and
 production volume/cost remain **[NOT VERIFIED]** until deployment.
 
+## Runtime Model and Web-Search Diagnostics (2026-07-27)
+
+The existing event pipeline now records actual configuration-resolved task role, provider,
+deployment/model, fallback use, and duration for primary classifier, strong classifier, generator,
+and image classification. It also records a web-search decision on every request, provider
+execution attempts/candidates/selected-source quality/context size, and final grounding status.
+
+The readable request block renders `RUNTIME MODELS`, `WEB SEARCH`, and `GROUNDING` sections.
+`GROUNDING=grounded` is emitted only after required-web output cites selected source URLs and passes
+the bounded current-affairs practice cardinality check. Provider success or context delivery alone
+is not reported as final grounding. Full prompts, search queries, response bodies, raw provider
+payloads, endpoint URLs, credentials, and private conversation content remain excluded.
+
+## LLM Token and Cost Observability (2026-07-27)
+
+Every production LLM invocation now passes through one request-scoped usage collector. The
+orchestrated provider-executor boundary records primary, fallback, continuation, rewrite, and
+verified-replay repair calls;
+the legacy role router records its provider calls; and the image-classification service records
+each Gemini attempt without adding a provider request. Cached image results correctly add no model
+call. Planner usage remains zero because the LLM Planner policy is still disabled.
+
+Provider adapters normalize OpenAI/Azure/OpenAI-compatible prompt, completion, total, cached-input,
+and reasoning counters. Gemini extraction supports native usage metadata and the OpenAI-compatible
+shape. Bedrock Converse and ConverseStream metadata have a tested normalizer, but the current
+runtime has no Bedrock text-generation call to attach it to. Titan query embedding remains outside
+LLM-generation totals, as do Tavily, S3 Vector, ColBERT, DynamoDB, and AgentCore Memory.
+
+Streaming OpenAI and Azure requests ask the provider for terminal usage, continue yielding answer
+chunks without waiting for telemetry, and record the final counters when the stream ends.
+Cancellation records `status=cancelled`; absent terminal metadata remains
+`usage_source=unavailable`. Image-classifier records created before the SSE response are copied
+into the stream-owned collector so one terminal request aggregate covers both image extraction and
+generation. The transfer is retained intentionally: the AgentCore invocation scope finishes before
+the lazy SSE iterator is consumed, so replacing it would require an SSE lifecycle redesign or
+unsafe global state.
+
+Each call emits a content-free `llm_call_usage` event and one concise `LLM CALL` line containing
+role, provider, actual configured model/deployment, attempt, token counters, estimated cost,
+duration, and status. The terminal `llm_usage_summary` event and `LLM USAGE SUMMARY` line contain
+exact call/token totals and a role breakdown in the typed summary. Failed and retried calls are
+included. Unknown usage is never fabricated, and a missing call cost makes
+`cost_complete=false` instead of silently contributing zero.
+
+Pricing is loaded once from `app/config/llm/model_pricing.yaml` through a typed, cached loader.
+Entries are exact provider plus model/deployment matches and carry an effective date and root
+`pricing_version`. Reviewed standard rates are configured for native OpenAI `gpt-4.1-mini` and
+`gpt-4.1`, and Gemini Developer API `gemini-3.1-flash-lite`. Azure OpenAI remains unavailable:
+Microsoft publishes different Global, Data Zone, Regional, Batch, provisioned, and
+agreement-sensitive meters, while this runtime does not identify the deployed SKU or commercial
+rate. The application therefore does not guess an Azure estimate. Estimated cost uses regular
+input, separately priced cached input when configured, and output tokens; reasoning tokens are
+included in provider output-token billing. Provider invoices remain authoritative.
+
+Usage extraction, pricing, recording, log emission, and aggregation are all fail-open. Telemetry
+failures emit only bounded exception types and cannot retry a model, fail a student response,
+change quality/persistence decisions, or alter JSON/SSE contracts. The safe event filter allows
+only the five numeric token-count keys and continues rejecting prompts, answers, response content,
+credentials, generic token/secret fields, endpoints, images, and private context.
+
+The simplification audit retained the generic OpenAI/Gemini/Bedrock pure extractors, centralized
+provider-execution recording, optional cached/reasoning counters, and concise readable/structured
+events. It found no provider-response copying, local tokenization, synchronous remote telemetry,
+database write, per-call pricing file read, or duplicate usage record. Inactive Bedrock support is
+only a small tested normalizer and adds no monitoring-only orchestration.
+
+Classifier decision logs now distinguish `PRIMARY_ACCEPTED`, schema/provider failures, low material
+confidence, and routing-critical conflicts. The primary line includes schema validity, confidence,
+subject, intent, difficulty, relation, action, web-demand flag, and material-conflict count. The
+strong line includes only trigger, typed reason, primary confidence, and material field names.
+Classifier JSON, prompt, query, candidates, and response content remain excluded.
+
+Measured over 20,000 local iterations: OpenAI usage extraction 4.612 microseconds, pricing 0.536
+microseconds, four-call aggregation 21.943 microseconds, call log formatting with a no-op safe event
+sink 1.128 microseconds, and total record construction/pricing/logging 6.358 microseconds per call.
+These measurements exclude provider latency and are negligible beside observed multi-second model
+calls.
+
 ## Architecture
 
 All new logging and tracing code is isolated under `app/observability/`. The historical
@@ -56,6 +134,14 @@ persistence completion/skip/failure. Unknown event names are rejected.
 Detail keys containing prompt, query, answer, content, message, image, payload, raw, secret, token,
 credential, authorization, API key, or conversation context are removed before serialization.
 String metadata is single-line and capped.
+
+Conversation diagnostics render `CONVERSATION UNDERSTANDING`, `CONTEXT CANDIDATES`,
+`MEMORY HYGIENE`, and selected-context information in the local readable log. Structured events
+include the deterministic gate decision, context source/attempts, fetched/eligible/rejected counts,
+candidate count/size, relation, requested action, validated selected turn ID, context policy, and
+selected-context size. Prompt, full question, full answer, image bytes, and raw classifier output
+remain excluded from structured telemetry. Bounded content previews remain local-only and are
+forcibly disabled in production.
 
 The readable local block includes the full bounded trace ID for CloudWatch/OTEL correlation.
 Failures include only actionable safe evidence: stage, bounded error code, exception class,
@@ -245,7 +331,7 @@ AWS references:
 
 ## Unchanged Boundaries
 
-Public JSON/SSE schemas, graph topology, prompts, route selection, model/provider behavior,
+Public JSON/SSE schemas, graph topology, image/generator prompts, route selection, model/provider behavior,
 retrieval, retry counts, fallback policies, quality decisions, persistence eligibility, and
 frontend behavior are unchanged. No provider call, AWS call, extra model call, database write, or
 new log group was added by observability.
@@ -270,7 +356,7 @@ once per process; it causes no per-request Git, SSM, or provider calls.
 
 ## Validation
 
-- Full test suite: 2,210 passed, 1 credential-gated test skipped, 2 pre-existing warnings.
+- Full test suite: 2,454 passed, 1 credential-gated test skipped, 2 pre-existing warnings.
 - Readable-log and observability focused suites: 49 passed.
 - Streaming, lifecycle, conversation, entrypoint, and observability integration suites: 267 passed.
 - `agentcore validate`: valid.
@@ -282,3 +368,20 @@ once per process; it causes no per-request Git, SSM, or provider calls.
   active reload child, commit, environment, Region, and independent persistence readiness.
 - Deployed CloudWatch delivery, Transaction Search, and custom span export remain
   **[NOT VERIFIED]** until runtime deployment and AWS console verification.
+
+## 2026-07-28 readable LLM and retrieval evidence
+
+- Readable request blocks now render every `llm_call_usage` event with role, provider, model,
+  attempt, tokens, estimated cost, duration, and status.
+- The request usage line includes total calls/tokens/cost plus generator, rewrite/repair, and
+  correctness-verifier call counts.
+- Primary classifier confidence, acceptance, strong-trigger decision, and reason are rendered from
+  the existing materiality decision.
+- Intentional direct solving renders `Retrieval policy: fresh_solve` and
+  `External context selected: none`; it no longer emits a fallback warning. Actual required
+  retrieval failures remain warnings.
+- Answer-quality validation renders
+  `QUALITY_DECISION passed=<bool> reason_code=<codes|none> repair_required=<bool>`.
+- Azure responses that fail content extraction retain provider-reported token usage when the
+  provider supplied it; truly absent usage remains `unavailable` and cannot change verifier
+  success or failure.

@@ -1,50 +1,170 @@
-version: 1
-fallbackFamily: GENERAL_GOVT
+schemaVersion: 2
+defaultCategory: STANDARD_OBJECTIVE
 
 limits:
-  maxFamilyResponseChars: 190
-  maxExamOverrideChars: 120
-  maxStageOverrideChars: 120
+  maxCategoryGuideChars: 190
+  maxAppendGuideChars: 90
   maxResolvedContextChars: 260
 
-families:
-  GENERAL_GOVT:
-    response: "Answer directly with only the explanation needed for correctness and highly relevant exam facts."
-  RAILWAY_BASIC:
-    response: "Use simple language, direct formulas or rules, and essential steps; avoid advanced tricks."
+categories:
+  BASIC_OBJECTIVE:
+    guide: >-
+      Answer directly in simple language with essential steps or facts.
+      Add one useful fact or common mistake.
+  STANDARD_OBJECTIVE:
+    guide: >-
+      Give a concise, complete explanation with an efficient method,
+      useful rule, shortcut, or related fact.
+  ANALYTICAL_OBJECTIVE:
+    guide: >-
+      Preserve every condition, explain the decisive logic, and use the fastest fully reliable method.
+      Note one trap.
+  CONCEPTUAL_OBJECTIVE:
+    guide: >-
+      Explain the core concept, key distinctions, and essential background.
+      Add one useful fact or elimination clue.
+  DESCRIPTIVE_ANALYTICAL:
+    guide: >-
+      Give conceptual depth and balanced analysis.
+      Connect relevant dimensions, causes, effects, examples, and current relevance.
+  PEDAGOGY_CONCEPTUAL:
+    guide: >-
+      Explain the principle clearly and connect it to practical teaching
+      or classroom application when relevant.
+  TECHNICAL_PROBLEM_SOLVING:
+    guide: >-
+      State the governing concept or formula and show verifiable working,
+      including necessary assumptions and conditions.
+  ADVANCED_APTITUDE:
+    guide: >-
+      Use compact analytical reasoning and the shortest reliable approach,
+      focusing on constraints, interpretation, and elimination.
+
+familyMappings:
   SSC:
-    response: "Use concise exam-focused explanations and only validated shortcuts or elimination that materially help."
-  BANKING_OBJECTIVE:
-    response: "Use quick, clear methods for timed objective questions; keep arithmetic and reasoning verifiable."
-  BANKING_ANALYTICAL:
-    response: "Use efficient structured reasoning, preserve material constraints, and use only fully valid shortcuts."
-  REGULATORY_INSURANCE:
-    response: "Prioritize precise concepts, relevant domain terms, and analytical reasoning; avoid generic tricks."
-  UPSC_PSC:
-    response: "Prioritize conceptual accuracy, key distinctions, and directly relevant context; avoid shallow shortcuts."
-  TEACHING:
-    response: "Explain the governing concept or pedagogical rule clearly, then apply it briefly."
-  DEFENCE:
-    response: "Use direct explanations and reliable elimination when useful; preserve factual and numerical precision."
+    category: STANDARD_OBJECTIVE
+    exams: [SSC_CGL, SSC_CHSL, SSC_MTS, SSC_GD, SSC_CPO, SSC_STENOGRAPHER, SSC_SELECTION_POST]
+  BANKING:
+    category: STANDARD_OBJECTIVE
+    exams:
+      - IBPS_CSA
+      - IBPS_RRB_OFFICE_ASSISTANT
+      - SBI_JUNIOR_ASSOCIATE
+      - RBI_ASSISTANT
+      - IBPS_PO
+      - IBPS_SO
+      - IBPS_RRB_OFFICER_SCALE_I
+      - IBPS_RRB_OFFICER_SCALE_II
+      - IBPS_RRB_OFFICER_SCALE_III
+      - SBI_PO
+      - SBI_SO
+      - RBI_GRADE_B
+      - NABARD_GRADE_A
+      - NABARD_GRADE_B
+      - SEBI_GRADE_A
+      - SIDBI_GRADE_A
+      - SIDBI_GRADE_B
+  RAILWAY:
+    category: BASIC_OBJECTIVE
+    exams: [RRB_GROUP_D, RRB_NTPC, RRB_ALP, RRB_TECHNICIAN, RPF_CONSTABLE, RPF_SI]
+  UPSC:
+    category: CONCEPTUAL_OBJECTIVE
+    exams: [UPSC_CSE]
+  STATE_PSC:
+    category: CONCEPTUAL_OBJECTIVE
+    exams:
+      - STATE_PSC
+      - UPPSC_PCS
+      - BPSC_CCE
+      - RPSC_RAS
+      - MPPSC_STATE_SERVICE
+      - MPSC_STATE_SERVICE
+      - WBPSC_WBCS
+      - KPSC_KAS
+      - TNPSC_GROUP_1
+      - APPSC_GROUP_1
+      - TSPSC_GROUP_1
+      - OPSC_OCS
+      - HPSC_HCS
+      - GPSC_CLASS_1_2
   STATE_RECRUITMENT:
-    response: "Use clear practical language and essential steps for objective questions; avoid advanced alternatives."
-  TECHNICAL:
-    response: "Use the correct principle, formula, units, and assumptions; show only steps needed to verify the result."
-  MANAGEMENT_APTITUDE:
-    response: "Use compact analytical reasoning and the fastest reliable approach; mention alternatives only when useful."
+    category: BASIC_OBJECTIVE
+    exams: [UPSSSC_PET, STATE_CET, STATE_GROUP_C, STATE_GROUP_D, PATWARI, LEKHPAL, DSSSB_GENERAL]
+  TEACHING:
+    category: PEDAGOGY_CONCEPTUAL
+    exams: [CTET, STATE_TET, UPTET, REET, KVS_PRT, KVS_TGT, KVS_PGT, NVS_TEACHING, DSSSB_TEACHING]
+  DEFENCE:
+    category: STANDARD_OBJECTIVE
+    exams: [UPSC_NDA, UPSC_CDS, UPSC_CAPF_AC, AFCAT, AGNIVEER_ARMY, AGNIVEER_NAVY, AGNIVEER_AIR_FORCE, INDIAN_COAST_GUARD]
+  POLICE:
+    category: BASIC_OBJECTIVE
+    exams: [STATE_POLICE_CONSTABLE, STATE_POLICE_SI]
+  INSURANCE:
+    category: CONCEPTUAL_OBJECTIVE
+    exams: [IRDAI_ASSISTANT_MANAGER, LIC_AAO, LIC_ADO, NIACL_AO, NIACL_ASSISTANT, UIIC_AO, UIIC_ASSISTANT]
+  MANAGEMENT:
+    category: ADVANCED_APTITUDE
+    exams: [CAT, XAT, CMAT, MAT, SNAP, NMAT]
+  ENGINEERING:
+    category: TECHNICAL_PROBLEM_SOLVING
+    exams: [SSC_JE, RRB_JE, UPSC_ESE, GATE, ISRO_TECHNICAL, DRDO_CEPTAM]
+  MEDICAL:
+    category: CONCEPTUAL_OBJECTIVE
+    exams: []
+  LAW:
+    category: CONCEPTUAL_OBJECTIVE
+    exams: []
 
 examMappings:
-  RAILWAY_BASIC: [RRB_GROUP_D, RRB_NTPC, RRB_ALP, RRB_TECHNICIAN, RPF_CONSTABLE, RPF_SI]
-  SSC: [SSC_CGL, SSC_CHSL, SSC_MTS, SSC_GD, SSC_CPO, SSC_STENOGRAPHER, SSC_SELECTION_POST]
-  BANKING_OBJECTIVE: [IBPS_CSA, IBPS_RRB_OFFICE_ASSISTANT, SBI_JUNIOR_ASSOCIATE, RBI_ASSISTANT]
-  BANKING_ANALYTICAL: [IBPS_PO, IBPS_SO, IBPS_RRB_OFFICER_SCALE_I, IBPS_RRB_OFFICER_SCALE_II, IBPS_RRB_OFFICER_SCALE_III, SBI_PO, SBI_SO]
-  REGULATORY_INSURANCE: [RBI_GRADE_B, NABARD_GRADE_A, NABARD_GRADE_B, SEBI_GRADE_A, SIDBI_GRADE_A, SIDBI_GRADE_B, IRDAI_ASSISTANT_MANAGER, LIC_AAO, LIC_ADO, NIACL_AO, NIACL_ASSISTANT, UIIC_AO, UIIC_ASSISTANT]
-  UPSC_PSC: [UPSC_CSE, STATE_PSC, UPPSC_PCS, BPSC_CCE, RPSC_RAS, MPPSC_STATE_SERVICE, MPSC_STATE_SERVICE, WBPSC_WBCS, KPSC_KAS, TNPSC_GROUP_1, APPSC_GROUP_1, TSPSC_GROUP_1, OPSC_OCS, HPSC_HCS, GPSC_CLASS_1_2]
-  TEACHING: [CTET, STATE_TET, UPTET, REET, KVS_PRT, KVS_TGT, KVS_PGT, NVS_TEACHING, DSSSB_TEACHING]
-  DEFENCE: [UPSC_NDA, UPSC_CDS, UPSC_CAPF_AC, AFCAT, AGNIVEER_ARMY, AGNIVEER_NAVY, AGNIVEER_AIR_FORCE, INDIAN_COAST_GUARD]
-  STATE_RECRUITMENT: [UPSSSC_PET, STATE_CET, STATE_GROUP_C, STATE_GROUP_D, STATE_POLICE_CONSTABLE, STATE_POLICE_SI, PATWARI, LEKHPAL, DSSSB_GENERAL]
-  TECHNICAL: [SSC_JE, RRB_JE, UPSC_ESE, GATE, ISRO_TECHNICAL, DRDO_CEPTAM]
-  MANAGEMENT_APTITUDE: [CAT, XAT, CMAT, MAT, SNAP, NMAT]
+  SSC_MTS:
+    category: BASIC_OBJECTIVE
+  SSC_GD:
+    category: BASIC_OBJECTIVE
+  SSC_CGL:
+    stageOverrides:
+      TIER_2:
+        category: ANALYTICAL_OBJECTIVE
+        appendGuide: "If useful, identify why the obvious longer method is unnecessary."
+  RRB_NTPC:
+    category: STANDARD_OBJECTIVE
+  IBPS_PO:
+    category: ANALYTICAL_OBJECTIVE
+  IBPS_SO:
+    category: ANALYTICAL_OBJECTIVE
+  IBPS_RRB_OFFICER_SCALE_I:
+    category: ANALYTICAL_OBJECTIVE
+  IBPS_RRB_OFFICER_SCALE_II:
+    category: ANALYTICAL_OBJECTIVE
+  IBPS_RRB_OFFICER_SCALE_III:
+    category: ANALYTICAL_OBJECTIVE
+  SBI_PO:
+    category: ANALYTICAL_OBJECTIVE
+  SBI_SO:
+    category: ANALYTICAL_OBJECTIVE
+  RBI_GRADE_B:
+    category: CONCEPTUAL_OBJECTIVE
+  NABARD_GRADE_A:
+    category: CONCEPTUAL_OBJECTIVE
+  NABARD_GRADE_B:
+    category: CONCEPTUAL_OBJECTIVE
+  SEBI_GRADE_A:
+    category: CONCEPTUAL_OBJECTIVE
+  SIDBI_GRADE_A:
+    category: CONCEPTUAL_OBJECTIVE
+  SIDBI_GRADE_B:
+    category: CONCEPTUAL_OBJECTIVE
+  UPSC_CSE:
+    stageOverrides:
+      PRELIMS:
+        category: CONCEPTUAL_OBJECTIVE
+      MAINS:
+        category: DESCRIPTIVE_ANALYTICAL
+  STATE_PSC:
+    stageOverrides:
+      PRELIMS:
+        category: CONCEPTUAL_OBJECTIVE
+      MAINS:
+        category: DESCRIPTIVE_ANALYTICAL
 
 aliases:
   IBPS_CLERK: IBPS_CSA
@@ -55,36 +175,3 @@ aliases:
   NDA: UPSC_NDA
   CDS: UPSC_CDS
   CAPF_AC: UPSC_CAPF_AC
-
-examOverrides:
-  RRB_NTPC: "Allow a validated standard aptitude shortcut when it is clearly faster."
-  SSC_CHSL: "Prefer simple wording and avoid advanced alternative methods."
-  SSC_MTS: "Use very clear wording, direct rules, and minimum necessary steps."
-  SSC_GD: "Keep explanations direct and practical without theoretical expansion."
-  IBPS_SO: "Preserve stream terminology; do not replace domain reasoning with generic shortcuts."
-  SBI_PO: "For multi-condition questions, keep a concise structured method."
-  RBI_GRADE_B: "Distinguish closely related economic and financial concepts when relevant."
-  NABARD_GRADE_A: "Use precise agriculture, rural-development, and economic terms only when relevant."
-  SEBI_GRADE_A: "Use precise market and regulatory concepts; avoid unsupported legal or market claims."
-  UPSC_CSE: "Use accurate distinctions and only directly relevant context."
-  CTET: "For pedagogy, explain the governing learning principle before selecting the answer."
-  KVS_PGT: "Use accurate subject terminology without unnecessary academic expansion."
-  UPSC_NDA: "Keep answers direct and preserve exact numerical, scientific, and factual reasoning."
-  UPSC_CAPF_AC: "Distinguish closely related factual or constitutional options concisely."
-  CAT: "Prioritize interpretation and the fastest reliable path; avoid formula dumping."
-
-stageOverrides:
-  SSC_CGL:
-    TIER_2: "Preserve deeper constraints and show the efficient method when the obvious path is long."
-  IBPS_PO:
-    PRELIMS: "Use the shortest reliable objective method."
-    MAINS: "Preserve all conditions and use compact structured reasoning."
-  SBI_PO:
-    PRELIMS: "Use the shortest reliable objective method."
-    MAINS: "Preserve every condition and state the decisive reasoning briefly."
-  UPSC_CSE:
-    PRELIMS: "Distinguish close options using only relevant verified facts."
-    MAINS: "Use structured conceptual explanation without padding."
-  STATE_PSC:
-    PRELIMS: "Focus on objective elimination or the decisive verified fact."
-    MAINS: "Explain the concept and relevant context in a compact structure."

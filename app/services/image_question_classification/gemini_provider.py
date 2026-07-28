@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from schemas.doubt_solver import (
@@ -25,12 +23,13 @@ from schemas.image_question_classification import (
     VisualContext,
     VisualType,
 )
+from schemas.llm_usage import ProviderTokenUsage
 from services.image_question_classification.errors import (
     ImageProviderResponseError,
     ImageProviderTemporaryError,
 )
+from services.llm.providers.usage import extract_gemini_usage
 
-_GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +95,17 @@ class _GeminiQueryClassification(BaseModel):
     retrieval_need: RetrievalNeed
     reasoning_summary: str
     need_web_search: bool
-    web_search_reason: str
+    web_search_reason: Literal[
+        "",
+        "explicit_latest_request",
+        "current_affairs",
+        "current_economy",
+        "latest_exam_update",
+        "current_event",
+        "user_requested_web",
+        "freshness_required",
+        "none",
+    ]
     web_search_query: str
 
     model_config = {"extra": "forbid"}
@@ -125,83 +134,95 @@ class GeminiImageQuestionClassificationProvider:
         if not api_key:
             raise ValueError("Gemini image-classifier API key is required.")
         self._api_key = api_key
-        self._client_factory = client_factory or OpenAI
+        self._client_factory = client_factory
 
     def classify(self, request: ImageProviderRequest) -> ImageProviderOutput:
-        encoded = base64.b64encode(request.image.content).decode("ascii")
-        data_url = f"data:{request.image.mime_type};base64,{encoded}"
+        from google import genai  # noqa: PLC0415
+        from google.genai import types  # noqa: PLC0415
+
         instruction = request.instruction or "Classify the question shown in the image."
-        client = self._client_factory(
+        client_factory = self._client_factory or genai.Client
+        client = client_factory(
             api_key=self._api_key,
-            base_url=_GEMINI_OPENAI_BASE_URL,
-            timeout=request.timeout_seconds,
-            max_retries=0,
+            http_options=types.HttpOptions(
+                timeout=int(request.timeout_seconds * 1000),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
 
         try:
-            completion = client.beta.chat.completions.parse(
+            response = client.models.generate_content(
                 model=request.model,
-                messages=[
-                    {"role": "system", "content": request.prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": instruction},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    },
+                contents=[
+                    types.Part.from_text(text=instruction),
+                    types.Part.from_bytes(
+                        data=request.image.content,
+                        mime_type=request.image.mime_type,
+                    ),
                 ],
-                response_format=_GeminiImageProviderOutput,
-                temperature=0.0,
-                max_tokens=request.max_output_tokens,
+                config=types.GenerateContentConfig(
+                    system_instruction=request.prompt,
+                    response_mime_type="application/json",
+                    response_schema=_GeminiImageProviderOutput,
+                    temperature=0.0,
+                    max_output_tokens=request.max_output_tokens,
+                ),
             )
-        except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+            message = str(exc).casefold()
+            is_temporary = (
+                status_code == 429
+                or (isinstance(status_code, int) and status_code >= 500)
+                or "timeout" in message
+                or "deadline" in message
+                or "connection" in message
+            )
             logger.warning(
-                "gemini_image_classifier provider_error category=temporary "
-                "error_type=%s model=%s",
+                "gemini_image_classifier provider_error category=%s "
+                "status_code=%s error_type=%s model=%s",
+                "temporary" if is_temporary else "execution",
+                status_code if status_code is not None else "none",
                 type(exc).__name__,
                 request.model,
             )
-            raise ImageProviderTemporaryError("Image provider is temporarily unavailable.") from exc
-        except APIStatusError as exc:
-            logger.warning(
-                "gemini_image_classifier provider_error category=http status_code=%d "
-                "error_type=%s model=%s",
-                exc.status_code,
-                type(exc).__name__,
-                request.model,
-            )
-            if exc.status_code >= 500 or exc.status_code == 429:
+            if is_temporary:
                 raise ImageProviderTemporaryError(
                     "Image provider is temporarily unavailable."
                 ) from exc
             raise ImageProviderResponseError("Image provider rejected the request.") from exc
-        except Exception as exc:
-            logger.warning(
-                "gemini_image_classifier provider_error category=execution "
-                "error_type=%s model=%s",
-                type(exc).__name__,
-                request.model,
-            )
-            raise ImageProviderResponseError("Image provider execution failed safely.") from exc
 
+        provider_usage = extract_gemini_usage(response)
         try:
-            message = completion.choices[0].message
-            parsed = message.parsed
+            parsed = response.parsed
             if parsed is not None:
                 wire_output = _GeminiImageProviderOutput.model_validate(parsed)
-                return self._to_domain_output(wire_output)
-            if message.content:
-                wire_output = _GeminiImageProviderOutput.model_validate_json(message.content)
-                return self._to_domain_output(wire_output)
-        except (AttributeError, IndexError, TypeError, ValidationError, ValueError) as exc:
+                return self._to_domain_output(
+                    wire_output,
+                    provider_usage=provider_usage,
+                )
+            if response.text:
+                wire_output = _GeminiImageProviderOutput.model_validate_json(response.text)
+                return self._to_domain_output(
+                    wire_output,
+                    provider_usage=provider_usage,
+                )
+        except (AttributeError, TypeError, ValidationError, ValueError) as exc:
             raise ImageProviderResponseError(
-                "Image provider returned invalid structured output."
+                "Image provider returned invalid structured output.",
+                provider_usage=provider_usage,
             ) from exc
-        raise ImageProviderResponseError("Image provider returned no structured output.")
+        raise ImageProviderResponseError(
+            "Image provider returned no structured output.",
+            provider_usage=provider_usage,
+        )
 
     @staticmethod
-    def _to_domain_output(wire: _GeminiImageProviderOutput) -> ImageProviderOutput:
+    def _to_domain_output(
+        wire: _GeminiImageProviderOutput,
+        *,
+        provider_usage: ProviderTokenUsage,
+    ) -> ImageProviderOutput:
         visual = wire.image_parse_metadata.visual_context
         metadata = ImageParseMetadata(
             has_question=wire.image_parse_metadata.has_question,
@@ -231,6 +252,7 @@ class GeminiImageQuestionClassificationProvider:
             return ImageProviderOutput(
                 status=wire.status,
                 image_parse_metadata=metadata,
+                provider_usage=provider_usage,
             )
 
         classification = wire.classification
@@ -256,4 +278,5 @@ class GeminiImageQuestionClassificationProvider:
                 web_search_query=classification.web_search_query or None,
             ),
             image_parse_metadata=metadata,
+            provider_usage=provider_usage,
         )

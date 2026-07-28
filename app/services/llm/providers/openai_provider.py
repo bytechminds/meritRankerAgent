@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from openai import OpenAI
 
 from schemas.llm import LlmRequest, LlmResponse, LlmRoleConfig, LlmStreamChunk
+from schemas.llm_usage import ProviderTokenUsage
 from services.llm.providers.base import BaseLlmProvider
 from services.llm.providers.errors import (
     LlmConfigurationError,
@@ -35,6 +36,11 @@ from services.llm.providers.errors import (
     LlmProviderError,
     LlmProviderExecutionError,
     LlmProviderResponseError,
+)
+from services.llm.providers.usage import (
+    clear_stream_usage,
+    extract_openai_usage,
+    set_stream_usage,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +102,7 @@ class OpenAIProvider(BaseLlmProvider):
 
         content = completion.choices[0].message.content or ""
         finish_reason = completion.choices[0].finish_reason
+        usage = extract_openai_usage(completion)
         logger.info(
             "openai_provider.generate  role=%s  model_label=%s — done",
             request.role,
@@ -107,6 +114,11 @@ class OpenAIProvider(BaseLlmProvider):
             model_label=config.model_label,
             content=content,
             finish_reason=finish_reason,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
         )
 
     def stream(self, request: LlmRequest, config: LlmRoleConfig) -> Iterator[LlmStreamChunk]:
@@ -126,6 +138,7 @@ class OpenAIProvider(BaseLlmProvider):
             request.role,
             config.model_label,
         )
+        usage = ProviderTokenUsage()
         try:
             stream = client.chat.completions.create(
                 model=config.model,
@@ -133,8 +146,12 @@ class OpenAIProvider(BaseLlmProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             for chunk in stream:
+                chunk_usage = extract_openai_usage(chunk)
+                if chunk_usage.available:
+                    usage = chunk_usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta.content or ""
@@ -151,6 +168,8 @@ class OpenAIProvider(BaseLlmProvider):
             raise
         except Exception as exc:
             raise LlmGenerationError(f"OpenAI streaming failed: {exc}") from exc
+        finally:
+            set_stream_usage(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -265,15 +284,15 @@ class OpenAIProviderAdapter:
 
         content = self._extract_content(completion, request)
         finish_reason = self._extract_finish_reason(completion)
-        input_tokens, output_tokens = self._extract_usage(completion)
+        usage = extract_openai_usage(completion)
 
         logger.info(
             "openai_provider_adapter.generate  model_alias=%s — done  "
             "finish_reason=%s  input_tokens=%s  output_tokens=%s",
             request.model_resolution.model_alias,
             finish_reason,
-            input_tokens,
-            output_tokens,
+            usage.input_tokens,
+            usage.output_tokens,
         )
 
         return ModelExecutionResult(
@@ -281,8 +300,12 @@ class OpenAIProviderAdapter:
             model=request.route_decision.model,
             provider="openai",
             finish_reason=finish_reason,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            usage_source=("provider_reported" if usage.available else "unavailable"),
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
             },
@@ -316,6 +339,8 @@ class OpenAIProviderAdapter:
             request.model_resolution.model_config.model_label,
         )
 
+        clear_stream_usage()
+        usage = extract_openai_usage(object())
         try:
             stream = client.chat.completions.create(
                 model=model_id,
@@ -323,9 +348,13 @@ class OpenAIProviderAdapter:
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             finish_reason: str | None = None
             for chunk in stream:
+                chunk_usage = extract_openai_usage(chunk)
+                if chunk_usage.available:
+                    usage = chunk_usage
                 if not chunk.choices:
                     continue
                 fr = getattr(chunk.choices[0], "finish_reason", None)
@@ -344,6 +373,8 @@ class OpenAIProviderAdapter:
                 provider="openai",
                 model_alias=request.model_resolution.model_alias,
             ) from exc
+        finally:
+            set_stream_usage(usage)
 
     @staticmethod
     def _extract_content(completion: Any, request: ProviderExecutionRequest) -> str:

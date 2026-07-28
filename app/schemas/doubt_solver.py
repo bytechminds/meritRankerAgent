@@ -145,6 +145,25 @@ ResponseStyle = Literal["step_by_step", "short_answer", "simple_explanation"]
 QueryDifficulty = Literal["default", "basic", "intermediate", "advanced"]
 RetrievalNeed = Literal["none", "concept_context", "similar_question", "unknown"]
 ClassificationSource = Literal["deterministic", "llm", "fallback"]
+ConversationClassificationRelation = Literal[
+    "NEW_QUESTION",
+    "FOLLOW_UP",
+    "CONTINUATION",
+    "CORRECTION",
+    "RESOLVE_AGAIN",
+    "AMBIGUOUS",
+]
+ConversationClassificationAction = Literal[
+    "ANSWER_CURRENT",
+    "ANSWER_WITH_CONTEXT",
+    "EXPLAIN_PREVIOUS",
+    "CONTINUE_PREVIOUS",
+    "GENERATE_SIMILAR",
+    "TRANSFORM_PREVIOUS",
+    "VERIFY_AND_CORRECT",
+    "RESOLVE_FROM_SCRATCH",
+    "ASK_CLARIFICATION",
+]
 
 
 class QueryClassification(BaseModel):
@@ -224,6 +243,19 @@ class QueryClassification(BaseModel):
     requires_recent_conversation: bool = Field(
         default=False,
         description="True only when recent completed turns are required to understand the query.",
+    )
+    relation: ConversationClassificationRelation = Field(
+        default="NEW_QUESTION",
+        description="Conversation relation for the current query.",
+    )
+    selected_turn_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="One supplied recent-turn ID selected by the classifier, or null.",
+    )
+    requested_action: ConversationClassificationAction = Field(
+        default="ANSWER_CURRENT",
+        description="Generation behavior requested by the current query.",
     )
 
     @field_validator("retrieval_tags", mode="before")

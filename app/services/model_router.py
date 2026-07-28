@@ -20,14 +20,18 @@ Rules:
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 
+from observability import current_request_context, record_llm_call
 from schemas.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
+from schemas.llm_usage import ProviderTokenUsage, UsageStatus
 from services.llm.providers.azure_openai_provider import AzureOpenAIProvider
 from services.llm.providers.base import BaseLlmProvider
 from services.llm.providers.errors import LlmConfigurationError
 from services.llm.providers.mock_provider import MockProvider
 from services.llm.providers.openai_provider import OpenAIProvider
+from services.llm.providers.usage import clear_stream_usage, consume_stream_usage
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +107,35 @@ def generate(
         config.provider,
         config.model_label,
     )
-    return provider.generate(request, config)
+    started_at = time.monotonic()
+    try:
+        response = provider.generate(request, config)
+    except Exception as exc:
+        _record_usage(
+            role=role,
+            config=config,
+            usage=ProviderTokenUsage(),
+            started_at=started_at,
+            streaming=False,
+            status="failed",
+            error_type=type(exc).__name__,
+        )
+        raise
+    _record_usage(
+        role=role,
+        config=config,
+        usage=ProviderTokenUsage(
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            total_tokens=response.total_tokens,
+            cached_input_tokens=response.cached_input_tokens,
+            reasoning_tokens=response.reasoning_tokens,
+        ),
+        started_at=started_at,
+        streaming=False,
+        status="succeeded",
+    )
+    return response
 
 
 def stream(
@@ -139,4 +171,60 @@ def stream(
         config.provider,
         config.model_label,
     )
-    yield from provider.stream(request, config)
+    started_at = time.monotonic()
+    status: UsageStatus = "succeeded"
+    error_type: str | None = None
+    clear_stream_usage()
+    try:
+        yield from provider.stream(request, config)
+    except GeneratorExit:
+        status = "cancelled"
+        error_type = "GeneratorExit"
+        raise
+    except Exception as exc:
+        status = "failed"
+        error_type = type(exc).__name__
+        raise
+    finally:
+        _record_usage(
+            role=role,
+            config=config,
+            usage=consume_stream_usage(),
+            started_at=started_at,
+            streaming=True,
+            status=status,
+            error_type=error_type,
+        )
+
+
+def _record_usage(
+    *,
+    role: str,
+    config: object,
+    usage: ProviderTokenUsage,
+    started_at: float,
+    streaming: bool,
+    status: UsageStatus,
+    error_type: str | None = None,
+) -> None:
+    context = current_request_context()
+    provider = str(getattr(config, "provider", "unknown"))
+    model = (
+        getattr(config, "model", None)
+        or getattr(config, "deployment", None)
+        or getattr(config, "model_label", "unknown")
+    )
+    deployment = getattr(config, "deployment", None)
+    record_llm_call(
+        request_id=context.request_id if context else "unknown",
+        role=role,
+        provider=provider,
+        model=str(model),
+        deployment=str(deployment) if deployment else None,
+        attempt_type="primary",
+        streaming=streaming,
+        usage=usage,
+        duration_ms=max(int((time.monotonic() - started_at) * 1000), 0),
+        status=status,
+        error_type=error_type,
+    )

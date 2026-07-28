@@ -1,314 +1,49 @@
-"""Bounded, Memory-first conversation relationship understanding."""
+"""Conditional conversation loading and compact candidate preparation."""
 
 from __future__ import annotations
 
-import re
-import time
-from dataclasses import dataclass
+import logging
 
-from observability import (
-    log_event,
-    record_local_preview,
-    update_request_summary,
-    update_request_type,
-)
+from observability import log_event, record_local_preview, update_request_summary
 from schemas.conversation import (
-    ConversationRelation,
-    ConversationUnderstandingResult,
-    RecentConversationTurn,
+    ContextNeedAssessment,
+    ConversationPreparation,
+    RecentContextLoadResult,
+)
+from schemas.doubt_solver import CanonicalLanguage
+from services.conversation.candidate_builder import (
+    EXPANDED_CANDIDATE_LIMIT,
+    NORMAL_CANDIDATE_LIMIT,
+    build_candidate_cards,
+    format_candidate_cards,
+)
+from services.conversation.context_need_gate import ContextNeedGate
+from services.conversation.memory_hygiene import (
+    MemoryHygieneDecision,
+    filter_substantive_turns,
 )
 from services.conversation.persistence import ConversationPersistenceService
-from services.conversation.recent_context import format_recent_conversation
-
-_WORD_PATTERN = re.compile(r"[a-zA-Z\u0900-\u097f]{2,}")
-_NUMBER_PATTERN = re.compile(
-    r"(?<![\w.])(?:[$₹€£]\s*)?-?\d+(?:\.\d+)?\s*(?:%|percent|प्रतिशत)?",
-    re.IGNORECASE,
-)
-_OPTION_PATTERN = re.compile(r"\boption\s*([a-d1-4])\b", re.IGNORECASE)
-_FORMULA_SYMBOL_PATTERN = re.compile(
-    r"\b(?:[A-Z]{2,8}|sqrt|sin|cos|tan|log|[xyz])\b"
-)
-_STOP_WORDS = {
-    "and",
-    "about",
-    "answer",
-    "answers",
-    "apply",
-    "applied",
-    "asked",
-    "calculate",
-    "calculated",
-    "calculating",
-    "can",
-    "could",
-    "did",
-    "explain",
-    "from",
-    "formula",
-    "have",
-    "how",
-    "into",
-    "is",
-    "it",
-    "mark",
-    "marks",
-    "of",
-    "out",
-    "please",
-    "question",
-    "relevant",
-    "score",
-    "scored",
-    "student",
-    "that",
-    "the",
-    "their",
-    "then",
-    "this",
-    "to",
-    "used",
-    "using",
-    "was",
-    "what",
-    "when",
-    "where",
-    "which",
-    "why",
-    "with",
-    "would",
-    "you",
-    "your",
-}
-_REFERENCE_WORDS = {
-    "aapne",
-    "above",
-    "add",
-    "aaya",
-    "answer",
-    "apply",
-    "calculate",
-    "calculated",
-    "clarify",
-    "continue",
-    "divide",
-    "earlier",
-    "explain",
-    "formula",
-    "get",
-    "got",
-    "kaise",
-    "kahan",
-    "kiya",
-    "kyu",
-    "last",
-    "mean",
-    "multiply",
-    "nikala",
-    "operation",
-    "pattern",
-    "previous",
-    "step",
-    "subtract",
-    "use",
-    "used",
-    "value",
-    "why",
-}
-
-_ASSISTANT_ACTION = re.compile(
-    r"\b(?:"
-    r"how\s+(?:did\s+)?(?:you|u)\s+(?:calculate|calculated|get|got)|"
-    r"how\s+(?:was|is)\s+(?:this|that|it|ye|yeh)?\s*(?:calculated|calculate)|"
-    r"why\s+did\s+(?:you|u)\s+(?:use|apply|divide)|"
-    r"which\s+operation\s+did\s+(?:you|u)\s+(?:use|apply)|"
-    r"where\s+did\s+(?:this|that|the)?\s*value\s+come\s+from|"
-    r"(?:you|u)\s+(?:calculated|applied|said|used)|"
-    r"aapne\s+.*(?:kaise|kyu|nikala|lagaya|calculate)|"
-    r"(?:ye|yeh)\s+(?:value|formula)\s+(?:kahan|kyu)|"
-    r"(?:kaise\s+nikala|kaise\s+aaya)"
-    r")\b",
-    re.IGNORECASE,
-)
-_PREVIOUS_REFERENCE = re.compile(
-    r"\b(?:last|previous|earlier|above|pichla|pichli|pichle|pehle\s+wala)"
-    r"\s*(?:answer|question|step|pattern|formula|उत्तर|सवाल|चरण)?\b",
-    re.IGNORECASE,
-)
-_PRONOUN_REFERENCE = re.compile(
-    r"\b(?:this|that|it|these|those|ye|yeh|isko|usko)\b",
-    re.IGNORECASE,
-)
-_CLARIFICATION_REFERENCE = re.compile(
-    r"\b(?:"
-    r"(?:explain|samjhao|samjhaao|what\s+does).*(?:step|formula|mean|मतलब)|"
-    r"what\s+was\s+the\s+pattern"
-    r")\b",
-    re.IGNORECASE,
-)
-_CONTINUATION_REFERENCE = re.compile(
-    r"\b(?:continue|go\s+on|carry\s+on|aage|आगे)\b",
-    re.IGNORECASE,
-)
-_CORRECTION_REFERENCE = re.compile(
-    r"\b(?:that(?:'s|\s+is)\s+wrong|you\s+are\s+wrong|गलत|galat|correct\s+that)\b",
-    re.IGNORECASE,
-)
-_REGENERATION_REFERENCE = re.compile(
-    r"\b(?:regenerate|try\s+again|another\s+method|different\s+method|dobara)\b",
-    re.IGNORECASE,
-)
-_BARE_RESULT_REFERENCE = re.compile(
-    r"^\s*(?:why|how|kaise|kyu|क्यों|कैसे)\s+"
-    r"(?:[$₹€£]?\s*-?\d+(?:\.\d+)?\s*(?:%|percent|प्रतिशत)?|option\s*[a-d1-4])"
-    r"\s*\??\s*$",
-    re.IGNORECASE,
-)
-_CALCULATION_REFERENCE = re.compile(
-    r"\b(?:"
-    r"how\s+(?:did|do)?\s*(?:you|u)?\s*(?:calculate|calculated|get|got)|"
-    r"why\s+(?:did\s+you\s+)?(?:divide|multiply|add|subtract|use)|"
-    r"(?:kaise|कैसे)\s+(?:nikala|aaya|calculate)"
-    r")\b",
-    re.IGNORECASE,
-)
-_ELLIPTICAL_REFERENCE = re.compile(
-    r"^\s*(?:why|how|explain|what\s+about|kyu|kaise|क्यों|कैसे)\b",
-    re.IGNORECASE,
+from services.conversation.reference_resolution import (
+    analyze_reference,
+    assess_candidate_compatibility,
+    grounded_entity_labels,
+    group_compatible_candidates,
 )
 
-
-@dataclass(frozen=True)
-class _TurnScore:
-    turn: RecentConversationTurn
-    position: str
-    score: float
-    signals: tuple[str, ...]
-
-
-def _normalized_number(value: str) -> str:
-    normalized = re.sub(r"\s+", "", value.lower())
-    normalized = normalized.replace("percent", "%").replace("प्रतिशत", "%")
-    return normalized
-
-
-def _entities(text: str) -> set[str]:
-    values = {_normalized_number(match.group(0)) for match in _NUMBER_PATTERN.finditer(text)}
-    values.update(f"option:{match.group(1).lower()}" for match in _OPTION_PATTERN.finditer(text))
-    values.update(
-        f"formula:{match.group(0).lower()}"
-        for match in _FORMULA_SYMBOL_PATTERN.finditer(text)
-    )
-    return values
-
-
-def _concepts(text: str) -> set[str]:
-    return {
-        token.lower()
-        for token in _WORD_PATTERN.findall(text)
-        if token.lower() not in _STOP_WORDS
-    }
-
-
-def _ordered_concepts(text: str) -> list[str]:
-    values: list[str] = []
-    for token in _WORD_PATTERN.findall(text):
-        normalized = token.lower()
-        if normalized in _STOP_WORDS or normalized in values:
-            continue
-        values.append(normalized)
-    return values
-
-
-def _base_signals(query: str) -> list[str]:
-    signals: list[str] = []
-    for name, pattern in (
-        ("assistant_action_reference", _ASSISTANT_ACTION),
-        ("previous_turn_reference", _PREVIOUS_REFERENCE),
-        ("pronoun_reference", _PRONOUN_REFERENCE),
-        ("clarification_reference", _CLARIFICATION_REFERENCE),
-        ("continuation_reference", _CONTINUATION_REFERENCE),
-        ("correction_reference", _CORRECTION_REFERENCE),
-        ("regeneration_reference", _REGENERATION_REFERENCE),
-        ("bare_result_reference", _BARE_RESULT_REFERENCE),
-        ("calculation_reference", _CALCULATION_REFERENCE),
-        ("elliptical_reference", _ELLIPTICAL_REFERENCE),
-    ):
-        if pattern.search(query):
-            signals.append(name)
-    return signals
-
-
-def _relation_name(signals: set[str]) -> str:
-    if "regeneration_reference" in signals:
-        return "regeneration_request"
-    if "correction_reference" in signals:
-        return "correction"
-    if "continuation_reference" in signals:
-        return "continuation"
-    if "clarification_reference" in signals:
-        return "clarification_of_previous"
-    return "follow_up"
-
-
-def _resolve_query(
-    query: str,
-    selected: tuple[RecentConversationTurn, ...],
-    relation: str,
-) -> str:
-    concepts: list[str] = []
-    for turn in selected:
-        for concept in _ordered_concepts(turn.original_query):
-            if concept not in concepts:
-                concepts.append(concept)
-    concepts = concepts[:12]
-    referenced_entities = sorted(_entities(query))[:8]
-    selected_concepts = set().union(
-        *(_concepts(turn.original_query) | _concepts(turn.final_answer) for turn in selected)
-    )
-    referenced_concepts = [
-        concept
-        for concept in _ordered_concepts(query)
-        if concept not in _REFERENCE_WORDS and concept in selected_concepts
-    ][:8]
-    topic = ", ".join(concepts) or "the selected academic problem"
-    values = ", ".join(
-        (
-            value.removeprefix("formula:").upper()
-            if value.startswith("formula:")
-            else (
-                f"option {value.removeprefix('option:').upper()}"
-                if value.startswith("option:")
-                else value
-            )
-        )
-        for value in referenced_entities
-    )
-    if relation == "correction":
-        instruction = f"Re-evaluate and correct the solution for: {topic}."
-    elif relation == "regeneration_request":
-        instruction = f"Provide a different valid solution method for: {topic}."
-    elif relation == "continuation":
-        instruction = f"Continue the solution for: {topic}."
-    elif values:
-        instruction = (
-            f"Explain how or why the referenced value or result {values} "
-            f"is obtained in: {topic}."
-        )
-    elif referenced_concepts:
-        instruction = (
-            f"Explain how or why {', '.join(referenced_concepts)} applies in: {topic}."
-        )
-    else:
-        instruction = f"Explain the relevant formula, operation, or step for: {topic}."
-    return instruction[:5000]
+logger = logging.getLogger(__name__)
 
 
 class ConversationUnderstandingService:
-    """Load bounded context, establish relevance, and resolve contextual input."""
+    """Gate context reads and prepare untrusted candidates; never classify them."""
 
-    def __init__(self, *, persistence: ConversationPersistenceService) -> None:
+    def __init__(
+        self,
+        *,
+        persistence: ConversationPersistenceService,
+        gate: ContextNeedGate | None = None,
+    ) -> None:
         self._persistence = persistence
+        self._gate = gate or ContextNeedGate()
 
     def understand(
         self,
@@ -316,235 +51,275 @@ class ConversationUnderstandingService:
         actor_id: str,
         conversation_id: str,
         query: str,
-    ) -> ConversationUnderstandingResult:
-        loaded = self._persistence.load_recent_context(actor_id, conversation_id, 2)
-        started = time.monotonic()
-        base_signals = _base_signals(query)
-        signal_set = set(base_signals)
-        query_entities = _entities(query)
-        query_concepts = _concepts(query)
-        specific_query_concepts = query_concepts - _REFERENCE_WORDS
-
-        scored: list[_TurnScore] = []
-        turns = tuple(loaded.turns[-2:])
-        for index, turn in enumerate(turns):
-            position = "latest_turn" if index == len(turns) - 1 else "previous_of_two"
-            combined = f"{turn.original_query}\n{turn.final_answer}"
-            entity_overlap = sorted(query_entities & _entities(combined))
-            concept_overlap = specific_query_concepts & _concepts(combined)
-            signals = list(base_signals)
-            score = 0.08 if position == "latest_turn" else 0.04
-            if "assistant_action_reference" in signal_set:
-                score += 0.45
-            if "previous_turn_reference" in signal_set:
-                score += 0.4
-            if "clarification_reference" in signal_set:
-                score += 0.4
-            if signal_set & {
-                "continuation_reference",
-                "correction_reference",
-                "regeneration_reference",
-            }:
-                score += 0.5
-            if "pronoun_reference" in signal_set:
-                score += 0.4
-            if "bare_result_reference" in signal_set:
-                score += 0.3
-            if "calculation_reference" in signal_set:
-                score += 0.25
-            if "elliptical_reference" in signal_set:
-                score += 0.15
-            if entity_overlap:
-                for value in entity_overlap:
-                    if value.startswith("formula:"):
-                        signals.append(f"formula_reference={value.removeprefix('formula:')}")
-                    elif value.startswith("option:"):
-                        signals.append(f"option_reference={value.removeprefix('option:')}")
-                    else:
-                        signals.append(f"numeric_reference={value}")
-                score += min(0.4, 0.25 + 0.05 * len(entity_overlap))
-            if concept_overlap:
-                signals.append("semantic_relevance")
-                score += min(0.15, len(concept_overlap) * 0.03)
-            scored.append(
-                _TurnScore(
-                    turn=turn,
-                    position=position,
-                    score=min(score, 1.0),
-                    signals=tuple(dict.fromkeys(signals)),
-                )
-            )
-
-        contextual_signal = bool(
-            signal_set
-            & {
-                "assistant_action_reference",
-                "previous_turn_reference",
-                "clarification_reference",
-                "continuation_reference",
-                "correction_reference",
-                "regeneration_reference",
-                "bare_result_reference",
-                "calculation_reference",
-                "pronoun_reference",
-                "elliptical_reference",
-            }
+        request_id: str = "conversation-understanding",
+        exam_id: str | None = None,
+        language: CanonicalLanguage = "english",
+    ) -> ConversationPreparation:
+        """Compatibility name used by graph/stream; returns preparation only."""
+        del exam_id, language
+        return self.prepare(
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            query=query,
+            request_id=request_id,
         )
-        ranked = sorted(scored, key=lambda candidate: candidate.score, reverse=True)
-        best = ranked[0] if ranked else None
-        selected: tuple[RecentConversationTurn, ...] = ()
-        selection_signals: tuple[str, ...] = tuple(base_signals)
-        selection_confidence = 0.0
-        position = "none"
 
-        has_relevance_overlap = bool(
-            best
-            and (
-                "semantic_relevance" in best.signals
-                or any(
-                    signal.startswith(
-                        ("numeric_reference=", "formula_reference=", "option_reference=")
-                    )
-                    for signal in best.signals
-                )
+    def prepare(
+        self,
+        *,
+        actor_id: str,
+        conversation_id: str,
+        query: str,
+        request_id: str,
+    ) -> ConversationPreparation:
+        gate = self._gate.evaluate(query)
+        self._log_gate(gate, request_id=request_id)
+        if gate.decision == "CONTEXT_NOT_NEEDED":
+            preparation = ConversationPreparation(
+                gate=gate,
+                context_load=RecentContextLoadResult(),
             )
-        )
-        self_contained_topic_mismatch = bool(
-            specific_query_concepts
-            and not any(
-                specific_query_concepts
-                & _concepts(f"{candidate.turn.original_query}\n{candidate.turn.final_answer}")
-                for candidate in ranked
+            self._log_reference_analysis(
+                query=query,
+                preparation=preparation,
             )
-            and not has_relevance_overlap
+            self._log_preparation(preparation, (), request_id=request_id)
+            return preparation
+        correction_chain = bool(
+            {"correction_reference", "resolve_again_reference"}
+            & set(gate.matched_signals)
         )
-        competing_context_is_ambiguous = bool(
-            len(ranked) > 1
-            and best is not None
-            and not has_relevance_overlap
-            and ranked[0].score - ranked[1].score < 0.1
-            and not signal_set
-            & {
-                "previous_turn_reference",
-                "continuation_reference",
-                "correction_reference",
-                "regeneration_reference",
-            }
+        return self._load_candidates(
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            query=query,
+            request_id=request_id,
+            gate=gate,
+            limit=(
+                EXPANDED_CANDIDATE_LIMIT
+                if correction_chain
+                else NORMAL_CANDIDATE_LIMIT
+            ),
         )
-        minimum_score = 0.25 if has_relevance_overlap else 0.45
 
-        if (
-            best is not None
-            and contextual_signal
-            and best.score >= minimum_score
-            and not self_contained_topic_mismatch
-            and not competing_context_is_ambiguous
-        ):
-            selected = (best.turn,)
-            selection_signals = best.signals
-            selection_confidence = max(0.75, best.score)
-            position = best.position
-
-        if selected:
-            relation_name = _relation_name(set(selection_signals))
-            relation = ConversationRelation(
-                relation=relation_name,
-                requires_recent_conversation=True,
-                referenced_turn_id=selected[0].turn_id,
-                referenced_turn_position=position,
-                confidence=selection_confidence,
-                decision_source="deterministic_signal",
-                matched_signals=selection_signals,
-            )
-            context = format_recent_conversation(list(selected), source={
-                "agentcore_memory": "agentcore",
-                "dynamodb_fallback": "dynamodb",
-                "none": "none",
-            }[loaded.source])
-            resolution_started = time.monotonic()
-            resolved_query = _resolve_query(query, selected, relation_name)
-            resolution_duration_ms = int(
-                (time.monotonic() - resolution_started) * 1000
-            )
-        elif contextual_signal and not self_contained_topic_mismatch:
-            relation = ConversationRelation(
-                relation="ambiguous",
-                requires_recent_conversation=True,
-                confidence=0.55 if turns else 0.35,
-                decision_source="deterministic_signal" if turns else "no_context",
-                matched_signals=tuple(base_signals),
-            )
-            context = format_recent_conversation([], source="none")
-            resolved_query = None
-            resolution_duration_ms = 0
-        else:
-            relation = ConversationRelation(
-                relation="independent",
-                requires_recent_conversation=False,
-                confidence=0.9,
-                decision_source="deterministic_signal" if turns else "no_context",
-                matched_signals=(),
-            )
-            context = format_recent_conversation([], source="none")
-            resolved_query = query
-            resolution_duration_ms = 0
-
-        duration_ms = int((time.monotonic() - started) * 1000)
-        final_type = "follow_up" if relation.requires_recent_conversation else "standalone"
-        update_request_type(final_type)
-        update_request_summary(
-            request_type=final_type,
-            context_required=relation.requires_recent_conversation,
-            context_source=loaded.source,
-            usable_recent_turns=loaded.usable_turn_count,
+    def expand(
+        self,
+        *,
+        actor_id: str,
+        conversation_id: str,
+        query: str,
+        request_id: str,
+        gate: ContextNeedAssessment,
+    ) -> ConversationPreparation:
+        """Exceptional correction/re-solve expansion, capped at five clean pairs."""
+        return self._load_candidates(
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+            query=query,
+            request_id=request_id,
+            gate=gate,
+            limit=EXPANDED_CANDIDATE_LIMIT,
         )
+
+    def _load_candidates(
+        self,
+        *,
+        actor_id: str,
+        conversation_id: str,
+        query: str,
+        request_id: str,
+        gate: ContextNeedAssessment,
+        limit: int,
+    ) -> ConversationPreparation:
+        loaded = self._persistence.load_recent_context(
+            actor_id,
+            conversation_id,
+            limit,
+        )
+        substantive, hygiene = filter_substantive_turns(tuple(loaded.turns))
+        cards = build_candidate_cards(
+            substantive,
+            current_query=query,
+            limit=limit,
+        )
+        rejected = tuple(item.turn.turn_id for item in hygiene if not item.usable)
+        candidate_characters = len(format_candidate_cards(cards))
+        preparation = ConversationPreparation(
+            gate=gate,
+            context_load=loaded,
+            eligible_turns=substantive[-limit:],
+            candidates=cards,
+            rejected_turn_ids=rejected,
+            candidate_characters=candidate_characters,
+        )
+        self._log_reference_analysis(
+            query=query,
+            preparation=preparation,
+        )
+        self._log_preparation(preparation, hygiene, request_id=request_id)
+        return preparation
+
+    @staticmethod
+    def _log_reference_analysis(
+        *,
+        query: str,
+        preparation: ConversationPreparation,
+    ) -> None:
+        analysis = analyze_reference(query)
+        compatibility = assess_candidate_compatibility(query, preparation.candidates)
         log_event(
-            "conversation_relation_completed",
-            component="conversation.understanding",
-            stage="conversation_relation",
+            "conversation_reference_analyzed",
+            component="conversation.reference_resolution",
+            stage="select_context",
             status="completed",
-            duration_ms=duration_ms,
             details={
-                "relation": relation.relation,
-                "confidence": relation.confidence,
-                "decision_source": relation.decision_source,
-                "matched_signals": ",".join(relation.matched_signals),
+                "local_reference": analysis.local_reference,
+                "external_reference_detected": analysis.external_reference_detected,
+                "reference_types": ",".join(analysis.reference_types) or "none",
             },
         )
-        if selected:
+        for card in preparation.candidates:
+            labels = grounded_entity_labels(card)
             log_event(
-                "conversation_context_selected",
-                component="conversation.understanding",
+                "conversation_grounded_entity_extracted",
+                component="conversation.reference_resolution",
                 stage="select_context",
-                status="completed",
+                status="grounded" if labels else "ungrounded",
                 details={
-                    "selected_turn_id": selected[0].turn_id,
-                    "selected_turn_position": position,
-                    "selection_reason": ",".join(selection_signals),
-                    "selection_confidence": selection_confidence,
+                    "turn_id": card.turn_id,
+                    "entity_count": len(labels),
+                    "validated_label_count": len(labels),
                 },
             )
-            record_local_preview("selected_turn_id", selected[0].turn_id)
-            record_local_preview("selection_reason", ",".join(selection_signals))
-            record_local_preview("selected_previous_user", selected[0].original_query)
-            record_local_preview("selected_previous_assistant", selected[0].final_answer)
-        if resolved_query and relation.requires_recent_conversation:
-            record_local_preview("resolved_query", resolved_query)
+            if labels:
+                record_local_preview(
+                    f"grounded_labels_{card.turn_id[:8]}",
+                    ",".join(labels),
+                )
+        for item in compatibility:
             log_event(
-                "follow_up_resolution_completed",
-                component="conversation.follow_up",
-                stage="resolve_follow_up",
-                status="completed",
-                duration_ms=resolution_duration_ms,
-                details={"confidence": relation.confidence},
+                "conversation_candidate_compatibility",
+                component="conversation.reference_resolution",
+                stage="select_context",
+                status="compatible" if item.compatible else "incompatible",
+                details={
+                    "turn_id": item.turn_id,
+                    "compatible": item.compatible,
+                    "grounded_antecedent": item.grounded_antecedent,
+                    "compatibility_reason": item.reason,
+                    "recency_rank": item.recency_rank,
+                },
             )
+        for index, group in enumerate(
+            group_compatible_candidates(query, preparation.candidates),
+            start=1,
+        ):
+            log_event(
+                "conversation_entity_grouped",
+                component="conversation.reference_resolution",
+                stage="select_context",
+                status="grouped",
+                details={
+                    "entity_index": index,
+                    "member_count": len(group.turn_ids),
+                    "selected_turn_id": group.selected_turn_id,
+                },
+            )
+            if group.label:
+                record_local_preview(
+                    f"entity_group_{index}",
+                    f"{group.label}:{','.join(group.turn_ids)}",
+                )
 
-        return ConversationUnderstandingResult(
-            relation=relation,
-            context_load=loaded,
-            selected_turns=selected,
-            selection_reason=selection_signals,
-            selection_confidence=selection_confidence,
-            resolved_query=resolved_query,
-            conversation_context=context.formatted_reference,
+    @staticmethod
+    def _log_gate(gate: ContextNeedAssessment, *, request_id: str) -> None:
+        log_event(
+            "context_gate_completed",
+            component="conversation.context_need_gate",
+            stage="context_gate",
+            status="completed",
+            duration_ms=gate.duration_ms,
+            details={
+                "decision": gate.decision,
+                "reason_codes": ",".join(gate.reason_codes),
+                "matched_signals": ",".join(gate.matched_signals),
+            },
+        )
+        logger.debug(
+            "context_gate request_id=%s decision=%s reasons=%s duration_ms=%d",
+            request_id,
+            gate.decision,
+            ",".join(gate.reason_codes),
+            gate.duration_ms,
+        )
+
+    @staticmethod
+    def _log_preparation(
+        preparation: ConversationPreparation,
+        hygiene: tuple[MemoryHygieneDecision, ...],
+        *,
+        request_id: str,
+    ) -> None:
+        loaded = preparation.context_load
+        update_request_summary(
+            context_required=preparation.gate.decision != "CONTEXT_NOT_NEEDED",
+            context_source=loaded.source,
+            usable_recent_turns=len(preparation.eligible_turns),
+        )
+        log_event(
+            "conversation_candidates_prepared",
+            component="conversation.context_candidates",
+            stage="load_recent_context",
+            status="completed",
+            duration_ms=loaded.latency_ms,
+            details={
+                "gate_decision": preparation.gate.decision,
+                "source": loaded.source,
+                "fetched": len(loaded.turns),
+                "eligible": len(preparation.eligible_turns),
+                "rejected": len(preparation.rejected_turn_ids),
+                "candidate_count": len(preparation.candidates),
+                "candidate_characters": preparation.candidate_characters,
+                "turn_ids": ",".join(card.turn_id for card in preparation.candidates),
+                "query_match_indicators": ",".join(
+                    sorted(
+                        {
+                            indicator
+                            for card in preparation.candidates
+                            for indicator in card.query_match_indicators
+                        }
+                    )
+                ),
+                "memory_attempted": loaded.memory_attempted,
+                "dynamodb_attempted": loaded.dynamodb_attempted,
+            },
+        )
+        for item in hygiene:
+            log_event(
+                "conversation_context_selected",
+                component="conversation.memory_hygiene",
+                stage="select_context",
+                status="selected" if item.usable else "rejected",
+                details={
+                    "turn_id": item.turn.turn_id,
+                    "turn_type": item.turn_type,
+                    "reason": item.reason,
+                },
+            )
+        for card in preparation.candidates:
+            record_local_preview("selected_turn_id", card.turn_id)
+        if preparation.rejected_turn_ids:
+            record_local_preview(
+                "rejected_turn_ids",
+                ",".join(preparation.rejected_turn_ids),
+            )
+        logger.debug(
+            "conversation_candidates request_id=%s source=%s fetched=%d eligible=%d "
+            "rejected=%d chars=%d",
+            request_id,
+            loaded.source,
+            len(loaded.turns),
+            len(preparation.eligible_turns),
+            len(preparation.rejected_turn_ids),
+            preparation.candidate_characters,
         )

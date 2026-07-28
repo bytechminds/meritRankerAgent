@@ -18,6 +18,7 @@ from services.solution_brief.metadata_helpers import (
     subject_label,
 )
 from services.solution_brief.models import SolutionBrief
+from services.solution_brief.planner_policy import PlannerNeedPolicy
 from tools.web_search.models import WebSearchItem
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ class SolutionBriefBuildResult:
 class SolutionBriefBuilder:
     """Build compact SolutionBrief text from query, classification, and context."""
 
+    def __init__(self, *, planner_need_policy: PlannerNeedPolicy | None = None) -> None:
+        self._planner_need_policy = planner_need_policy or PlannerNeedPolicy()
+
     def build(
         self,
         request: ContextRetrievalRequest,
@@ -67,15 +71,22 @@ class SolutionBriefBuilder:
         web_items = web_items or []
         sources = _context_sources(kb_items, web_items)
 
-        if not self._should_build_brief(request, kb_items, web_items):
+        decision = self._planner_need_policy.decide(
+            request,
+            kb_item_count=len(kb_items),
+            web_item_count=len(web_items),
+        )
+        if not decision.use_solution_brief:
             logger.info(
                 "solution_brief_builder  request_id=%s  used=false  "
                 "context_sources=%s  subject=%s  topic=%s  given_count=0  "
-                "context_count=0  core_concept_count=0  risk_count=0  brief_chars=0",
+                "context_count=0  core_concept_count=0  risk_count=0  brief_chars=0  "
+                "decision_reason=%s",
                 request.request_id,
                 sources,
                 request.subject,
                 request.topic or "",
+                decision.reason,
             )
             return SolutionBriefBuildResult(
                 brief=None,
@@ -114,14 +125,28 @@ class SolutionBriefBuilder:
         web_section: str,
         max_chars: int,
     ) -> str:
-        """Compose final generator context from brief and optional web section."""
-        parts = [part for part in (brief_text.strip(), web_section.strip()) if part]
-        if not parts:
+        """Compose bounded context without truncating web source cards."""
+        brief = brief_text.strip()
+        web = web_section.strip()
+        if not brief and not web:
             return ""
-        combined = "\n\n".join(parts)
-        if len(combined) > max_chars:
-            combined = combined[:max_chars].rstrip()
-        return combined
+        if max_chars <= 0:
+            return ""
+        if not web:
+            return _trim_to_line_boundary(brief, max_chars)
+        if not brief:
+            return _trim_to_line_boundary(web, max_chars)
+
+        separator = "\n\n"
+        if len(web) >= max_chars:
+            # The web formatter receives this same cap and owns atomic source
+            # card formatting. Do not slice it again after briefing.
+            return web
+        brief_budget = max_chars - len(web) - len(separator)
+        if brief_budget <= 0:
+            return web
+        bounded_brief = _trim_to_line_boundary(brief, brief_budget)
+        return f"{bounded_brief}{separator}{web}" if bounded_brief else web
 
     @staticmethod
     def format_brief(brief: SolutionBrief) -> str:
@@ -158,20 +183,6 @@ class SolutionBriefBuilder:
             lines.append("Generator instructions:")
             lines.extend(f"- {item}" for item in brief.generator_instructions)
         return "\n".join(lines)
-
-    @staticmethod
-    def _should_build_brief(
-        request: ContextRetrievalRequest,
-        kb_items: list[RetrievedContextItem],
-        web_items: list[WebSearchItem],
-    ) -> bool:
-        if request.difficulty == "advanced":
-            return True
-        if not kb_items and not web_items:
-            return False
-        if request.difficulty in {"intermediate", "default"}:
-            return True
-        return request.difficulty == "basic" and bool(kb_items or web_items)
 
     def _build_brief(
         self,
@@ -356,3 +367,14 @@ def _dedupe_cap(items: list[str]) -> list[str]:
         if len(result) >= 7:
             break
     return result
+
+
+def _trim_to_line_boundary(text: str, max_chars: int) -> str:
+    """Bound internal context at a complete line when practical."""
+    if len(text) <= max_chars:
+        return text
+    bounded = text[:max_chars].rstrip()
+    last_newline = bounded.rfind("\n")
+    if last_newline > 0:
+        return bounded[:last_newline].rstrip()
+    return bounded

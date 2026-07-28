@@ -31,8 +31,20 @@ _READABLE_EVENTS = frozenset(
         "request_cancelled",
         "classification_completed",
         "classification_fallback_used",
+        "classifier_primary_decision",
+        "model_execution_completed",
+        "llm_call_usage",
+        "llm_usage_summary",
+        "web_search_decision",
+        "web_search_execution",
+        "grounding_completed",
+        "context_gate_completed",
+        "conversation_candidates_prepared",
+        "conversation_reference_analyzed",
+        "conversation_candidate_compatibility",
         "conversation_relation_completed",
         "conversation_context_selected",
+        "selected_generation_context_built",
         "follow_up_detected",
         "follow_up_context_loaded",
         "follow_up_context_failed",
@@ -43,9 +55,11 @@ _READABLE_EVENTS = frozenset(
         "retrieval_failed",
         "generation_completed",
         "generation_failed",
+        "quality_decision",
         "quality_validation_completed",
         "quality_rewrite_completed",
         "quality_repair_completed",
+        "correctness_verification_completed",
         "conversation_persistence_completed",
         "conversation_persistence_failed",
         "conversation_persistence_skipped",
@@ -204,6 +218,7 @@ _PREVIEW_LIMITS = {
     "selection_reason": 300,
     "selected_previous_user": 250,
     "selected_previous_assistant": 400,
+    "rejected_turn_ids": 500,
     "memory_turn_1_id": 128,
     "memory_turn_1_user": 250,
     "memory_turn_1_assistant": 400,
@@ -329,6 +344,10 @@ def _safe_count(value: object) -> int:
         return 0
 
 
+def _safe_bool(value: object) -> str:
+    return "true" if value is True else "false" if value is False else "-"
+
+
 def _failure_description(
     event: dict[str, object],
     safe: dict[str, object],
@@ -372,9 +391,217 @@ def _timeline_entries(
             _clean(safe.get("intent"), limit=24),
             _clean(safe.get("difficulty"), limit=16),
         ]
-        return [("OK", f"Classified: {', '.join(value for value in values if value)}")]
+        return [
+            ("OK", f"Classified: {', '.join(value for value in values if value)}"),
+            (
+                "OK" if safe.get("need_web_search") is True else "SKIP",
+                "Web demand: "
+                f"required={_safe_bool(safe.get('need_web_search'))}, "
+                f"reason={_clean(safe.get('web_search_reason'), limit=32)}, "
+                f"search_term_present={_safe_bool(safe.get('search_term_present'))}",
+            ),
+        ]
     if name == "classification_fallback_used":
         return [("WARN", "Classification fallback used")]
+    if name == "classifier_primary_decision":
+        return [
+            (
+                "OK" if safe.get("primary_accepted") is True else "WARN",
+                "Primary classifier: "
+                f"confidence={_clean(safe.get('primary_confidence'), limit=8)}, "
+                f"accepted={_safe_bool(safe.get('primary_accepted'))}, "
+                f"strong_triggered={_safe_bool(safe.get('strong_triggered'))}, "
+                f"reason={_clean(safe.get('strong_reason'), limit=40)}",
+            )
+        ]
+    if name == "llm_call_usage":
+        tokens = (
+            "unavailable"
+            if safe.get("usage_source") == "unavailable"
+            else (
+                f"in:{_safe_count(safe.get('input_tokens'))} "
+                f"out:{_safe_count(safe.get('output_tokens'))} "
+                f"total:{_safe_count(safe.get('total_tokens'))}"
+            )
+        )
+        label = "OK" if status == "succeeded" else "WARN"
+        return [
+            (
+                label,
+                "LLM CALL "
+                f"role={_clean(safe.get('role'), limit=36)} "
+                f"provider={_clean(safe.get('provider'), limit=20)} "
+                f"model={_clean(safe.get('model'), limit=36)}",
+            ),
+            (
+                label,
+                f"tokens={tokens} "
+                f"cost_usd={_clean(safe.get('estimated_cost_usd'), limit=20) or 'unavailable'} "
+                f"duration_ms={_safe_count(event.get('duration_ms'))} "
+                f"attempt={_clean(safe.get('attempt_type'), limit=20)} "
+                f"status={_clean(status, limit=16)}",
+            ),
+        ]
+    if name == "llm_usage_summary":
+        return [
+            (
+                "OK",
+                "LLM USAGE SUMMARY "
+                f"calls={_safe_count(safe.get('calls'))} "
+                f"input_tokens={_safe_count(safe.get('input_tokens'))} "
+                f"output_tokens={_safe_count(safe.get('output_tokens'))} "
+                f"total_tokens={_safe_count(safe.get('total_tokens'))}",
+            ),
+            (
+                "OK",
+                f"estimated_cost_usd="
+                f"{_clean(safe.get('estimated_cost_usd'), limit=20) or 'unavailable'} "
+                f"cost_complete={_safe_bool(safe.get('cost_complete'))} "
+                f"generator_calls={_safe_count(safe.get('generator_calls'))} "
+                f"rewrite_count={_safe_count(safe.get('rewrite_count'))} "
+                f"verification_calls={_safe_count(safe.get('verification_calls'))}",
+            ),
+            (
+                "OK",
+                f"roles={_clean(safe.get('role_breakdown'), limit=100)}",
+            ),
+        ]
+    if name == "model_execution_completed":
+        return [
+            (
+                "OK",
+                "Model: "
+                f"role={_clean(safe.get('role'), limit=28)}, "
+                f"provider={_clean(safe.get('provider'), limit=24)}, "
+                f"model={_clean(safe.get('model'), limit=40)}, "
+                f"route={_clean(safe.get('route'), limit=40)}, "
+                f"duration={_safe_count(event.get('duration_ms'))}ms",
+            )
+        ]
+    if name == "web_search_decision":
+        return [
+            (
+                "OK" if safe.get("will_call") is True else "SKIP",
+                "Decision: "
+                f"required={_safe_bool(safe.get('required'))}, "
+                f"reason={_clean(safe.get('reason'), limit=32)}, "
+                f"provider={_clean(safe.get('provider'), limit=24)}, "
+                f"enabled={_safe_bool(safe.get('provider_enabled'))}, "
+                f"configured={_safe_bool(safe.get('provider_configured'))}, "
+                f"will_call={_safe_bool(safe.get('will_call'))}",
+            )
+        ]
+    if name == "web_search_execution":
+        return [
+            (
+                "OK" if status == "succeeded" else "WARN",
+                "Execution: "
+                f"provider={_clean(safe.get('provider'), limit=24)}, "
+                f"status={_clean(status, limit=24)}, "
+                f"attempts={_safe_count(safe.get('attempts'))}, "
+                f"candidates={_safe_count(safe.get('candidate_count'))}, "
+                f"selected={_safe_count(safe.get('selected_count'))}, "
+                f"context={_safe_count(safe.get('context_characters'))} chars, "
+                f"duration={_safe_count(event.get('duration_ms'))}ms",
+            )
+        ]
+    if name == "grounding_completed":
+        return [
+            (
+                "OK" if status == "grounded" else "WARN",
+                "Grounding: "
+                f"required={_safe_bool(safe.get('web_required'))}, "
+                f"executed={_safe_bool(safe.get('web_executed'))}, "
+                f"context_used={_safe_bool(safe.get('web_context_used'))}, "
+                f"citations={_safe_count(safe.get('citation_count'))}, "
+                f"status={_clean(safe.get('verification_status'), limit=32)}",
+            )
+        ]
+    if name == "context_gate_completed":
+        return [
+            (
+                "OK",
+                "Context gate: "
+                f"{_clean(safe.get('decision'), limit=28)}, "
+                f"reasons={_clean(safe.get('reason_codes'), limit=72)}, "
+                f"duration={_safe_count(event.get('duration_ms'))}ms",
+            )
+        ]
+    if name == "conversation_candidates_prepared":
+        return [
+            (
+                "OK",
+                "Context load: "
+                f"source={_clean(safe.get('source'), limit=24)}, "
+                f"fetched={_safe_count(safe.get('fetched'))}, "
+                f"eligible={_safe_count(safe.get('eligible'))}, "
+                f"rejected={_safe_count(safe.get('rejected'))}, "
+                f"chars={_safe_count(safe.get('candidate_characters'))}",
+            )
+        ]
+    if name == "conversation_reference_analyzed":
+        return [
+            (
+                "OK",
+                "Reference analysis: "
+                f"local={_safe_bool(safe.get('local_reference'))}, "
+                f"external={_safe_bool(safe.get('external_reference_detected'))}, "
+                f"types={_clean(safe.get('reference_types'), limit=48)}",
+            )
+        ]
+    if name == "conversation_candidate_compatibility":
+        return [
+            (
+                "OK" if status == "compatible" else "INFO",
+                "Candidate compatibility: "
+                f"turn={_short(safe.get('turn_id'))}, "
+                f"compatible={_safe_bool(safe.get('compatible'))}, "
+                f"grounded={_safe_bool(safe.get('grounded_antecedent'))}, "
+                f"reason={_clean(safe.get('compatibility_reason'), limit=48)}, "
+                f"recency={_safe_count(safe.get('recency_rank'))}",
+            )
+        ]
+    if name == "conversation_grounded_entity_extracted":
+        return [
+            (
+                "OK" if status == "grounded" else "INFO",
+                "Grounded entities: "
+                f"turn={_short(safe.get('turn_id'))}, "
+                f"count={_safe_count(safe.get('entity_count'))}, "
+                f"validated_labels={_safe_count(safe.get('validated_label_count'))}",
+            )
+        ]
+    if name == "conversation_entity_grouped":
+        return [
+            (
+                "OK",
+                "Entity group: "
+                f"index={_safe_count(safe.get('entity_index'))}, "
+                f"members={_safe_count(safe.get('member_count'))}, "
+                f"selected={_short(safe.get('selected_turn_id'))}",
+            )
+        ]
+    if name == "conversation_clarification_labels":
+        return [
+            (
+                "OK",
+                "Clarification labels: "
+                f"accepted={_safe_count(safe.get('accepted_label_count'))}, "
+                f"rejected={_safe_count(safe.get('rejected_label_count'))}",
+            )
+        ]
+    if name == "selected_generation_context_built":
+        return [
+            (
+                "OK",
+                "Selected context: "
+                f"relation={_clean(safe.get('relation'), limit=24)}, "
+                f"action={_clean(safe.get('action'), limit=28)}, "
+                f"turn={_short(safe.get('selected_turn_id'))}, "
+                f"policy={_clean(safe.get('context_policy'), limit=28)}, "
+                f"chars={_safe_count(safe.get('context_characters'))}",
+            )
+        ]
     if name == "conversation_relation_completed":
         return [
             (
@@ -386,21 +613,35 @@ def _timeline_entries(
             ),
             (
                 "OK",
-                f"Signals: {_clean(safe.get('matched_signals'), limit=90)}",
+                "Action: "
+                f"{_clean(safe.get('requested_action'), limit=36)}, "
+                f"self-contained={_clean(safe.get('self_contained'), limit=8)}, "
+                f"topic-switch={_clean(safe.get('topic_switch'), limit=8)}",
+            ),
+            (
+                "OK",
+                "Memory hygiene: "
+                f"fetched={_safe_count(safe.get('fetched_pairs'))}, "
+                f"substantive={_safe_count(safe.get('substantive_pairs'))}, "
+                f"rejected={_safe_count(safe.get('rejected_pair_count'))}",
+            ),
+            (
+                "OK",
+                "Reasons: "
+                f"{_clean(safe.get('reason_codes'), limit=96)}; "
+                f"signals={_clean(safe.get('matched_signals'), limit=96)}",
             ),
         ]
     if name == "conversation_context_selected":
+        turn_id = safe.get("turn_id") or safe.get("selected_turn_id")
+        turn_type = safe.get("turn_type") or safe.get("selected_turn_position")
+        reason = safe.get("reason") or safe.get("selection_reason")
         return [
             (
-                "OK",
-                "Selected turn: "
-                f"{_short(safe.get('selected_turn_id'))}, "
-                f"position={_clean(safe.get('selected_turn_position'), limit=24)}, "
-                f"confidence={_clean(safe.get('selection_confidence'), limit=8)}",
-            ),
-            (
-                "OK",
-                f"Selection reason: {_clean(safe.get('selection_reason'), limit=82)}",
+                "OK" if status == "selected" else "SKIP",
+                f"Turn {_short(turn_id)}: {_clean(status, limit=12)}, "
+                f"type={_clean(turn_type, limit=32)}, "
+                f"reason={_clean(reason, limit=64)}",
             ),
         ]
     if name == "follow_up_detected":
@@ -467,6 +708,11 @@ def _timeline_entries(
         ]
     if name == "retrieval_completed":
         source = _clean(safe.get("source"), limit=32)
+        if source == "fresh_solve":
+            return [
+                ("OK", "Retrieval policy: fresh_solve"),
+                ("SKIP", "External context selected: none"),
+            ]
         return [("OK", f"Retrieval completed{f': {source}' if source else ''}")]
     if name == "retrieval_fallback_used":
         if str(event.get("stage") or "") == "load_recent_context":
@@ -521,6 +767,16 @@ def _timeline_entries(
                 )
             ]
         return [("OK", "Quality passed")]
+    if name == "quality_decision":
+        return [
+            (
+                "OK" if safe.get("passed") is True else "WARN",
+                "QUALITY_DECISION "
+                f"passed={_safe_bool(safe.get('passed'))} "
+                f"reason_code={_clean(safe.get('reason_code'), limit=96) or 'none'} "
+                f"repair_required={_safe_bool(safe.get('repair_required'))}",
+            )
+        ]
     if name == "quality_rewrite_completed":
         if "failed" in status:
             return [("FAIL", _failure_description(event, safe, "Answer rewrite failed"))]
@@ -529,6 +785,18 @@ def _timeline_entries(
         if "failed" in status:
             return [("FAIL", _failure_description(event, safe, "Answer repair failed"))]
         return [("OK", "Answer repair completed")]
+    if name == "correctness_verification_completed":
+        approved = safe.get("approved") is True
+        return [
+            (
+                "OK" if approved else "FAIL",
+                "Correctness verification: "
+                f"status={_clean(safe.get('verification_status'), limit=20)}, "
+                f"method={_clean(safe.get('method'), limit=16)}, "
+                f"single_answer={_safe_bool(safe.get('single_defensible_answer'))}, "
+                f"approved={_safe_bool(safe.get('approved'))}",
+            )
+        ]
     if name in {
         "conversation_persistence_completed",
         "conversation_persistence_failed",
@@ -710,6 +978,13 @@ def format_request_block(
             "resolved_query"
         ):
             lines.append(_line(f"Resolved: {previews['resolved_query']}"))
+    if previews.get("rejected_turn_ids"):
+        lines.extend(
+            [
+                "MEMORY HYGIENE",
+                _line(f"Rejected turns: {previews['rejected_turn_ids']}"),
+            ]
+        )
     lines.append("PERSISTENCE")
     for event in events:
         if not str(event.get("event") or "").startswith("conversation_persistence_"):
@@ -741,10 +1016,28 @@ def format_request_block(
 def _event_section(event_name: str) -> str | None:
     if event_name.startswith("classification_"):
         return "ACADEMIC CLASSIFICATION"
+    if event_name == "classifier_primary_decision":
+        return "ACADEMIC CLASSIFICATION"
+    if event_name in {"llm_call_usage", "llm_usage_summary"}:
+        return "LLM USAGE"
+    if event_name == "model_execution_completed":
+        return "RUNTIME MODELS"
+    if event_name.startswith("web_search_"):
+        return "WEB SEARCH"
+    if event_name == "grounding_completed":
+        return "GROUNDING"
     if event_name == "conversation_relation_completed":
-        return "CONVERSATION RELATION"
+        return "CONVERSATION UNDERSTANDING"
+    if event_name in {
+        "conversation_reference_analyzed",
+        "conversation_grounded_entity_extracted",
+        "conversation_candidate_compatibility",
+        "conversation_entity_grouped",
+        "conversation_clarification_labels",
+    }:
+        return "REFERENCE ANALYSIS"
     if event_name == "conversation_context_selected":
-        return "SELECTED CONTEXT"
+        return "CONTEXT CANDIDATES"
     if event_name == "follow_up_detected":
         return "FOLLOW-UP"
     if event_name.startswith("follow_up_context_"):
@@ -756,6 +1049,8 @@ def _event_section(event_name: str) -> str | None:
     if event_name.startswith("generation_"):
         return "GENERATION"
     if event_name.startswith("quality_"):
+        return "QUALITY"
+    if event_name == "correctness_verification_completed":
         return "QUALITY"
     return None
 

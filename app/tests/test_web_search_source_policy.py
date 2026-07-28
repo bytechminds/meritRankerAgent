@@ -224,7 +224,7 @@ class TestWebSourcePolicyResolver:
 
 
 class TestQueryBuilderAttempts:
-    def test_authoritative_first_then_reputed_then_exam_prep_then_generic(self) -> None:
+    def test_broad_current_affairs_starts_with_combined_trusted_sources(self) -> None:
         policy = WebSourcePolicyResolver().resolve(
             query="monthly current affairs summary for SSC",
             web_search_query="monthly current affairs SSC",
@@ -243,13 +243,13 @@ class TestQueryBuilderAttempts:
             official_only=False,
         )
         assert [a.kind for a in attempts] == [
-            "authoritative",
             "authoritative_plus_reputed",
             "exam_prep_fallback",
             "generic_fallback",
         ]
-        assert attempts[0].include_domains == policy.trusted_domains
-        assert attempts[2].include_domains == policy.exam_prep_domains
+        assert set(policy.trusted_domains).issubset(attempts[0].include_domains)
+        assert set(policy.reputed_domains).issubset(attempts[0].include_domains)
+        assert attempts[1].include_domains == policy.exam_prep_domains
         assert "youtube.com" in attempts[0].exclude_domains
 
     def test_exam_prep_not_planned_for_official_only(self) -> None:
@@ -540,6 +540,21 @@ class TestScopePolicy:
         )
         assert "India" in built or "india" in built.lower()
         assert "international relations" not in built.lower()
+
+    def test_explicit_month_query_does_not_add_relative_latest_terms(self) -> None:
+        scope = detect_source_scope_policy(
+            query="provide current affairs questions July 2026",
+            web_search_query="current affairs July 2026",
+            web_search_reason="current_affairs",
+        )
+
+        built = build_scope_aware_search_query(
+            "provide current affairs questions July 2026",
+            "current affairs July 2026",
+            scope,
+        )
+
+        assert built == "current affairs July 2026"
 
 
 class TestOfficialOnlyGuard:

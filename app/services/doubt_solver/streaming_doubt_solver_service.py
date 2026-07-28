@@ -12,11 +12,14 @@ from config import get_settings
 from graphs.doubt_solver_graph import (
     _ORCHESTRATED_FALLBACK_CLASSIFICATION,
     _orchestrated_collect_context_node,
+    orchestrated_classify_query_stage,
     orchestrated_classify_query_with_delivery_signals,
 )
 from observability import (
     begin_request_summary,
+    bind_llm_attempt_type,
     bind_request_context,
+    count_generator_calls,
     current_request_summary,
     emit_request_summary,
     log_event,
@@ -33,15 +36,30 @@ from schemas.doubt_solver import (
     DoubtSolverStreamEvent,
     ResponseContent,
 )
-from services.conversation.follow_up_query_resolver import (
-    resolve_follow_up_with_recent_context,
+from schemas.llm_usage import LLMUsageRecord
+from services.context_retrieval.web_grounding import (
+    log_grounding_status,
+    required_web_answer_verified,
+    required_web_context_verified,
+    sanitize_required_web_answer,
+    verification_limited_response,
+)
+from services.conversation.selected_context_builder import (
+    build_context_aware_clarification,
+    build_selected_generation_context,
+)
+from services.doubt_solver.answer_correctness import (
+    requires_independent_correctness_verification,
 )
 from services.doubt_solver.answer_delivery_policy import (
     AnswerDeliveryPolicy,
     AnswerDeliverySignals,
 )
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
-from services.doubt_solver.answer_quality import AnswerQualityPolicy, validate_answer_quality
+from services.doubt_solver.answer_quality import (
+    AnswerQualityPolicy,
+    validate_answer_quality,
+)
 from services.doubt_solver.final_answer import build_final_answer_result
 from services.doubt_solver.markdown_replay import iter_markdown_replay_chunks
 from services.doubt_solver.stream_labels import (
@@ -56,6 +74,7 @@ from services.doubt_solver.stream_labels import (
 from services.doubt_solver.stream_status import StreamStatusTracker
 
 logger = logging.getLogger(__name__)
+__all__ = ["orchestrated_classify_query_with_delivery_signals"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +100,7 @@ class StreamDoubtSolverInput:
     should_cancel: Callable[[], bool] | None = None
     cancellation_reason: Callable[[], str | None] | None = None
     request_started_logged: bool = False
+    initial_llm_usage_records: tuple[LLMUsageRecord, ...] = ()
 
 
 def _cancelled(input: StreamDoubtSolverInput) -> bool:
@@ -144,26 +164,68 @@ def _iter_stream_doubt_solver(
     if _cancelled(input):
         return
 
-    conversation_result = None
+    conversation_preparation = None
     conversation_context = ""
-    if conversation_understanding is not None:
-        conversation_result = conversation_understanding.understand(
+    if conversation_understanding is not None and input.source_modality == "text":
+        conversation_preparation = conversation_understanding.understand(
             actor_id=input.actor_id,
             conversation_id=input.conversation_id,
             query=query,
+            request_id=request_id,
+            exam_id=input.exam_id,
+            language=input.language,
         )
-        conversation_context = conversation_result.conversation_context
-        if conversation_result.resolved_query is not None:
-            query = conversation_result.resolved_query
-        elif conversation_result.relation.requires_recent_conversation:
-            clarification = {
-                "english": "Please clarify which earlier question, step, or option you mean.",
-                "hinglish": (
-                    "Please clarify karein ki aap kis pehle question, step, ya option "
-                    "ki baat kar rahe hain."
-                ),
-                "hindi": "कृपया स्पष्ट करें कि आप पहले के किस प्रश्न, चरण या विकल्प की बात कर रहे हैं।",
-            }[input.language]
+
+    state = {
+        "request_id": request_id,
+        "query": query,
+        "original_query": input.original_query or query,
+        "actor_id": input.actor_id,
+        "language": input.language,
+        "exam_id": input.exam_id,
+        "exam_stage": input.exam_stage,
+        "classification": None,
+        "retrieval_context": {},
+        "context_text": "",
+        "answer": None,
+    }
+    careful_status_pending = False
+
+    def on_before_strong_classifier() -> None:
+        nonlocal careful_status_pending
+        careful_status_pending = True
+
+    classification_started = time.monotonic()
+    with stage_span("doubt_solver.classify"):
+        classification_dict = input.classification
+        raw_classification = None
+        if classification_dict is None:
+            stage_result = orchestrated_classify_query_stage(
+                query=query,
+                request_id=request_id,
+                on_before_strong_classifier=on_before_strong_classifier,
+                conversation=conversation_preparation,
+            )
+            classification_dict = stage_result.classification
+            raw_classification = stage_result.raw
+            classifier_confidence = stage_result.classifier_confidence
+            classifier_fallback = stage_result.classifier_fallback
+        else:
+            classifier_confidence = input.classifier_confidence
+            classifier_fallback = input.classifier_fallback
+
+    if raw_classification is not None and conversation_preparation is not None:
+        selected_context = build_selected_generation_context(
+            current_query=input.original_query or query,
+            classification=raw_classification,
+            preparation=conversation_preparation,
+        )
+        if selected_context.clarification_required:
+            clarification = build_context_aware_clarification(
+                conversation_preparation,
+                language=input.language,
+                current_query=input.original_query or query,
+            )
             record_local_preview("response_type", "clarification")
             record_local_preview("response", clarification)
             final = build_final_answer_result(
@@ -200,62 +262,33 @@ def _iter_stream_doubt_solver(
                 ),
             )
             return
-
-    state = {
-        "request_id": request_id,
-        "query": query,
-        "original_query": input.original_query or query,
-        "actor_id": input.actor_id,
-        "language": input.language,
-        "exam_id": input.exam_id,
-        "exam_stage": input.exam_stage,
-        "classification": None,
-        "retrieval_context": {},
-        "context_text": "",
-        "answer": None,
-    }
-    careful_status_pending = False
-
-    def on_before_strong_classifier() -> None:
-        nonlocal careful_status_pending
-        careful_status_pending = True
-
-    classification_started = time.monotonic()
-    with stage_span("doubt_solver.classify"):
-        classification_dict = (
-            None
-            if conversation_result is not None
-            and conversation_result.relation.requires_recent_conversation
-            else input.classification
+        query = selected_context.resolved_query
+        conversation_context = selected_context.conversation_context
+        state["query"] = query
+        log_event(
+            "selected_generation_context_built",
+            component="conversation.selected_context",
+            stage="prepare_follow_up",
+            status="completed",
+            details={
+                "relation": selected_context.relation,
+                "action": selected_context.requested_action,
+                "selected_turn_id": selected_context.selected_turn_id,
+                "context_policy": selected_context.context_policy,
+                "context_characters": selected_context.context_characters,
+            },
         )
-        if classification_dict is None:
-            (
-                classification_dict,
-                classifier_confidence,
-                classifier_fallback,
-            ) = orchestrated_classify_query_with_delivery_signals(
-                query,
-                request_id=request_id,
-                on_before_strong_classifier=on_before_strong_classifier,
-            )
-        else:
-            classifier_confidence = input.classifier_confidence
-            classifier_fallback = input.classifier_fallback
-    if (
-        conversation_result is not None
-        and not conversation_result.relation.requires_recent_conversation
-    ):
-        classification_dict = dict(classification_dict)
-        classification_dict["requires_recent_conversation"] = False
+
     state["classification"] = classification_dict
     request_type = (
-        "follow_up"
-        if (
-            conversation_result is not None
-            and conversation_result.relation.requires_recent_conversation
+        "image"
+        if input.source_modality == "image"
+        else (
+            "follow_up"
+            if raw_classification is not None
+            and raw_classification.relation != "NEW_QUESTION"
+            else "standalone"
         )
-        or classification_dict.get("requires_recent_conversation", False)
-        else ("image" if input.source_modality == "image" else "standalone")
     )
     update_request_type(request_type)
     update_request_summary(
@@ -283,6 +316,25 @@ def _iter_stream_doubt_solver(
             "difficulty": classification_dict.get("difficulty"),
             "classifier_source": "fallback" if classifier_fallback else "llm",
             "strong_classifier_used": careful_status_pending,
+            "relation": (
+                raw_classification.relation
+                if raw_classification is not None
+                else "NEW_QUESTION"
+            ),
+            "action": (
+                raw_classification.requested_action
+                if raw_classification is not None
+                else "ANSWER_CURRENT"
+            ),
+            "selected_turn_id": (
+                raw_classification.selected_turn_id
+                if raw_classification is not None
+                else None
+            ),
+            "confidence": classifier_confidence,
+            "need_web_search": bool(classification_dict.get("need_web_search")),
+            "web_search_reason": classification_dict.get("web_search_reason"),
+            "search_term_present": bool(classification_dict.get("web_search_query")),
         },
     )
     if classifier_fallback:
@@ -303,117 +355,9 @@ def _iter_stream_doubt_solver(
             yield event
     if _cancelled(input):
         return
-
-    if (
-        conversation_result is None
-        and classification_dict.get("requires_recent_conversation", False)
-    ):
-        logger.debug("follow_up_request_count count=1")
-        log_event(
-            "follow_up_detected",
-            component="conversation.follow_up",
-            stage="load_recent_context",
-            status="detected",
-        )
-        try:
-            if conversation_persistence is None or follow_up_resolver is None:
-                raise RuntimeError("Conversation context is unavailable.")
-            with stage_span("doubt_solver.resolve_follow_up"):
-                resolved, recent = resolve_follow_up_with_recent_context(
-                    persistence=conversation_persistence,
-                    resolver=follow_up_resolver,
-                    actor_id=input.actor_id,
-                    conversation_id=input.conversation_id,
-                    request_id=request_id,
-                    original_query=input.original_query or query,
-                )
-            query = resolved.resolved_query
-            record_local_preview("resolved_query", query)
-            classification_dict, classifier_confidence, classifier_fallback = (
-                orchestrated_classify_query_with_delivery_signals(
-                    query,
-                    request_id=request_id,
-                    on_before_strong_classifier=on_before_strong_classifier,
-                )
-            )
-            classification_dict["requires_recent_conversation"] = False
-            state["query"] = query
-            state["classification"] = classification_dict
-            conversation_context = recent.formatted_reference
-            update_request_summary(
-                context_source=getattr(recent, "source", "unknown"),
-                usable_recent_turns=getattr(recent, "usable_turn_count", len(recent.turns)),
-            )
-        except Exception as exc:  # noqa: BLE001
-            stage = getattr(exc, "stage", "context_load")
-            reason = getattr(exc, "reason", "context_unavailable")
-            logger.warning(
-                "follow_up_resolution_failure count=1 failure_stage=%s "
-                "failure_reason=%s",
-                stage,
-                reason,
-            )
-            log_event(
-                "follow_up_resolution_failed",
-                component="conversation.follow_up",
-                stage=str(stage),
-                status="failed",
-                error_code=str(reason).upper(),
-                details={
-                    "error_type": type(exc).__name__,
-                    "failure_stage": stage,
-                    "failure_reason": reason,
-                },
-                level=logging.WARNING,
-            )
-            clarification = {
-                "english": "Please clarify which earlier question, step, or option you mean.",
-                "hinglish": (
-                    "Please clarify karein ki aap kis pehle question, step, ya option "
-                    "ki baat kar rahe hain."
-                ),
-                "hindi": "कृपया स्पष्ट करें कि आप पहले के किस प्रश्न, चरण या विकल्प की बात कर रहे हैं।",
-            }[input.language]
-            record_local_preview("response_type", "clarification")
-            record_local_preview("response", clarification)
-            final = build_final_answer_result(
-                content=clarification,
-                language=input.language,
-                quality_status="failed_quality_gate",
-            )
-            if conversation_persistence is not None:
-                conversation_persistence.record_skip(
-                    request_id=request_id,
-                    conversation_id=input.conversation_id,
-                    turn_id=input.turn_id,
-                    skip_reason="clarification_response",
-                )
-            yield DoubtSolverStreamEvent(
-                type="chunk", request_id=request_id, content=clarification
-            )
-            yield DoubtSolverStreamEvent(
-                type="complete",
-                request_id=request_id,
-                stage="complete",
-                label=get_stream_label("complete"),
-                metadata={
-                    "request_id": request_id,
-                    "terminal_reason": "clarification_required",
-                },
-                response=DoubtSolverFinalResponse(
-                    request_id=request_id,
-                    content=ResponseContent(value=clarification),
-                    answer=clarification,
-                    final_answer=final,
-                ),
-            )
-            return
-    elif (
-        conversation_result is None
-        or not conversation_result.relation.requires_recent_conversation
-    ):
+    if request_type == "standalone":
         logger.debug("standalone_request_count count=1")
-    else:
+    elif request_type == "follow_up":
         logger.debug("follow_up_request_count count=1")
 
     event = emit_status(stage="thinking", reason_code="thinking")
@@ -457,7 +401,21 @@ def _iter_stream_doubt_solver(
     subject = str(classification_dict.get("subject", "general"))
     intent = str(classification_dict.get("intent", "explain"))
     difficulty = str(classification_dict.get("difficulty", "default"))
+    requested_action = (
+        raw_classification.requested_action
+        if raw_classification is not None
+        else str(classification_dict.get("requested_action") or "ANSWER_CURRENT")
+    )
+    correctness_verification_required = (
+        requires_independent_correctness_verification(
+            subject=subject,
+            difficulty=difficulty,
+            intent=intent,
+            requested_action=requested_action,
+        )
+    )
     context_text = str(state.get("context_text") or "")
+    web_verified = required_web_context_verified(classification_dict, state)
     retrieval_context = state.get("retrieval_context") or {}
     retrieval_mode = retrieval_context.get("mode")
     retrieval_used = retrieval_mode not in {None, "fresh_solve"}
@@ -478,7 +436,8 @@ def _iter_stream_doubt_solver(
                 retrieval_context.get("materialConflicts") or []
             ),
             provider_fallback=False,
-            needs_review=False,
+            needs_review=correctness_verification_required,
+            language=input.language,
         )
     )
     logger.debug(
@@ -499,7 +458,15 @@ def _iter_stream_doubt_solver(
     verification = None
     repair_attempted = False
     generation_started = time.monotonic()
-    if decision.strategy == "live_stream":
+    if not web_verified:
+        answer = verification_limited_response(input.language)
+        log_grounding_status(classification_dict, state, verified=False)
+        yield DoubtSolverStreamEvent(
+            type="chunk",
+            request_id=request_id,
+            content=answer,
+        )
+    elif decision.strategy == "live_stream":
         answer_parts: list[str] = []
         visible_answer_emitted = False
         try:
@@ -617,6 +584,7 @@ def _iter_stream_doubt_solver(
                     subject=subject,
                     intent=intent,
                     difficulty=difficulty,
+                    query=query,
                     language=input.language,
                     policy=AnswerQualityPolicy.from_settings(settings),
                 )
@@ -634,29 +602,33 @@ def _iter_stream_doubt_solver(
         if _cancelled(input):
             return
         if settings.answer_verifier_enabled and not verification.is_valid:
-            if settings.answer_verifier_max_repair_attempts == 1:
+            if (
+                settings.answer_verifier_max_repair_attempts == 1
+                and count_generator_calls() < 2
+            ):
                 repair_attempted = True
                 logger.debug("repair_started request_id=%s stage=verifying", request_id)
                 if _cancelled(input):
                     return
                 try:
-                    draft = adapter.generate(
-                        request_id=request_id,
-                        query=query,
-                        subject=subject,
-                        intent=intent,
-                        difficulty=difficulty,
-                        context=context_text,
-                        web_search_reason=(
-                            str(classification_dict["web_search_reason"])
-                            if classification_dict.get("web_search_reason")
-                            else None
-                        ),
-                        exam_id=input.exam_id,
-                        exam_stage=input.exam_stage,
-                        language=input.language,
-                        conversation_context=conversation_context or None,
-                    )
+                    with bind_llm_attempt_type("repair"):
+                        draft = adapter.generate(
+                            request_id=request_id,
+                            query=query,
+                            subject=subject,
+                            intent=intent,
+                            difficulty=difficulty,
+                            context=context_text,
+                            web_search_reason=(
+                                str(classification_dict["web_search_reason"])
+                                if classification_dict.get("web_search_reason")
+                                else None
+                            ),
+                            exam_id=input.exam_id,
+                            exam_stage=input.exam_stage,
+                            language=input.language,
+                            conversation_context=conversation_context or None,
+                        )
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "answer_delivery request_id=%s stage=repair terminal_reason=%s",
@@ -678,6 +650,7 @@ def _iter_stream_doubt_solver(
                             subject=subject,
                             intent=intent,
                             difficulty=difficulty,
+                            query=query,
                             language=input.language,
                             policy=AnswerQualityPolicy.from_settings(settings),
                         )
@@ -693,9 +666,11 @@ def _iter_stream_doubt_solver(
                     return
             if not verification.is_valid:
                 logger.warning(
-                    "answer_delivery request_id=%s stage=verification approved=false repair=%s",
+                    "answer_delivery request_id=%s stage=verification approved=false "
+                    "repair=%s generator_calls=%d",
                     request_id,
                     repair_attempted,
+                    count_generator_calls(),
                 )
                 yield _error_event(
                     request_id,
@@ -705,7 +680,48 @@ def _iter_stream_doubt_solver(
                 return
         if _cancelled(input):
             return
+        correctness_verifier = getattr(adapter, "correctness_verifier", None)
+        if correctness_verification_required and correctness_verifier is not None:
+            correctness = correctness_verifier.verify(
+                request_id=request_id,
+                query=query,
+                candidate_answer=verification.sanitized_text or draft,
+                subject=subject,
+                difficulty=difficulty,
+                language=input.language,
+            )
+            if not correctness.approved or not verification.is_valid:
+                yield _error_event(
+                    request_id,
+                    code=(
+                        "ANSWER_VERIFICATION_UNAVAILABLE"
+                        if correctness.status == "unavailable"
+                        else "ANSWER_VERIFICATION_FAILED"
+                    ),
+                    retryable=False,
+                )
+                return
         answer = verification.sanitized_text or draft
+        grounded_answer = sanitize_required_web_answer(
+            classification_dict,
+            state,
+            answer,
+        )
+        if grounded_answer is not None:
+            answer = grounded_answer
+        answer_grounded = grounded_answer is not None and required_web_answer_verified(
+            classification_dict,
+            state,
+            answer,
+        )
+        if not answer_grounded:
+            answer = verification_limited_response(input.language)
+        log_grounding_status(
+            classification_dict,
+            state,
+            verified=answer_grounded,
+            answer=answer,
+        )
         replay_chunks = list(
             iter_markdown_replay_chunks(
                 answer,
@@ -740,6 +756,18 @@ def _iter_stream_doubt_solver(
                 )
         logger.debug("replay_completed request_id=%s stage=verifying", request_id)
 
+    if web_verified and decision.strategy == "live_stream":
+        answer_grounded = required_web_answer_verified(
+            classification_dict,
+            state,
+            answer,
+        )
+        log_grounding_status(
+            classification_dict,
+            state,
+            verified=answer_grounded,
+            answer=answer,
+        )
     if not answer.strip():
         yield _error_event(
             request_id,
@@ -758,7 +786,7 @@ def _iter_stream_doubt_solver(
     log_event(
         (
             "generation_completed"
-            if decision.strategy == "live_stream"
+            if decision.strategy == "live_stream" and web_verified
             else "answer_delivery_completed"
         ),
         component=(
@@ -769,7 +797,13 @@ def _iter_stream_doubt_solver(
         stage="generating",
         status="completed",
         duration_ms=generation_duration_ms,
-        details={"route": decision.strategy},
+        details={
+            "route": decision.strategy if web_verified else "verification_limited",
+            "web_context_received": bool(context_text) and web_verified,
+            "web_context_characters": len(context_text) if web_verified else 0,
+            "retrieval_context_characters": 0 if web_verified else len(context_text),
+            "conversation_context_characters": len(conversation_context or ""),
+        },
     )
     if _cancelled(input):
         return
@@ -781,6 +815,7 @@ def _iter_stream_doubt_solver(
                 subject=subject,
                 intent=intent,
                 difficulty=difficulty,
+                query=query,
                 language=input.language,
                 policy=final_quality_policy,
             )
@@ -914,7 +949,9 @@ def stream_doubt_solver(
         turn_id=input.turn_id,
         request_type=initial_type,
     ):
-        summary_token = begin_request_summary()
+        summary_token = begin_request_summary(
+            initial_llm_usage_records=input.initial_llm_usage_records
+        )
         visible = False
         terminal = False
         terminal_reason = "unexpected_internal_error"

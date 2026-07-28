@@ -8,12 +8,18 @@ from typing import Literal
 
 from observability.context import current_request_context
 from observability.events import log_event
+from observability.llm_usage import (
+    begin_llm_usage_collection,
+    emit_llm_usage_summary,
+    reset_llm_usage_collection,
+)
 from observability.readable_log import (
     RequestLogBuffer,
     begin_request_log,
     finalize_request_log,
     reset_request_log,
 )
+from schemas.llm_usage import LLMUsageRecord
 
 
 @dataclass(frozen=True)
@@ -57,9 +63,13 @@ _SUMMARY_FIELDS = frozenset(RequestExecutionSummary.__dataclass_fields__)
 class RequestSummaryToken:
     summary: Token[RequestExecutionSummary | None]
     readable_log: Token[RequestLogBuffer | None]
+    llm_usage: Token
 
 
-def begin_request_summary() -> RequestSummaryToken:
+def begin_request_summary(
+    *,
+    initial_llm_usage_records: tuple[LLMUsageRecord, ...] = (),
+) -> RequestSummaryToken:
     context = current_request_context()
     if context is None:
         raise RuntimeError("Request context must be bound before starting a summary.")
@@ -75,6 +85,7 @@ def begin_request_summary() -> RequestSummaryToken:
             )
         ),
         readable_log=readable_token,
+        llm_usage=begin_llm_usage_collection(initial_llm_usage_records),
     )
 
 
@@ -84,6 +95,7 @@ def reset_request_summary(token: RequestSummaryToken) -> None:
         finalize_request_log(summary)
     _summary.reset(token.summary)
     reset_request_log(token.readable_log)
+    reset_llm_usage_collection(token.llm_usage)
 
 
 def current_request_summary() -> RequestExecutionSummary | None:
@@ -106,6 +118,7 @@ def emit_request_summary() -> None:
     summary = _summary.get()
     if summary is None:
         return
+    emit_llm_usage_summary()
     details = {
         key: value
         for key, value in asdict(summary).items()

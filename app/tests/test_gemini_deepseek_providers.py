@@ -24,9 +24,9 @@ from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderExecutionError,
 )
+from services.llm.providers.gemini_provider import GeminiProviderAdapter
 from services.llm.providers.openai_compatible_adapter import (
     DeepSeekProviderAdapter,
-    GeminiProviderAdapter,
     classify_gemini_error,
 )
 from services.llm.providers.provider_factory import ProviderAdapterFactory
@@ -183,9 +183,81 @@ class TestGeminiDeepSeekConfigDefaults:
 
 
 class TestGeminiAdapterExecution:
+    def test_classifier_uses_native_structured_output_schema(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Models:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    text='{"intent":"solve_question","subject":"math","confidence":0.96}',
+                    parsed=None,
+                    candidates=[SimpleNamespace(finish_reason="STOP")],
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=100,
+                        candidates_token_count=25,
+                        total_token_count=125,
+                    ),
+                )
+
+        registry = LlmConfigRegistry()
+        route = RouteDecision(
+            route_id="general.classifier.default",
+            subject="general",
+            task_role="classifier",
+            difficulty="default",
+            model="doubt_solver_classifier_gemini",
+            prompt="classification_semantics.md",
+            temperature=0.1,
+            max_tokens=650,
+            provider_options={},
+            fallback=[],
+            fallback_attempts=[],
+            route_source="exact",
+        )
+        request = ProviderExecutionRequest(
+            route_decision=route,
+            model_resolution=ModelConfigResolver(registry=registry).resolve(route),
+            messages=[
+                LlmMessage(role="system", content="Classify without solving."),
+                LlmMessage(role="user", content="What is 20% of 500?"),
+            ],
+            temperature=0.1,
+            max_tokens=650,
+            provider_options={},
+        )
+        result = GeminiProviderAdapter(
+            client_factory=lambda _credentials, _timeout: SimpleNamespace(
+                models=Models()
+            )
+        ).generate(
+            request=request,
+            credentials=ProviderCredentials(provider="gemini", api_key="test-key"),
+        )
+
+        config = captured["config"]
+        schema = config.response_json_schema
+        assert captured["model"] == "gemini-3.1-flash-lite"
+        assert config.response_mime_type == "application/json"
+        assert "classification_source" not in schema["properties"]
+        assert "requires_recent_conversation" not in schema["properties"]
+        assert set(schema["required"]) == set(schema["properties"])
+        assert result.provider == "gemini"
+        assert result.total_tokens == 125
+        assert result.metadata["native_structured_output"] is True
+
     def test_generate_returns_normalized_response(self, tmp_path: Path) -> None:
         fake_client = MagicMock()
-        fake_client.chat.completions.create.return_value = _fake_completion("Gemini answer.")
+        fake_client.models.generate_content.return_value = SimpleNamespace(
+            text="Gemini answer.",
+            parsed=None,
+            candidates=[SimpleNamespace(finish_reason="STOP")],
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=10,
+                candidates_token_count=20,
+                total_token_count=30,
+            ),
+        )
 
         adapter = GeminiProviderAdapter(
             client_factory=lambda _creds, _timeout: fake_client,
@@ -204,9 +276,9 @@ class TestGeminiAdapterExecution:
         assert result.finish_reason == "stop"
         assert result.input_tokens == 10
         assert result.output_tokens == 20
-        call_kwargs = fake_client.chat.completions.create.call_args.kwargs
+        call_kwargs = fake_client.models.generate_content.call_args.kwargs
         assert call_kwargs["model"] == "gemini-2.5-flash"
-        assert call_kwargs["max_tokens"] == 900
+        assert call_kwargs["config"].max_output_tokens == 900
 
     def test_missing_api_key_raises_provider_not_configured(self, tmp_path: Path) -> None:
         adapter = GeminiProviderAdapter(client_factory=lambda _c, _t: MagicMock())

@@ -27,9 +27,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from observability.context import bind_request_context
+from observability.llm_usage import (
+    begin_llm_usage_collection,
+    bind_llm_attempt_type,
+    reset_llm_usage_collection,
+    snapshot_llm_usage_records,
+)
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
 from schemas.llm_routing import RouteDecision
+from schemas.llm_usage import ProviderTokenUsage
+from services.llm.providers.usage import set_stream_usage
 from services.llm_orchestration.config_registry import LlmConfigRegistry
 from services.llm_orchestration.model_config_resolver import ModelConfigResolver
 from services.llm_orchestration.model_execution import ProviderAdapterExecutor
@@ -288,6 +297,79 @@ class TestProviderAdapterExecutorMockPath:
 
         assert mock_adapter.call_count == 1
 
+    def test_stream_terminal_usage_is_recorded(self, tmp_path: Path) -> None:
+        request = _make_request(tmp_path, _MOCK_YAML, _mock_route_decision())
+
+        class UsageStreamAdapter:
+            last_stream_finish_reason = "stop"
+
+            def generate_stream(self, *, request, credentials):
+                del request, credentials
+                yield "Answer"
+                set_stream_usage(
+                    ProviderTokenUsage(
+                        input_tokens=12,
+                        output_tokens=3,
+                        total_tokens=15,
+                    )
+                )
+
+        executor = ProviderAdapterExecutor(
+            credential_resolver=ProviderCredentialResolver(
+                secret_resolver=EnvSecretResolver()
+            ),
+            provider_factory=ProviderAdapterFactory(
+                adapter_map={"mock": UsageStreamAdapter()}  # type: ignore[dict-item]
+            ),
+        )
+
+        with bind_request_context(request_id="request-stream-usage"):
+            token = begin_llm_usage_collection()
+            try:
+                assert list(executor.execute_stream(request)) == ["Answer"]
+                records = snapshot_llm_usage_records()
+            finally:
+                reset_llm_usage_collection(token)
+
+        assert len(records) == 1
+        assert records[0].streaming is True
+        assert records[0].total_tokens == 15
+        assert records[0].status == "succeeded"
+
+    def test_stream_close_records_controlled_cancellation(self, tmp_path: Path) -> None:
+        request = _make_request(tmp_path, _MOCK_YAML, _mock_route_decision())
+
+        class CancellableStreamAdapter:
+            last_stream_finish_reason = None
+
+            def generate_stream(self, *, request, credentials):
+                del request, credentials
+                yield "first"
+                yield "second"
+
+        executor = ProviderAdapterExecutor(
+            credential_resolver=ProviderCredentialResolver(
+                secret_resolver=EnvSecretResolver()
+            ),
+            provider_factory=ProviderAdapterFactory(
+                adapter_map={"mock": CancellableStreamAdapter()}  # type: ignore[dict-item]
+            ),
+        )
+
+        with bind_request_context(request_id="request-stream-cancelled"):
+            token = begin_llm_usage_collection()
+            try:
+                stream = executor.execute_stream(request)
+                assert next(stream) == "first"
+                stream.close()
+                records = snapshot_llm_usage_records()
+            finally:
+                reset_llm_usage_collection(token)
+
+        assert len(records) == 1
+        assert records[0].status == "cancelled"
+        assert records[0].usage_source == "unavailable"
+
 
 # ---------------------------------------------------------------------------
 # OpenAI adapter path with fake client + fake env
@@ -318,6 +400,75 @@ class TestProviderAdapterExecutorOpenAIPath:
 
         assert result.content == "OpenAI answer."
         assert result.provider == "openai"
+
+    def test_openai_call_is_recorded_at_central_executor_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-test-key-for-openai")
+        request = _make_request(tmp_path, _OPENAI_YAML, _openai_route_decision())
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = _fake_completion()
+        executor = ProviderAdapterExecutor(
+            credential_resolver=ProviderCredentialResolver(
+                secret_resolver=EnvSecretResolver()
+            ),
+            provider_factory=ProviderAdapterFactory(
+                adapter_map={
+                    "openai": OpenAIProviderAdapter(
+                        client_factory=lambda _creds: fake_client
+                    )
+                }
+            ),
+        )
+
+        with bind_request_context(request_id="request-executor"):
+            token = begin_llm_usage_collection()
+            try:
+                executor.execute(request)
+                records = snapshot_llm_usage_records()
+            finally:
+                reset_llm_usage_collection(token)
+
+        assert len(records) == 1
+        assert records[0].role == "general.generator.default"
+        assert records[0].provider == "openai"
+        assert records[0].model == "gpt-4o"
+        assert records[0].input_tokens == 10
+        assert records[0].output_tokens == 5
+        assert records[0].total_tokens == 15
+        assert records[0].status == "succeeded"
+
+    def test_caller_attempt_type_is_preserved_for_repair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-test-key-for-openai")
+        request = _make_request(tmp_path, _OPENAI_YAML, _openai_route_decision())
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = _fake_completion()
+        executor = ProviderAdapterExecutor(
+            credential_resolver=ProviderCredentialResolver(
+                secret_resolver=EnvSecretResolver()
+            ),
+            provider_factory=ProviderAdapterFactory(
+                adapter_map={
+                    "openai": OpenAIProviderAdapter(
+                        client_factory=lambda _creds: fake_client
+                    )
+                }
+            ),
+        )
+
+        with bind_request_context(request_id="request-repair"):
+            token = begin_llm_usage_collection()
+            try:
+                with bind_llm_attempt_type("repair"):
+                    executor.execute(request)
+                records = snapshot_llm_usage_records()
+            finally:
+                reset_llm_usage_collection(token)
+
+        assert len(records) == 1
+        assert records[0].attempt_type == "repair"
 
     def test_openai_missing_env_raises_secret_not_found(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -391,10 +542,19 @@ class TestProviderAdapterExecutorAzurePath:
             credential_resolver=cred_resolver,
             provider_factory=factory,
         )
-        result = executor.execute(request)
+        with bind_request_context(request_id="request-azure-executor"):
+            token = begin_llm_usage_collection()
+            try:
+                result = executor.execute(request)
+                records = snapshot_llm_usage_records()
+            finally:
+                reset_llm_usage_collection(token)
 
         assert result.content == "Azure answer."
         assert result.provider == "azure_openai"
+        assert len(records) == 1
+        assert records[0].model == "gpt-4o-deployment"
+        assert records[0].deployment == "gpt-4o-deployment"
 
     def test_azure_missing_endpoint_env_raises_secret_not_found(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

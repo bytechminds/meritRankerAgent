@@ -439,6 +439,7 @@ def test_observed_invocation_emits_summary_and_terminal(
     assert result == {"success": True}
     assert events == [
         "request_started",
+        "llm_usage_summary",
         "request_execution_summary",
         "request_completed",
     ]

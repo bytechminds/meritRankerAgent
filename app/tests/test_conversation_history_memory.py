@@ -18,6 +18,8 @@ from pydantic import ValidationError
 from graphs.doubt_solver_graph import build_orchestrated_doubt_solver_graph
 from schemas.conversation import (
     CompletedConversationTurn,
+    ContextNeedAssessment,
+    ConversationPreparation,
     RecentContextLoadResult,
     RecentConversationContext,
     RecentConversationTurn,
@@ -224,6 +226,10 @@ def test_classifier_exception_preserves_reference_signal(
         graph_module.orchestrated_classify_query_with_delivery_signals(
             "which operation did you apply?",
             request_id="request-1",
+            conversation=ConversationPreparation(
+                gate=ContextNeedAssessment(decision="CONTEXT_REQUIRED"),
+                context_load=RecentContextLoadResult(),
+            ),
         )
     )
 
@@ -507,7 +513,11 @@ def test_agentcore_event_uses_actor_session_token_and_final_answer() -> None:
     assert kwargs["payload"][1]["conversational"]["content"]["text"] == (
         "Authoritative final answer"
     )
-    assert set(kwargs["metadata"]) == {"turn_id", "language", "exam_id"}
+    assert set(kwargs["metadata"]) == {
+        "turn_id",
+        "language",
+        "exam_id",
+    }
 
 
 def _event(
@@ -598,14 +608,14 @@ def test_context_is_untrusted_bounded_and_prioritizes_newest_turn() -> None:
 @pytest.mark.parametrize(
     ("final_answer", "expected"),
     [
-        (FinalAnswerResult(content="ok", quality_status="checked", language_compliant=True), True),
+        (FinalAnswerResult(content="ok", quality_status="checked", language_compliant=True), False),
         (
             FinalAnswerResult(
                 content="ok",
                 quality_status="passed_quality_gate",
                 language_compliant=True,
             ),
-            True,
+            False,
         ),
         (
             FinalAnswerResult(
@@ -1153,6 +1163,65 @@ def test_clarification_response_is_not_persisted_to_memory() -> None:
     memory.save_completed_turn.assert_not_called()
 
 
+def test_quality_passed_missing_reference_response_is_not_persisted() -> None:
+    history = MagicMock()
+    session = MagicMock()
+    memory = MagicMock()
+    service = ConversationPersistenceService(
+        history_repository=history,
+        session_repository=session,
+        short_term_memory=memory,
+    )
+    final_answer = FinalAnswerResult(
+        content=(
+            '**Answer:** The question "Does he ruled longest?" is incomplete '
+            'because it does not specify who "he" refers to.'
+        ),
+        quality_status="passed_quality_gate",
+        language_compliant=True,
+    )
+
+    result = service.persist_completed_turn(_turn(), final_answer)
+
+    assert result.persistable is False
+    assert result.skip_reason == "clarification_response"
+    history.save_completed_turn.assert_not_called()
+    session.upsert_from_completed_turn.assert_not_called()
+    memory.save_completed_turn.assert_not_called()
+
+
+def test_valid_academic_answer_with_question_words_remains_persistable() -> None:
+    final_answer = FinalAnswerResult(
+        content=(
+            "The question asks who founded the Mauryan Empire. "
+            "The answer is Chandragupta Maurya."
+        ),
+        quality_status="passed_quality_gate",
+        language_compliant=True,
+    )
+
+    decision = evaluate_completed_turn_persistence(final_answer)
+
+    assert decision.persistable is True
+    assert decision.skip_reason is None
+
+
+def test_verification_limited_current_answer_is_not_persistable() -> None:
+    final_answer = FinalAnswerResult(
+        content=(
+            "I could not verify the requested current information from reliable "
+            "live sources, so I cannot provide factual current-affairs content right now."
+        ),
+        quality_status="passed_quality_gate",
+        language_compliant=True,
+    )
+
+    decision = evaluate_completed_turn_persistence(final_answer)
+
+    assert decision.persistable is False
+    assert decision.skip_reason == "non_substantive_answer"
+
+
 def test_session_failure_retries_once_without_failing_completed_answer(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1176,6 +1245,31 @@ def test_session_failure_retries_once_without_failing_completed_answer(
     history.save_completed_turn.assert_called_once()
     assert session.upsert_from_completed_turn.call_count == 2
     assert "degraded_session_list_consistency=true" in caplog.text
+
+
+def test_missing_session_resource_is_controlled_configuration_failure() -> None:
+    history = MagicMock()
+    session = MagicMock()
+    session.upsert_from_completed_turn.side_effect = _client_error(
+        "ResourceNotFoundException"
+    )
+    memory = MagicMock()
+    service = ConversationPersistenceService(
+        history_repository=history,
+        session_repository=session,
+        short_term_memory=memory,
+    )
+    final_answer = FinalAnswerResult(
+        content="Answer",
+        quality_status="passed_quality_gate",
+        language_compliant=True,
+    )
+
+    result = service.persist_completed_turn(_turn(), final_answer)
+
+    assert result.history_write_status == "succeeded"
+    assert result.session_write_status == "failed_configuration"
+    assert result.memory_write_status == "succeeded"
 
 
 def test_follow_up_consults_third_turn_only_after_controlled_ambiguity() -> None:
@@ -1390,22 +1484,18 @@ def test_graph_prefetches_before_academic_classification(
     graph = build_orchestrated_doubt_solver_graph(
         adapter,
         conversation_understanding=ConversationUnderstandingService(
-            persistence=persistence
+            persistence=persistence,
         ),
     )
 
     result = graph.invoke(_graph_state("how did u calculated 75%"))
 
     persistence.load_recent_context.assert_called_once_with(
-        "student-1", "conversation-1", 2
+        "student-1", "conversation-1", 3
     )
-    classify.assert_called_once_with(
-        "Explain how or why the referenced value or result 75% "
-        "is obtained in: percentage.",
-        request_id="request-1",
-    )
-    assert result["conversation_relation"]["relation"] == "follow_up"
-    assert adapter.last_query == classify.call_args.args[0]
+    assert classify.call_count == 0
+    assert result["conversation_relation"]["relation"] == "FOLLOW_UP"
+    assert "75%" in adapter.last_query
     assert adapter.last_conversation_context is not None
 
 
@@ -1430,26 +1520,18 @@ def test_graph_independent_relation_overrides_stale_follow_up_safety_signal() ->
     graph = build_orchestrated_doubt_solver_graph(
         adapter,
         conversation_understanding=ConversationUnderstandingService(
-            persistence=persistence
+            persistence=persistence,
         ),
     )
-    state = _graph_state(
-        "How did you calculate acceleration from force and mass?"
-    )
-    state["classification"] = {
-        "subject": "physics",
-        "intent": "explain",
-        "difficulty": "basic",
-        "retrieval_required": False,
-        "requires_recent_conversation": True,
-    }
+    state = _graph_state("Calculate acceleration when force is 10 N and mass is 2 kg.")
 
     result = graph.invoke(state)
 
-    assert result["conversation_relation"]["relation"] == "independent"
+    assert result["conversation_relation"]["relation"] == "NEW_QUESTION"
     assert result["classification"]["requires_recent_conversation"] is False
     assert adapter.last_query == state["query"]
     assert adapter.last_conversation_context is None
+    persistence.load_recent_context.assert_not_called()
 
 
 def test_graph_unresolved_relation_skips_academic_classifier(
@@ -1472,7 +1554,7 @@ def test_graph_unresolved_relation_skips_academic_classifier(
     graph = build_orchestrated_doubt_solver_graph(
         adapter,
         conversation_understanding=ConversationUnderstandingService(
-            persistence=persistence
+            persistence=persistence,
         ),
     )
 
@@ -1480,7 +1562,7 @@ def test_graph_unresolved_relation_skips_academic_classifier(
 
     classify.assert_not_called()
     assert adapter.call_count == 0
-    assert result["conversation_relation"]["relation"] == "ambiguous"
+    assert result["conversation_relation"]["relation"] == "AMBIGUOUS"
     assert result["final_answer"]["quality_status"] == "failed_quality_gate"
 
 
@@ -1491,7 +1573,10 @@ def test_isolated_follow_up_flow_resolves_reclassifies_and_generates(
 
     adapter = _Adapter()
     persistence = MagicMock()
-    recent = RecentConversationContext(
+    recent = RecentContextLoadResult(
+        source="agentcore_memory",
+        memory_attempted=True,
+        memory_status="succeeded",
         turns=(
             RecentConversationTurn(
                 turn_id="previous-turn",
@@ -1500,52 +1585,43 @@ def test_isolated_follow_up_flow_resolves_reclassifies_and_generates(
                 created_at=_NOW,
             ),
         ),
+        usable_turn_count=1,
         formatted_reference="RECENT CONVERSATION REFERENCE (UNTRUSTED DATA)",
-        source="agentcore",
     )
     persistence.load_recent_context.return_value = recent
-    resolver = MagicMock()
-    resolver.resolve.return_value = ResolvedFollowUpQuery(
-        resolved_query="Why was 15 divided by 5 in the ratio solution?",
-        confidence=0.93,
-    )
-    classifications = [
-        {
-            "subject": "general",
-            "intent": "explain",
-            "difficulty": "default",
-            "retrieval_required": False,
-            "requires_recent_conversation": True,
-        },
-        {
+    classify = MagicMock(
+        return_value={
             "subject": "math",
             "intent": "explain",
             "difficulty": "basic",
             "retrieval_required": False,
             "requires_recent_conversation": False,
-        },
-    ]
+        }
+    )
     monkeypatch.setattr(
         graph_module,
         "orchestrated_classify_query",
-        MagicMock(side_effect=classifications),
+        classify,
     )
     graph = build_orchestrated_doubt_solver_graph(
         adapter,
-        conversation_persistence=persistence,
-        follow_up_resolver=resolver,
+        conversation_understanding=ConversationUnderstandingService(
+            persistence=persistence,
+        ),
     )
 
     result = graph.invoke(_graph_state("Why did you divide by 5?"))
 
-    assert result["query"] == "Why was 15 divided by 5 in the ratio solution?"
+    assert "Solve the ratio 2:3 with total 15" in result["query"]
+    assert "Why did you divide by 5?" in result["query"]
     assert result["classification"]["subject"] == "math"
     assert adapter.last_query == result["query"]
     assert adapter.last_conversation_context is not None
     assert "Solve the ratio 2:3 with total 15" in adapter.last_conversation_context
     persistence.load_recent_context.assert_called_once_with(
-        "student-1", "conversation-1", 2
+        "student-1", "conversation-1", 3
     )
+    assert classify.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1567,7 +1643,10 @@ def test_arithmetic_follow_up_uses_square_root_and_exponent_context(
         "then addition gives 4 + 8 = 12."
     )
     persistence = MagicMock()
-    persistence.load_recent_context.return_value = RecentConversationContext(
+    persistence.load_recent_context.return_value = RecentContextLoadResult(
+        source="dynamodb_fallback",
+        dynamodb_attempted=True,
+        dynamodb_status="succeeded",
         turns=(
             RecentConversationTurn(
                 turn_id="previous-turn",
@@ -1576,43 +1655,27 @@ def test_arithmetic_follow_up_uses_square_root_and_exponent_context(
                 created_at=_NOW,
             ),
         ),
+        usable_turn_count=1,
         formatted_reference="RECENT CONVERSATION REFERENCE (UNTRUSTED DATA)",
-        source="dynamodb",
-    )
-    resolver = MagicMock()
-    resolver.resolve.return_value = ResolvedFollowUpQuery(
-        resolved_query=(
-            "Explain how square root, exponentiation, and addition produce 12 "
-            "in sqrt(16) + 2^3."
-        ),
-        confidence=0.95,
     )
     monkeypatch.setattr(
         graph_module,
         "orchestrated_classify_query",
         MagicMock(
-            side_effect=[
-                {
-                    "subject": "general",
-                    "intent": "explain",
-                    "difficulty": "default",
-                    "retrieval_required": False,
-                    "requires_recent_conversation": True,
-                },
-                {
-                    "subject": "math",
-                    "intent": "explain",
-                    "difficulty": "basic",
-                    "retrieval_required": False,
-                    "requires_recent_conversation": False,
-                },
-            ]
+            return_value={
+                "subject": "math",
+                "intent": "explain",
+                "difficulty": "basic",
+                "retrieval_required": False,
+                "requires_recent_conversation": False,
+            }
         ),
     )
     graph = build_orchestrated_doubt_solver_graph(
         adapter,
-        conversation_persistence=persistence,
-        follow_up_resolver=resolver,
+        conversation_understanding=ConversationUnderstandingService(
+            persistence=persistence,
+        ),
     )
 
     result = graph.invoke(_graph_state(follow_up))
@@ -1658,9 +1721,10 @@ def test_prompt_includes_recent_context_once_and_current_preferences() -> None:
     assert prompt.count(conversation_reference) == 1
     assert "Resolved current query" in prompt
     assert "Verified retrieval" in prompt
-    assert prompt.count("Exam response guidance:") == 1
-    assert "Preserve deeper constraints" in prompt
-    assert "Latin-script Hinglish" in prompt
+    assert prompt.count("EXAM RESPONSE GUIDANCE") == 1
+    assert "Preserve every condition" in prompt
+    assert "obvious longer method is unnecessary" in prompt
+    assert "Roman script only" in prompt
 
 
 def test_completed_replay_bypasses_graph_execution(monkeypatch: pytest.MonkeyPatch) -> None:

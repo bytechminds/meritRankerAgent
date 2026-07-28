@@ -170,3 +170,43 @@ Every integration point should be swappable without touching the graph:
 - `2026-07-15` — Use S3 Vectors for student retrieval candidates and DynamoDB PatternGraph
   bundles as final authority. Rationale: vector metadata is stale-prone and cannot grant
   student final-answer authority without the current approved runtime bundle.
+- `2026-07-24` — Keep the existing query classifier as the only model-based academic
+  classification authority. Text classification and existing image classification converge through
+  a shared validated stage contract; Memory and DynamoDB provide bounded context but never classify.
+  Conversation relation handling remains a separate non-model compatibility concern until its
+  dedicated redesign.
+- `2026-07-25` — Use a deterministic gate only to decide whether recent conversation is read, then
+  let the existing query classifier decide academic fields plus relation, requested action, and at
+  most one supplied turn ID. A deterministic selected-context builder converts that validated
+  decision into one action-specific generation context. Rationale: this removes duplicate
+  conversation interpretation without adding another model, summarizer, cache, or storage schema.
+- `2026-07-27` — Resolve bounded external pronouns and indirect references inside the existing
+  query-classifier authority. A focused deterministic validator distinguishes local from external
+  references, rejects incompatible selections, and permits a one-candidate safe fallback; it never
+  selects from Memory directly or adds persistent reference lineage. Rationale: semantic model
+  selection remains primary while structural safeguards prevent unresolved standalone answers and
+  recency-only cross-topic contamination.
+- `2026-07-27` — Treat durable conversation transcripts and contextual candidate projections as
+  separate responsibilities. Clarification, unresolved-reference, acknowledgement, technical, and
+  failed-quality records remain stored but cannot enter classifier candidates; the same
+  response-function policy blocks future meta responses from academic persistence. Reference
+  compatibility requires a grounded antecedent and validated label before recency or same-entity
+  grouping. Rationale: durable audit history must not become contextual authority by default.
+- `2026-07-27` — Keep the validated frontend request as the sole response-language authority and
+  apply conditional language guidance only at the existing `PromptResolver` generator boundary.
+  English adds no prompt section; Hindi/Hinglish use private verified replay for SSE so language
+  validation and the existing bounded repair occur before student-visible chunks. Rationale:
+  central composition prevents route drift, while pre-emission verification avoids an
+  unrepairable wrong-language partial stream without adding a classifier or translation model.
+- `2026-07-28` — Keep correctness verification selective and outside graph topology. Deterministic
+  recomputation runs first for supported forms; only intermediate/advanced Quant or Reasoning,
+  correction/re-solve, and generated-practice cases may use the existing verifier task role.
+  Primary generation, continuation, rewrite, and repair share a two-generator-call request cap.
+  Rationale: formatting validation alone cannot protect numerical correctness, while a universal
+  verifier or independent repair loops would add avoidable latency and cost.
+- `2026-07-28` — Normalize all existing verifier infrastructure and parsing failures at the
+  verifier boundary to `ANSWER_VERIFICATION_UNAVAILABLE`; preserve the original exception only in
+  internal debug logging and never approve or persist an unavailable result. Keep one o4-mini call,
+  no fallback verifier, no correctness-repair generation, and the shared two-generator-call cap.
+  Rationale: fail-closed typed outcomes preserve public contracts and prevent exception-handling
+  defects from becoming raw request failures.

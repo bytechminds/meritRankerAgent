@@ -30,6 +30,7 @@ import pytest
 import config as cfg_module
 import services.query_classifier_service as classifier_module
 from schemas.doubt_solver import QueryClassification
+from services.doubt_solver.classifier_json import ClassifierJsonError
 from services.query_classifier_service import (
     _CLASSIFIER_ROLE,
     ClassifierRunResult,
@@ -112,10 +113,12 @@ class TestModelRegistryClassifierAliases:
         model = registry.model_map["doubt_solver_classifier"]
         assert model.provider == "azure_openai"
 
-    def test_primary_alias_has_fallback(self):
+    def test_gemini_primary_alias_has_no_model_fallback(self):
         registry = self._load_registry()
-        model = registry.model_map["doubt_solver_classifier"]
-        assert "doubt_solver_classifier_openai_native" in (model.fallback_models or [])
+        model = registry.model_map["doubt_solver_classifier_gemini"]
+        assert model.provider == "gemini"
+        assert model.model_id == "gemini-3.1-flash-lite"
+        assert not (model.fallback_models or [])
 
     def test_native_fallback_alias_exists(self):
         registry = self._load_registry()
@@ -163,7 +166,7 @@ class TestLlmRoutesClassifierRoute:
     def test_classifier_route_points_to_correct_model(self):
         registry = self._load_registry()
         route = registry.route_map[("general", "classifier", "default")]
-        assert route.model == "doubt_solver_classifier"
+        assert route.model == "doubt_solver_classifier_gemini"
 
     def test_classifier_route_prompt_set(self):
         registry = self._load_registry()
@@ -758,11 +761,53 @@ def _llm_classification(confidence: float) -> QueryClassification:
 
 
 class TestClassifierConfidenceFallback:
-    def test_follow_up_skips_strong_classifier_until_context_resolution(self) -> None:
+    def test_low_confidence_contextual_query_requires_strong_classifier(self) -> None:
         primary = _llm_classification(0.30).model_copy(
-            update={"requires_recent_conversation": True}
+            update={
+                "requires_recent_conversation": True,
+                "relation": "FOLLOW_UP",
+                "selected_turn_id": "turn-1",
+                "requested_action": "ANSWER_WITH_CONTEXT",
+            }
         )
+        strong = primary.model_copy(update={"confidence": 0.94})
         calls: list[str] = []
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "What was the pattern in the last one?",
+                request_id="req-follow-up",
+                on_before_strong_classifier=lambda: calls.append("hook"),
+                context_gate="CONTEXT_REQUIRED",
+                candidate_turn_ids=("turn-1",),
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.classification.requires_recent_conversation is True
+        assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.LOW_MATERIAL_CONFIDENCE
+        )
+        assert calls == ["hook"]
+
+    def test_resolved_one_candidate_follow_up_accepts_materially_certain_primary(
+        self,
+    ) -> None:
+        primary = _llm_classification(0.90).model_copy(
+            update={
+                "intent": "practice_question",
+                "requires_recent_conversation": True,
+                "relation": "FOLLOW_UP",
+                "selected_turn_id": "turn-1",
+                "requested_action": "GENERATE_SIMILAR",
+            }
+        )
 
         with patch.object(
             classifier_module,
@@ -770,23 +815,93 @@ class TestClassifierConfidenceFallback:
             return_value=primary,
         ) as mock_classify:
             run = classifier_module._classify_with_llm_orchestrated_or_fallback(
-                "What was the pattern in the last one?",
-                request_id="req-follow-up",
-                on_before_strong_classifier=lambda: calls.append("hook"),
+                "Create one similar question.",
+                request_id="req-resolved-follow-up",
+                context_gate="CONTEXT_REQUIRED",
+                candidate_turn_ids=("turn-1",),
             )
 
         assert mock_classify.call_count == 1
-        assert run.classification.requires_recent_conversation is True
         assert run.strong_classifier_used is False
-        assert calls == []
+        assert run.primary_decision is not None
+        assert run.primary_decision.accepted is True
 
-    def test_low_confidence_triggers_strong_classifier(
+    def test_multiple_candidate_ambiguity_keeps_strict_confidence_threshold(
+        self,
+    ) -> None:
+        primary = _llm_classification(0.90).model_copy(
+            update={
+                "subject": "general",
+                "intent": "general_doubt",
+                "relation": "AMBIGUOUS",
+                "selected_turn_id": None,
+                "requested_action": "ASK_CLARIFICATION",
+            }
+        )
+        strong = primary.model_copy(update={"confidence": 0.95})
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "Did he rule longer?",
+                request_id="req-ambiguous-context",
+                context_gate="CONTEXT_REQUIRED",
+                candidate_turn_ids=("akbar-turn", "shah-turn"),
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.LOW_MATERIAL_CONFIDENCE
+        )
+
+    def test_optional_uncertainty_does_not_trigger_strong_classifier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
         monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
         cfg_module._settings = None
-        primary = _llm_classification(0.91)
+        primary = _llm_classification(0.91).model_copy(
+            update={
+                "topic": None,
+                "topic_confidence": 0.20,
+                "pattern_topic_candidate": None,
+                "pattern_family_candidate": None,
+                "retrieval_tags": [],
+                "retrieval_need": "unknown",
+            }
+        )
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            return_value=primary,
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "profit question", request_id="req-low"
+            )
+        assert mock_classify.call_count == 1
+        assert run.classification.confidence == 0.91
+        assert run.strong_classifier_used is False
+        assert run.primary_decision is not None
+        assert run.primary_decision.accepted is True
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.PRIMARY_ACCEPTED
+        )
+        cfg_module._settings = None
+
+    def test_low_material_confidence_triggers_strong_classifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", raising=False)
+        monkeypatch.delenv("CLASSIFIER_CONFIDENCE_FALLBACK_THRESHOLD", raising=False)
+        cfg_module._settings = None
+        primary = _llm_classification(0.80)
         strong = _llm_classification(0.94)
         with patch.object(
             classifier_module,
@@ -794,19 +909,23 @@ class TestClassifierConfidenceFallback:
             side_effect=[primary, strong],
         ) as mock_classify:
             run = classifier_module._classify_with_llm_orchestrated_or_fallback(
-                "profit question", request_id="req-low"
+                "profit question", request_id="req-material-low"
             )
         assert mock_classify.call_count == 2
         mock_classify.assert_any_call(
-            "profit question", request_id="req-low", task_role="classifier"
-        )
-        mock_classify.assert_any_call(
             "profit question",
-            request_id="req-low",
+            request_id="req-material-low",
             task_role="classifier_strong",
+            primary_result=primary,
+            conflict_reason="LOW_MATERIAL_CONFIDENCE",
         )
         assert run.classification.confidence == 0.94
         assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.LOW_MATERIAL_CONFIDENCE
+        )
         cfg_module._settings = None
 
     def test_high_confidence_does_not_trigger_strong_classifier(
@@ -828,6 +947,184 @@ class TestClassifierConfidenceFallback:
         assert run.classification.confidence == 0.94
         assert run.strong_classifier_used is False
         cfg_module._settings = None
+
+    def test_exact_riya_primary_is_accepted_without_strong_classifier(self) -> None:
+        primary = QueryClassification(
+            intent="solve_question",
+            subject="reasoning",
+            topic="Position in Row",
+            topic_confidence=0.90,
+            pattern_topic_candidate="POSITION_IN_ROW",
+            pattern_family_candidate="REASONING",
+            retrieval_tags=["rank_order", "relative_position"],
+            response_style="step_by_step",
+            confidence=0.90,
+            difficulty="basic",
+            retrieval_need="none",
+            reasoning_summary="Infer total from two ordinal row positions.",
+            need_web_search=False,
+            relation="NEW_QUESTION",
+            requested_action="ANSWER_CURRENT",
+            classification_source="llm",
+        )
+        query = (
+            "Riya is 12th from the left and 9th from the right in a row.\n"
+            "How many students are there?"
+        )
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            return_value=primary,
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                query,
+                request_id="req-riya",
+            )
+
+        assert mock_classify.call_count == 1
+        assert run.strong_classifier_used is False
+        assert run.classification.subject == "reasoning"
+        assert run.classification.intent == "solve_question"
+        assert run.classification.difficulty == "basic"
+        assert run.classification.relation == "NEW_QUESTION"
+        assert run.classification.requested_action == "ANSWER_CURRENT"
+        assert run.classification.need_web_search is False
+        assert run.primary_decision is not None
+        assert run.primary_decision.accepted is True
+
+    def test_subject_pattern_family_conflict_requires_one_strong_classifier(self) -> None:
+        primary = _llm_classification(0.90).model_copy(
+            update={
+                "subject": "math",
+                "topic": "SEATING_ARRANGEMENT",
+                "pattern_topic_candidate": "SEATING_ARRANGEMENT",
+                "pattern_family_candidate": "REASONING",
+            }
+        )
+        strong = primary.model_copy(
+            update={
+                "subject": "reasoning",
+                "confidence": 0.95,
+            }
+        )
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "A rank and order question.",
+                request_id="req-subject-conflict",
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.SUBJECT_INTENT_CONFLICT
+        )
+        assert "subject,pattern_family" in run.primary_decision.material_conflicts
+
+    def test_explicit_current_query_with_web_false_requires_strong_classifier(
+        self,
+    ) -> None:
+        primary = QueryClassification(
+            intent="practice_question",
+            subject="general",
+            confidence=0.90,
+            difficulty="basic",
+            need_web_search=False,
+            relation="NEW_QUESTION",
+            requested_action="ANSWER_CURRENT",
+            classification_source="llm",
+        )
+        strong = primary.model_copy(
+            update={
+                "confidence": 0.95,
+                "need_web_search": True,
+                "web_search_reason": "current_affairs",
+                "web_search_query": "current affairs July 2026",
+            }
+        )
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "Provide current affairs questions for July 2026.",
+                request_id="req-current",
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.WEB_SEARCH_CONFLICT
+        )
+
+    def test_practice_action_conflict_requires_strong_classifier(self) -> None:
+        primary = _llm_classification(0.90).model_copy(
+            update={
+                "intent": "solve_question",
+                "relation": "FOLLOW_UP",
+                "selected_turn_id": "turn-1",
+                "requested_action": "GENERATE_SIMILAR",
+            }
+        )
+        strong = primary.model_copy(
+            update={
+                "intent": "practice_question",
+                "confidence": 0.95,
+            }
+        )
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "Create a similar question.",
+                request_id="req-practice-conflict",
+                context_gate="CONTEXT_REQUIRED",
+                candidate_turn_ids=("turn-1",),
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.PRACTICE_INTENT_CONFLICT
+        )
+
+    def test_safe_logs_include_typed_reason_without_classifier_json(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        primary = _llm_classification(0.80)
+        strong = _llm_classification(0.95)
+        caplog.set_level("INFO", logger=classifier_module.__name__)
+
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[primary, strong],
+        ):
+            classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "ambiguous routing request",
+                request_id="req-safe-log",
+            )
+
+        text = caplog.text
+        assert "reason=LOW_MATERIAL_CONFIDENCE" in text
+        assert "primary_confidence=0.80" in text
+        assert "material_conflicts=1" in text
+        assert primary.model_dump_json() not in text
 
     def test_custom_threshold_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "0.85")
@@ -887,3 +1184,31 @@ class TestClassifierConfidenceFallback:
             )
         assert run.classification.classification_source == "fallback"
         assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.PRIMARY_PROVIDER_FAILURE
+        )
+
+    def test_invalid_primary_schema_uses_exactly_one_strong_classifier(self) -> None:
+        strong = _llm_classification(0.95)
+        with patch.object(
+            classifier_module,
+            "_classify_with_llm_orchestrated",
+            side_effect=[
+                ClassifierJsonError("json_decode_error", "invalid classifier JSON"),
+                strong,
+            ],
+        ) as mock_classify:
+            run = classifier_module._classify_with_llm_orchestrated_or_fallback(
+                "Solve 2x + 5 = 15.",
+                request_id="req-invalid-schema",
+            )
+
+        assert mock_classify.call_count == 2
+        assert run.strong_classifier_used is True
+        assert run.primary_decision is not None
+        assert (
+            run.primary_decision.primary_reason
+            == classifier_module.StrongFallbackReason.INVALID_SCHEMA
+        )

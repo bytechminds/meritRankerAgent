@@ -26,6 +26,8 @@ from services.context_retrieval.web_search_decision import (
 from tools.web_search.formatter import format_web_context
 from tools.web_search.models import WebSearchItem, WebSearchProviderRequest, WebSearchRequest
 from tools.web_search.providers.tavily_provider import TavilyWebSearchProvider
+from tools.web_search.query_builder import WebSearchQueryBuilder
+from tools.web_search.source_policy import WebSourcePolicyResolver
 from tools.web_search.web_search_tool import WebSearchTool, build_fake_web_search_tool
 
 
@@ -139,6 +141,87 @@ class TestWebSearchDecisionRules:
 
 
 class TestWebSearchContextIntegration:
+    def test_s3_vector_mode_honors_classifier_web_search_demand(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RETRIEVAL_PROVIDER", "s3_vector")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+        monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")
+        monkeypatch.setenv("WEB_SEARCH_REQUIRE_TRUSTED_FOR_CURRENT_AFFAIRS", "true")
+        _reset_settings()
+
+        student_retrieval = MagicMock()
+        service = ContextRetrievalService(
+            web_search_tool=build_fake_web_search_tool(),
+            student_retrieval_service=student_retrieval,
+        )
+        result = service.retrieve_context(
+            _request(
+                need_web_search=True,
+                web_search_reason="current_affairs",
+                web_search_query="latest current affairs",
+            )
+        )
+
+        student_retrieval.retrieve.assert_not_called()
+        assert result.retrieval_used is True
+        assert "[Web Context]" in result.context_text
+
+    def test_s3_vector_mode_static_question_does_not_call_web(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from retrieval.models import StudentRetrievalContext
+
+        monkeypatch.setenv("RETRIEVAL_PROVIDER", "s3_vector")
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+        _reset_settings()
+
+        student_retrieval = MagicMock()
+        student_retrieval.retrieve.return_value = StudentRetrievalContext.fresh_solve(
+            "no_candidate"
+        )
+        web_tool = MagicMock()
+        service = ContextRetrievalService(
+            web_search_tool=web_tool,
+            student_retrieval_service=student_retrieval,
+        )
+        result = service.retrieve_context(
+            _request(
+                query="Explain Akbar's revenue administration.",
+                subject="general",
+                difficulty="basic",
+                need_web_search=False,
+            )
+        )
+
+        web_tool.search.assert_not_called()
+        student_retrieval.retrieve.assert_called_once()
+        assert result.reason == "no_candidate"
+
+    def test_search_start_hook_runs_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+        monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")
+        monkeypatch.setenv("WEB_SEARCH_REQUIRE_TRUSTED_FOR_CURRENT_AFFAIRS", "true")
+        _reset_settings()
+
+        hook = MagicMock()
+        service = ContextRetrievalService(web_search_tool=build_fake_web_search_tool())
+        service.retrieve_context(
+            _request(
+                need_web_search=True,
+                web_search_reason="current_affairs",
+                web_search_query="latest current affairs",
+            ),
+            on_before_web_search=hook,
+        )
+
+        hook.assert_called_once_with()
+
     def test_need_web_search_skips_kb_for_current_affairs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -279,6 +362,38 @@ class TestWebSearchContextIntegration:
 
 
 class TestWebSearchToolProvider:
+    def test_absolute_month_window_does_not_send_relative_time_range(self) -> None:
+        settings = cfg_module.get_settings()
+        policy = WebSourcePolicyResolver().resolve(
+            query="provide current affairs question july 2026",
+            web_search_query="current affairs July 2026",
+            subject="general",
+            topic="Current Affairs",
+            retrieval_tags=["current_affairs", "july_2026"],
+            web_search_reason="current_affairs",
+            source_strictness=settings.web_search_source_strictness,
+            default_recent_days=settings.web_search_default_recent_days,
+        )
+        attempt = WebSearchQueryBuilder.plan_attempts(
+            policy,
+            allow_generic_fallback=False,
+            allow_exam_prep_fallback=False,
+            exam_prep_suitable=False,
+            official_only=False,
+        )[0]
+        request = WebSearchQueryBuilder.build_provider_request(
+            search_query="current affairs July 2026",
+            policy=policy,
+            attempt=attempt,
+            max_results=5,
+            search_depth="basic",
+            timeout_seconds=8,
+        )
+
+        assert request.start_date == "2026-07-01"
+        assert request.end_date == "2026-07-31"
+        assert request.time_range is None
+
     def test_fake_provider_returns_items(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
         monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")

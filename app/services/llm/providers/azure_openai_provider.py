@@ -43,12 +43,13 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from openai import AzureOpenAI
 
 from schemas.llm import LlmRequest, LlmResponse, LlmRoleConfig, LlmStreamChunk
+from schemas.llm_usage import ProviderTokenUsage
 from services.llm.providers.base import BaseLlmProvider
 from services.llm.providers.errors import (
     LlmConfigurationError,
@@ -59,6 +60,11 @@ from services.llm.providers.errors import (
     LlmProviderResponseError,
 )
 from services.llm.providers.payload_shaping import build_azure_openai_chat_completion_kwargs
+from services.llm.providers.usage import (
+    clear_stream_usage,
+    extract_openai_usage,
+    set_stream_usage,
+)
 
 if TYPE_CHECKING:
     from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
@@ -170,6 +176,7 @@ class AzureOpenAIProvider(BaseLlmProvider):
 
         content = completion.choices[0].message.content or ""
         finish_reason = completion.choices[0].finish_reason
+        usage = extract_openai_usage(completion)
         logger.info(
             "azure_openai_provider.generate  role=%s  model_label=%s — done",
             request.role,
@@ -181,6 +188,11 @@ class AzureOpenAIProvider(BaseLlmProvider):
             model_label=config.model_label,
             content=content,
             finish_reason=finish_reason,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
         )
 
     def stream(self, request: LlmRequest, config: LlmRoleConfig) -> Iterator[LlmStreamChunk]:
@@ -200,6 +212,7 @@ class AzureOpenAIProvider(BaseLlmProvider):
             request.role,
             config.model_label,
         )
+        usage = ProviderTokenUsage()
         try:
             stream = client.chat.completions.create(
                 model=config.deployment,  # deployment name, not model ID
@@ -207,8 +220,12 @@ class AzureOpenAIProvider(BaseLlmProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             for chunk in stream:
+                chunk_usage = extract_openai_usage(chunk)
+                if chunk_usage.available:
+                    usage = chunk_usage
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta.content or ""
@@ -225,6 +242,8 @@ class AzureOpenAIProvider(BaseLlmProvider):
             raise
         except Exception as exc:
             raise LlmGenerationError(f"Azure OpenAI streaming failed: {exc}") from exc
+        finally:
+            set_stream_usage(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -409,17 +428,32 @@ class AzureOpenAIProviderAdapter:
                 model_alias=request.model_resolution.model_alias,
             ) from exc
 
-        content = self._extract_content(completion, request)
         finish_reason = self._extract_finish_reason(completion)
-        input_tokens, output_tokens = self._extract_usage(completion)
+        usage = extract_openai_usage(completion)
+        try:
+            content = self._extract_content(completion, request)
+        except LlmProviderResponseError as exc:
+            exc.provider_usage = usage
+            logger.warning(
+                "azure_openai_provider_adapter.generate  response_unavailable  "
+                "model_alias=%s  finish_reason=%s  usage_available=%s  "
+                "input_tokens=%s  output_tokens=%s  reasoning_tokens=%s",
+                request.model_resolution.model_alias,
+                finish_reason or "none",
+                usage.available,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+            )
+            raise
 
         logger.info(
             "azure_openai_provider_adapter.generate  model_alias=%s — done  "
             "finish_reason=%s  input_tokens=%s  output_tokens=%s",
             request.model_resolution.model_alias,
             finish_reason,
-            input_tokens,
-            output_tokens,
+            usage.input_tokens,
+            usage.output_tokens,
         )
 
         return ModelExecutionResult(
@@ -427,8 +461,12 @@ class AzureOpenAIProviderAdapter:
             model=request.route_decision.model,
             provider="azure_openai",
             finish_reason=finish_reason,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            usage_source=("provider_reported" if usage.available else "unavailable"),
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
                 "deployment": deployment,
@@ -477,7 +515,10 @@ class AzureOpenAIProviderAdapter:
             deployment=deployment,
             stream=True,
         )
+        stream_kwargs["stream_options"] = {"include_usage": True}
 
+        clear_stream_usage()
+        usage = extract_openai_usage(object())
         try:
             stream = client.chat.completions.create(**stream_kwargs)
             finish_reason: str | None = None
@@ -487,6 +528,9 @@ class AzureOpenAIProviderAdapter:
                 if chunk is None:
                     empty_chunk_count += 1
                     continue
+                chunk_usage = extract_openai_usage(chunk)
+                if chunk_usage.available:
+                    usage = chunk_usage
                 if not chunk.choices:
                     empty_chunk_count += 1
                     continue
@@ -548,6 +592,8 @@ class AzureOpenAIProviderAdapter:
                 provider="azure_openai",
                 model_alias=request.model_resolution.model_alias,
             ) from exc
+        finally:
+            set_stream_usage(usage)
 
     # ------------------------------------------------------------------
     # Mode-specific credential validation helpers
@@ -613,15 +659,44 @@ class AzureOpenAIProviderAdapter:
     @staticmethod
     def _extract_content(completion: Any, request: ProviderExecutionRequest) -> str:
         try:
-            content = completion.choices[0].message.content
+            message = completion.choices[0].message
         except (AttributeError, IndexError, TypeError):
-            content = None
-        if not content:
+            message = None
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise LlmProviderResponseError(
+                "Azure OpenAI response was refused "
+                f"(model_alias={request.model_resolution.model_alias!r})."
+            )
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            normalized = content.strip()
+        elif isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                    continue
+                text = (
+                    part.get("text")
+                    if isinstance(part, Mapping)
+                    else getattr(part, "text", None)
+                )
+                if isinstance(text, Mapping):
+                    text = text.get("value")
+                elif text is not None and not isinstance(text, str):
+                    text = getattr(text, "value", None)
+                if isinstance(text, str):
+                    text_parts.append(text)
+            normalized = "".join(text_parts).strip()
+        else:
+            normalized = ""
+        if not normalized:
             raise LlmProviderResponseError(
                 f"Azure OpenAI response is missing content "
                 f"(model_alias={request.model_resolution.model_alias!r})."
             )
-        return content
+        return normalized
 
     @staticmethod
     def _extract_finish_reason(completion: Any) -> str | None:

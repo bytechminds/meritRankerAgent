@@ -205,11 +205,14 @@ def test_streaming_reuses_image_classification(monkeypatch) -> None:
     class FakeStreamingAdapter:
         def generate(self, **kwargs):
             assert kwargs["query"] == "Extracted image question"
-            return "**Final Answer:**\n\\(20\\)"
+            assert kwargs["language"] == "hindi"
+            return (
+                "**Final Answer:**\n\\(20\\) सही उत्तर है।\n\n"
+                "दिए गए मानों को सूत्र में रखने पर यही परिणाम मिलता है।"
+            )
 
         def generate_stream(self, **kwargs):
-            assert kwargs["query"] == "Extracted image question"
-            yield "**Final Answer:**\n\\(20\\)"
+            raise AssertionError("Hindi image answer must be verified before replay")
 
     events = list(
         streaming_module.stream_doubt_solver(
@@ -217,10 +220,14 @@ def test_streaming_reuses_image_classification(monkeypatch) -> None:
                 request_id="image-stream",
                 query="Extracted image question",
                 classification=expected,
+                language="hindi",
+                source_modality="image",
+                image_confidence=0.99,
             ),
             adapter=FakeStreamingAdapter(),
         )
     )
     assert "".join(event.content or "" for event in events if event.type == "chunk") == (
-        "**Final Answer:**\n\\(20\\)"
+        "**Final Answer:**\n\\(20\\) सही उत्तर है।\n\n"
+        "दिए गए मानों को सूत्र में रखने पर यही परिणाम मिलता है।"
     )

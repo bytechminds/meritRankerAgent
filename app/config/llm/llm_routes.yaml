@@ -50,7 +50,7 @@ routes:
         model: math_intermediate_generator
         overlays:
           - levels/intermediate.md
-        max_tokens: 1500
+        max_tokens: 2600
         fallback:
           - basic
           - default
@@ -271,6 +271,16 @@ routes:
           - safe_mock
 
   general:
+    verifier:
+      default:
+        model: openai_o4_mini
+        prompt: answer_correctness_verifier.md
+        temperature: 0.0
+        max_tokens: 3000
+        provider_options:
+          reasoning_effort: medium
+        fallback: []
+
     follow_up_resolver:
       default:
         model: doubt_solver_classifier
@@ -281,19 +291,24 @@ routes:
 
     classifier:
       default:
-        model: doubt_solver_classifier
-        prompt: query_classifier.md
+        model: doubt_solver_classifier_gemini
+        prompt: classification_semantics.md
         temperature: 0.1
         max_tokens: 650
+        overlays:
+          - query_classifier_text.md
         fallback:
           - safe_mock
 
     classifier_strong:
       default:
         model: doubt_solver_classifier_strong
-        prompt: query_classifier.md
+        prompt: classification_semantics.md
         temperature: 0.0
         max_tokens: 800
+        overlays:
+          - query_classifier_text.md
+          - query_classifier.md
         fallback:
           - safe_mock
 

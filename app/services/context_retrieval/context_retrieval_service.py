@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from config import get_settings
+from observability import log_event
 from retrieval.context.data_context_builder import render_retrieval_context
+from retrieval.models import StudentRetrievalContext
 from retrieval.retrieval_service import StudentRetrievalService
 from services.context_retrieval.bedrock_kb_retriever import BedrockKnowledgeBaseRetriever
 from services.context_retrieval.context_models import (
@@ -689,9 +692,6 @@ class ContextRetrievalService:
         on_web_search_weak_context: Callable[[], None] | None = None,
     ) -> ContextRetrievalResult:
         settings = get_settings()
-        if settings.retrieval_provider == "s3_vector":
-            return self._retrieve_s3_vector_context(request)
-
         web_decision = evaluate_web_search_decision(request, settings)
         logger.info(
             "web_search_decision  request_id=%s  need_web_search=%s  reason=%s  "
@@ -703,6 +703,21 @@ class ContextRetrievalService:
             web_decision.enabled,
             web_decision.will_call,
         )
+        log_event(
+            "web_search_decision",
+            component="doubt_solver.web_search",
+            stage="retrieve",
+            status="required" if web_decision.direct_web else "skipped",
+            details={
+                "required": web_decision.direct_web,
+                "reason": web_decision.reason,
+                "provider": web_decision.provider,
+                "provider_enabled": web_decision.enabled,
+                "provider_configured": self._credentials_ready(settings),
+                "will_call": web_decision.will_call,
+                "search_term_present": bool(web_decision.query),
+            },
+        )
 
         if request.need_web_search:
             return self._retrieve_direct_web_context(
@@ -712,6 +727,9 @@ class ContextRetrievalService:
                 on_web_search_retry=on_web_search_retry,
                 on_web_search_weak_context=on_web_search_weak_context,
             )
+
+        if settings.retrieval_provider == "s3_vector":
+            return self._retrieve_s3_vector_context(request)
 
         kb_result = self._retrieve_kb_context(request)
         if kb_result.retrieval_used and kb_result.context_text:
@@ -903,18 +921,60 @@ class ContextRetrievalService:
         on_web_search_weak_context: Callable[[], None] | None = None,
     ) -> ContextRetrievalResult:
         search_query = resolve_web_search_query(request)
-        web_result = self._web_search_tool.search(
-            WebSearchRequest(
-                request_id=request.request_id,
-                query=request.query,
-                web_search_query=search_query,
-                subject=request.subject,
-                topic=request.topic,
-                retrieval_tags=request.retrieval_tags,
-                web_search_reason=request.web_search_reason,
-                timeout_seconds=settings.web_search_timeout_seconds,
-            ),
-            on_retry_sources=on_web_search_retry,
+        started_at = time.monotonic()
+        try:
+            web_result = self._web_search_tool.search(
+                WebSearchRequest(
+                    request_id=request.request_id,
+                    query=request.query,
+                    web_search_query=search_query,
+                    subject=request.subject,
+                    topic=request.topic,
+                    retrieval_tags=request.retrieval_tags,
+                    web_search_reason=request.web_search_reason,
+                    timeout_seconds=settings.web_search_timeout_seconds,
+                ),
+                on_retry_sources=on_web_search_retry,
+            )
+        except Exception as exc:
+            log_event(
+                "web_search_execution",
+                component="doubt_solver.web_search",
+                stage="retrieve",
+                status="failed",
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                error_code="WEB_SEARCH_PROVIDER_FAILED",
+                details={
+                    "provider": settings.web_search_provider,
+                    "error_type": type(exc).__name__,
+                },
+                level=logging.WARNING,
+            )
+            raise
+        execution_status = (
+            "succeeded"
+            if web_result.used
+            else "weak"
+            if web_result.weak_context
+            else "skipped"
+            if not web_result.executed
+            else "empty"
+        )
+        log_event(
+            "web_search_execution",
+            component="doubt_solver.web_search",
+            stage="retrieve",
+            status=execution_status,
+            duration_ms=web_result.duration_ms,
+            details={
+                "provider": web_result.provider,
+                "attempts": web_result.attempt_count,
+                "candidate_count": web_result.candidate_count,
+                "selected_count": len(web_result.items),
+                "official_count": web_result.official_count,
+                "reputable_count": web_result.reputable_count,
+                "context_characters": len(web_result.context_text),
+            },
         )
         if web_result.weak_context or not web_result.items:
             if request.need_web_search and on_web_search_weak_context is not None:
@@ -925,6 +985,15 @@ class ContextRetrievalService:
                 item_count=0,
                 retrieval_used=bool(safe_context),
                 reason=web_result.reason,
+                retrieval_context=StudentRetrievalContext.fresh_solve(
+                    web_result.reason
+                ),
+                web_search_executed=web_result.executed,
+                web_search_status=execution_status,
+                web_search_provider=web_result.provider,
+                web_context_chars=0,
+                web_result_count=0,
+                web_citation_count=0,
             )
 
         brief_result = self._brief_builder.build(
@@ -942,6 +1011,15 @@ class ContextRetrievalService:
             item_count=len(web_result.items),
             retrieval_used=bool(context_text),
             reason=web_result.reason,
+            retrieval_context=StudentRetrievalContext.fresh_solve(
+                web_result.reason
+            ),
+            web_search_executed=web_result.executed,
+            web_search_status=execution_status,
+            web_search_provider=web_result.provider,
+            web_context_chars=len(web_result.context_text),
+            web_result_count=len(web_result.items),
+            web_citation_count=sum(bool(item.url) for item in web_result.items),
         )
 
     def _compose_generator_context(
@@ -975,6 +1053,20 @@ class ContextRetrievalService:
                     request.request_id,
                     selected_count,
                     len(brief_result.brief_text),
+                    len(context_text),
+                )
+                return context_text
+            if not brief_result.used and kb_items:
+                context_text = _format_kb_fallback_context(
+                    request,
+                    kb_items,
+                    max_chars=max_chars,
+                )
+                logger.info(
+                    "context_retrieval_brief  request_id=%s  solution_brief_builder_used=false  "
+                    "fallback_context_used=true  selected_count=%d  context_chars=%d",
+                    request.request_id,
+                    selected_count,
                     len(context_text),
                 )
                 return context_text

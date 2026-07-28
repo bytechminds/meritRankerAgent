@@ -99,11 +99,12 @@ class TestModelRegistryEnvOverrides:
         with pytest.raises(LlmConfigValidationError, match="empty Azure DeepSeek deployment"):
             reg.validate_real_mode_deployments()
 
-    def test_classifier_uses_safe_azure_deployment(self):
+    def test_classifier_uses_gemini_primary_and_azure_strong(self):
         reg = LlmConfigRegistry()
-        primary = reg.model_map["doubt_solver_classifier"]
+        primary = reg.model_map["doubt_solver_classifier_gemini"]
         strong = reg.model_map["doubt_solver_classifier_strong"]
-        assert primary.deployment == "gpt-4.1-mini"
+        assert primary.provider == "gemini"
+        assert primary.model_id == "gemini-3.1-flash-lite"
         assert strong.deployment == "gpt-4.1"
         assert primary.supports_streaming is False
         assert strong.supports_streaming is False
@@ -117,7 +118,7 @@ class TestModelRegistryEnvOverrides:
     def test_active_routes_point_to_available_aliases(self):
         reg = LlmConfigRegistry()
         active = reg._active_route_model_aliases()
-        assert "doubt_solver_classifier" in active
+        assert "doubt_solver_classifier_gemini" in active
         assert "math_intermediate_generator" in active
         reg.validate_real_mode_deployments()
 

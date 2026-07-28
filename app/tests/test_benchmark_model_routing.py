@@ -128,11 +128,11 @@ class TestBenchmarkRouteResolution:
     def test_general_default_route(self):
         assert self._route_model("general", "default") == "general_fast_generator"
 
-    def test_classifier_routes_unchanged(self):
+    def test_classifier_routes_use_gemini_primary_and_azure_strong(self):
         reg = LlmConfigRegistry()
         primary = reg.get_route("general", "classifier", "default")
         strong = reg.get_route("general", "classifier_strong", "default")
-        assert primary is not None and primary.model == "doubt_solver_classifier"
+        assert primary is not None and primary.model == "doubt_solver_classifier_gemini"
         assert strong is not None and strong.model == "doubt_solver_classifier_strong"
 
 

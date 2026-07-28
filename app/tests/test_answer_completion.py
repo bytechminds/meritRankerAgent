@@ -192,7 +192,7 @@ class TestGeneratorRouteBudgets:
 
         route = LlmConfigRegistry().get_route("math", "generator", "intermediate")
         assert route is not None
-        assert route.max_tokens == 1500
+        assert route.max_tokens == 2600
 
     def test_practice_route_budget(self) -> None:
         from services.llm.orchestration.config_registry import LlmConfigRegistry
@@ -340,7 +340,10 @@ class TestOrchestratorContinuation:
         outputs = iter(
             [
                 "Actually check setup. **Final Answer:** $15$ km/h <ANSWER_DONE>",
-                r"**Final Answer:** \(15\) km/h",
+                (
+                    r"**Final Answer:** \(15\) km/h"
+                    "\n\nUsing distance divided by time gives the required speed."
+                ),
             ]
         )
 
@@ -365,7 +368,10 @@ class TestOrchestratorContinuation:
             query="speed",
         )
 
-        assert result.content == r"**Final Answer:** \(15\) km/h"
+        assert result.content == (
+            r"**Final Answer:** \(15\) km/h"
+            "\n\nUsing distance divided by time gives the required speed."
+        )
         assert result.final_answer is not None
         assert result.final_answer.quality_status == "passed_quality_gate"
         assert any(

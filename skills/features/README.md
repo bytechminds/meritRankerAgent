@@ -32,6 +32,7 @@ if a fact is unknown.
 | `conversation-history.md` | Completed turns, session metadata, and read contracts | In Progress |
 | `image-question-classification.md` | Image extraction and classification entry path | Partially Implemented |
 | `agent-observability.md` | Structured events, request summaries, local inspection, and tracing | In Progress |
+| `classification-pipeline.md` | Text/image academic classification ownership and fallback pipeline | In Progress |
 
 ---
 

@@ -7,7 +7,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from schemas.doubt_solver import CanonicalLanguage, QualityStatus
+from schemas.doubt_solver import (
+    CanonicalLanguage,
+    ConversationClassificationAction,
+    ConversationClassificationRelation,
+    QualityStatus,
+)
 
 PersistenceStatus = Literal[
     "succeeded",
@@ -24,6 +29,7 @@ PersistenceSkipReason = Literal[
     "language_non_compliant",
     "request_cancelled",
     "clarification_response",
+    "non_substantive_answer",
     "not_finalized",
 ]
 RecentContextSource = Literal["agentcore_memory", "dynamodb_fallback", "none"]
@@ -55,26 +61,30 @@ RecentContextStoreStatus = Literal[
     "failed_configuration",
     "failed_validation",
 ]
-ConversationRelationType = Literal[
-    "independent",
-    "follow_up",
-    "continuation",
-    "correction",
-    "clarification_of_previous",
-    "regeneration_request",
-    "ambiguous",
+ConversationTurnType = Literal[
+    "academic_question_answer",
+    "clarification",
+    "acknowledgement",
+    "error",
+    "failed_quality",
+    "correction_only",
+    "meta_response",
 ]
-ConversationDecisionSource = Literal[
-    "contextual_classifier",
-    "deterministic_signal",
-    "combined",
-    "no_context",
+ContextNeedDecision = Literal[
+    "CONTEXT_NOT_NEEDED",
+    "CONTEXT_REQUIRED",
+    "UNCERTAIN",
 ]
-ReferencedTurnPosition = Literal[
-    "latest_turn",
-    "previous_of_two",
-    "both_turns",
-    "none",
+GenerationContextPolicy = Literal[
+    "current_only",
+    "answer_with_context",
+    "explain_previous",
+    "continue_previous",
+    "generate_similar",
+    "transform_previous",
+    "verify_and_correct",
+    "resolve_from_scratch",
+    "clarification",
 ]
 
 
@@ -85,6 +95,59 @@ class RecentConversationTurn(BaseModel):
     original_query: str = Field(min_length=1, max_length=5000)
     final_answer: str = Field(min_length=1, max_length=8000)
     created_at: datetime
+    turn_type: ConversationTurnType = "academic_question_answer"
+
+
+class ContextNeedAssessment(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    decision: ContextNeedDecision
+    reason_codes: tuple[str, ...] = Field(default_factory=tuple, max_length=8)
+    matched_signals: tuple[str, ...] = Field(default_factory=tuple, max_length=8)
+    duration_ms: int = Field(default=0, ge=0)
+
+
+class ConversationCandidateCard(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    turn_id: str = Field(min_length=1, max_length=128)
+    question_preview: str = Field(min_length=1, max_length=700)
+    answer_clue: str = Field(min_length=1, max_length=500)
+    subject: str = Field(default="unknown", max_length=128)
+    topic: str | None = Field(default=None, max_length=256)
+    difficulty: str = Field(default="default", max_length=32)
+    query_match_indicators: tuple[str, ...] = Field(default_factory=tuple, max_length=6)
+
+
+class ConversationPreparation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    gate: ContextNeedAssessment
+    context_load: RecentContextLoadResult
+    eligible_turns: tuple[RecentConversationTurn, ...] = Field(
+        default_factory=tuple,
+        max_length=5,
+    )
+    candidates: tuple[ConversationCandidateCard, ...] = Field(
+        default_factory=tuple,
+        max_length=5,
+    )
+    rejected_turn_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
+    candidate_characters: int = Field(default=0, ge=0, le=7200)
+
+
+class SelectedGenerationContext(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    relation: ConversationClassificationRelation
+    requested_action: ConversationClassificationAction
+    selected_turn_id: str | None = Field(default=None, max_length=128)
+    resolved_reference: str | None = Field(default=None, max_length=128)
+    resolved_query: str = Field(min_length=1, max_length=5000)
+    conversation_context: str = Field(default="", max_length=8000)
+    context_policy: GenerationContextPolicy
+    context_characters: int = Field(default=0, ge=0, le=8000)
+    clarification_required: bool = False
 
 
 class CompletedConversationTurn(RecentConversationTurn):
@@ -113,7 +176,7 @@ class ResolvedFollowUpQuery(BaseModel):
 class RecentConversationContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    turns: tuple[RecentConversationTurn, ...] = Field(default_factory=tuple, max_length=3)
+    turns: tuple[RecentConversationTurn, ...] = Field(default_factory=tuple, max_length=5)
     formatted_reference: str = Field(default="", max_length=7000)
     source: str = Field(default="none", pattern=r"^(agentcore|dynamodb|none)$")
 
@@ -126,18 +189,18 @@ class RecentContextLoadResult(BaseModel):
     memory_status: RecentContextStoreStatus = "not_attempted"
     memory_event_count: int = Field(default=0, ge=0)
     memory_completed_pair_count: int = Field(default=0, ge=0)
-    memory_returned_turn_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=3)
+    memory_returned_turn_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
     memory_latest_event_time: datetime | None = None
     memory_duration_ms: int = Field(default=0, ge=0)
     memory_failure_reason: RecentContextFailureReason | None = None
     dynamodb_attempted: bool = False
     dynamodb_status: RecentContextStoreStatus = "not_attempted"
     dynamodb_item_count: int = Field(default=0, ge=0)
-    dynamodb_returned_turn_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=3)
+    dynamodb_returned_turn_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
     dynamodb_duration_ms: int = Field(default=0, ge=0)
     dynamodb_failure_reason: RecentContextFailureReason | None = None
-    turns: tuple[RecentConversationTurn, ...] = Field(default_factory=tuple, max_length=3)
-    usable_turn_count: int = Field(default=0, ge=0, le=3)
+    turns: tuple[RecentConversationTurn, ...] = Field(default_factory=tuple, max_length=5)
+    usable_turn_count: int = Field(default=0, ge=0, le=5)
     failure_reason: RecentContextFailureReason | None = None
     latency_ms: int = Field(default=0, ge=0)
     formatted_reference: str = Field(default="", max_length=7000)
@@ -153,33 +216,6 @@ class RecentContextLoadResult(BaseModel):
             formatted_reference=self.formatted_reference,
             source=source,
         )
-
-
-class ConversationRelation(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    relation: ConversationRelationType
-    requires_recent_conversation: bool
-    referenced_turn_id: str | None = Field(default=None, max_length=128)
-    referenced_turn_position: ReferencedTurnPosition = "none"
-    confidence: float = Field(ge=0.0, le=1.0)
-    decision_source: ConversationDecisionSource
-    matched_signals: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
-
-
-class ConversationUnderstandingResult(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    relation: ConversationRelation
-    context_load: RecentContextLoadResult
-    selected_turns: tuple[RecentConversationTurn, ...] = Field(
-        default_factory=tuple,
-        max_length=2,
-    )
-    selection_reason: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
-    selection_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    resolved_query: str | None = Field(default=None, max_length=5000)
-    conversation_context: str = Field(default="", max_length=7000)
 
 
 class PersistenceDecision(BaseModel):

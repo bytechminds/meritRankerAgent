@@ -19,6 +19,11 @@ from services.llm.providers.errors import (
     LlmProviderResponseError,
 )
 from services.llm.providers.openai_provider import _classify_openai_error
+from services.llm.providers.usage import (
+    clear_stream_usage,
+    extract_openai_usage,
+    set_stream_usage,
+)
 
 if TYPE_CHECKING:
     from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
@@ -131,7 +136,7 @@ class OpenAICompatibleProviderAdapter:
 
         content = _extract_content(completion, request)
         finish_reason = _extract_finish_reason(completion)
-        input_tokens, output_tokens = _extract_usage(completion)
+        usage = extract_openai_usage(completion)
 
         logger.info(
             "%s_provider_adapter.generate  model_alias=%s — done  "
@@ -139,8 +144,8 @@ class OpenAICompatibleProviderAdapter:
             self._provider,
             request.model_resolution.model_alias,
             finish_reason,
-            input_tokens,
-            output_tokens,
+            usage.input_tokens,
+            usage.output_tokens,
         )
 
         return ModelExecutionResult(
@@ -148,8 +153,12 @@ class OpenAICompatibleProviderAdapter:
             model=request.route_decision.model,
             provider=self._provider,
             finish_reason=finish_reason,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            usage_source=("provider_reported" if usage.available else "unavailable"),
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
             },
@@ -181,6 +190,8 @@ class OpenAICompatibleProviderAdapter:
             request.model_resolution.model_config.model_label,
         )
 
+        clear_stream_usage()
+        usage = extract_openai_usage(object())
         try:
             stream = client.chat.completions.create(
                 model=model_id,
@@ -191,6 +202,9 @@ class OpenAICompatibleProviderAdapter:
             )
             finish_reason: str | None = None
             for chunk in stream:
+                chunk_usage = extract_openai_usage(chunk)
+                if chunk_usage.available:
+                    usage = chunk_usage
                 if not chunk.choices:
                     continue
                 fr = getattr(chunk.choices[0], "finish_reason", None)
@@ -210,6 +224,8 @@ class OpenAICompatibleProviderAdapter:
                 provider=self._provider,
                 model_alias=request.model_resolution.model_alias,
             ) from exc
+        finally:
+            set_stream_usage(usage)
 
     def generate_with_image(
         self,
@@ -277,15 +293,19 @@ class OpenAICompatibleProviderAdapter:
 
         content = _extract_content(completion, request)
         finish_reason = _extract_finish_reason(completion)
-        input_tokens, output_tokens = _extract_usage(completion)
+        usage = extract_openai_usage(completion)
 
         return ModelExecutionResult(
             content=content,
             model=request.route_decision.model,
             provider=self._provider,
             finish_reason=finish_reason,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            usage_source=("provider_reported" if usage.available else "unavailable"),
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
                 "multimodal": True,

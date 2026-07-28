@@ -77,6 +77,9 @@ Do not introduce many variables if one invariant variable is enough.
 
 - Verify using exact arithmetic only when needed.
 - Never say “close enough” or accept mismatch.
+- Before writing `**Answer:**`, privately derive the result and test it against every listed
+  option. If none satisfies the derived condition, write `**Answer:** None of the listed
+  options`; never choose the closest or merely plausible option.
 - If verification fails, restart silently and output only the corrected solution.
 - Never leave the response incomplete after “Actually”, “Let’s recheck”, or “Correct approach is”.
 - If no valid answer can be derived, state the missing information.

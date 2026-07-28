@@ -13,7 +13,12 @@ import yaml
 from pydantic import ValidationError
 
 import graphs.doubt_solver_graph as graph_module
-from schemas.doubt_solver import AnswerOutput, DoubtSolverRequest, QueryClassification
+from schemas.doubt_solver import (
+    AnswerOutput,
+    CanonicalLanguage,
+    DoubtSolverRequest,
+    QueryClassification,
+)
 from schemas.exam_response_profiles import (
     ExamResponseProfilesConfig,
     ResolvedExamResponseProfile,
@@ -44,9 +49,7 @@ def resolver() -> ExamResponseProfileResolver:
 
 @pytest.fixture
 def raw_config() -> dict[str, Any]:
-    return yaml.safe_load(
-        DEFAULT_EXAM_RESPONSE_PROFILES_PATH.read_text(encoding="utf-8")
-    )
+    return yaml.safe_load(DEFAULT_EXAM_RESPONSE_PROFILES_PATH.read_text(encoding="utf-8"))
 
 
 def _route(
@@ -54,6 +57,7 @@ def _route(
     task_role: str = "generator",
     exam: str | None = None,
     exam_stage: str | None = None,
+    language: CanonicalLanguage = "english",
 ) -> RouteDecision:
     return RouteDecision(
         route_id=f"math.{task_role}.default",
@@ -63,11 +67,10 @@ def _route(
         intent="solve",
         exam=exam,
         exam_stage=exam_stage,
+        language=language,
         model="safe_mock",
         prompt=(
-            "subjects/math_generator.md"
-            if task_role == "generator"
-            else "query_classifier.md"
+            "subjects/math_generator.md" if task_role == "generator" else "query_classifier.md"
         ),
         overlays=[],
         intent_overlays={},
@@ -80,25 +83,55 @@ def _route(
 
 
 @pytest.mark.parametrize(
-    ("exam_id", "family", "override"),
+    ("exam_id", "stage", "family", "category", "provenance"),
     [
-        ("SSC_CGL", "SSC", False),
-        ("SSC_CHSL", "SSC", True),
-        ("RRB_NTPC", "RAILWAY_BASIC", True),
-        ("SSC_JE", "TECHNICAL", False),
-        ("RRB_JE", "TECHNICAL", False),
+        ("SSC_MTS", None, "SSC", "BASIC_OBJECTIVE", "exam"),
+        ("SSC_CHSL", None, "SSC", "STANDARD_OBJECTIVE", "family"),
+        ("SSC_CGL", "TIER_1", "SSC", "STANDARD_OBJECTIVE", "family"),
+        ("SSC_CGL", "TIER_2", "SSC", "ANALYTICAL_OBJECTIVE", "exam_stage"),
+        ("RRB_GROUP_D", None, "RAILWAY", "BASIC_OBJECTIVE", "family"),
+        ("RRB_NTPC", None, "RAILWAY", "STANDARD_OBJECTIVE", "exam"),
+        ("IBPS_CLERK", None, "BANKING", "STANDARD_OBJECTIVE", "family"),
+        ("SBI_PO", None, "BANKING", "ANALYTICAL_OBJECTIVE", "exam"),
+        ("UPSC_CSE", "PRELIMS", "UPSC", "CONCEPTUAL_OBJECTIVE", "exam_stage"),
+        (
+            "UPSC_CSE",
+            "MAINS",
+            "UPSC",
+            "DESCRIPTIVE_ANALYTICAL",
+            "exam_stage",
+        ),
+        (
+            "STATE_PSC",
+            "MAINS",
+            "STATE_PSC",
+            "DESCRIPTIVE_ANALYTICAL",
+            "exam_stage",
+        ),
+        ("CTET", None, "TEACHING", "PEDAGOGY_CONCEPTUAL", "family"),
+        (
+            "GATE",
+            None,
+            "ENGINEERING",
+            "TECHNICAL_PROBLEM_SOLVING",
+            "family",
+        ),
+        ("CAT", None, "MANAGEMENT", "ADVANCED_APTITUDE", "family"),
     ],
 )
-def test_exam_family_and_override_resolution(
+def test_representative_exam_category_resolution(
     resolver: ExamResponseProfileResolver,
     exam_id: str,
+    stage: str | None,
     family: str,
-    override: bool,
+    category: str,
+    provenance: str,
 ) -> None:
-    result = resolver.resolve(exam_id, None)
+    result = resolver.resolve(exam_id, stage)
 
     assert result.exam_family == family
-    assert result.exam_override_applied is override
+    assert result.response_category == category
+    assert result.provenance == provenance
 
 
 @pytest.mark.parametrize(
@@ -126,25 +159,27 @@ def test_upsc_stages_apply_distinct_guidance(
     prelims = resolver.resolve("UPSC_CSE", "preliminary")
     mains = resolver.resolve("upsc-cse", "main")
 
-    assert prelims.exam_family == "UPSC_PSC"
-    assert prelims.exam_override_applied
-    assert prelims.stage_override_applied
+    assert prelims.exam_family == "UPSC"
     assert prelims.stage == "PRELIMS"
     assert mains.stage == "MAINS"
+    assert prelims.response_category == "CONCEPTUAL_OBJECTIVE"
+    assert mains.response_category == "DESCRIPTIVE_ANALYTICAL"
+    assert prelims.provenance == mains.provenance == "exam_stage"
     assert prelims.compact_instruction != mains.compact_instruction
 
 
-def test_unknown_exam_uses_general_fallback(
+def test_unknown_exam_uses_default_category(
     resolver: ExamResponseProfileResolver,
 ) -> None:
     result = resolver.resolve("UNSUPPORTED_STATE_EXAM", "MAINS")
 
-    assert result.exam_family == "GENERAL_GOVT"
+    assert result.exam_family is None
     assert result.exam_id == "UNSUPPORTED_STATE_EXAM"
     assert result.canonical_exam_id is None
+    assert result.response_category == "STANDARD_OBJECTIVE"
+    assert result.provenance == "default"
     assert result.fallback_used
     assert result.source == "unknown_fallback"
-    assert not result.override_applied
 
 
 def test_missing_exam_resolves_but_is_not_implicitly_selected(
@@ -152,8 +187,10 @@ def test_missing_exam_resolves_but_is_not_implicitly_selected(
 ) -> None:
     result = resolver.resolve(None, None)
 
-    assert result.exam_family == "GENERAL_GOVT"
+    assert result.exam_family is None
     assert result.canonical_exam_id is None
+    assert result.response_category == "STANDARD_OBJECTIVE"
+    assert result.provenance == "default"
     assert result.source == "missing_fallback"
 
 
@@ -163,7 +200,7 @@ def test_resolved_profile_has_no_difficulty_field() -> None:
 
 def test_duplicate_exam_mapping_fails(raw_config: dict[str, Any]) -> None:
     invalid = copy.deepcopy(raw_config)
-    invalid["examMappings"]["TECHNICAL"].append("SSC_CGL")
+    invalid["familyMappings"]["ENGINEERING"]["exams"].append("SSC_CGL")
 
     with pytest.raises(ValidationError, match="mapped to both"):
         ExamResponseProfilesConfig.model_validate(invalid)
@@ -178,20 +215,22 @@ def test_alias_cycle_fails(raw_config: dict[str, Any]) -> None:
         ExamResponseProfilesConfig.model_validate(invalid)
 
 
-def test_invalid_family_reference_fails(raw_config: dict[str, Any]) -> None:
+def test_unknown_exam_override_fails(raw_config: dict[str, Any]) -> None:
     invalid = copy.deepcopy(raw_config)
-    invalid["examMappings"]["UNKNOWN_FAMILY"] = ["EXAM_X"]
+    invalid["examMappings"]["EXAM_X"] = {"category": "STANDARD_OBJECTIVE"}
 
-    with pytest.raises(ValidationError, match="unknown family"):
+    with pytest.raises(ValidationError, match="unknown exam"):
         ExamResponseProfilesConfig.model_validate(invalid)
 
 
 @pytest.mark.parametrize(
     ("path", "message"),
     [
-        (("families", "SSC", "response"), "Family response"),
-        (("examOverrides", "SSC_CHSL"), "Exam override"),
-        (("stageOverrides", "UPSC_CSE", "PRELIMS"), "Stage override"),
+        (("categories", "STANDARD_OBJECTIVE", "guide"), "Category guide"),
+        (
+            ("examMappings", "SSC_CGL", "stageOverrides", "TIER_2", "appendGuide"),
+            "Stage appendGuide",
+        ),
     ],
 )
 def test_whitespace_only_directions_fail_validation(
@@ -212,12 +251,15 @@ def test_whitespace_only_directions_fail_validation(
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
-        (("families", "SSC", "response"), "x" * 191, "Family response"),
-        (("examOverrides", "SSC_CHSL"), "x" * 121, "Exam override"),
         (
-            ("stageOverrides", "UPSC_CSE", "PRELIMS"),
-            "x" * 121,
-            "Stage override",
+            ("categories", "STANDARD_OBJECTIVE", "guide"),
+            "x" * 191,
+            "Category guide",
+        ),
+        (
+            ("examMappings", "SSC_CGL", "stageOverrides", "TIER_2", "appendGuide"),
+            "x" * 91,
+            "Stage appendGuide",
         ),
     ],
 )
@@ -239,27 +281,65 @@ def test_direction_character_limits_are_enforced(
 
 def test_resolved_character_limit_is_enforced(raw_config: dict[str, Any]) -> None:
     invalid = copy.deepcopy(raw_config)
-    invalid["limits"]["maxResolvedContextChars"] = 100
+    invalid["limits"]["maxResolvedContextChars"] = 120
 
     with pytest.raises(ValidationError, match="Resolved context"):
+        ExamResponseProfilesConfig.model_validate(invalid)
+
+
+def test_unsupported_category_is_rejected(raw_config: dict[str, Any]) -> None:
+    invalid = copy.deepcopy(raw_config)
+    invalid["familyMappings"]["SSC"]["category"] = "SSC_SPECIAL"
+
+    with pytest.raises(ValidationError, match="literal_error"):
+        ExamResponseProfilesConfig.model_validate(invalid)
+
+
+def test_empty_exam_mapping_is_rejected(raw_config: dict[str, Any]) -> None:
+    invalid = copy.deepcopy(raw_config)
+    invalid["examMappings"]["SSC_CHSL"] = {}
+
+    with pytest.raises(ValidationError, match="must define"):
         ExamResponseProfilesConfig.model_validate(invalid)
 
 
 def test_all_production_profiles_fit_character_and_token_budget(
     resolver: ExamResponseProfileResolver,
 ) -> None:
-    profiles = []
-    for exams in resolver.config.exam_mappings.values():
-        for exam in exams:
+    profiles: list[ResolvedExamResponseProfile] = []
+    for family in resolver.config.family_mappings.values():
+        for exam in family.exams:
             profiles.append(resolver.resolve(exam, None))
-            for stage in resolver.config.stage_overrides.get(exam, {}):
+            mapping = resolver.config.exam_mappings.get(exam)
+            for stage in mapping.stage_overrides if mapping is not None else {}:
                 profiles.append(resolver.resolve(exam, stage))
 
     lengths = [len(profile.compact_instruction) for profile in profiles]
-    rough_token_estimates = [math.ceil(length / 4) for length in lengths]
+    guide_token_estimates = [
+        math.ceil(len(profile.guide) / 4) for profile in resolver.config.categories.values()
+    ]
+    override_token_estimates = [
+        math.ceil(len(override) / 4)
+        for mapping in resolver.config.exam_mappings.values()
+        for override in [
+            mapping.append_guide,
+            *(stage.append_guide for stage in mapping.stage_overrides.values()),
+        ]
+        if override is not None
+    ]
     assert max(lengths) <= resolver.config.limits.max_resolved_context_chars
-    assert max(rough_token_estimates) <= 65
-    assert sum(lengths) / len(lengths) < 150
+    assert max(guide_token_estimates) <= 60
+    assert max(override_token_estimates) <= 25
+    assert sum(lengths) / len(lengths) < 140
+
+
+def test_all_supported_exams_have_one_family_membership(
+    resolver: ExamResponseProfileResolver,
+) -> None:
+    exams = [exam for mapping in resolver.config.family_mappings.values() for exam in mapping.exams]
+
+    assert len(exams) == 90
+    assert len(exams) == len(set(exams))
 
 
 def test_yaml_is_loaded_once_per_resolver(
@@ -294,10 +374,12 @@ def test_generator_prompt_receives_guidance_exactly_once(
     )
 
     system = messages[0].content
-    assert system.count("Exam response guidance:") == 1
+    assert system.count("EXAM RESPONSE GUIDANCE") == 1
     assert resolver.resolve("SSC_CHSL", None).compact_instruction in system
     assert "only answer" in messages[1].content.lower()
     assert "SSC_CHSL" not in "\n".join(message.content for message in messages)
+    assert "STANDARD_OBJECTIVE" not in system
+    assert "familyMappings" not in system
     assert "competitive-exam shortcut style" in system
 
 
@@ -309,7 +391,7 @@ def test_missing_exam_leaves_generator_prompt_without_dynamic_guidance(
         exam_profile_resolver=resolver,
     ).resolve(_route(), "Question")
 
-    assert "Exam response guidance:" not in messages[0].content
+    assert "EXAM RESPONSE GUIDANCE" not in messages[0].content
 
 
 def test_classifier_prompt_never_receives_exam_guidance(
@@ -320,7 +402,28 @@ def test_classifier_prompt_never_receives_exam_guidance(
         exam_profile_resolver=resolver,
     ).resolve(_route(task_role="classifier", exam="SSC_CGL"), "Question")
 
-    assert "Exam response guidance:" not in messages[0].content
+    assert "EXAM RESPONSE GUIDANCE" not in messages[0].content
+
+
+def test_stage_override_is_appended_once_and_language_remains_separate(
+    resolver: ExamResponseProfileResolver,
+) -> None:
+    profile = resolver.resolve("SSC_CGL", "TIER_2")
+    messages = PromptResolver(
+        prompt_root=_PROMPT_ROOT,
+        exam_profile_resolver=resolver,
+    ).resolve(
+        _route(exam="SSC_CGL", exam_stage="TIER_2", language="hindi"),
+        "Question",
+    )
+
+    system = messages[0].content
+    assert profile.optional_override is not None
+    assert system.count(profile.category_guide) == 1
+    assert system.count(profile.optional_override) == 1
+    assert system.count("EXAM RESPONSE GUIDANCE") == 1
+    assert "देवनागरी प्रयोग करें" in system
+    assert system.index("EXAM RESPONSE GUIDANCE") < system.index("देवनागरी प्रयोग करें")
 
 
 def test_legacy_and_orchestrated_prompts_use_same_compact_profile(
@@ -498,7 +601,7 @@ def test_full_isolated_orchestrated_flow_applies_profile_safely(
         )
 
     orchestrator, executor = create_mock_orchestrator_for_tests(
-        content="**Answer:** 10",
+        content="**Answer:** 10\n\nUsing percentage = part per hundred, 20% of 50 is 10.",
         prompt_resolver=PromptResolver(
             prompt_root=tmp_path,
             exam_profile_resolver=resolver,
@@ -530,11 +633,13 @@ def test_full_isolated_orchestrated_flow_applies_profile_safely(
         },
     )
 
-    assert result["answer"] == "**Answer:** 10"
+    assert result["answer"] == (
+        "**Answer:** 10\n\nUsing percentage = part per hundred, 20% of 50 is 10."
+    )
     assert executor.call_count == 1
     assert executor.last_messages is not None
     prompt = "\n".join(message.content for message in executor.last_messages)
-    assert prompt.count("Exam response guidance:") == 1
+    assert prompt.count("EXAM RESPONSE GUIDANCE") == 1
     assert "SSC_CGL" not in prompt
     assert result["exam_id"] == "SSC_CGL"
     assert result["exam_stage"] is None
@@ -546,9 +651,7 @@ def test_exam_request_fields_are_optional_and_response_neutral() -> None:
         "conversation_id": "conversation-1",
         "turn_id": "turn-1",
     }
-    baseline = DoubtSolverRequest(
-        mode="doubt_solver", query="Question", **request_ids
-    )
+    baseline = DoubtSolverRequest(mode="doubt_solver", query="Question", **request_ids)
     selected = DoubtSolverRequest(
         mode="doubt_solver",
         query="Question",
@@ -586,6 +689,8 @@ def test_resolution_log_contains_only_safe_profile_metadata(
     assert "safe-request" in message
     assert "canonical_exam_id=SSC_CGL" in message
     assert "exam_family=SSC" in message
+    assert "response_category=ANALYTICAL_OBJECTIVE" in message
+    assert "provenance=exam_stage" in message
     assert "compact_instruction_chars=" in message
     assert result.compact_instruction not in message
     assert secret_text not in message
@@ -595,12 +700,15 @@ def test_static_guidance_does_not_claim_trends_or_force_shortcuts(
     resolver: ExamResponseProfileResolver,
 ) -> None:
     text = " ".join(
-        [family.response for family in resolver.config.families.values()]
-        + list(resolver.config.exam_overrides.values())
+        [profile.guide for profile in resolver.config.categories.values()]
         + [
-            direction
-            for stages in resolver.config.stage_overrides.values()
-            for direction in stages.values()
+            append_guide
+            for mapping in resolver.config.exam_mappings.values()
+            for append_guide in [
+                mapping.append_guide,
+                *(stage.append_guide for stage in mapping.stage_overrides.values()),
+            ]
+            if append_guide is not None
         ]
     ).lower()
 
@@ -608,4 +716,4 @@ def test_static_guidance_does_not_claim_trends_or_force_shortcuts(
     assert "pyq" not in text
     assert "syllabus" not in text
     assert "always use" not in text
-    assert "validated" in text
+    assert "fully reliable" in text

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from config import Settings, get_settings
+from schemas.doubt_solver import CanonicalLanguage
 
 DeliveryStrategy = Literal["live_stream", "verified_replay"]
 DeliveryRiskLevel = Literal["low", "medium", "high"]
@@ -35,6 +36,7 @@ class AnswerDeliverySignals:
     pattern_candidate_conflict: bool
     provider_fallback: bool
     needs_review: bool
+    language: CanonicalLanguage = "english"
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,18 @@ class AnswerDeliveryPolicy:
         )
 
     def decide(self, signals: AnswerDeliverySignals) -> AnswerDeliveryDecision:
+        if signals.language != "english":
+            return AnswerDeliveryDecision(
+                strategy="verified_replay",
+                risk_level="high",
+                reason_codes=("language_verification_required",),
+            )
+        if self.mode == "always_live" and signals.current_fact_dependency:
+            return AnswerDeliveryDecision(
+                strategy="verified_replay",
+                risk_level="high",
+                reason_codes=("current_fact_dependency",),
+            )
         if self.mode == "always_verified":
             return AnswerDeliveryDecision(
                 strategy="verified_replay",

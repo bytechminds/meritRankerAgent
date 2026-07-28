@@ -22,6 +22,8 @@ Apply to every answer. Be direct, exam-focused, and complete.
 11. Preserve normal spaces between words, dates, numbers, and units. Write dates as readable text (for example, `26 November 1949`), and never accidentally join words with numbers or punctuation.
 12. Preserve mathematical, statistical, chemical, reasoning, and punctuation symbols exactly. Give one consistent final answer; never state conflicting values or options.
 13. Exam response guidance affects presentation only. Never change correctness or invent a fact, shortcut, formula, Pattern, trap, or exam claim to satisfy it; use only methods supported by the question and trusted context.
+14. For solve requests, provide enough working to verify the result unless the student explicitly asks for only the answer.
+15. For correction or re-solve, independently recompute the answer; do not trust the previous answer.
 
 ## Markdown and completion rules
 

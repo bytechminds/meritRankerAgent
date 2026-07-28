@@ -301,7 +301,13 @@ class TestCarefulClassificationStreamStatus:
             "graphs.doubt_solver_graph.classify_query",
             return_value=high_conf,
         ):
-            events = _collect(_make_adapter("**Final Answer:** Short answer."))
+            events = _collect(
+                _make_adapter(
+                    "**Final Answer:** 10\n\nUsing the percentage formula with the "
+                    "given values produces the required result."
+                ),
+                query="What is 20% of 50?",
+            )
         labels = [e.label for e in events if e.type == "status"]
         assert labels.count("Checking the question more carefully...") == 0
 
@@ -324,7 +330,13 @@ class TestCarefulClassificationStreamStatus:
             "graphs.doubt_solver_graph.classify_query",
             side_effect=_classify_with_hook,
         ):
-            events = _collect(_make_adapter("**Final Answer:** Short answer."))
+            events = _collect(
+                _make_adapter(
+                    "**Final Answer:** 10\n\nUsing the percentage formula with the "
+                    "given values produces the required result."
+                ),
+                query="What is 20% of 50?",
+            )
 
         labels = [e.label for e in events if e.type == "status"]
         assert labels.count("Understanding...") == 1
@@ -437,6 +449,9 @@ class TestNonStreamRegression:
             "final_answer",
             "conversation_context",
             "conversation_relation",
+            "conversation_preparation",
+            "query_classification",
+            "source_modality",
         }
         assert fields == expected
 
@@ -533,7 +548,15 @@ class TestWebSearchStreamStatus:
         ):
             if on_before_web_search is not None:
                 on_before_web_search()
-            return {"context_text": "Fresh web context: sample"}
+            return {
+                "context_text": (
+                    "[Web Context]\n"
+                    "Source: https://example.gov/current-affairs"
+                ),
+                "retrieval_context": {
+                    "retrievalTrace": {"fallbackReason": "web_context_selected"}
+                },
+            }
 
         with patch(
             "graphs.doubt_solver_graph.classify_query",
@@ -554,6 +577,41 @@ class TestWebSearchStreamStatus:
         labels = [e.label for e in events if e.type == "status"]
         assert labels.count("Thinking...") == 1
         assert "Checking recent information..." not in labels
+
+    def test_required_web_failure_returns_verification_limited_response(self) -> None:
+        from unittest.mock import patch
+
+        from schemas.doubt_solver import QueryClassification
+
+        with patch(
+            "graphs.doubt_solver_graph.classify_query",
+            return_value=QueryClassification(
+                intent="practice_question",
+                subject="general",
+                confidence=0.95,
+                need_web_search=True,
+                web_search_reason="current_affairs",
+                web_search_query="current affairs July 2026",
+                classification_source="llm",
+            ),
+        ), patch(
+            "services.doubt_solver.streaming_doubt_solver_service."
+            "_orchestrated_collect_context_node",
+            return_value={
+                "context_text": "",
+                "retrieval_context": {
+                    "retrievalTrace": {"fallbackReason": "retrieval_error"}
+                },
+            },
+        ):
+            events = _collect(
+                _make_adapter("INVENTED CURRENT AFFAIRS"),
+                query="provide current affairs question july 2026",
+            )
+
+        content = "".join(event.content or "" for event in events if event.type == "chunk")
+        assert "could not verify" in content
+        assert "INVENTED CURRENT AFFAIRS" not in content
 
     def test_no_web_status_when_web_not_called(self) -> None:
         events = _collect(_make_adapter())

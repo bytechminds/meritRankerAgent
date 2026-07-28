@@ -578,14 +578,13 @@ models:
     timeout_seconds: 20
 
   # -------------------------------------------------------------------------
-  # Classifier models — Azure-first, native OpenAI fallback
+  # Classifier models — Gemini primary, Azure GPT-4.1 strong fallback
   # -------------------------------------------------------------------------
 
   doubt_solver_classifier:
     description: >-
-      Azure-first classifier. Active deployment gpt-4.1-mini via
-      AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI until GPT-5.4-mini is provisioned.
-      To enable GPT-5.4-mini: set env and point this alias to openai_gpt_5_4_mini.
+      Azure GPT-4.1-mini classifier retained only as a configuration rollback target.
+      No active classifier route references this alias.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     allowed_task_roles: [classifier, follow_up_resolver]
@@ -593,8 +592,16 @@ models:
     supports_streaming: false
     supports_thinking: false
     timeout_seconds: 20
-    fallback_models:
-      - doubt_solver_classifier_openai_native
+
+  doubt_solver_classifier_gemini:
+    description: Native Gemini 3.1 Flash-Lite primary classifier.
+    provider: gemini
+    provider_profile: gemini_primary
+    allowed_task_roles: [classifier]
+    model_id: gemini-3.1-flash-lite
+    supports_streaming: false
+    supports_thinking: false
+    timeout_seconds: 20
 
   doubt_solver_classifier_openai_native:
     description: Native OpenAI fallback for doubt solver classifier.
@@ -608,8 +615,7 @@ models:
 
   doubt_solver_classifier_strong:
     description: >-
-      Stronger Azure-first classifier. Active deployment gpt-4.1 via
-      AZURE_OPENAI_DEPLOYMENT_GPT_4_1 until GPT-5.4 is provisioned.
+      Sole strong classifier fallback: Azure GPT-4.1.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     allowed_task_roles: [classifier_strong]
@@ -617,8 +623,6 @@ models:
     supports_streaming: false
     supports_thinking: false
     timeout_seconds: 25
-    fallback_models:
-      - doubt_solver_classifier_openai_native
 
   # -------------------------------------------------------------------------
   # Safe mock — always present for the nuclear fallback / dry-run path

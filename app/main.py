@@ -54,6 +54,7 @@ from observability import (
     emit_request_summary,
     log_event,
     observe_invocation,
+    snapshot_llm_usage_records,
     stage_span,
     update_request_summary,
     update_request_type,
@@ -65,12 +66,15 @@ from schemas.doubt_solver import (
     DoubtSolverRequest,
     DoubtSolverStreamEvent,
     FinalAnswerResult,
-    QueryClassification,
     ResponseContent,
 )
 from schemas.image_question_classification import ImageClassificationStatus
 from schemas.request import AgentRequest
 from schemas.response import AgentResponse
+from services.classification.coordinator import ClassificationCoordinator
+from services.classification.image_classification_adapter import (
+    adapt_image_classification,
+)
 from services.conversation.bootstrap import build_conversation_persistence_service
 from services.conversation.conversation_understanding import (
     ConversationUnderstandingService,
@@ -157,6 +161,7 @@ graph = build_demo_graph()
 doubt_solver_graph = build_doubt_solver_graph()
 
 image_question_classifier = None
+classification_coordinator = ClassificationCoordinator()
 if settings.image_classifier_enabled:
     from services.image_question_classification.factory import (  # noqa: PLC0415
         build_image_question_classifier,
@@ -539,6 +544,7 @@ def invoke(payload: dict) -> dict | Response:
             query = ds_request.query or ""
             original_query = query
             entry_classification = None
+            entry_classification_result = None
             source_modality = "text"
             image_confidence: float | None = None
             image_uncertain = False
@@ -596,6 +602,12 @@ def invoke(payload: dict) -> dict | Response:
                     if replay is not None:
                         return _replay_response(replay, request_id)
                 entry_classification = image_result.classification
+                entry_classification_result = adapt_image_classification(
+                    image_result,
+                    request_id=request_id,
+                    coordinator=classification_coordinator,
+                )
+                entry_classification = entry_classification_result.raw
                 image_metadata = image_result.image_parse_metadata
                 image_confidence = min(
                     image_metadata.extraction_confidence,
@@ -624,33 +636,13 @@ def invoke(payload: dict) -> dict | Response:
                         "intent": entry_classification.intent,
                         "difficulty": entry_classification.difficulty,
                         "classifier_source": entry_classification.classification_source,
+                        "need_web_search": entry_classification.need_web_search,
+                        "web_search_reason": entry_classification.web_search_reason,
+                        "search_term_present": bool(
+                            entry_classification.web_search_query
+                        ),
                     },
                 )
-
-            conversation_result = None
-            if not ds_request.stream and conversation_understanding is not None:
-                conversation_result = conversation_understanding.understand(
-                    actor_id=actor_id,
-                    conversation_id=ds_request.conversation_id,
-                    query=query,
-                )
-                if conversation_result.resolved_query is not None:
-                    query = conversation_result.resolved_query
-                    if conversation_result.relation.requires_recent_conversation:
-                        entry_classification = None
-                    elif entry_classification is not None:
-                        entry_classification = entry_classification.model_copy(
-                            update={"requires_recent_conversation": False}
-                        )
-                elif conversation_result.relation.requires_recent_conversation:
-                    entry_classification = QueryClassification(
-                        intent="explain",
-                        subject="general",
-                        confidence=0.0,
-                        retrieval_need="none",
-                        classification_source="fallback",
-                        requires_recent_conversation=True,
-                    )
 
             # Orchestrated path — ENABLE_ORCHESTRATED_DOUBT_SOLVER=true
             if (
@@ -672,7 +664,10 @@ def invoke(payload: dict) -> dict | Response:
                     )
 
                     mapped_classification = (
-                        map_to_orchestrated_classification(
+                        entry_classification_result.classification
+                        if entry_classification_result is not None
+                        and entry_classification is not None
+                        else map_to_orchestrated_classification(
                             entry_classification,
                             query=query,
                             request_id=request_id,
@@ -706,6 +701,7 @@ def invoke(payload: dict) -> dict | Response:
                             should_cancel=cancellation.is_cancelled,
                             cancellation_reason=lambda: cancellation.reason,
                             request_started_logged=True,
+                            initial_llm_usage_records=snapshot_llm_usage_records(),
                         ),
                         adapter=orchestrated_adapter,
                         conversation_persistence=conversation_persistence,
@@ -739,7 +735,10 @@ def invoke(payload: dict) -> dict | Response:
                     "exam_id": ds_request.exam_id,
                     "exam_stage": ds_request.exam_stage,
                     "classification": (
-                        map_to_orchestrated_classification(
+                        entry_classification_result.classification
+                        if entry_classification_result is not None
+                        and entry_classification is not None
+                        else map_to_orchestrated_classification(
                             entry_classification,
                             query=query,
                             request_id=request_id,
@@ -753,14 +752,14 @@ def invoke(payload: dict) -> dict | Response:
                     "final_answer": None,
                     "conversation_context": "",
                     "conversation_relation": None,
+                    "conversation_preparation": None,
+                    "query_classification": (
+                        entry_classification.model_dump()
+                        if entry_classification is not None
+                        else None
+                    ),
+                    "source_modality": source_modality,
                 }
-                if conversation_result is not None:
-                    orchestrated_input["conversation_context"] = (
-                        conversation_result.conversation_context
-                    )
-                    orchestrated_input["conversation_relation"] = (
-                        conversation_result.relation.model_dump()
-                    )
                 generation_started = time.monotonic()
                 try:
                     with stage_span("doubt_solver.generate", route="orchestrated_non_stream"):
@@ -896,16 +895,8 @@ def invoke(payload: dict) -> dict | Response:
                 "context_used": False,
                 "service_error": False,
                 "retrieval_context": None,
-                "conversation_context": (
-                    conversation_result.conversation_context
-                    if conversation_result is not None
-                    else ""
-                ),
-                "conversation_relation": (
-                    conversation_result.relation.model_dump()
-                    if conversation_result is not None
-                    else None
-                ),
+                "conversation_context": "",
+                "conversation_relation": None,
             }
             generation_started = time.monotonic()
             try:
@@ -936,8 +927,7 @@ def invoke(payload: dict) -> dict | Response:
                 if initial_request_type == "image"
                 else (
                     "follow_up"
-                    if conversation_result is not None
-                    and conversation_result.relation.requires_recent_conversation
+                    if result_classification.get("requires_recent_conversation")
                     else "standalone"
                 )
             )

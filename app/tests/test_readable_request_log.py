@@ -82,6 +82,16 @@ def _write_request(
                 details={"route": "primary"},
             )
             log_event(
+                "quality_decision",
+                component="quality",
+                status="passed",
+                details={
+                    "passed": True,
+                    "reason_code": "none",
+                    "repair_required": False,
+                },
+            )
+            log_event(
                 "quality_validation_completed",
                 component="quality",
                 status=quality_status,
@@ -108,10 +118,174 @@ def test_successful_request_block(tmp_path: Path) -> None:
     assert "| standalone | completed" in content
     assert "OK    Request received" in content
     assert "OK    Answer generated: o4-mini" in content
+    assert (
+        "QUALITY_DECISION passed=true reason_code=none repair_required=false"
+        in content
+    )
     assert "OK    Quality passed" in content
     assert "PERSISTENCE\nHistory: not_attempted" in content
     assert "RESULT: Completed successfully." in content
     assert content.count(DIVIDER) == 1
+
+
+def test_runtime_models_web_search_and_grounding_are_readable(tmp_path: Path) -> None:
+    path = tmp_path / "agent-runtime.log"
+    _configure(path)
+    with bind_request_context(
+        request_id="observable-request",
+        conversation_id="observable-conversation",
+        turn_id="observable-turn",
+        request_type="standalone",
+    ):
+        token = begin_request_summary()
+        try:
+            log_event(
+                "request_started",
+                component="request.lifecycle",
+                status="started",
+            )
+            log_event(
+                "model_execution_completed",
+                component="llm.model_execution",
+                stage="classifier",
+                status="completed",
+                duration_ms=120,
+                details={
+                    "route": "general.classifier.default",
+                    "role": "classifier",
+                    "provider": "azure_openai",
+                    "model": "gpt-4.1-mini",
+                },
+            )
+            log_event(
+                "web_search_decision",
+                component="web",
+                status="required",
+                details={
+                    "required": True,
+                    "reason": "current_affairs",
+                    "provider": "tavily",
+                    "provider_enabled": True,
+                    "provider_configured": True,
+                    "will_call": True,
+                },
+            )
+            log_event(
+                "web_search_execution",
+                component="web",
+                status="succeeded",
+                duration_ms=350,
+                details={
+                    "provider": "tavily",
+                    "attempts": 1,
+                    "candidate_count": 5,
+                    "selected_count": 3,
+                    "context_characters": 1200,
+                },
+            )
+            log_event(
+                "grounding_completed",
+                component="grounding",
+                status="grounded",
+                details={
+                    "web_required": True,
+                    "web_executed": True,
+                    "web_context_used": True,
+                    "citation_count": 3,
+                    "verification_status": "grounded",
+                },
+            )
+            update_request_summary(
+                terminal_status="completed",
+                terminal_reason="completed",
+                total_duration_ms=500,
+            )
+            emit_request_summary()
+        finally:
+            reset_request_summary(token)
+
+    content = path.read_text(encoding="utf-8")
+    assert "provider=azure_openai" in content
+    assert "model=gpt-4.1-mini" in content
+    assert "provider=tavily" in content
+    assert "selected=3" in content
+    assert "status=grounded" in content
+
+
+def test_llm_usage_and_primary_decision_are_visible_in_readable_log(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent-runtime.log"
+    _configure(path)
+    with bind_request_context(request_id="llm-usage-visible", request_type="standalone"):
+        token = begin_request_summary()
+        try:
+            log_event(
+                "classifier_primary_decision",
+                component="classifier",
+                status="accepted",
+                details={
+                    "primary_confidence": 0.96,
+                    "primary_accepted": True,
+                    "strong_triggered": False,
+                    "strong_reason": "PRIMARY_ACCEPTED",
+                },
+            )
+            log_event(
+                "llm_call_usage",
+                component="llm.usage",
+                status="succeeded",
+                duration_ms=125,
+                details={
+                    "role": "general.classifier.default",
+                    "provider": "gemini",
+                    "model": "gemini-3.1-flash-lite",
+                    "attempt_type": "primary",
+                    "usage_source": "provider_reported",
+                    "input_tokens": 420,
+                    "output_tokens": 80,
+                    "total_tokens": 500,
+                    "estimated_cost_usd": 0.0001,
+                },
+            )
+            log_event(
+                "llm_usage_summary",
+                component="llm.usage",
+                status="completed",
+                details={
+                    "calls": 1,
+                    "input_tokens": 420,
+                    "output_tokens": 80,
+                    "total_tokens": 500,
+                    "estimated_cost_usd": 0.0001,
+                    "cost_complete": True,
+                    "generator_calls": 0,
+                    "rewrite_count": 0,
+                    "verification_calls": 0,
+                    "role_breakdown": "classifier:calls=1,tokens=500,cost=0.0001",
+                },
+            )
+            log_event(
+                "retrieval_completed",
+                component="retrieval",
+                status="completed",
+                details={"source": "fresh_solve"},
+            )
+            update_request_summary(
+                terminal_status="completed",
+                terminal_reason="completed",
+            )
+        finally:
+            reset_request_summary(token)
+
+    content = path.read_text(encoding="utf-8")
+    assert "confidence=0.96, accepted=true, strong_triggered=false" in content
+    assert "LLM CALL role=general.classifier.default provider=gemini" in content
+    assert "tokens=in:420 out:80 total:500" in content
+    assert "LLM USAGE SUMMARY calls=1" in content
+    assert "Retrieval policy: fresh_solve" in content
+    assert "External context selected: none" in content
+    assert "Retrieval fallback used" not in content
 
 
 def test_runtime_configuration_reports_memory_enabled(tmp_path: Path) -> None:
@@ -323,9 +497,8 @@ def test_contextual_request_log_orders_prefetch_relation_and_resolution(
     sections = [
         "PAYLOAD",
         "CONTEXT PREFETCH",
-        "MEMORY FETCH",
-        "CONVERSATION RELATION",
-        "SELECTED CONTEXT",
+        "CONVERSATION UNDERSTANDING",
+        "CONTEXT CANDIDATES",
         "RESOLUTION",
         "ACADEMIC CLASSIFICATION",
     ]
@@ -333,7 +506,7 @@ def test_contextual_request_log_orders_prefetch_relation_and_resolution(
     assert positions == sorted(positions)
     assert "| follow_up | completed" in content
     assert "Turn percenta" in content
-    assert "numeric_reference=75%" in content
+    assert "type=latest_turn" in content
 
 
 def test_local_preview_is_bounded_and_off_when_disabled(tmp_path: Path) -> None:
@@ -902,3 +1075,47 @@ def test_bounded_buffer_preserves_late_persistence_result(tmp_path: Path) -> Non
     content = path.read_text(encoding="utf-8")
     assert "WARN  Memory write unavailable" in content
     assert "subject-0" not in content
+
+
+def test_reference_analysis_is_bounded_and_readable(tmp_path: Path) -> None:
+    path = tmp_path / "agent-runtime.log"
+    _configure(path)
+    with bind_request_context(request_id="reference-log", request_type="follow_up"):
+        token = begin_request_summary()
+        try:
+            log_event(
+                "conversation_reference_analyzed",
+                component="conversation.reference_resolution",
+                stage="select_context",
+                status="completed",
+                details={
+                    "local_reference": False,
+                    "external_reference_detected": True,
+                    "reference_types": "person,event",
+                },
+            )
+            log_event(
+                "conversation_candidate_compatibility",
+                component="conversation.reference_resolution",
+                stage="select_context",
+                status="compatible",
+                details={
+                    "turn_id": "akbar-turn",
+                    "compatible": True,
+                    "compatibility_reason": "event_or_person",
+                    "recency_rank": 1,
+                },
+            )
+            update_request_summary(
+                terminal_status="completed",
+                terminal_reason="completed",
+                total_duration_ms=1,
+            )
+            emit_request_summary()
+        finally:
+            reset_request_summary(token)
+
+    content = path.read_text(encoding="utf-8")
+    assert "REFERENCE ANALYSIS" in content
+    assert "local=false, external=true, types=person,event" in content
+    assert "reason=event_or_person" in content

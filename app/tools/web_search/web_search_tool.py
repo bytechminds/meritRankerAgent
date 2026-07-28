@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 
 from config import Settings, get_settings
@@ -69,6 +70,7 @@ class WebSearchTool:
         *,
         on_retry_sources: Callable[[], None] | None = None,
     ) -> WebSearchResult:
+        started_at = time.monotonic()
         settings = self._settings or get_settings()
         provider_name = settings.web_search_provider
 
@@ -148,6 +150,8 @@ class WebSearchTool:
         best_attempt: SearchAttemptKind | None = None
         best_rerank = None
         retry_status_sent = False
+        attempt_count = 0
+        candidate_count = 0
 
         for attempt_idx, attempt in enumerate(attempts):
             if (
@@ -164,6 +168,8 @@ class WebSearchTool:
                 attempt=attempt,
                 search_query=search_query,
             )
+            attempt_count += 1
+            candidate_count += len(provider_result.items)
             tagged = tag_items_with_source_quality(
                 provider_result.items,
                 policy=policy,
@@ -239,10 +245,15 @@ class WebSearchTool:
             safe_note_chars = 0
 
         logger.info(
-            "web_search_result  request_id=%s  used=%s  result_count=%d  "
+            "web_search_result  request_id=%s  provider=%s  attempts=%d  "
+            "candidate_count=%d  used=%s  result_count=%d  "
             "context_chars=%d  evidence_context_chars=%d  safe_note_chars=%d  "
-            "source_pack=%s  scope=%s  source_need=%s  attempt=%s  weak_context=%s",
+            "source_pack=%s  scope=%s  source_need=%s  attempt=%s  weak_context=%s  "
+            "duration_ms=%d",
             request.request_id,
+            provider_name,
+            attempt_count,
+            candidate_count,
             bool(best_items) and not weak_context,
             len(best_items),
             len(context_text),
@@ -253,8 +264,15 @@ class WebSearchTool:
             policy.source_need,
             best_attempt or "",
             weak_context,
+            int((time.monotonic() - started_at) * 1000),
         )
 
+        official_count = sum(
+            item.source_quality == "trusted" for item in best_items
+        )
+        reputable_count = sum(
+            item.source_quality == "reputed" for item in best_items
+        )
         return WebSearchResult(
             used=bool(best_items) and not weak_context,
             provider=provider_name,
@@ -266,6 +284,12 @@ class WebSearchTool:
             source_pack_name=policy.source_pack_name,
             attempt_used=best_attempt,
             freshness_label=policy.freshness_label,
+            executed=True,
+            attempt_count=attempt_count,
+            candidate_count=candidate_count,
+            official_count=official_count,
+            reputable_count=reputable_count,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
         )
 
     def _run_attempt(

@@ -27,8 +27,9 @@ REWRITE_USER_PROMPT = (
     "Rewrite the answer into the required compact format. Keep only the final clean "
     "solution with one consistent answer. Preserve normal prose spacing and every "
     "number, unit, punctuation mark, and math, statistics, or chemistry symbol. Do not "
-    "show failed attempts. Use valid Markdown. Use \\(...\\) and \\[...\\] only for "
-    "math. Do not use $ or $$. Keep it concise. "
+    "show failed attempts. Follow every original system instruction, including the "
+    "requested response language and script. Use valid Markdown. Use \\(...\\) and "
+    "\\[...\\] only for math. Do not use $ or $$. Keep it concise. "
     "End with <ANSWER_DONE>."
 )
 
@@ -50,7 +51,7 @@ _RAW_HTML_PATTERN = re.compile(
     r"<\s*(script|iframe|object|embed|style|link|meta|form|input|button)\b",
     re.IGNORECASE,
 )
-_HTML_TAG_PATTERN = re.compile(r"<\s*[a-zA-Z][^>]*>")
+_HTML_TAG_PATTERN = re.compile(r"</?[a-zA-Z][^>\n]*>")
 _DOLLAR_INLINE = re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", re.DOTALL)
 _DOLLAR_DISPLAY = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 _QUAD_DOLLAR = re.compile(r"\${4,}")
@@ -78,6 +79,17 @@ _NUMBERED_STEP = re.compile(r"(?m)^\s*\d+\.\s+")
 _DISPLAY_MATH = re.compile(r"\\\[.*?\\\]", re.DOTALL)
 _INCOMPLETE_ENDINGS = re.compile(
     r"(?i)\b(calculate|therefore|actually|let's|lets)\s*[.:]?\s*$"
+)
+_ANSWER_ONLY_REQUEST = re.compile(
+    r"\b(?:only\s+(?:the\s+)?answer|just\s+(?:the\s+)?answer|"
+    r"answer\s+only|no\s+(?:solution|steps?|explanation)|one[- ]word\s+answer)\b",
+    re.IGNORECASE,
+)
+_REASONING_MARKER = re.compile(
+    r"(?:[=+\-*/×÷]|\\(?:frac|times|div|sqrt)|"
+    r"\b(?:because|since|therefore|thus|using|formula|substitut|"
+    r"let|given|condition|case|step)\b)",
+    re.IGNORECASE,
 )
 
 _MAX_MATH_LINE_CHARS_DEFAULT = 300
@@ -217,6 +229,7 @@ def validate_answer_quality(
     subject: str,
     difficulty: str,
     intent: str | None,
+    query: str | None = None,
     language: CanonicalLanguage = "english",
     policy: AnswerQualityPolicy | None = None,
 ) -> AnswerQualityResult:
@@ -323,6 +336,13 @@ def validate_answer_quality(
 
     if intent in ("solve", "solve_question") and not detect_final_answer(content):
         _flag("missing_final_answer", "rewrite_required")
+    if (
+        intent in ("solve", "solve_question")
+        and query is not None
+        and not _ANSWER_ONLY_REQUEST.search(query)
+        and not has_sufficient_solve_working(content, difficulty=difficulty)
+    ):
+        _flag("insufficient_solve_working", "rewrite_required")
 
     if _INCOMPLETE_ENDINGS.search(content.rstrip()):
         _flag("incomplete_ending", "rewrite_required")
@@ -354,6 +374,32 @@ def validate_answer_quality(
         sanitized_text=sanitized,
         language_compliant=language_compliant,
     )
+
+
+def has_sufficient_solve_working(content: str, *, difficulty: str) -> bool:
+    """Require compact reproducible working, scaled to the classified difficulty."""
+    working_lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == "<ANSWER_DONE>":
+            continue
+        answer_match = _ANSWER_HEADING_LINE.fullmatch(stripped)
+        if answer_match is not None:
+            inline_value = answer_match.group("value").strip()
+            if inline_value:
+                working_lines.append(inline_value)
+            continue
+        if re.fullmatch(r"#{1,6}\s*(?:answer|final answer)\s*", stripped, re.IGNORECASE):
+            continue
+        working_lines.append(stripped)
+    supporting = " ".join(working_lines)
+    words = re.findall(r"[A-Za-z0-9\u0900-\u097f]+", supporting)
+    marker_count = len(_REASONING_MARKER.findall(supporting))
+    if difficulty == "advanced":
+        return len(words) >= 15 and (marker_count >= 2 or len(working_lines) >= 3)
+    if difficulty == "intermediate":
+        return len(words) >= 8 and (marker_count >= 1 or len(working_lines) >= 2)
+    return len(words) >= 4 or marker_count >= 1
 
 
 def try_sanitize_minor(
@@ -508,6 +554,18 @@ def log_answer_quality_validation(
         rewrite_required,
         sanitized,
         fallback_required_for_result(result),
+    )
+    log_event(
+        "quality_decision",
+        component="doubt_solver.quality",
+        stage="validate_quality",
+        status="passed" if result.is_valid else "failed",
+        error_code=None if result.is_valid else "QUALITY_REWRITE_REQUIRED",
+        details={
+            "passed": result.is_valid,
+            "reason_code": ",".join(result.reason_codes[:8]) or "none",
+            "repair_required": rewrite_required,
+        },
     )
 
 

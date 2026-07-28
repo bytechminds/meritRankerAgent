@@ -7,16 +7,25 @@ Model execution boundary backed by the LLM config registry.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from observability import update_request_summary
+from observability import (
+    current_llm_attempt_type,
+    current_request_context,
+    log_event,
+    record_llm_call,
+    update_request_summary,
+)
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import (
     ModelExecutionResult,
     ProviderExecutionRequest,
+    ResolvedModelConfig,
 )
 from schemas.llm_routing import RouteDecision
+from schemas.llm_usage import ProviderTokenUsage, UsageStatus
 from services.llm.orchestration.errors import (
     ModelExecutionConfigError,
     ProviderExecutionError,
@@ -26,12 +35,54 @@ from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderExecutionError,
 )
+from services.llm.providers.usage import clear_stream_usage, consume_stream_usage
 
 if TYPE_CHECKING:
     from services.llm.providers.provider_factory import ProviderAdapterFactory
     from services.secrets.provider_credentials import ProviderCredentialResolver
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_model_name(resolution: ResolvedModelConfig) -> str:
+    config = resolution.model_config
+    return config.deployment or config.model_id or resolution.model_alias
+
+
+def _log_model_execution(
+    *,
+    route_decision: RouteDecision,
+    resolution: ResolvedModelConfig,
+    duration_ms: int,
+    fallback_used: bool,
+) -> None:
+    configured_model = _configured_model_name(resolution)
+    logger.info(
+        "model_execution  route=%s  role=%s  provider=%s  model=%s  "
+        "model_alias=%s  fallback_used=%s  duration_ms=%d",
+        route_decision.route_id,
+        route_decision.task_role,
+        resolution.provider,
+        configured_model,
+        resolution.model_alias,
+        str(fallback_used).lower(),
+        duration_ms,
+    )
+    log_event(
+        "model_execution_completed",
+        component="llm.model_execution",
+        stage=route_decision.task_role,
+        status="completed",
+        duration_ms=duration_ms,
+        details={
+            "route": route_decision.route_id,
+            "role": route_decision.task_role,
+            "provider": resolution.provider,
+            "model": configured_model,
+            "model_alias": resolution.model_alias,
+            "fallback_used": fallback_used,
+        },
+    )
 
 
 def _is_visible_text(chunk: str) -> bool:
@@ -161,6 +212,7 @@ class RegistryBackedModelExecutor:
         route_decision: RouteDecision,
         messages: list[LlmMessage],
     ) -> ModelExecutionResult:
+        started_at = time.monotonic()
         primary_alias = route_decision.model
         model_resolution = self._model_config_resolver.resolve(route_decision)
         _validate_model_role(
@@ -217,6 +269,12 @@ class RegistryBackedModelExecutor:
                     generation_route=route_decision.route_id,
                     generation_model=model_resolution.model_alias,
                 )
+            _log_model_execution(
+                route_decision=route_decision,
+                resolution=model_resolution,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                fallback_used=False,
+            )
             return raw_result
         except LlmProviderExecutionError as exc:
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
@@ -301,6 +359,10 @@ class RegistryBackedModelExecutor:
                     finish_reason=raw_result.finish_reason,
                     input_tokens=raw_result.input_tokens,
                     output_tokens=raw_result.output_tokens,
+                    total_tokens=raw_result.total_tokens,
+                    cached_input_tokens=raw_result.cached_input_tokens,
+                    reasoning_tokens=raw_result.reasoning_tokens,
+                    usage_source=raw_result.usage_source,
                     fallback_used=True,
                     metadata={
                         **{k: v for k, v in raw_result.metadata.items()},
@@ -321,6 +383,12 @@ class RegistryBackedModelExecutor:
                         generation_route=route_decision.route_id,
                         generation_model=fallback_alias,
                     )
+                _log_model_execution(
+                    route_decision=route_decision,
+                    resolution=fallback_resolution,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    fallback_used=True,
+                )
                 return result
             except LlmProviderExecutionError as exc:
                 attempted.append(fallback_alias)
@@ -354,6 +422,7 @@ class RegistryBackedModelExecutor:
         on_before_fallback: Callable[[], None] | None = None,
     ) -> Iterator[str]:
         """Resolve model metadata and stream answer text chunks from the provider."""
+        started_at = time.monotonic()
         primary_alias = route_decision.model
         model_resolution = self._model_config_resolver.resolve(route_decision)
         _validate_model_role(
@@ -424,6 +493,12 @@ class RegistryBackedModelExecutor:
                     generation_route=route_decision.route_id,
                     generation_model=model_resolution.model_alias,
                 )
+            _log_model_execution(
+                route_decision=route_decision,
+                resolution=model_resolution,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                fallback_used=False,
+            )
             return
         except LlmProviderExecutionError as exc:
             if visible_chunk_count > 0:
@@ -547,6 +622,12 @@ class RegistryBackedModelExecutor:
                         generation_route=route_decision.route_id,
                         generation_model=fallback_alias,
                     )
+                _log_model_execution(
+                    route_decision=route_decision,
+                    resolution=fallback_resolution,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    fallback_used=True,
+                )
                 return
             except LlmProviderExecutionError as exc:
                 if fallback_visible > 0:
@@ -636,43 +717,140 @@ class ProviderAdapterExecutor:
             SecretResolverError:        Credential resolution failed.
             LlmProviderAdapterError:    Adapter execution failed.
         """
-        profile = request.model_resolution.provider_profile
-        credentials = self._credential_resolver.resolve(profile)
-
-        adapter = self._provider_factory.get_provider(request.model_resolution.provider)
-
-        logger.debug(
-            "provider_adapter_executor.execute  model_alias=%s  provider=%s",
-            request.model_resolution.model_alias,
-            request.model_resolution.provider,
+        started_at = time.monotonic()
+        try:
+            profile = request.model_resolution.provider_profile
+            credentials = self._credential_resolver.resolve(profile)
+            adapter = self._provider_factory.get_provider(
+                request.model_resolution.provider
+            )
+            logger.debug(
+                "provider_adapter_executor.execute  model_alias=%s  provider=%s",
+                request.model_resolution.model_alias,
+                request.model_resolution.provider,
+            )
+            result = adapter.generate(request=request, credentials=credentials)
+        except Exception as exc:
+            provider_usage = getattr(exc, "provider_usage", None)
+            self._record_usage(
+                request=request,
+                usage=(
+                    provider_usage
+                    if isinstance(provider_usage, ProviderTokenUsage)
+                    else ProviderTokenUsage()
+                ),
+                started_at=started_at,
+                streaming=False,
+                status="failed",
+                error_type=type(exc).__name__,
+            )
+            raise
+        self._record_usage(
+            request=request,
+            usage=self._usage_from_result(result),
+            started_at=started_at,
+            streaming=False,
+            status="succeeded",
         )
-
-        return adapter.generate(request=request, credentials=credentials)
+        return result
 
     def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
         """Execute the provider request and yield answer text chunks."""
-        profile = request.model_resolution.provider_profile
-        credentials = self._credential_resolver.resolve(profile)
+        started_at = time.monotonic()
+        usage = ProviderTokenUsage()
+        status: UsageStatus = "succeeded"
+        error_type: str | None = None
+        clear_stream_usage()
+        try:
+            profile = request.model_resolution.provider_profile
+            credentials = self._credential_resolver.resolve(profile)
+            adapter = self._provider_factory.get_provider(
+                request.model_resolution.provider
+            )
+            logger.debug(
+                "provider_adapter_executor.execute_stream  model_alias=%s  provider=%s",
+                request.model_resolution.model_alias,
+                request.model_resolution.provider,
+            )
 
-        adapter = self._provider_factory.get_provider(request.model_resolution.provider)
+            if hasattr(adapter, "generate_stream"):
+                finish_reason: str | None = None
+                for chunk in adapter.generate_stream(
+                    request=request,
+                    credentials=credentials,
+                ):
+                    if hasattr(adapter, "last_stream_finish_reason"):
+                        finish_reason = adapter.last_stream_finish_reason
+                    yield chunk
+                self.last_stream_finish_reason = finish_reason or "stop"
+                return
 
-        logger.debug(
-            "provider_adapter_executor.execute_stream  model_alias=%s  provider=%s",
-            request.model_resolution.model_alias,
-            request.model_resolution.provider,
+            result = adapter.generate(request=request, credentials=credentials)
+            usage = self._usage_from_result(result)
+            if result.content:
+                yield result.content
+            self.last_stream_finish_reason = result.finish_reason or "stop"
+        except GeneratorExit:
+            status = "cancelled"
+            error_type = "GeneratorExit"
+            raise
+        except Exception as exc:
+            status = "failed"
+            error_type = type(exc).__name__
+            raise
+        finally:
+            provider_usage = consume_stream_usage()
+            if provider_usage.available:
+                usage = provider_usage
+            self._record_usage(
+                request=request,
+                usage=usage,
+                started_at=started_at,
+                streaming=True,
+                status=status,
+                error_type=error_type,
+            )
+
+    @staticmethod
+    def _usage_from_result(result: ModelExecutionResult) -> ProviderTokenUsage:
+        return ProviderTokenUsage(
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            total_tokens=result.total_tokens,
+            cached_input_tokens=result.cached_input_tokens,
+            reasoning_tokens=result.reasoning_tokens,
         )
 
-        if hasattr(adapter, "generate_stream"):
-            finish_reason: str | None = None
-            for chunk in adapter.generate_stream(request=request, credentials=credentials):
-                if hasattr(adapter, "last_stream_finish_reason"):
-                    finish_reason = adapter.last_stream_finish_reason
-                yield chunk
-            self.last_stream_finish_reason = finish_reason or "stop"
-            return
-
-        # Buffered fallback when adapter lacks native streaming.
-        result = adapter.generate(request=request, credentials=credentials)
-        if result.content:
-            yield result.content
-        self.last_stream_finish_reason = result.finish_reason or "stop"
+    @staticmethod
+    def _record_usage(
+        *,
+        request: ProviderExecutionRequest,
+        usage: ProviderTokenUsage,
+        started_at: float,
+        streaming: bool,
+        status: UsageStatus,
+        error_type: str | None = None,
+    ) -> None:
+        resolution = request.model_resolution
+        config = resolution.model_config
+        context = current_request_context()
+        base_attempt = current_llm_attempt_type()
+        is_fallback = resolution.model_alias != request.route_decision.model
+        attempt_type = (
+            f"{base_attempt}_fallback"
+            if is_fallback and "fallback" not in base_attempt
+            else base_attempt
+        )
+        record_llm_call(
+            request_id=context.request_id if context else "unknown",
+            role=request.route_decision.route_id,
+            provider=resolution.provider,
+            model=config.model_id or config.deployment or resolution.model_alias,
+            deployment=config.deployment or None,
+            attempt_type=attempt_type,
+            streaming=streaming,
+            usage=usage,
+            duration_ms=max(int((time.monotonic() - started_at) * 1000), 0),
+            status=status,
+            error_type=error_type,
+        )

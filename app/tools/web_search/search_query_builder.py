@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from tools.web_search.scope_policy import SourceScopePolicy
+
+_MONTH_YEAR = re.compile(
+    r"\b(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s+20\d{2}\b",
+    re.IGNORECASE,
+)
 
 
 def build_scope_aware_search_query(
@@ -23,7 +31,7 @@ def build_scope_aware_search_query(
         if scope_policy.scope == "world":
             if not any(token in lower for token in ("international", "global", "world")):
                 parts.append("international relations latest updates")
-        elif scope_policy.scope == "mixed":
+        elif scope_policy.scope == "mixed" and _MONTH_YEAR.search(base) is None:
             parts.append("latest updates")
         elif scope_policy.scope == "india" and "india" not in lower:
             parts.append("India")

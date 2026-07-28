@@ -28,7 +28,101 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-27
+
+---
+
+## Latest Changes - Required Web Grounding (2026-07-27)
+
+- The existing classifier contract remains the sole source of
+  `need_web_search`, `web_search_reason`, and `web_search_query`. A shared deterministic
+  normalization step repairs clear current-affairs, recent-information, explicit-search, and
+  selected current-affairs follow-up demand when a model omits it; static conceptual questions
+  remain search-free.
+- Broad current-affairs practice starts with one combined authoritative-plus-reputable Tavily
+  attempt. Official lifecycle queries retain strict official-first behavior; bounded fallback
+  attempts remain available only when the first result set is insufficient.
+- Required web search executes before configured KB/vector retrieval. Absolute Tavily date windows
+  no longer include a conflicting relative `time_range`, which was the live HTTP 400 root cause.
+- Missing credentials, provider errors, timeouts, empty/weak results, or lost selected context
+  produce a localized verification-limited response and cannot fall through to current-fact
+  generation. Verification-limited responses are non-substantive and are skipped by
+  History/Session/Memory persistence.
+- Required-web delivery always uses private verified replay. The final answer must cite exact URLs
+  retained in selected bounded web context. Current-affairs practice output is limited to at most
+  one numbered question per selected source card; repeated-source expansions are discarded and
+  unsupported output is replaced before any answer chunk is emitted.
+- No classifier, provider, summarizer model, graph node, public schema, persistence field, cache, or
+  frontend contract was added.
+
+---
+
+## Latest Changes - Pronoun and Contextual Reference Resolution (2026-07-27)
+
+- Legacy unresolved-reference answers remain in durable transcripts but are removed before
+  candidate-card construction. New unresolved-reference or clarification responses are rejected at
+  academic persistence even if their writing quality passed.
+- Candidate compatibility now requires grounded antecedent evidence. Pronouns alone and arbitrary
+  title-cased tokens such as `To`, `The`, `Who`, or `Question` cannot create a person entity or
+  clarification label.
+- Compatible candidates are grouped by validated entity identity; the newest substantive turn is
+  selected only within one same-entity chain. Distinct grounded entities still require
+  clarification.
+- The existing primary query classifier now owns generic external pronoun and indirect-reference
+  selection using the same bounded recent candidate cards. No classifier or model call was added.
+- A focused deterministic safeguard distinguishes local antecedents from external references,
+  checks candidate type compatibility before recency, rejects unresolved `NEW_QUESTION` results,
+  and invokes the existing strong classifier at most once on conflict.
+- `ANSWER_WITH_CONTEXT` handles factual follow-ups about one selected prior entity/object/concept.
+  The selected-context builder passes only that turn plus an optional bounded resolved-reference
+  string; the value is not persisted or exposed through frontend contracts.
+- Multiple compatible candidates and no-compatible-candidate cases return bounded contextual
+  clarification. Existing clarification persistence exclusion remains unchanged.
+- AgentCore Memory, exact-conversation DynamoDB fallback, cache boundaries, retrieval, generation,
+  quality, persistence, SSE contracts, and image classification remain unchanged.
+- Local live evidence verified exact Akbar resolution, chained `his` resolution, standalone math
+  isolation, two-person clarification, one-call image classification, and a text reference to the
+  image-derived equation. The final repository gate passed with 2,346 tests and one skipped.
+- The grounded polluted-Memory rerun used a synthetic Dev identity and an actual seeded AgentCore
+  Memory event. The event was fetched and rejected as `unresolved_reference_response`; exact Akbar
+  and multi-question follow-ups completed with successful History/Session/Memory persistence,
+  distinct Akbar/Shah Jahan cards clarified, and unrelated math remained standalone.
+
+---
+
+## Latest Changes - Conditional Conversation Context (2026-07-25)
+
+- A deterministic `ContextNeedGate` now skips Memory and DynamoDB for clear standalone text and
+  permits bounded reads only for explicit contextual or uncertain input.
+- AgentCore Memory remains primary; controlled empty/unavailable results retain the
+  exact-conversation DynamoDB fallback. Normal candidate input is capped at three clean pairs.
+  Explicit correction and re-solve chains are the only path allowed to expand to five pairs.
+- The existing query classifier remains the only text-classifier model authority and now returns
+  the minimal relation, requested action, and supplied selected-turn ID alongside academic fields.
+- Strict validation rejects unknown IDs and incompatible relation/action combinations. The existing
+  strong classifier runs at most once.
+- One deterministic action-specific selected turn reaches generation. Correction marks prior
+  conclusions untrusted; re-solve omits prior reasoning; similar-question generation does not copy
+  the old answer by default.
+- Graph and streaming paths use the same classification and selected-context services. Classified
+  images still bypass the text classifier, and later text turns can use the persisted image-derived
+  question-answer pair.
+
+---
+
+## Latest Changes - Classification Pipeline Stabilization (2026-07-24)
+
+- The existing query classifier remains the only model-based academic classifier and retains its
+  configured primary/strong fallback behavior.
+- A small `services/classification` package now owns validation, mapping, text coordination, and the
+  adapter for existing image-classifier results.
+- Image requests use the existing multimodal extraction/classification result and do not invoke the
+  text classifier a second time.
+- Graph and streaming execution share the same coordinator-backed text classification function.
+- The experimental conversation-classifier model route, action-aware prompt overlays, root-lineage
+  persistence, and task-alignment gate are disabled.
+- Memory remains a bounded context source with Memory-first/DynamoDB fallback. The normal cap is
+  three clean recent turns and no six-turn expansion is performed.
 
 ---
 
@@ -127,21 +221,20 @@ The four V1 planning documents are complete and implementation is done:
   completed turn creates one USER/ASSISTANT event with `clientToken=turn_id`. IAM is narrowed
   to `CreateEvent` and `ListEvents` on that memory ARN. Memory reads validate actor/session,
   roles, pagination, timestamps, and deduplicate by the newest turn event.
-- Every normal doubt-solver request prefetches the latest two completed turns from AgentCore
-  Memory before its final conversation-relation decision. Empty or controlled Memory failure uses
-  the exact-conversation DynamoDB fallback. A typed relation result separates context availability
-  from relevance, selects the referenced turn using explicit references, numeric/entity overlap,
-  bounded semantic token overlap, confidence, and recency, and discards unrelated history.
-- Contextual input is resolved before academic classification and existing retrieval/generation.
-  Unresolved contextual input returns a controlled clarification and cannot enter generic
-  generation. Deterministic English/Hindi/Hinglish and typo signals remain safety hints, not the
-  sole relevance decision.
+- `ContextNeedGate` skips recent-context reads for clearly complete standalone requests.
+  `CONTEXT_REQUIRED` and `UNCERTAIN` requests load at most three completed pairs from AgentCore
+  Memory; correction/re-solve may use the bounded five-pair exception. Empty or controlled Memory
+  failure uses the exact-conversation DynamoDB fallback.
+- The existing query classifier receives compact clean candidates and owns academic labels plus
+  relation/action/one selected turn ID. Unresolved uncertain input returns a controlled
+  clarification and cannot enter unsupported numerical generation. Deterministic
+  English/Hindi/Hinglish and typo signals decide read eligibility, not final semantic selection.
 - Substantive academic concepts, formulas, numbers, percentages, currency values, options, named
   relationships, and ambiguity margin establish relevance. Generic action-word overlap cannot
   contaminate a new self-contained topic.
-- Recent context is capped at 6,000 characters, prioritizes newest turns, preserves user queries,
-  bounds long answer bodies, and is labelled untrusted. `PromptResolver` injects it exactly once;
-  current exam/language policy remains authoritative.
+- Candidate cards are capped at 6,200 characters and include bounded question previews,
+  current-query-aware answer clues, and safe match indicators. Only one validated selected turn
+  enters generation; current exam/language policy remains authoritative.
 - Only `FinalAnswerResult.content` with non-empty content, accepted quality status, and language
   compliance is eligible. DynamoDB and memory writes run concurrently with bounded SDK timeouts
   and one transient-only retry. Persistence failure never replaces a valid student answer.
@@ -150,16 +243,15 @@ The four V1 planning documents are complete and implementation is done:
   query reuse conflicts fail safely.
 - Conversation summary, learner profile, long-term memory strategies, Redis, semantic cache,
   cross-conversation search, recommendations, and JWT infrastructure remain deferred.
-- Orchestrated JSON and streaming paths perform follow-up resolution. The legacy compatibility
-  path blocks unresolved context-dependent input and returns clarification without calling its
-  older direct generator boundary.
+- Orchestrated JSON and streaming paths share the same classification coordinator and selected
+  context builder. No post-classification resolver reinterprets and reclassifies the query.
 - Offline unit/integration and CDK assertions cover request validation, isolation, replay,
   fallback, ordering, caps, prompt composition, persistence eligibility, retries, and
   least-privilege policies. SSM existence and live DynamoDB/Memory create-list-delete smoke are
   **[NOT VERIFIED]** until both infrastructure repositories are deployed to a non-production account.
-- Final local validation: the equivalent Ruff plus full pytest gate passed with 2,210 tests and one credential-gated live
-  image test skipped; `agentcore validate` passed; CDK format/build and both IAM synthesis tests
-  passed. The Dev target is configured; this reliability fix does not deploy resources.
+- Earlier local validation counts are historical. The current conditional-context gate and live
+  evidence are recorded in `skills/features/classification-pipeline.md`; this change does not
+  deploy resources.
 
 ---
 
@@ -195,46 +287,131 @@ The four V1 planning documents are complete and implementation is done:
 - This foundation was subsequently extended by the conversation-history section above. It did
   not itself add summaries, learner profile, Redis, semantic cache, or JWT infrastructure.
 
+### Language-generation reliability hardening (2026-07-27)
+
+- The validated frontend `language` field remains the only response-language authority. The
+  classifier understands multilingual input but has no output-language field and cannot replace
+  the frontend preference.
+- `PromptResolver` remains the single model-facing language composition boundary. English adds
+  zero language-policy characters; Hindi and Hinglish each add exactly one concise conditional
+  block. Continuation, quality rewrite, contextual actions, retrieval, and web-grounded generation
+  retain the same system block instead of adding another instruction.
+- Hindi requires meaningful Devanagari prose while allowing formulas, numbers, option labels,
+  acronyms, technical terms, official names, citations, source titles, and URLs. Hinglish requires
+  Roman script and a natural Hindi-English mix for substantive prose. The deterministic validator
+  uses high-confidence script/word heuristics rather than a fixed language-percentage threshold.
+- Hindi and Hinglish SSE answers use private verified replay even when the configured delivery
+  policy is `always_live`. This prevents noncompliant provider chunks from reaching a student
+  before the existing maximum-one repair can run. English retains eligible live streaming.
+- The legacy generator cannot rewrite because it has no existing bounded rewrite boundary. A
+  noncompliant legacy result therefore fails closed to the existing localized generation-failure
+  response and is marked `failed_quality_gate`; it is not persisted as an academic answer.
+- No classifier, translation model, generator route, frontend/database field, provider/model
+  configuration, image-classifier call, retrieval call, web-search call, or public JSON/SSE schema
+  was added or changed.
+- Focused coverage is in `test_language_foundation.py`, `test_answer_delivery_policy.py`,
+  `test_adaptive_verified_streaming.py`, and `test_image_question_entry_integration.py`.
+- **[AI RISK]** Deterministic compliance detects high-confidence script and English-dominance
+  failures; it is not a general translation, grammar, or semantic-quality evaluator. Live provider
+  adherence is evidence-gated and must not be inferred from unit tests.
+- **[BLOCKER]** The 2026-07-27 live Hindi image solve produced a formula-only answer with an
+  English heading on both the initial generation and the one allowed rewrite. The final boundary
+  correctly replaced it with the localized Hindi reliability response, so no wrong-language answer
+  escaped, but successful Hindi image-answer generation remains unverified and release is held.
+
+### Planner inspection and deterministic briefing policy (2026-07-27)
+
+- The active graph has no Planner node. Both JSON and SSE follow selected-context preparation,
+  classification, context retrieval, direct generator invocation, quality boundary, and existing
+  persistence. The `planner` task role remains intentionally unsupported by the LLM route table;
+  there is no Planner prompt, provider, model alias, cache, or additional LLM call.
+- `SolutionBrief` is a typed deterministic context-compaction helper, not an LLM Planner. It is
+  used only by the legacy Bedrock-KB and direct-web retrieval formatting paths; the S3-vector
+  retrieval renderer passes its existing bounded approved context directly to the generator.
+- `PlannerNeedPolicy` now makes deterministic briefing explicit: advanced requests use it; grounded
+  intermediate requests use it; default requests require more than one selected source; basic or
+  otherwise direct-sufficient requests retain bounded direct context. This policy does not alter
+  classifier, retrieval selection, generator routing, provider/model configuration, prompts, graph
+  topology, cache, or public contracts.
+- If deterministic briefing is not selected for grounded KB context, the existing bounded
+  `[Relevant KB Context]` fallback is intentional and logged as a normal direct path rather than a
+  briefing failure. When a formatted web section fills the budget, it is retained intact instead
+  of being sliced again after a brief is prepended.
+- Focused offline coverage is in `test_solution_brief.py` and
+  `test_context_retrieval_service.py`. Live Planner-model performance, cost, and failure behavior
+  are **[NOT APPLICABLE]** because no active Planner model exists; this inspection does not deploy
+  or introduce one.
+
 ---
 
-## Latest Changes - Compact Exam-Aware Answer Response Profiles (2026-07-20)
+## Latest Changes - Exam Response Categories (2026-07-28)
 
-- A single versioned `app/config/exam_response_profiles.yaml` now defines 12 broad
-  answer-presentation families, 90 canonical exam mappings, approved aliases, compact
-  exam exceptions, and supported stage exceptions. The repository had no existing
-  canonical exam-family catalog to reuse, so this file is the static catalog authority
-  for this feature. Unsupported state-specific IDs use `GENERAL_GOVT`.
-- `ExamResponseProfileResolver` validates and loads the YAML once per process, normalizes
-  identifiers and approved stage aliases, and builds a deterministic instruction capped
-  at 260 characters. It performs no provider, LLM, database, environment, retrieval, or
-  profile lookup.
-- The runtime currently has no authenticated session/profile selected-exam source and no
-  intentional application default exam. Optional `DoubtSolverRequest.exam_id` and
-  `exam_stage` values are therefore the only production input. They are carried in the
-  immutable request-scoped graph state and are not response data. Missing input preserves
-  the previous prompt exactly; unknown explicit input resolves safely to the generic
-  family.
-- `PromptResolver` appends the resolved instruction once to generator system messages.
-  Legacy generation uses the same resolver, while answer continuation and deterministic
-  rewrite retain the original generator messages. Classifiers, image processing,
-  retrieval, embeddings, routing, Pattern/SolveFlow, and unrelated prompts receive no
-  exam-response guidance. Streaming and non-streaming public response schemas are
-  unchanged.
-- One compact global prompt rule keeps correctness, trusted evidence, explicit student
-  instructions, and subject policy authoritative. The profile can alter presentation or
-  method preference only; it cannot invent facts, formulas, shortcuts, Patterns, traps,
-  trends, or exam claims.
-- No extra model call, feature environment variable, graph node, model-route change,
-  provider change, PYQ/syllabus data, difficulty control, database placeholder, response
-  field, Markdown behavior, image behavior, or frontend behavior was added. Future
-  database-derived exam-pattern context remains a separate deferred input.
-- Tests cover catalog validation, aliases, stages, fallback, limits, cache behavior,
-  prompt composition, continuation/rewrite preservation, legacy/orchestrated parity,
-  graph-state isolation, safe logs, and representative regressions.
-- **[AI RISK]** Live-provider adherence to presentation guidance and upstream
-  frontend/session population of `exam_id` remain **[NOT VERIFIED]**. The initial static
-  catalog is based on the approved starter scope because no repository catalog existed;
-  newly supported exams require an explicit reviewed mapping or safe generic fallback.
+- Schema v2 replaces 12 repeated family guides plus 15 exam prose overrides with eight controlled
+  presentation categories. A family owns the default category and canonical exam membership;
+  `examMappings` contains only category differences and sparse stage adjustments.
+- Resolution precedence is `exam + stage override -> exam mapping -> family mapping -> default
+  category`. Existing canonical normalization, approved alias chains, stage aliases, process-level
+  resolver caching, and the `ExamResponseProfileResolver`/`PromptResolver` boundary are preserved.
+- `PromptResolver` still adds exactly one bounded `EXAM RESPONSE GUIDANCE` block only for generator
+  calls with a selected exam. The block contains the resolved category guide and at most one
+  append-only override; it never contains the category name, family, aliases, mappings, or YAML.
+  Missing exam input preserves the existing prompt, while an unknown explicit exam safely uses
+  `STANDARD_OBJECTIVE`.
+- Correctness, trusted context, explicit student instructions, requested action, subject method,
+  difficulty, and language remain authoritative. Category text adjusts presentation only and
+  cannot introduce facts, formulas, shortcuts, traps, or complexity unsupported by the question.
+- Category guides are capped at 190 characters (all current guides are approximately 26–32 tokens),
+  append-only adjustments at 90 characters (approximately 25 tokens maximum), and the final block
+  at 260 characters. Across the 90 canonical default-stage mappings, the deterministic rough
+  estimate decreased from 34.47 to 33.48 tokens on average.
+- No request/response or graph-state field, classifier, LLM call, Planner, prompt route, model,
+  subject/difficulty/language rule, retrieval/SolveFlow path, image path, quality path, streaming
+  contract, persistence behavior, database, or deployment configuration changed.
+
+### Category catalog
+
+| Category | Intended presentation |
+|---|---|
+| `BASIC_OBJECTIVE` | Direct, simple, essential steps/facts |
+| `STANDARD_OBJECTIVE` | Concise complete explanation and efficient relevant method |
+| `ANALYTICAL_OBJECTIVE` | Constraint-preserving decisive logic and reliable method |
+| `CONCEPTUAL_OBJECTIVE` | Core concept, distinctions, background, useful elimination |
+| `DESCRIPTIVE_ANALYTICAL` | Multi-dimensional conceptual depth and balanced analysis |
+| `PEDAGOGY_CONCEPTUAL` | Principle plus practical teaching/classroom application |
+| `TECHNICAL_PROBLEM_SOLVING` | Governing concept/formula and verifiable technical working |
+| `ADVANCED_APTITUDE` | Compact strategic reasoning, constraints, interpretation, elimination |
+
+### Canonical exam mapping
+
+| Exam(s) | Family | Default category | Stage override | Reason |
+|---|---|---|---|---|
+| `SSC_CGL`, `SSC_CHSL`, `SSC_CPO`, `SSC_STENOGRAPHER`, `SSC_SELECTION_POST` | `SSC` | `STANDARD_OBJECTIVE` | `SSC_CGL/TIER_2 -> ANALYTICAL_OBJECTIVE` plus one narrow method override | Standard objective baseline; Tier 2 needs stronger constraint handling |
+| `SSC_MTS`, `SSC_GD` | `SSC` | `BASIC_OBJECTIVE` | None | Direct high-volume objective presentation |
+| `IBPS_CSA`, `IBPS_RRB_OFFICE_ASSISTANT`, `SBI_JUNIOR_ASSOCIATE`, `RBI_ASSISTANT` | `BANKING` | `STANDARD_OBJECTIVE` | None | Timed standard objective presentation |
+| `IBPS_PO`, `IBPS_SO`, `IBPS_RRB_OFFICER_SCALE_I`, `IBPS_RRB_OFFICER_SCALE_II`, `IBPS_RRB_OFFICER_SCALE_III`, `SBI_PO`, `SBI_SO` | `BANKING` | `ANALYTICAL_OBJECTIVE` | None | Officer and specialist exams need stronger constraint reasoning |
+| `RBI_GRADE_B`, `NABARD_GRADE_A`, `NABARD_GRADE_B`, `SEBI_GRADE_A`, `SIDBI_GRADE_A`, `SIDBI_GRADE_B` | `BANKING` | `CONCEPTUAL_OBJECTIVE` | None | Precise domain concepts and distinctions |
+| `RRB_GROUP_D`, `RRB_ALP`, `RRB_TECHNICIAN`, `RPF_CONSTABLE`, `RPF_SI` | `RAILWAY` | `BASIC_OBJECTIVE` | None | Direct basic objective presentation |
+| `RRB_NTPC` | `RAILWAY` | `STANDARD_OBJECTIVE` | None | Broader graduate-level objective presentation |
+| `UPSC_CSE` | `UPSC` | `CONCEPTUAL_OBJECTIVE` | `PRELIMS -> CONCEPTUAL_OBJECTIVE`; `MAINS -> DESCRIPTIVE_ANALYTICAL` | Explicit prelims/mains presentation difference |
+| `STATE_PSC`, `UPPSC_PCS`, `BPSC_CCE`, `RPSC_RAS`, `MPPSC_STATE_SERVICE`, `MPSC_STATE_SERVICE`, `WBPSC_WBCS`, `KPSC_KAS`, `TNPSC_GROUP_1`, `APPSC_GROUP_1`, `TSPSC_GROUP_1`, `OPSC_OCS`, `HPSC_HCS`, `GPSC_CLASS_1_2` | `STATE_PSC` | `CONCEPTUAL_OBJECTIVE` | Generic `STATE_PSC/MAINS -> DESCRIPTIVE_ANALYTICAL` | Conceptual PSC default; only the existing generic stage contract is specialized |
+| `UPSSSC_PET`, `STATE_CET`, `STATE_GROUP_C`, `STATE_GROUP_D`, `PATWARI`, `LEKHPAL`, `DSSSB_GENERAL` | `STATE_RECRUITMENT` | `BASIC_OBJECTIVE` | None | Direct practical objective presentation |
+| `STATE_POLICE_CONSTABLE`, `STATE_POLICE_SI` | `POLICE` | `BASIC_OBJECTIVE` | None | Direct factual/numerical objective presentation |
+| `CTET`, `STATE_TET`, `UPTET`, `REET`, `KVS_PRT`, `KVS_TGT`, `KVS_PGT`, `NVS_TEACHING`, `DSSSB_TEACHING` | `TEACHING` | `PEDAGOGY_CONCEPTUAL` | None | Principle-to-classroom connection |
+| `UPSC_NDA`, `UPSC_CDS`, `UPSC_CAPF_AC`, `AFCAT`, `AGNIVEER_ARMY`, `AGNIVEER_NAVY`, `AGNIVEER_AIR_FORCE`, `INDIAN_COAST_GUARD` | `DEFENCE` | `STANDARD_OBJECTIVE` | None | Standard precise objective presentation |
+| `IRDAI_ASSISTANT_MANAGER`, `LIC_AAO`, `LIC_ADO`, `NIACL_AO`, `NIACL_ASSISTANT`, `UIIC_AO`, `UIIC_ASSISTANT` | `INSURANCE` | `CONCEPTUAL_OBJECTIVE` | None | Domain concepts and close distinctions |
+| `CAT`, `XAT`, `CMAT`, `MAT`, `SNAP`, `NMAT` | `MANAGEMENT` | `ADVANCED_APTITUDE` | None | Strategic aptitude reasoning |
+| `SSC_JE`, `RRB_JE`, `UPSC_ESE`, `GATE`, `ISRO_TECHNICAL`, `DRDO_CEPTAM` | `ENGINEERING` | `TECHNICAL_PROBLEM_SOLVING` | None | Formula/concept-led verifiable working |
+| No current canonical exam IDs | `MEDICAL`, `LAW` | `CONCEPTUAL_OBJECTIVE` | None | Reserved required family defaults without inventing unsupported IDs |
+
+Approved aliases remain `IBPS_CLERK -> IBPS_CSA`, `SBI_CLERK ->
+SBI_JUNIOR_ASSOCIATE`, `RRB_LEVEL_1`/`RAILWAY_GROUP_D -> RRB_GROUP_D`,
+`CIVIL_SERVICES_EXAM -> UPSC_CSE`, `NDA -> UPSC_NDA`, `CDS -> UPSC_CDS`, and
+`CAPF_AC -> UPSC_CAPF_AC`.
+
+- **[AI RISK]** Categories are static presentation defaults, not evidence about current exam
+  patterns. Live-provider adherence and visible response differentiation require the recorded live
+  comparison; newly supported exams still require an intentional family membership or use the safe
+  explicit-unknown default.
 
 ---
 
@@ -509,6 +686,12 @@ Config:
 ### Conditional web search (latest)
 
 - Classifier optional fields (nested in orchestrated `classification` dict — graph state unchanged): `need_web_search`, `web_search_reason`, `web_search_query`.
+- The shared `ContextRetrievalService` evaluates direct classifier web demand before
+  `RETRIEVAL_PROVIDER`. This fixes the default `s3_vector` path previously returning before the web
+  decision. Static S3-vector requests remain unchanged and do not call web search.
+- Image classification uses the same fields through the shared classification adapter. Gemini
+  prompt v4 defines current/explicit demand and restricts `web_search_reason` to the existing shared
+  values; no text-classifier call was added.
 - **Provider-agnostic web search subsystem** under `app/tools/web_search/`:
   - `WebSearchTool.search()` — sole entry point for context retrieval
   - `WebSourcePolicyResolver` — selects YAML source pack + freshness window
@@ -523,6 +706,11 @@ Config:
 - Starter source packs in `source_packs.yaml` include trusted/reputed/exam_prep tiers plus `international_current_affairs`; expand gradually from logs
 - **Scope-aware routing:** default current affairs uses mixed India 70% / world 30%; explicit India or world/global signals shift weights to 100%; exam names are audience context only — lifecycle intent routes to exam updates
 - Streaming status labels (student-facing, deduped per request): `"Checking the question more carefully..."`, `"Checking recent information..."`, `"Looking for more reliable sources..."`, `"Reliable recent sources were limited, answering carefully..."`, `"Preparing a more reliable answer..."`
+- Focused automated inspection: 197 tests passed across classification convergence, image entry,
+  web search, graph, and streaming suites. Live Dev verified static text, current text, static image,
+  and current image paths. The live official SSC query selected three `ssc.gov.in` results in one
+  authoritative Tavily attempt; the live current RBI image mapped search demand in one Gemini call
+  and the web tool selected three reputed results after the authoritative attempt was weak.
 ### Generator answer budget + completion (latest)
 
 - Route-level `max_tokens` in `llm_routes.yaml` is the hard output token budget (documented as max_output_tokens).
@@ -2655,6 +2843,52 @@ QueryClassification.intent  →  _ORCHESTRATED_INTENT_MAP  →  RouteRequest.int
 - `output_mode` field for structured output type control.
 - Real provider streaming for visual responses.
 - `visualize` is text/Markdown only — no image generation.
+
+---
+
+## 2026-07-28 answer reliability and bounded verification
+
+- Solve responses must include compact reproducible working unless the student explicitly requests
+  answer-only output. Basic requires a rule or essential calculation, intermediate requires main
+  steps, and advanced requires sufficient derivation or constraint reasoning.
+- Independent correctness verification is selective: intermediate/advanced math and reasoning,
+  corrections/re-solves, and generated practice sets. Supported percentage, rank/order, and
+  simple/compound-interest forms use deterministic recomputation first.
+- Deterministic numeric extraction uses the final numeric value on the explicit answer line, so
+  expressions such as `30% of 300 = 90` verify against 90 rather than the first operand. Currency,
+  option labels, optional `and` in year/month durations, and multi-item verifier results remain
+  bounded but no longer cause false verifier failures.
+- Inconclusive selected cases use the existing `verifier` task role through
+  `general.verifier.default`; it is not a universal graph node and does not run for ordinary
+  low-risk answers.
+- A request-local call policy permits one primary generator attempt plus one continuation,
+  rewrite, or repair attempt. A third generator call is blocked and the answer fails closed.
+- The graph topology, frontend response schema, retrieval architecture, image one-call
+  classification, persistence schema, and normal generator routes remain unchanged.
+
+### 2026-07-28 verifier exception-normalization correction
+
+- `CorrectnessVerification` requires `status`; verifier exception handling must always construct
+  it with `status="unavailable"` and the controlled `ANSWER_VERIFICATION_UNAVAILABLE` reason.
+  Provider, parser, refusal, empty-content, and usage failures never escape as raw exceptions.
+- Azure verifier content accepts a string or text content parts. Empty/refused/incomplete content
+  is a typed provider-response failure, and provider-reported usage is retained on failed
+  responses when present.
+- The verifier prompt explicitly requires a JSON boolean for `single_defensible_answer`; status is
+  normalized case-insensitively and arbitrary field types remain fail-closed.
+- `general.verifier.default` remains o4-mini with no fallback and one call maximum. It uses medium
+  reasoning and a bounded 3,000 completion-token envelope to avoid reasoning-only truncation.
+- The intermediate Math generator keeps the request-wide two-call cap but uses a 2,600-token
+  primary envelope so truncation does not consume the only rewrite allowance. The Math prompt
+  forbids selecting a merely close option when no listed option satisfies the derived condition.
+- Quality decisions emit `QUALITY_DECISION passed=... reason_code=... repair_required=...`.
+  Mathematical inequalities are no longer mistaken for HTML; genuine overlong, unbalanced, or
+  excessive-display output still requires one rewrite.
+- Final live gate: 20 exact-question SSE requests produced 14 verifier calls, all 14 parsed with
+  provider-reported usage, zero unavailable verifier results, zero TypeErrors, and zero unexpected
+  internal errors. Six requests completed. Release remains **NO-GO** because five advanced-route
+  provider calls failed, one response failed quality before verification, seven verifier decisions
+  were mismatches, and one match was not single-defensible. No unverified answer was persisted.
 
 ---
 

@@ -39,6 +39,10 @@ _AZURE_DEPLOYMENT_ENV: dict[str, tuple[str, str]] = {
 }
 
 _GEMINI_MODEL_ENV: dict[str, tuple[str, str]] = {
+    "doubt_solver_classifier_gemini": (
+        "GEMINI_CLASSIFIER_MODEL",
+        "gemini-3.1-flash-lite",
+    ),
     "gemini_flash_lite_text": ("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash-lite"),
     "gemini_flash_text": ("GEMINI_TEXT_MODEL", "gemini-2.5-flash"),
     "gemini_image_extractor": ("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-lite"),

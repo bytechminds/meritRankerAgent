@@ -28,6 +28,8 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 _ALLOWED_PROMPTS: frozenset[str] = frozenset(
     {
         "query_classifier",
+        "query_classifier_text",
+        "classification_semantics",
         "answer_generator",
         "image_question_classifier",
     }

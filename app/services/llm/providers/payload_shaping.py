@@ -108,7 +108,11 @@ def build_azure_openai_chat_completion_kwargs(
             dropped.append(blocked)
 
     reasoning_param_sent = False
-    if _resolve_send_reasoning_effort(model_config):
+    route_reasoning_effort = request.provider_options.get("reasoning_effort")
+    if isinstance(route_reasoning_effort, str) and model_config.supports_reasoning:
+        payload["reasoning_effort"] = route_reasoning_effort
+        reasoning_param_sent = True
+    elif _resolve_send_reasoning_effort(model_config):
         payload["reasoning_effort"] = model_config.reasoning_effort
         reasoning_param_sent = True
     else:

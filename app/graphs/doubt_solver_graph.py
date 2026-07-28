@@ -34,7 +34,9 @@ from typing import TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
 
+from config import get_settings
 from observability import log_event, update_request_summary
+from schemas.conversation import ConversationCandidateCard, ConversationPreparation
 from schemas.doubt_solver import (
     CanonicalLanguage,
     DoubtSolverResponse,
@@ -48,16 +50,21 @@ from services.bedrock_kb_service import (
     KnowledgeBaseServiceError,
     retrieve_similar_context,
 )
+from services.classification.academic_classifier import map_academic_classification
+from services.classification.contracts import ClassificationStageResult
+from services.classification.coordinator import ClassificationCoordinator
 from services.context_builder_service import build_doubt_solver_context
+from services.conversation.selected_context_builder import (
+    build_context_aware_clarification,
+    build_selected_generation_context,
+)
+from services.doubt_solver.answer_correctness import (
+    requires_independent_correctness_verification,
+)
 from services.doubt_solver.answer_quality import generation_failure_message
 from services.doubt_solver.final_answer import build_final_answer_result
 from services.dynamodb_service import DynamoDbConfigurationError, DynamoDbServiceError
-from services.query_classifier_service import (
-    apply_classification_policy,
-    apply_classification_sanity,
-    classify_query,
-    requires_recent_conversation,
-)
+from services.query_classifier_service import classify_query
 from services.question_record_service import fetch_question_records_by_ids
 
 logger = logging.getLogger(__name__)
@@ -165,7 +172,6 @@ def retrieve_kb_context_node(state: DoubtSolverGraphState) -> dict:
     - Sets service_error=True so build_response marks needs_review.
     - Continues with empty KB results.
     """
-    from config import get_settings  # noqa: PLC0415
 
     if get_settings().retrieval_provider == "s3_vector":
         return _retrieve_s3_vector_context_node(state)
@@ -259,7 +265,6 @@ def fetch_dynamodb_records_node(state: DoubtSolverGraphState) -> dict:
     Pattern record fetching is deferred to a future part.
     """
     # Deferred import — ensures dotenv has loaded before config is read.
-    from config import get_settings  # noqa: PLC0415
 
     if get_settings().retrieval_provider == "s3_vector":
         return {"dynamodb_records": None}
@@ -302,7 +307,6 @@ def build_answer_context_node(state: DoubtSolverGraphState) -> dict:
     Calls context_builder_service which handles truncation and safety labelling.
     Sets context_used=True only when the context string is non-empty.
     """
-    from config import get_settings  # noqa: PLC0415
 
     if get_settings().retrieval_provider == "s3_vector":
         context = state.get("answer_context") or ""
@@ -404,6 +408,19 @@ def generate_answer_node(
         language=language,
         quality_status="checked",
     )
+    if not final_answer.language_compliant:
+        fallback = generation_failure_message(language)
+        final_answer = build_final_answer_result(
+            content=fallback,
+            language=language,
+            quality_status="failed_quality_gate",
+        )
+        output = output.model_copy(
+            update={
+                "content": fallback,
+                "answer_source": "fallback",
+            }
+        )
     logger.debug(
         "request_id=%s  generate_answer  source=%s  answer_len=%d  truncated=%s",
         state.get("request_id", ""),
@@ -590,30 +607,40 @@ class OrchestratedDoubtSolverState(TypedDict):
     final_answer: dict | None
     conversation_context: str
     conversation_relation: dict | None
+    conversation_preparation: dict | None
+    query_classification: dict | None
+    source_modality: str
 
 
 # ---------------------------------------------------------------------------
 # Subject/intent normalisation helpers
 # ---------------------------------------------------------------------------
 
-_ORCHESTRATED_SUBJECT_MAP: dict[str, str] = {
-    "math": "math",
-    "reasoning": "reasoning",
-    "english": "english",
-    "general": "general",
-    "science": "general",   # unmapped subjects → general
-    "unknown": "general",
-}
+def _run_graph_classifier(
+    query: str,
+    request_id: str | None = None,
+    *,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+    conversation_candidates: str | None = None,
+    candidate_cards: tuple[ConversationCandidateCard, ...] = (),
+    candidate_turn_ids: tuple[str, ...] = (),
+    context_gate: str = "CONTEXT_NOT_NEEDED",
+) -> QueryClassification:
+    """Keep existing graph monkeypatch and dependency-injection boundaries intact."""
+    return classify_query(
+        query,
+        request_id,
+        on_before_strong_classifier=on_before_strong_classifier,
+        conversation_candidates=conversation_candidates,
+        candidate_cards=candidate_cards,
+        candidate_turn_ids=candidate_turn_ids,
+        context_gate=context_gate,
+    )
 
-_ORCHESTRATED_INTENT_MAP: dict[str, str] = {
-    "solve_question": "solve",
-    "explain_concept": "explain",
-    "explain_option": "explain",
-    "general_doubt": "explain",
-    "practice_question": "practice",
-    "visualize_question": "visualize",
-    "unknown": "explain",
-}
+
+_classification_coordinator = ClassificationCoordinator(
+    classifier=_run_graph_classifier
+)
 
 # Safe fallback classification used when the classifier fails.
 _ORCHESTRATED_FALLBACK_CLASSIFICATION: dict = {
@@ -636,41 +663,10 @@ def _map_to_orchestrated_classification(
     optional retrieval hints nested in the same classification dict (graph state
     remains 5 top-level fields).
     """
-    from schemas.doubt_solver import DoubtSolverClassification  # noqa: PLC0415
-
-    subject = _ORCHESTRATED_SUBJECT_MAP.get(raw.subject, "general")
-    intent = _ORCHESTRATED_INTENT_MAP.get(raw.intent, "explain")
-    # Pass classifier difficulty through directly — no longer hardcoded "default".
-    difficulty = raw.difficulty
-    retrieval_required = raw.retrieval_need != "none"
-
-    classification = DoubtSolverClassification(
-        subject=subject,
-        intent=intent,
-        difficulty=difficulty,
-        retrieval_required=retrieval_required,
-        requires_recent_conversation=raw.requires_recent_conversation,
-        topic=raw.topic,
-        topic_confidence=raw.topic_confidence,
-        pattern_topic_candidate=raw.pattern_topic_candidate,
-        pattern_family_candidate=raw.pattern_family_candidate,
-        retrieval_tags=raw.retrieval_tags,
-        need_web_search=raw.need_web_search,
-        web_search_reason=raw.web_search_reason,
-        web_search_query=raw.web_search_query,
-    )
-    classification_dict = classification.model_dump()
-    classification_dict = apply_classification_sanity(
-        query,
-        classification_dict,
+    return map_academic_classification(
+        raw,
+        query=query,
         request_id=request_id,
-        classifier_confidence=raw.confidence,
-    )
-    return apply_classification_policy(
-        query,
-        classification_dict,
-        request_id=request_id,
-        classifier_confidence=raw.confidence,
     )
 
 
@@ -714,41 +710,36 @@ def orchestrated_classify_query_with_delivery_signals(
     request_id: str = "",
     *,
     on_before_strong_classifier: Callable[[], None] | None = None,
+    conversation: ConversationPreparation | None = None,
 ) -> tuple[dict, float | None, bool]:
     """Return graph-safe classification plus streaming-only delivery signals."""
-    try:
-        raw: QueryClassification = classify_query(
-            query,
-            request_id=request_id or None,
-            on_before_strong_classifier=on_before_strong_classifier,
-        )
-        return (
-            _map_to_orchestrated_classification(
-                raw,
-                query=query,
-                request_id=request_id,
-            ),
-            raw.confidence,
-            raw.classification_source == "fallback",
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "request_id=%s  orchestrated_classify  classifier raised, using fallback",
-            request_id,
-        )
-        classification_dict = _ORCHESTRATED_FALLBACK_CLASSIFICATION.copy()
-        classification_dict["requires_recent_conversation"] = (
-            requires_recent_conversation(query)
-        )
-        return (
-            apply_classification_policy(
-                query,
-                classification_dict,
-                request_id=request_id,
-            ),
-            None,
-            True,
-        )
+    result = orchestrated_classify_query_stage(
+        query=query,
+        request_id=request_id,
+        on_before_strong_classifier=on_before_strong_classifier,
+        conversation=conversation,
+    )
+    return (
+        result.classification,
+        result.classifier_confidence,
+        result.classifier_fallback,
+    )
+
+
+def orchestrated_classify_query_stage(
+    *,
+    query: str,
+    request_id: str,
+    on_before_strong_classifier: Callable[[], None] | None = None,
+    conversation: ConversationPreparation | None = None,
+) -> ClassificationStageResult:
+    """Shared typed classification result for graph and streaming paths."""
+    return _classification_coordinator.classify_text(
+        query=query,
+        request_id=request_id,
+        on_before_strong_classifier=on_before_strong_classifier,
+        conversation=conversation,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -768,24 +759,22 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
     - Call any provider.
     - Use model_id / provider / deployment.
     """
-    relation = state.get("conversation_relation") or {}
-    if (
-        relation.get("requires_recent_conversation")
-        and not state.get("conversation_context")
-    ):
-        classification_dict = _ORCHESTRATED_FALLBACK_CLASSIFICATION.copy()
-        classification_dict["requires_recent_conversation"] = True
-        return {"classification": classification_dict}
-
     classification_dict = state.get("classification")
+    raw_classification = state.get("query_classification")
     if classification_dict is None:
-        classification_dict = orchestrated_classify_query(
-            state["query"],
-            request_id=state.get("request_id", ""),
+        preparation_payload = state.get("conversation_preparation")
+        preparation = (
+            ConversationPreparation.model_validate(preparation_payload)
+            if preparation_payload
+            else None
         )
-    if relation and not relation.get("requires_recent_conversation"):
-        classification_dict = dict(classification_dict)
-        classification_dict["requires_recent_conversation"] = False
+        stage_result = orchestrated_classify_query_stage(
+            query=state["query"],
+            request_id=state.get("request_id", ""),
+            conversation=preparation,
+        )
+        classification_dict = stage_result.classification
+        raw_classification = stage_result.raw.model_dump()
 
     logger.debug(
         "request_id=%s  orchestrated_classify  subject=%s  intent=%s  difficulty=%s  "
@@ -805,9 +794,33 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
             "subject": classification_dict.get("subject"),
             "intent": classification_dict.get("intent"),
             "difficulty": classification_dict.get("difficulty"),
+            "relation": (
+                raw_classification.relation
+                if isinstance(raw_classification, QueryClassification)
+                else (
+                    raw_classification.get("relation")
+                    if isinstance(raw_classification, dict)
+                    else "NEW_QUESTION"
+                )
+            ),
+            "action": (
+                raw_classification.requested_action
+                if isinstance(raw_classification, QueryClassification)
+                else (
+                    raw_classification.get("requested_action")
+                    if isinstance(raw_classification, dict)
+                    else "ANSWER_CURRENT"
+                )
+            ),
+            "need_web_search": bool(classification_dict.get("need_web_search")),
+            "web_search_reason": classification_dict.get("web_search_reason"),
+            "search_term_present": bool(classification_dict.get("web_search_query")),
         },
     )
-    return {"classification": classification_dict}
+    update = {"classification": classification_dict}
+    if raw_classification is not None:
+        update["query_classification"] = raw_classification
+    return update
 # ---------------------------------------------------------------------------
 # Node 2: collect_context
 # ---------------------------------------------------------------------------
@@ -870,10 +883,15 @@ def _orchestrated_collect_context_node(
         )
         retrieval_payload = result.retrieval_context.model_dump(by_alias=True)
         retrieval_mode = str(retrieval_payload.get("mode") or "none")
+        retrieval_source = (
+            result.web_search_provider or "web"
+            if result.reason == "web_context_selected"
+            else retrieval_mode
+        )
         duration_ms = int((time.monotonic() - started_at) * 1000)
         update_request_summary(
             retrieval_status="completed",
-            retrieval_source=retrieval_mode,
+            retrieval_source=retrieval_source,
         )
         log_event(
             "retrieval_completed",
@@ -881,18 +899,8 @@ def _orchestrated_collect_context_node(
             stage="retrieve",
             status="completed",
             duration_ms=duration_ms,
-            details={"source": retrieval_mode, "item_count": result.item_count},
+            details={"source": retrieval_source, "item_count": result.item_count},
         )
-        if retrieval_mode == "fresh_solve":
-            log_event(
-                "retrieval_fallback_used",
-                component="doubt_solver.retrieval",
-                stage="retrieve",
-                status="fallback",
-                duration_ms=duration_ms,
-                details={"source": retrieval_mode, "reason": result.reason},
-                level=logging.WARNING,
-            )
         return {
             "context_text": context_text,
             "retrieval_context": retrieval_payload,
@@ -973,55 +981,82 @@ def build_orchestrated_doubt_solver_graph(
         Only call when ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.
         Default path is build_doubt_solver_graph().
     """
-    from services.conversation.follow_up_query_resolver import (  # noqa: PLC0415
-        resolve_follow_up_with_recent_context,
-    )
-
     def _understand_conversation_node(
         state: OrchestratedDoubtSolverState,
     ) -> dict:
-        if state.get("conversation_relation") or conversation_understanding is None:
+        if (
+            state.get("source_modality") == "image"
+            or state.get("conversation_preparation")
+            or conversation_understanding is None
+        ):
             return {}
-        result = conversation_understanding.understand(
+        preparation = conversation_understanding.understand(
             actor_id=state["actor_id"],
             conversation_id=state["conversation_id"],
             query=state["query"],
+            request_id=state["request_id"],
+            exam_id=state.get("exam_id"),
+            language=cast(CanonicalLanguage, state.get("language", "english")),
         )
-        update: dict[str, object] = {
-            "conversation_relation": result.relation.model_dump(),
-            "conversation_context": result.conversation_context,
-        }
-        if result.resolved_query is not None:
-            update["query"] = result.resolved_query
-            if result.relation.requires_recent_conversation:
-                update["classification"] = None
-        return update
+        return {"conversation_preparation": preparation.model_dump()}
 
     def _prepare_follow_up_node(state: OrchestratedDoubtSolverState) -> dict:
         classification = state.get("classification") or {}
-        prefetched_relation = state.get("conversation_relation") or {}
-        if prefetched_relation:
-            if state.get("conversation_context"):
-                return {}
-            if prefetched_relation.get("requires_recent_conversation"):
+        preparation_payload = state.get("conversation_preparation")
+        raw_payload = state.get("query_classification")
+        if preparation_payload and raw_payload:
+            preparation = ConversationPreparation.model_validate(preparation_payload)
+            raw = QueryClassification.model_validate(raw_payload)
+            selected = build_selected_generation_context(
+                current_query=state["original_query"],
+                classification=raw,
+                preparation=preparation,
+            )
+            relation = {
+                "relation": selected.relation,
+                "requested_action": selected.requested_action,
+                "selected_turn_id": selected.selected_turn_id,
+                "requires_recent_conversation": selected.context_policy != "current_only",
+                "clarification_needed": selected.clarification_required,
+                "confidence": raw.confidence,
+                "decision_source": raw.classification_source,
+            }
+            if selected.clarification_required:
                 language = cast(CanonicalLanguage, state.get("language", "english"))
-                clarification = {
-                    "english": "Please clarify which earlier question, step, or option you mean.",
-                    "hinglish": (
-                        "Please clarify karein ki aap kis pehle question, step, ya option "
-                        "ki baat kar rahe hain."
-                    ),
-                    "hindi": (
-                        "कृपया स्पष्ट करें कि आप पहले के किस प्रश्न, चरण या विकल्प "
-                        "की बात कर रहे हैं।"
-                    ),
-                }[language]
+                clarification = build_context_aware_clarification(
+                    preparation,
+                    language=language,
+                    current_query=str(state.get("original_query") or state["query"]),
+                )
                 final = build_final_answer_result(
                     content=clarification,
                     language=language,
                     quality_status="failed_quality_gate",
                 )
-                return {"answer": clarification, "final_answer": final.model_dump()}
+                return {
+                    "answer": clarification,
+                    "final_answer": final.model_dump(),
+                    "conversation_relation": relation,
+                    "conversation_context": "",
+                }
+            log_event(
+                "selected_generation_context_built",
+                component="conversation.selected_context",
+                stage="prepare_follow_up",
+                status="completed",
+                details={
+                    "relation": selected.relation,
+                    "action": selected.requested_action,
+                    "selected_turn_id": selected.selected_turn_id,
+                    "context_policy": selected.context_policy,
+                    "context_characters": selected.context_characters,
+                },
+            )
+            return {
+                "query": selected.resolved_query,
+                "conversation_context": selected.conversation_context,
+                "conversation_relation": relation,
+            }
         if not classification.get("requires_recent_conversation", False):
             logger.debug("standalone_request_count count=1")
             return {"conversation_context": ""}
@@ -1042,50 +1077,12 @@ def build_orchestrated_doubt_solver_graph(
             ),
             "hindi": "कृपया स्पष्ट करें कि आप पहले के किस प्रश्न, चरण या विकल्प की बात कर रहे हैं।",
         }[language]
-        try:
-            if conversation_persistence is None or follow_up_resolver is None:
-                raise RuntimeError("Conversation context is unavailable.")
-            resolved, recent = resolve_follow_up_with_recent_context(
-                persistence=conversation_persistence,
-                resolver=follow_up_resolver,
-                actor_id=state["actor_id"],
-                conversation_id=state["conversation_id"],
-                request_id=state["request_id"],
-                original_query=state["original_query"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            reason = getattr(exc, "reason", "context_unavailable")
-            logger.warning(
-                "follow_up_resolution_failure count=1 failure_stage=%s "
-                "failure_reason=%s",
-                getattr(exc, "stage", "context_load"),
-                reason,
-            )
-            log_event(
-                "follow_up_resolution_failed",
-                component="conversation.follow_up",
-                stage="resolve_follow_up",
-                status="failed",
-                error_code=str(reason).upper(),
-                details={"error_type": type(exc).__name__},
-                level=logging.WARNING,
-            )
-            final = build_final_answer_result(
-                content=clarification,
-                language=language,
-                quality_status="failed_quality_gate",
-            )
-            return {"answer": clarification, "final_answer": final.model_dump()}
-        resolved_classification = orchestrated_classify_query(
-            resolved.resolved_query,
-            request_id=state["request_id"],
+        final = build_final_answer_result(
+            content=clarification,
+            language=language,
+            quality_status="failed_quality_gate",
         )
-        resolved_classification["requires_recent_conversation"] = False
-        return {
-            "query": resolved.resolved_query,
-            "classification": resolved_classification,
-            "conversation_context": recent.formatted_reference,
-        }
+        return {"answer": clarification, "final_answer": final.model_dump()}
 
     def _generate_node(
         state: OrchestratedDoubtSolverState,
@@ -1113,6 +1110,24 @@ def build_orchestrated_doubt_solver_graph(
         context_text: str = state.get("context_text") or ""
 
         language = cast(CanonicalLanguage, state.get("language", "english"))
+        from services.context_retrieval.web_grounding import (  # noqa: PLC0415
+            log_grounding_status,
+            required_web_answer_verified,
+            required_web_context_verified,
+            sanitize_required_web_answer,
+            verification_limited_response,
+        )
+
+        web_verified = required_web_context_verified(classification_dict, state)
+        if not web_verified:
+            answer = verification_limited_response(language)
+            log_grounding_status(classification_dict, state, verified=False)
+            final_answer = build_final_answer_result(
+                content=answer,
+                language=language,
+                quality_status="failed_quality_gate",
+            )
+            return {"answer": answer, "final_answer": final_answer.model_dump()}
         try:
             generate_final = getattr(adapter, "generate_final", None)
             if generate_final is not None:
@@ -1132,21 +1147,55 @@ def build_orchestrated_doubt_solver_graph(
                     conversation_context=state.get("conversation_context") or None,
                 )
                 answer = final_answer.content
+                relation = state.get("conversation_relation") or {}
+                verification_required = (
+                    requires_independent_correctness_verification(
+                        subject=subject,
+                        difficulty=difficulty,
+                        intent=intent,
+                        requested_action=str(
+                            relation.get("requested_action") or "ANSWER_CURRENT"
+                        ),
+                    )
+                )
+                correctness_verifier = getattr(adapter, "correctness_verifier", None)
+                if (
+                    verification_required
+                    and correctness_verifier is not None
+                    and final_answer.quality_status != "failed_quality_gate"
+                ):
+                    correctness = correctness_verifier.verify(
+                        request_id=state["request_id"],
+                        query=state["query"],
+                        candidate_answer=answer,
+                        subject=subject,
+                        difficulty=difficulty,
+                        language=language,
+                    )
+                    if not correctness.approved:
+                        answer = generation_failure_message(language)
+                        final_answer = build_final_answer_result(
+                            content=answer,
+                            language=language,
+                            quality_status="failed_quality_gate",
+                        )
             else:
                 answer = adapter.generate(
-                request_id=state["request_id"],
-                query=state["query"],
-                subject=subject,
-                intent=intent,
-                difficulty=difficulty,
-                context=context_text,
-                web_search_reason=str(classification_dict.get("web_search_reason"))
-                if classification_dict.get("web_search_reason")
-                else None,
-                exam_id=state.get("exam_id"),
-                exam_stage=state.get("exam_stage"),
-                language=language,
-                conversation_context=state.get("conversation_context") or None,
+                    request_id=state["request_id"],
+                    query=state["query"],
+                    subject=subject,
+                    intent=intent,
+                    difficulty=difficulty,
+                    context=context_text,
+                    web_search_reason=str(
+                        classification_dict.get("web_search_reason")
+                    )
+                    if classification_dict.get("web_search_reason")
+                    else None,
+                    exam_id=state.get("exam_id"),
+                    exam_stage=state.get("exam_stage"),
+                    language=language,
+                    conversation_context=state.get("conversation_context") or None,
                 )
                 final_answer = build_final_answer_result(
                     content=answer,
@@ -1178,6 +1227,36 @@ def build_orchestrated_doubt_solver_graph(
                 quality_status="failed_quality_gate",
             )
 
+        grounded_answer = sanitize_required_web_answer(
+            classification_dict,
+            state,
+            answer,
+        )
+        if grounded_answer is not None:
+            answer = grounded_answer
+            final_answer = build_final_answer_result(
+                content=answer,
+                language=language,
+                quality_status=final_answer.quality_status,
+            )
+        answer_grounded = grounded_answer is not None and required_web_answer_verified(
+            classification_dict,
+            state,
+            answer,
+        )
+        if not answer_grounded:
+            answer = verification_limited_response(language)
+            final_answer = build_final_answer_result(
+                content=answer,
+                language=language,
+                quality_status="failed_quality_gate",
+            )
+        log_grounding_status(
+            classification_dict,
+            state,
+            verified=answer_grounded,
+            answer=answer,
+        )
         logger.debug(
             "request_id=%s  orchestrated_generate  subject=%s  intent=%s  "
             "difficulty=%s  answer_len=%d",

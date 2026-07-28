@@ -568,6 +568,38 @@ class TestOrchestratedGenerateNode:
         # No retrieval required for arithmetic query → context=""\
         assert adapter.last_kwargs["context"] == ""
 
+    def test_required_web_failure_blocks_generator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = MagicMock()
+        service.retrieve_context.side_effect = RuntimeError("provider_http_error")
+        monkeypatch.setattr(
+            "services.context_retrieval.context_retrieval_service."
+            "get_context_retrieval_service",
+            lambda: service,
+        )
+        adapter = _FakeAdapter(content="INVENTED CURRENT AFFAIRS")
+        graph = build_orchestrated_doubt_solver_graph(adapter)
+        state = _minimal_state(
+            query="provide current affairs question july 2026",
+            classification={
+                "subject": "general",
+                "intent": "practice",
+                "difficulty": "default",
+                "retrieval_required": True,
+                "requires_recent_conversation": False,
+                "need_web_search": True,
+                "web_search_reason": "current_affairs",
+                "web_search_query": "current affairs July 2026",
+            },
+        )
+
+        result = graph.invoke(state)
+
+        assert adapter.call_count == 0
+        assert "could not verify" in result["answer"]
+        assert "INVENTED CURRENT AFFAIRS" not in result["answer"]
+
 
 # ===========================================================================
 # Full graph flow tests
@@ -617,6 +649,7 @@ class TestOrchestratedGraphFlow:
             "answer",
             "final_answer",
             "conversation_context",
+            "query_classification",
         }
 
     def test_full_flow_classification_is_dict(self) -> None:

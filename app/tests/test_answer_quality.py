@@ -105,6 +105,38 @@ class TestAnswerQualityValidator:
         )
         assert result.severity == "unsafe"
 
+    def test_valid_math_inequality_is_not_misread_as_html(self) -> None:
+        text = (
+            "From the extrema, \\(-4c^2 + 8c > 2.25c^2 - 2c\\), so "
+            "\\(0 < c < 1.6\\).\n\n"
+            "**Final Answer:** None of the listed options.\n<ANSWER_DONE>"
+        )
+
+        result = validate_answer_quality(
+            text,
+            subject="math",
+            difficulty="intermediate",
+            intent="solve",
+            query="Find c and show the working.",
+            policy=_policy(),
+        )
+
+        assert result.is_valid is True
+        assert "raw_html_tag" not in result.reason_codes
+
+    def test_actual_non_script_html_still_requires_rewrite(self) -> None:
+        result = validate_answer_quality(
+            "<div>Formatted answer</div>\n**Final Answer:** 1\n<ANSWER_DONE>",
+            subject="math",
+            difficulty="intermediate",
+            intent="solve",
+            query="Find the value and show the working.",
+            policy=_policy(),
+        )
+
+        assert result.is_valid is False
+        assert "raw_html_tag" in result.reason_codes
+
     def test_duplicate_final_answer_detected(self) -> None:
         text = (
             "**Final Answer:**\n1\n\n**Final Answer:**\n1\n<ANSWER_DONE>"

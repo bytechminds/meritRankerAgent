@@ -9,6 +9,7 @@ import pytest
 import config as cfg_module
 import services.doubt_solver.streaming_doubt_solver_service as streaming_module
 from schemas.doubt_solver import CanonicalLanguage
+from services.doubt_solver.answer_correctness import CorrectnessVerification
 from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
@@ -23,7 +24,10 @@ _CLASSIFICATION = {
     "classifier_confidence": 0.99,
     "classification_source": "llm",
 }
-_VALID_ANSWER = "**Final Answer:**\n\\(20\\)"
+_VALID_ANSWER = (
+    "**Final Answer:**\n\\(20\\)\n\nUsing percentage = part per hundred, "
+    "\\(20\\% \\times 100 = 20\\)."
+)
 
 
 class _FakeAdapter:
@@ -55,6 +59,21 @@ class _FakeAdapter:
         if not self.generated_answers:
             raise AssertionError("unexpected generation")
         return self.generated_answers.pop(0)
+
+
+class _FakeCorrectnessVerifier:
+    def __init__(self, result: CorrectnessVerification) -> None:
+        self.result = result
+        self.calls = 0
+
+    def verify(self, **_: object) -> CorrectnessVerification:
+        self.calls += 1
+        return self.result
+
+
+class _NoPersistenceExpected:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"unexpected persistence call: {name}")
 
 
 @pytest.fixture(autouse=True)
@@ -111,7 +130,13 @@ def test_low_risk_request_streams_live_and_final_response_is_canonical(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "adaptive")
-    adapter = _FakeAdapter(stream_chunks=["**Final ", "Answer:**\n\\(20\\)"])
+    adapter = _FakeAdapter(
+        stream_chunks=[
+            "**Final ",
+            "Answer:**\n\\(20\\)\n\nUsing percentage = part per hundred, ",
+            "\\(20\\% \\times 100 = 20\\).",
+        ]
+    )
 
     events = _events(adapter)
 
@@ -136,11 +161,13 @@ def test_language_reaches_live_stream_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "adaptive")
-    adapter = _FakeAdapter(stream_chunks=["**Answer:** Sahi option B hai."])
+    adapter = _FakeAdapter(generated_answers=["**Answer:** Sahi option B hai."])
 
-    _events(adapter, language="hinglish")
+    events = _events(adapter, language="hinglish")
 
-    assert adapter.last_stream_kwargs["language"] == "hinglish"
+    assert adapter.stream_calls == 0
+    assert adapter.last_generate_kwargs["language"] == "hinglish"
+    assert events[-1].type == "complete"
 
 
 def test_language_reaches_verified_replay_generation() -> None:
@@ -157,6 +184,26 @@ def test_language_reaches_verified_replay_generation() -> None:
     assert events[-1].response is not None
     assert events[-1].response.final_answer is not None
     assert events[-1].response.final_answer.language_compliant is True
+
+
+def test_language_mismatch_is_rewritten_once_before_hindi_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "adaptive")
+    adapter = _FakeAdapter(
+        generated_answers=[
+            "**Answer:** The correct option is B because velocity is constant.",
+            "**Answer:** सही विकल्प B है क्योंकि वेग स्थिर है।",
+        ]
+    )
+
+    events = _events(adapter, language="hindi")
+
+    rendered = "".join(event.content or "" for event in events if event.type == "chunk")
+    assert adapter.generate_calls == 2
+    assert adapter.stream_calls == 0
+    assert rendered == "**Answer:** सही विकल्प B है क्योंकि वेग स्थिर है।"
+    assert events[-1].type == "complete"
 
 
 def test_live_stream_preserves_spaces_at_chunk_boundaries(
@@ -232,7 +279,7 @@ def test_conflicting_percentage_is_repaired_once_and_never_replayed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
-    corrected = "**Answer:** 70%"
+    corrected = "**Answer:** 70%\n\nThe percentage formula confirms this result."
     adapter = _FakeAdapter(
         generated_answers=[
             "**Final Answer:** 7%\n\n**Final Answer:** 70%",
@@ -280,4 +327,43 @@ def test_cancellation_during_verified_replay_has_no_completion(
     events = _events(adapter, should_cancel=should_cancel)
 
     assert not any(event.type in {"complete", "error"} for event in events)
+    assert not any(event.type == "complete" for event in events)
+
+
+def test_correctness_infrastructure_failure_is_controlled_without_regeneration_or_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
+    adapter = _FakeAdapter(generated_answers=[_VALID_ANSWER])
+    correctness = _FakeCorrectnessVerifier(
+        CorrectnessVerification(
+            status="unavailable",
+            reason="ANSWER_VERIFICATION_UNAVAILABLE",
+        )
+    )
+    adapter.correctness_verifier = correctness  # type: ignore[attr-defined]
+    classification = {
+        **_CLASSIFICATION,
+        "difficulty": "intermediate",
+        "classifier_confidence": 0.99,
+    }
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                query="Solve the quadratic and select the correct option.",
+                language="english",
+                classification=classification,
+                classifier_confidence=0.99,
+            ),
+            adapter=adapter,  # type: ignore[arg-type]
+            conversation_persistence=_NoPersistenceExpected(),
+        )
+    )
+
+    assert adapter.generate_calls == 1
+    assert correctness.calls == 1
+    assert events[-1].type == "error"
+    assert events[-1].metadata["code"] == "ANSWER_VERIFICATION_UNAVAILABLE"
     assert not any(event.type == "complete" for event in events)

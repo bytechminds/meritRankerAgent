@@ -21,7 +21,10 @@ from services.llm.providers.azure_openai_provider import (
     _is_unsupported_parameter_error,
     _log_azure_call_failure,
 )
-from services.llm.providers.errors import FALLBACK_ELIGIBLE_FAILURE_KINDS
+from services.llm.providers.errors import (
+    FALLBACK_ELIGIBLE_FAILURE_KINDS,
+    LlmProviderResponseError,
+)
 from services.llm.providers.payload_shaping import (
     build_azure_openai_chat_completion_kwargs,
     effective_supports_temperature,
@@ -194,6 +197,19 @@ class TestAzureReasoningPayloadShaping:
         assert meta.reasoning_param_sent is False
         assert "reasoning_effort" in meta.dropped_params
 
+    def test_o4_mini_sends_route_reasoning_effort(self, tmp_path: Path) -> None:
+        request = _make_request(
+            tmp_path,
+            provider_options={"reasoning_effort": "low"},
+        )
+        kwargs, meta = build_azure_openai_chat_completion_kwargs(
+            request=request,
+            deployment="o4-mini",
+        )
+        assert kwargs["reasoning_effort"] == "low"
+        assert meta.reasoning_param_sent is True
+        assert "reasoning_effort" not in meta.dropped_params
+
     def test_gpt_4_1_mini_preserves_max_tokens_and_temperature(self, tmp_path: Path) -> None:
         request = _make_request(tmp_path, model="openai_gpt_4_1_mini")
         kwargs, meta = build_azure_openai_chat_completion_kwargs(
@@ -207,15 +223,25 @@ class TestAzureReasoningPayloadShaping:
 
 
 class FakeAzureOpenAIClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        content: object = "Answer.",
+        refusal: str | None = None,
+        usage: object | None = None,
+    ) -> None:
         self.received_kwargs: dict = {}
 
         def _create(**kwargs):  # noqa: ANN202
             self.received_kwargs = kwargs
-            message = types.SimpleNamespace(content="Answer.")
+            message = types.SimpleNamespace(content=content, refusal=refusal)
             choice = types.SimpleNamespace(message=message, finish_reason="stop")
-            usage = types.SimpleNamespace(prompt_tokens=1, completion_tokens=2)
-            return types.SimpleNamespace(choices=[choice], usage=usage)
+            resolved_usage = (
+                usage
+                if usage is not None
+                else types.SimpleNamespace(prompt_tokens=1, completion_tokens=2)
+            )
+            return types.SimpleNamespace(choices=[choice], usage=resolved_usage)
 
         self.chat = types.SimpleNamespace(
             completions=types.SimpleNamespace(create=_create)
@@ -257,6 +283,64 @@ class TestAzureAdapterPayloadIntegration:
         assert fake.received_kwargs["max_tokens"] == 3200
         assert fake.received_kwargs["temperature"] == 0.3
         assert "max_completion_tokens" not in fake.received_kwargs
+
+    def test_adapter_normalizes_content_parts(self, tmp_path: Path) -> None:
+        fake = FakeAzureOpenAIClient(
+            content=[
+                {"type": "text", "text": '{"status":"MATCH",'},
+                types.SimpleNamespace(text='"reason":"ok"}'),
+            ]
+        )
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="fake-key",
+            endpoint="https://fake.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+
+        result = adapter.generate(request=_make_request(tmp_path), credentials=creds)
+
+        assert result.content == '{"status":"MATCH","reason":"ok"}'
+
+    def test_adapter_allows_missing_usage_metadata(self, tmp_path: Path) -> None:
+        fake = FakeAzureOpenAIClient(content="Answer.", usage=types.SimpleNamespace())
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="fake-key",
+            endpoint="https://fake.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+
+        result = adapter.generate(request=_make_request(tmp_path), credentials=creds)
+
+        assert result.content == "Answer."
+        assert result.usage_source == "unavailable"
+
+    @pytest.mark.parametrize(
+        ("content", "refusal"),
+        [(None, None), ("", None), (None, "safety refusal")],
+    )
+    def test_adapter_normalizes_empty_or_refused_response(
+        self,
+        tmp_path: Path,
+        content: object,
+        refusal: str | None,
+    ) -> None:
+        fake = FakeAzureOpenAIClient(content=content, refusal=refusal)
+        adapter = AzureOpenAIProviderAdapter(client_factory=lambda _creds: fake)
+        creds = ProviderCredentials(
+            provider="azure_openai",
+            api_key="fake-key",
+            endpoint="https://fake.openai.azure.com/openai/v1",
+            azure_api_mode="azure_openai_v1",
+        )
+
+        with pytest.raises(LlmProviderResponseError) as error:
+            adapter.generate(request=_make_request(tmp_path), credentials=creds)
+
+        assert error.value.provider_usage is not None
 
 
 class TestAzureUnsupportedParameterErrors:

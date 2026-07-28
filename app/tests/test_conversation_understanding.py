@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from unittest.mock import Mock
-
-import pytest
 
 from schemas.conversation import RecentContextLoadResult, RecentConversationTurn
 from services.conversation.conversation_understanding import (
     ConversationUnderstandingService,
 )
-from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
-from services.doubt_solver.streaming_doubt_solver_service import (
-    StreamDoubtSolverInput,
-    stream_doubt_solver,
-)
-from services.llm.orchestration.orchestrator import create_mock_orchestrator_for_tests
-from services.query_classifier_service import requires_recent_conversation
+from services.conversation.memory_hygiene import classify_stored_turn
 
 
 def _turn(
@@ -23,375 +15,312 @@ def _turn(
     question: str,
     answer: str,
     *,
-    minutes_ago: int,
+    turn_type: str = "academic_question_answer",
 ) -> RecentConversationTurn:
     return RecentConversationTurn(
         turn_id=turn_id,
         original_query=question,
         final_answer=answer,
-        created_at=datetime.now(UTC) - timedelta(minutes=minutes_ago),
+        created_at=datetime.now(UTC),
+        turn_type=turn_type,
     )
 
 
-def _service(*turns: RecentConversationTurn, source: str = "agentcore_memory"):
+def _service(*turns: RecentConversationTurn) -> tuple[ConversationUnderstandingService, Mock]:
     persistence = Mock()
-    persistence.load_recent_context.return_value = RecentContextLoadResult(
-        source=source,
-        memory_attempted=True,
-        memory_status="succeeded",
-        memory_event_count=len(turns),
-        memory_completed_pair_count=len(turns),
-        memory_returned_turn_ids=tuple(turn.turn_id for turn in turns),
-        turns=turns,
-        usable_turn_count=len(turns),
-        formatted_reference="available" if turns else "",
-    )
+
+    def load(_actor: str, _conversation: str, limit: int) -> RecentContextLoadResult:
+        bounded = tuple(turns[-limit:])
+        return RecentContextLoadResult(
+            source="agentcore_memory" if bounded else "none",
+            memory_attempted=bool(bounded),
+            memory_status="succeeded" if bounded else "empty",
+            turns=bounded,
+            usable_turn_count=len(bounded),
+        )
+
+    persistence.load_recent_context.side_effect = load
     return ConversationUnderstandingService(persistence=persistence), persistence
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "how did u calculated 75%",
-        "how did u calculate 75%",
-        "how did you calculated 75%",
-        "how u got 75%",
-        "why 75 percent",
-        "75% kaise nikala",
-        "aapne 75% kaise calculate kiya",
-    ],
-)
-def test_percentage_reference_is_linked_to_previous_turn(query: str) -> None:
-    previous = _turn(
-        "percentage-turn",
-        "What is the formula for calculating percentage and how is it used?",
-        "Percentage = (Part / Whole) x 100. For example, 75% is 75/100 or 0.75.",
-        minutes_ago=1,
+def test_complete_new_question_skips_memory() -> None:
+    service, persistence = _service(
+        _turn("old", "Calculate 75% of 200.", "Final Answer: 150")
     )
-    service, persistence = _service(previous)
 
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query=query,
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Solve 2x + 5 = 15.",
     )
 
-    persistence.load_recent_context.assert_called_once_with(
-        "student-1",
-        "conversation-1",
-        2,
+    persistence.load_recent_context.assert_not_called()
+    assert result.gate.decision == "CONTEXT_NOT_NEEDED"
+    assert result.candidates == ()
+
+
+def test_complete_word_problem_without_command_verb_skips_memory() -> None:
+    service, persistence = _service(
+        _turn("old", "Calculate 75% of 200.", "Final Answer: 150")
     )
-    assert result.context_load.source == "agentcore_memory"
-    assert result.relation.relation == "follow_up"
-    assert result.relation.requires_recent_conversation is True
-    assert result.relation.referenced_turn_id == "percentage-turn"
-    assert result.relation.referenced_turn_position == "latest_turn"
-    assert result.selection_confidence >= 0.75
-    assert any(
-        signal == "numeric_reference=75%"
-        for signal in result.relation.matched_signals
-    )
-    assert result.resolved_query is not None
-    assert "percentage" in result.resolved_query.lower()
-    assert "config" not in result.resolved_query.lower()
-    assert requires_recent_conversation(result.resolved_query) is False
-    assert "75%" in result.conversation_context
-
-
-def test_exact_reported_typo_is_also_a_deterministic_safety_signal() -> None:
-    assert requires_recent_conversation("how did u calculated 75%") is True
-
-
-def test_resolved_query_keeps_academic_topic_without_generic_sentence_words() -> None:
-    previous = _turn(
-        "percentage-turn",
-        "A student scored 150 marks out of 200. What percentage did the student score?",
-        "75%",
-        minutes_ago=1,
-    )
-    service, _ = _service(previous)
 
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
+        actor_id="actor",
+        conversation_id="conversation",
+        query=(
+            "A container holds 200 litres of an acid-water solution. It contains "
+            "25% acid. Ten percent is removed and replaced with acid. The final "
+            "acid percentage is required."
+        ),
+    )
+
+    assert result.gate.decision == "CONTEXT_NOT_NEEDED"
+    persistence.load_recent_context.assert_not_called()
+
+
+def test_complete_numeric_collision_question_skips_old_context() -> None:
+    service, persistence = _service(
+        _turn(
+            "old",
+            "A mixture used 10% replacement and produced 57 litres.",
+            "Final Answer: 3",
+        )
+    )
+
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Find x when 3x + 10 = 57.",
+    )
+
+    assert result.gate.decision == "CONTEXT_NOT_NEEDED"
+    assert result.candidates == ()
+    persistence.load_recent_context.assert_not_called()
+
+
+def test_informal_follow_up_reads_three_pairs() -> None:
+    service, persistence = _service(
+        _turn("percent", "Calculate 75% of 200.", "Final Answer: 150")
+    )
+
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
         query="how did u calculated 75%",
     )
 
-    assert result.resolved_query == (
-        "Explain how or why the referenced value or result 75% "
-        "is obtained in: percentage."
+    persistence.load_recent_context.assert_called_once_with(
+        "actor", "conversation", 3
     )
+    assert result.candidates[0].turn_id == "percent"
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "Explain blood relations.",
-        "What is the capital of Rajasthan?",
-        "Give me a Simple Interest example.",
-        "What is 75% of 200?",
-    ],
-)
-def test_unrelated_or_self_contained_query_remains_independent(query: str) -> None:
-    previous = _turn(
-        "percentage-turn",
-        "Explain percentage.",
-        "Percentage compares a part with a whole.",
-        minutes_ago=1,
-    )
-    service, _ = _service(previous)
-
-    result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query=query,
-    )
-
-    assert result.relation.relation == "independent"
-    assert result.relation.requires_recent_conversation is False
-    assert result.selected_turns == ()
-    assert result.conversation_context == ""
-    assert result.resolved_query == query
-
-
-def test_numeric_reference_selects_previous_of_two_turns() -> None:
-    percentage = _turn(
-        "percentage-turn",
-        "How do percentages work?",
-        "75% means 75/100.",
-        minutes_ago=2,
-    )
-    square_root = _turn(
-        "root-turn",
-        "Evaluate sqrt(16) + 2^3.",
-        "The result is 12.",
-        minutes_ago=1,
-    )
-    service, _ = _service(percentage, square_root)
-
-    result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query="how did u calculated 75%?",
-    )
-
-    assert result.relation.referenced_turn_id == "percentage-turn"
-    assert result.relation.referenced_turn_position == "previous_of_two"
-    assert result.selected_turns == (percentage,)
-
-
-def test_contextual_wording_with_new_self_contained_topic_remains_independent() -> None:
-    previous = _turn(
-        "percentage-turn",
-        "Explain percentage.",
-        "Percentage compares a part with a whole.",
-        minutes_ago=1,
-    )
-    service, _ = _service(previous)
-
-    result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query="How did you calculate acceleration from force and mass?",
-    )
-
-    assert result.relation.relation == "independent"
-    assert result.selected_turns == ()
-    assert result.resolved_query == (
-        "How did you calculate acceleration from force and mass?"
-    )
-
-
-def test_generic_action_overlap_does_not_contaminate_new_topic() -> None:
-    previous = _turn(
-        "interest-turn",
-        "Explain Simple Interest.",
-        "Use SI = PRT/100.",
-        minutes_ago=1,
-    )
-    service, _ = _service(previous)
-    query = "Why did you use photosynthesis to explain sunlight?"
-
-    result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query=query,
-    )
-
-    assert result.relation.relation == "independent"
-    assert result.selected_turns == ()
-    assert result.resolved_query == query
-
-
-def test_pronoun_only_reference_selects_single_available_turn() -> None:
-    previous = _turn(
-        "percentage-turn",
-        "Explain percentage.",
-        "Percentage compares a part with a whole.",
-        minutes_ago=1,
-    )
-    service, _ = _service(previous)
-
-    result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query="Can you explain this?",
-    )
-
-    assert result.relation.relation == "follow_up"
-    assert result.relation.referenced_turn_id == "percentage-turn"
-
-
-def test_weak_reference_across_two_turns_requires_clarification() -> None:
-    service, _ = _service(
-        _turn("first-turn", "Explain 25%.", "25% is one fourth.", minutes_ago=2),
-        _turn("second-turn", "Explain 75%.", "75% is three fourths.", minutes_ago=1),
+def test_replacement_step_follow_up_reads_three_pairs() -> None:
+    service, persistence = _service(
+        _turn(
+            "mixture",
+            "A container has 200 litres of acid-water solution.",
+            "Replace 10% of the new mixture with pure acid.",
+        )
     )
 
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query="how did you get that?",
+        actor_id="actor",
+        conversation_id="conversation",
+        query="How you replaced 10% of the new mix with acid?",
     )
 
-    assert result.relation.relation == "ambiguous"
-    assert result.selected_turns == ()
-    assert result.resolved_query is None
+    assert result.gate.decision == "CONTEXT_REQUIRED"
+    persistence.load_recent_context.assert_called_once_with(
+        "actor", "conversation", 3
+    )
 
 
-@pytest.mark.parametrize(
-    ("question", "answer", "query", "signal"),
-    [
-        ("Explain simple interest.", "Use SI = PRT/100.", "Why SI?", "formula_reference=si"),
-        (
-            "Explain blood relations.",
-            "A brother and sister are siblings.",
-            "Why siblings?",
-            "semantic_relevance",
-        ),
-    ],
-)
-def test_formula_and_named_concept_references_link_to_context(
-    question: str,
-    answer: str,
-    query: str,
-    signal: str,
-) -> None:
-    service, _ = _service(
-        _turn("reference-turn", question, answer, minutes_ago=1)
+def test_image_derived_equation_step_follow_up_reads_context() -> None:
+    service, persistence = _service(
+        _turn(
+            "image-turn",
+            "Solve: 2x + 7 = 19. Find x.",
+            "Subtract 7 from both sides, then divide by 2. Final Answer: x = 6",
+        )
     )
 
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query=query,
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Why did you subtract 7 from both sides?",
     )
 
-    assert result.relation.relation == "follow_up"
-    assert result.relation.referenced_turn_id == "reference-turn"
-    assert signal in result.relation.matched_signals
-    assert result.resolved_query is not None
-    assert "formula:" not in result.resolved_query
-    assert query.split()[-1].rstrip("?").lower() in result.resolved_query.lower()
-
-
-@pytest.mark.parametrize(
-    ("previous_answer", "query"),
-    [
-        ("sqrt(16) + 2^3 = 12.", "why 12?"),
-        ("Use SI = PRT/100.", "why divide by 100?"),
-        ("The correct answer is option B.", "why option B?"),
-        ("First multiply, then subtract.", "which operation did you use?"),
-        ("The sequence increases by 3.", "what was the pattern?"),
-    ],
-)
-def test_other_contextual_variants_are_follow_ups(
-    previous_answer: str,
-    query: str,
-) -> None:
-    previous = _turn(
-        "previous-turn",
-        "Solve the previous problem.",
-        previous_answer,
-        minutes_ago=1,
+    assert result.gate.decision == "CONTEXT_REQUIRED"
+    persistence.load_recent_context.assert_called_once_with(
+        "actor", "conversation", 3
     )
-    service, _ = _service(previous)
+    assert result.candidates[0].turn_id == "image-turn"
 
+
+def test_correction_request_requires_context() -> None:
+    service, _ = _service(_turn("task", "Solve 2x=10.", "Final Answer: x=7"))
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query=query,
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Your answer is wrong.",
     )
-
-    assert result.relation.requires_recent_conversation is True
-    assert result.relation.referenced_turn_id == "previous-turn"
-    assert result.resolved_query
+    assert result.gate.decision == "CONTEXT_REQUIRED"
 
 
-def test_contextual_query_without_history_requires_clarification() -> None:
-    service, persistence = _service()
-
+def test_resolve_from_scratch_requires_context() -> None:
+    service, _ = _service(_turn("task", "Solve 2x=10.", "Final Answer: x=7"))
     result = service.understand(
-        actor_id="student-1",
-        conversation_id="conversation-1",
-        query="how did you get that?",
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Solve it again from scratch.",
     )
+    assert result.gate.decision == "CONTEXT_REQUIRED"
 
+
+def test_uncertain_request_reads_context() -> None:
+    service, persistence = _service(_turn("task", "What is 25% of 80?", "20"))
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="What about 75?",
+    )
+    assert result.gate.decision == "UNCERTAIN"
     persistence.load_recent_context.assert_called_once()
-    assert result.relation.relation == "ambiguous"
-    assert result.relation.requires_recent_conversation is True
-    assert result.resolved_query is None
-    assert result.conversation_context == ""
 
 
-def test_full_streaming_flow_prefetches_resolves_generates_and_persists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import config as config_module
-
-    monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_live")
-    config_module._settings = None
-    previous = _turn(
-        "percentage-turn",
-        "What is the formula for calculating percentage and how is it used?",
-        "Percentage = (Part / Whole) x 100. For example, 75% is 75/100.",
-        minutes_ago=1,
+def test_only_latest_three_candidates_are_built() -> None:
+    turns = tuple(
+        _turn(f"turn-{index}", f"Question {index}: solve x={index}.", f"Answer {index}")
+        for index in range(5)
     )
-    understanding, persistence = _service(previous)
-    orchestrator, _ = create_mock_orchestrator_for_tests(
-        content=(
-            "**Solution**\n\n"
-            "Percentage means a value out of 100.\n\n"
-            "1. Write 75% as 75/100.\n"
-            "2. Divide 75 by 100 to get 0.75.\n\n"
-            "**Final Answer:** 75% = 75/100 = 0.75."
+    service, _ = _service(*turns)
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Explain the last step.",
+    )
+    assert tuple(card.turn_id for card in result.candidates) == (
+        "turn-2",
+        "turn-3",
+        "turn-4",
+    )
+
+
+def test_expansion_is_bounded_to_five() -> None:
+    turns = tuple(
+        _turn(f"turn-{index}", f"Question {index}: solve x={index}.", f"Answer {index}")
+        for index in range(6)
+    )
+    service, persistence = _service(*turns)
+    prepared = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Again wrong, resolve it.",
+    )
+    assert len(prepared.candidates) == 5
+    assert persistence.load_recent_context.call_args_list[-1].args[-1] == 5
+
+
+def test_generic_clarification_is_rejected() -> None:
+    service, _ = _service(
+        _turn(
+            "clarification",
+            "What about this?",
+            "Please clarify which earlier question you mean.",
+        ),
+        _turn("task", "Solve 2x=10.", "Final Answer: x=5"),
+    )
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Your answer is wrong.",
+    )
+    assert result.rejected_turn_ids == ("clarification",)
+    assert tuple(card.turn_id for card in result.candidates) == ("task",)
+
+
+def test_typed_non_academic_turn_is_rejected() -> None:
+    service, _ = _service(
+        _turn("error", "Solve x.", "Unable to complete.", turn_type="error")
+    )
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Explain the last step.",
+    )
+    assert result.candidates == ()
+    assert result.rejected_turn_ids == ("error",)
+
+
+def test_candidate_budget_is_bounded() -> None:
+    service, _ = _service(
+        _turn("one", "Q " * 2400, "A " * 3900),
+        _turn("two", "Q " * 2400, "A " * 3900),
+        _turn("three", "Q " * 2400, "A " * 3900),
+    )
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Explain the last step.",
+    )
+    assert result.candidate_characters <= 6200
+
+
+def test_actor_and_conversation_are_forwarded_unchanged() -> None:
+    service, persistence = _service()
+    service.understand(
+        actor_id="actor-123",
+        conversation_id="conversation-456",
+        query="Explain the last step.",
+    )
+    persistence.load_recent_context.assert_called_once_with(
+        "actor-123", "conversation-456", 3
+    )
+
+
+def test_memory_hygiene_classifies_generic_acknowledgement() -> None:
+    decision = classify_stored_turn(
+        _turn("ack", "Your answer is wrong.", "I understand that you think it is wrong.")
+    )
+    assert decision.usable is False
+    assert decision.turn_type == "correction_only"
+
+
+def test_memory_hygiene_rejects_correction_query_even_with_full_answer() -> None:
+    decision = classify_stored_turn(
+        _turn(
+            "correction",
+            "Your answer is wrong.",
+            "Solve 4x + 5 = 21. Subtract 5, then divide by 4. Final Answer: x = 4",
         )
     )
-    adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
 
-    events = list(
-        stream_doubt_solver(
-            StreamDoubtSolverInput(
-                request_id="request-1",
-                actor_id="student-1",
-                conversation_id="conversation-1",
-                turn_id="turn-2",
-                query="how did u calculated 75%",
-                original_query="how did u calculated 75%",
-            ),
-            adapter=adapter,
-            conversation_persistence=persistence,
-            conversation_understanding=understanding,
+    assert decision.usable is False
+    assert decision.turn_type == "correction_only"
+    assert decision.reason == "non_substantive_answer"
+
+
+def test_memory_hygiene_rejects_resolve_meta_query_even_with_full_answer() -> None:
+    decision = classify_stored_turn(
+        _turn(
+            "resolve",
+            "Again wrong, solve it from scratch.",
+            "Solve 4x + 5 = 21 independently. Final Answer: x = 4",
         )
     )
 
-    assert persistence.load_recent_context.call_args.args == (
-        "student-1",
-        "conversation-1",
-        2,
+    assert decision.usable is False
+    assert decision.turn_type == "correction_only"
+    assert decision.reason == "non_substantive_answer"
+
+
+def test_no_context_does_not_invent_candidate() -> None:
+    service, _ = _service()
+    result = service.understand(
+        actor_id="actor",
+        conversation_id="conversation",
+        query="Explain the last step.",
     )
-    persistence.persist_completed_turn.assert_called_once()
-    assert events[-1].type == "complete"
-    assert events[-1].response is not None
-    assert "75/100" in events[-1].response.answer
-    config_module._settings = None
+    assert result.candidates == ()
+    assert result.context_load.source == "none"

@@ -43,7 +43,6 @@ import pytest
 from pydantic import ValidationError
 
 from graphs.doubt_solver_graph import (
-    _ORCHESTRATED_INTENT_MAP,
     OrchestratedDoubtSolverState,
     _map_to_orchestrated_classification,
 )
@@ -53,6 +52,7 @@ from schemas.llm_routing import (
     RouteEntry,
     RouteRequest,
 )
+from services.classification.academic_classifier import ACADEMIC_INTENT_MAP
 from services.llm_orchestration.config_registry import LlmConfigRegistry
 from services.llm_orchestration.route_resolver import resolve_route
 
@@ -157,38 +157,38 @@ _ALL_RAW_INTENTS = [
 
 @pytest.mark.parametrize("raw_intent", _ALL_RAW_INTENTS)
 def test_orchestrated_intent_map_covers_all_raw_intents(raw_intent: str) -> None:
-    assert raw_intent in _ORCHESTRATED_INTENT_MAP, (
-        f"_ORCHESTRATED_INTENT_MAP is missing key {raw_intent!r}. "
+    assert raw_intent in ACADEMIC_INTENT_MAP, (
+        f"ACADEMIC_INTENT_MAP is missing key {raw_intent!r}. "
         "Add it to the map in doubt_solver_graph.py."
     )
 
 
 def test_practice_question_maps_to_practice() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["practice_question"] == "practice"
+    assert ACADEMIC_INTENT_MAP["practice_question"] == "practice"
 
 
 def test_visualize_question_maps_to_visualize() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["visualize_question"] == "visualize"
+    assert ACADEMIC_INTENT_MAP["visualize_question"] == "visualize"
 
 
 def test_unknown_maps_to_explain() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["unknown"] == "explain"
+    assert ACADEMIC_INTENT_MAP["unknown"] == "explain"
 
 
 def test_solve_question_maps_to_solve() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["solve_question"] == "solve"
+    assert ACADEMIC_INTENT_MAP["solve_question"] == "solve"
 
 
 def test_explain_concept_maps_to_explain() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["explain_concept"] == "explain"
+    assert ACADEMIC_INTENT_MAP["explain_concept"] == "explain"
 
 
 def test_explain_option_maps_to_explain() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["explain_option"] == "explain"
+    assert ACADEMIC_INTENT_MAP["explain_option"] == "explain"
 
 
 def test_general_doubt_maps_to_explain() -> None:
-    assert _ORCHESTRATED_INTENT_MAP["general_doubt"] == "explain"
+    assert ACADEMIC_INTENT_MAP["general_doubt"] == "explain"
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +396,9 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "final_answer",
         "conversation_context",
         "conversation_relation",
+        "conversation_preparation",
+        "query_classification",
+        "source_modality",
     }, f"State fields changed: {set(annotations.keys())}"
 
 

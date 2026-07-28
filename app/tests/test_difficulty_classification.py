@@ -448,6 +448,7 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "language", "exam_id",
         "exam_stage", "classification", "retrieval_context", "context_text", "answer",
         "final_answer", "conversation_context", "conversation_relation",
+        "conversation_preparation", "query_classification", "source_modality",
     }
 
 

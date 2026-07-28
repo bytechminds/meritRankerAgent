@@ -30,7 +30,10 @@ from services.doubt_solver.streaming_doubt_solver_service import (
 )
 
 _REQUEST_ID = "lifecycle-request-001"
-_ANSWER = "**Final Answer:**\n\\(20\\)"
+_ANSWER = (
+    "**Final Answer:**\n\\(20\\)\n\nUsing percentage = part per hundred, "
+    "\\(20\\% \\times 100 = 20\\)."
+)
 _CLASSIFICATION = {
     "subject": "math",
     "intent": "solve",

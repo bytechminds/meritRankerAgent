@@ -101,3 +101,9 @@ class ContextRetrievalResult(BaseModel):
     retrieval_context: StudentRetrievalContext = Field(
         default_factory=StudentRetrievalContext.fresh_solve
     )
+    web_search_executed: bool = False
+    web_search_status: str = Field(default="skipped", max_length=32)
+    web_search_provider: str = Field(default="", max_length=64)
+    web_context_chars: int = Field(default=0, ge=0, le=8000)
+    web_result_count: int = Field(default=0, ge=0, le=20)
+    web_citation_count: int = Field(default=0, ge=0, le=20)

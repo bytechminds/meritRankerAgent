@@ -23,8 +23,23 @@ EVENT_NAMES = frozenset(
         "request_cancelled",
         "classification_completed",
         "classification_fallback_used",
+        "classifier_primary_decision",
+        "model_execution_completed",
+        "llm_call_usage",
+        "llm_usage_summary",
+        "web_search_decision",
+        "web_search_execution",
+        "grounding_completed",
+        "context_gate_completed",
+        "conversation_candidates_prepared",
+        "conversation_reference_analyzed",
+        "conversation_grounded_entity_extracted",
+        "conversation_candidate_compatibility",
+        "conversation_entity_grouped",
+        "conversation_clarification_labels",
         "conversation_relation_completed",
         "conversation_context_selected",
+        "selected_generation_context_built",
         "follow_up_detected",
         "follow_up_context_loaded",
         "follow_up_context_failed",
@@ -36,9 +51,11 @@ EVENT_NAMES = frozenset(
         "generation_completed",
         "answer_delivery_completed",
         "generation_failed",
+        "quality_decision",
         "quality_validation_completed",
         "quality_rewrite_completed",
         "quality_repair_completed",
+        "correctness_verification_completed",
         "conversation_persistence_completed",
         "conversation_persistence_skipped",
         "conversation_persistence_failed",
@@ -57,6 +74,7 @@ _SENSITIVE_KEY_PARTS = (
     "conversation_context",
     "context_text",
     "credential",
+    "endpoint",
     "image",
     "jwt",
     "message",
@@ -68,6 +86,15 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "token",
     "user_id",
+)
+_SAFE_USAGE_KEYS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+    }
 )
 _MAX_DETAILS = 32
 _MAX_STRING = 256
@@ -84,6 +111,8 @@ def configure_event_metadata(*, environment: str, detailed_logs: bool) -> None:
 
 def _safe_key(key: object) -> str | None:
     normalized = str(key).strip().lower()
+    if normalized in _SAFE_USAGE_KEYS:
+        return normalized
     if not normalized or any(part in normalized for part in _SENSITIVE_KEY_PARTS):
         return None
     return normalized[:64]

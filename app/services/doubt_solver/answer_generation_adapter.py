@@ -28,6 +28,7 @@ from observability import log_event
 from schemas.doubt_solver import CanonicalLanguage, FinalAnswerResult
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_completion import resolve_generator_route_subject
+from services.doubt_solver.answer_correctness import AnswerCorrectnessVerifier
 from services.doubt_solver.final_answer import build_final_answer_result
 from services.llm.orchestration.orchestrator import LlmOrchestrator
 
@@ -41,6 +42,11 @@ class AnswerGenerationAdapter:
         if orchestrator is None:
             raise TypeError("orchestrator is required.")
         self._orchestrator = orchestrator
+        self._correctness_verifier = AnswerCorrectnessVerifier(orchestrator=orchestrator)
+
+    @property
+    def correctness_verifier(self) -> AnswerCorrectnessVerifier:
+        return self._correctness_verifier
 
     def generate(
         self,

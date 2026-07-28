@@ -166,24 +166,29 @@ class ModelExecutionResult(BaseModel):
     finish_reason: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    total_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    usage_source: Literal["provider_reported", "locally_estimated", "unavailable"] = (
+        "unavailable"
+    )
     latency_ms: int | None = None
     fallback_used: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"frozen": False}
 
-    @field_validator("input_tokens")
+    @field_validator(
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+    )
     @classmethod
-    def validate_input_tokens(cls, v: int | None) -> int | None:
+    def validate_token_counts(cls, v: int | None) -> int | None:
         if v is not None and v < 0:
-            raise ValueError("input_tokens must be >= 0")
-        return v
-
-    @field_validator("output_tokens")
-    @classmethod
-    def validate_output_tokens(cls, v: int | None) -> int | None:
-        if v is not None and v < 0:
-            raise ValueError("output_tokens must be >= 0")
+            raise ValueError("token counts must be >= 0")
         return v
 
     @field_validator("latency_ms")
@@ -240,6 +245,12 @@ class OrchestrationResult(BaseModel):
     finish_reason: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    total_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    usage_source: Literal["provider_reported", "locally_estimated", "unavailable"] = (
+        "unavailable"
+    )
     latency_ms: int | None = None
     answer_source: Literal["llm", "mock", "fallback"]
     metadata: dict[str, Any] = Field(default_factory=dict)

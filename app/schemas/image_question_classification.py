@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from schemas.doubt_solver import QueryClassification
+from schemas.llm_usage import ProviderTokenUsage
 
 
 class ImageClassificationStatus(StrEnum):
@@ -64,6 +65,11 @@ class ImageProviderOutput(BaseModel):
     normalized_query: str | None = Field(default=None, max_length=5000)
     classification: QueryClassification | None = None
     image_parse_metadata: ImageParseMetadata = Field(default_factory=ImageParseMetadata)
+    provider_usage: ProviderTokenUsage | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
 
     model_config = {"extra": "forbid"}
 

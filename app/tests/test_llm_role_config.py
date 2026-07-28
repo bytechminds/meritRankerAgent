@@ -32,7 +32,7 @@ class TestLlmRoleConfigJson:
         reg = LlmConfigRegistry()
         route = reg.get_route("general", "classifier", "default")
         assert route is not None
-        assert route.model == "doubt_solver_classifier"
+        assert route.model == "doubt_solver_classifier_gemini"
 
     def test_alias_format_resolves_from_registry(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("ENABLE_REAL_LLM", "true")

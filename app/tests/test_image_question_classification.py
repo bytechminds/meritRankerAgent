@@ -16,6 +16,12 @@ from pydantic import ValidationError
 import config as config_module
 import services.image_question_classification.classifier as classifier_module
 from graphs.image_question_classifier_node import ImageClassifierNodeInput, image_classifier_node
+from observability.context import bind_request_context
+from observability.llm_usage import (
+    begin_llm_usage_collection,
+    reset_llm_usage_collection,
+    snapshot_llm_usage_records,
+)
 from schemas.doubt_solver import DoubtSolverRequest, QueryClassification
 from schemas.image_input import ImageInput
 from schemas.image_question_classification import (
@@ -25,6 +31,7 @@ from schemas.image_question_classification import (
     ImageProviderOutput,
     VisualContext,
 )
+from schemas.llm_usage import ProviderTokenUsage
 from services.image_question_classification.cache import ImageClassificationCache
 from services.image_question_classification.classifier import ImageQuestionClassifier
 from services.image_question_classification.errors import (
@@ -117,6 +124,7 @@ def _provider_output(
     subject: str = "math",
     confidence: float = 0.95,
     visual_type: str = "none",
+    provider_usage: ProviderTokenUsage | None = None,
 ) -> ImageProviderOutput:
     return ImageProviderOutput(
         status=ImageClassificationStatus.CLASSIFIED,
@@ -126,6 +134,7 @@ def _provider_output(
             confidence=confidence,
             visual_type=visual_type,
         ),
+        provider_usage=provider_usage,
     )
 
 
@@ -192,6 +201,72 @@ class FakeProvider:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+def test_image_provider_usage_is_recorded_once_for_successful_call() -> None:
+    provider = FakeProvider(
+        [
+            _provider_output(
+                provider_usage=ProviderTokenUsage(
+                    input_tokens=100,
+                    output_tokens=20,
+                    total_tokens=120,
+                )
+            )
+        ]
+    )
+    with bind_request_context(request_id="request-image-usage"):
+        token = begin_llm_usage_collection()
+        try:
+            result = _build_classifier(provider).classify(
+                image=_image_input(),
+                instruction=None,
+                request_id="request-image-usage",
+            )
+            records = snapshot_llm_usage_records()
+        finally:
+            reset_llm_usage_collection(token)
+
+    assert result.status == ImageClassificationStatus.CLASSIFIED
+    assert len(records) == 1
+    assert records[0].role == "image_question_classifier"
+    assert records[0].provider == "gemini"
+    assert records[0].input_tokens == 100
+    assert records[0].total_tokens == 120
+
+
+def test_image_provider_failure_keeps_reported_usage() -> None:
+    provider = FakeProvider(
+        [
+            ImageProviderResponseError(
+                "invalid structured response",
+                provider_usage=ProviderTokenUsage(
+                    input_tokens=80,
+                    output_tokens=4,
+                    total_tokens=84,
+                ),
+            )
+        ]
+    )
+    with bind_request_context(request_id="request-image-failure"):
+        token = begin_llm_usage_collection()
+        try:
+            result = _build_classifier(provider).classify(
+                image=_image_input(),
+                instruction=None,
+                request_id="request-image-failure",
+            )
+            records = snapshot_llm_usage_records()
+        finally:
+            reset_llm_usage_collection(token)
+
+    assert (
+        result.status
+        == ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
+    )
+    assert len(records) == 1
+    assert records[0].status == "failed"
+    assert records[0].total_tokens == 84
 
 
 def _build_classifier(
@@ -553,6 +628,8 @@ class TestClassifierBehavior:
         assert encoded not in caplog.text
         assert "private student question" not in caplog.text
         assert "outcome_class=success" in caplog.text
+        assert "provider_call_count=1" in caplog.text
+        assert "text_classifier_bypassed=true" in caplog.text
         assert "metric_count=1" in caplog.text
         assert "provider_latency_ms=" in caplog.text
 
@@ -563,28 +640,29 @@ class TestProviderAndNodeContracts:
         for intent in QueryClassification.model_fields["intent"].annotation.__args__:
             assert intent in prompt
         assert "must not solve" in prompt.lower()
+        assert "current office holders" in prompt.lower()
+        assert "freshness_required" in prompt
+        assert "do not request web search merely because" in prompt.lower()
 
     def test_gemini_adapter_uses_one_multimodal_structured_call(self) -> None:
         captured = {}
 
-        class Completions:
-            def parse(self, **kwargs):
+        class Models:
+            def generate_content(self, **kwargs):
                 captured.update(kwargs)
                 return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                parsed=kwargs["response_format"].model_validate(
-                                    _gemini_wire_payload()
-                                )
-                            )
-                        )
-                    ]
+                    parsed=kwargs["config"].response_schema.model_validate(
+                        _gemini_wire_payload()
+                    ),
+                    text=None,
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=90,
+                        candidates_token_count=10,
+                        total_token_count=100,
+                    ),
                 )
 
-        client = SimpleNamespace(
-            beta=SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-        )
+        client = SimpleNamespace(models=Models())
         provider = GeminiImageQuestionClassificationProvider(
             api_key="test-key",
             client_factory=lambda **kwargs: client,
@@ -598,33 +676,72 @@ class TestProviderAndNodeContracts:
         assert output.classification.model_dump().keys() == _classification().model_dump().keys()
         assert output.classification.subject == "math"
         assert output.classification.classification_source == "llm"
+        assert output.provider_usage is not None
+        assert output.provider_usage.input_tokens == 90
+        assert output.provider_usage.total_tokens == 100
         assert captured["model"] == "gemini-3.1-flash-lite"
-        assert captured["response_format"] is not ImageProviderOutput
-        assert len(captured["messages"]) == 2
+        assert captured["config"].response_schema is not ImageProviderOutput
+        assert len(captured["contents"]) == 2
 
-        wire_schema = captured["response_format"].model_json_schema()
+        wire_schema = captured["config"].response_schema.model_json_schema()
         encoded_schema = json.dumps(wire_schema)
         assert '"anyOf"' not in encoded_schema
         assert '"additionalProperties": true' not in encoded_schema
+
+    def test_gemini_adapter_maps_current_information_search_demand(self) -> None:
+        payload = _gemini_wire_payload()
+        payload["normalized_query"] = "Who is the current holder of this office?"
+        payload["classification"].update(
+            {
+                "subject": "general",
+                "topic": "current office holder",
+                "pattern_topic_candidate": "",
+                "pattern_family_candidate": "",
+                "retrieval_tags": ["current_office_holder"],
+                "retrieval_need": "none",
+                "need_web_search": True,
+                "web_search_reason": "freshness_required",
+                "web_search_query": "current holder of the named office official",
+            }
+        )
+
+        class Models:
+            def generate_content(self, **kwargs):
+                return SimpleNamespace(
+                    parsed=kwargs["config"].response_schema.model_validate(payload),
+                    text=None,
+                    usage_metadata=None,
+                )
+
+        client = SimpleNamespace(models=Models())
+        provider = GeminiImageQuestionClassificationProvider(
+            api_key="test-key",
+            client_factory=lambda **kwargs: client,
+        )
+        seed_provider = FakeProvider()
+        classifier = _build_classifier(seed_provider)
+        classifier.classify(image=_image_input(), instruction=None, request_id="seed-current")
+
+        output = provider.classify(seed_provider.last_request)
+
+        assert output.classification is not None
+        assert output.classification.need_web_search is True
+        assert output.classification.web_search_reason == "freshness_required"
+        assert (
+            output.classification.web_search_query
+            == "current holder of the named office official"
+        )
 
     @pytest.mark.parametrize(
         "content",
         ["not-json", json.dumps({"status": "CLASSIFIED", "normalized_query": "x"})],
     )
     def test_gemini_adapter_rejects_invalid_or_incomplete_json(self, content: str) -> None:
-        class Completions:
-            def parse(self, **kwargs):  # noqa: ARG002
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(parsed=None, content=content)
-                        )
-                    ]
-                )
+        class Models:
+            def generate_content(self, **kwargs):  # noqa: ARG002
+                return SimpleNamespace(parsed=None, text=content, usage_metadata=None)
 
-        client = SimpleNamespace(
-            beta=SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-        )
+        client = SimpleNamespace(models=Models())
         provider = GeminiImageQuestionClassificationProvider(
             api_key="test-key", client_factory=lambda **kwargs: client
         )

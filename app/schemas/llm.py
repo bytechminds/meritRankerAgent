@@ -59,6 +59,11 @@ class LlmResponse(BaseModel):
     model_label: str
     content: str
     finish_reason: str | None = None
+    input_tokens: int | None = Field(default=None, ge=0, exclude=True)
+    output_tokens: int | None = Field(default=None, ge=0, exclude=True)
+    total_tokens: int | None = Field(default=None, ge=0, exclude=True)
+    cached_input_tokens: int | None = Field(default=None, ge=0, exclude=True)
+    reasoning_tokens: int | None = Field(default=None, ge=0, exclude=True)
 
 
 class LlmStreamChunk(BaseModel):

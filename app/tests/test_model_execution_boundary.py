@@ -384,6 +384,9 @@ def test_executor_logs_only_safe_metadata(
     log_text = caplog.text
     assert "gemini_flash_light" in log_text
     assert "gemini" in log_text
+    assert "model_execution" in log_text
+    assert "role=generator" in log_text
+    assert "model=gemini-2.5-flash" in log_text
     assert "Student question" not in log_text
     assert "System prompt" not in log_text
     assert "GEMINI_API_KEY" not in log_text

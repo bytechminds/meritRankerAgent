@@ -59,6 +59,15 @@ def test_shared_policy_requires_direct_answer_and_dynamic_sections() -> None:
     assert "Omit empty headings" in content
 
 
+def test_math_prompt_never_substitutes_a_closest_invalid_option() -> None:
+    content = _system_prompt(subject="math", prompt="subjects/math_generator.md")
+
+    assert "privately derive the result and test it against every listed" in content
+    assert "`**Answer:** None of the listed" in content
+    assert "never choose" in content
+    assert "closest or merely plausible option" in content
+
+
 def test_explicit_student_instruction_overrides_default_answer_shape() -> None:
     content = _system_prompt(
         subject="english",

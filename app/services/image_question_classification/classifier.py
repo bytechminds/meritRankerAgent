@@ -7,12 +7,14 @@ import logging
 import time
 from typing import Protocol
 
+from observability import record_llm_call
 from schemas.image_input import ImageInput
 from schemas.image_question_classification import (
     ImageClassificationResult,
     ImageClassificationStatus,
     ImageProviderRequest,
 )
+from schemas.llm_usage import ProviderTokenUsage, UsageStatus
 from services.image_question_classification.cache import ImageClassificationCache, SingleFlight
 from services.image_question_classification.errors import (
     ImageProviderResponseError,
@@ -108,13 +110,20 @@ class ImageQuestionClassifier:
                 result,
                 started_at,
                 provider_latency_ms=0,
+                provider_call_count=0,
             )
             return result
 
         cache_key = self._cache_key(validated.content_hash, instruction)
         cached = self._cache.get(cache_key)
         if cached is not None:
-            self._log_outcome(request_id, cached, started_at, provider_latency_ms=0)
+            self._log_outcome(
+                request_id,
+                cached,
+                started_at,
+                provider_latency_ms=0,
+                provider_call_count=0,
+            )
             return cached
 
         is_leader, flight = self._single_flight.enter(cache_key)
@@ -127,7 +136,13 @@ class ImageQuestionClassifier:
             result = result or self._result(
                 ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
             )
-            self._log_outcome(request_id, result, started_at, provider_latency_ms=0)
+            self._log_outcome(
+                request_id,
+                result,
+                started_at,
+                provider_latency_ms=0,
+                provider_call_count=0,
+            )
             return result
 
         result = self._result(ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE)
@@ -141,7 +156,10 @@ class ImageQuestionClassifier:
                 max_output_tokens=self._max_output_tokens,
             )
             provider_started_at = time.monotonic()
-            result = self._execute_provider(request)
+            result, provider_call_count = self._execute_provider(
+                request,
+                request_id=request_id,
+            )
             provider_latency_ms = int((time.monotonic() - provider_started_at) * 1000)
             if result.status != ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE:
                 self._cache.put(cache_key, result)
@@ -150,58 +168,137 @@ class ImageQuestionClassifier:
                 result,
                 started_at,
                 provider_latency_ms=provider_latency_ms,
+                provider_call_count=provider_call_count,
             )
             return result
         finally:
             self._single_flight.finish(cache_key, flight, result)
 
-    def _execute_provider(self, request: ImageProviderRequest) -> ImageClassificationResult:
+    def _execute_provider(
+        self,
+        request: ImageProviderRequest,
+        *,
+        request_id: str,
+    ) -> tuple[ImageClassificationResult, int]:
         for attempt in range(2):
+            attempt_started_at = time.monotonic()
             try:
                 output = self._provider.classify(request)
+                self._record_provider_attempt(
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=attempt_started_at,
+                    usage=output.provider_usage or ProviderTokenUsage(),
+                    status="succeeded",
+                )
                 break
-            except ImageProviderTemporaryError:
+            except ImageProviderTemporaryError as exc:
+                self._record_provider_attempt(
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=attempt_started_at,
+                    usage=exc.provider_usage or ProviderTokenUsage(),
+                    status="failed",
+                    error_type=type(exc).__name__,
+                )
                 if attempt == 0:
                     continue
-                return self._result(ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE)
-            except ImageProviderResponseError:
-                return self._result(
-                    ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
+                return (
+                    self._result(
+                        ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
+                    ),
+                    attempt + 1,
+                )
+            except ImageProviderResponseError as exc:
+                self._record_provider_attempt(
+                    request_id=request_id,
+                    attempt=attempt,
+                    started_at=attempt_started_at,
+                    usage=exc.provider_usage or ProviderTokenUsage(),
+                    status="failed",
+                    error_type=type(exc).__name__,
+                )
+                return (
+                    self._result(
+                        ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
+                    ),
+                    attempt + 1,
                 )
         else:  # pragma: no cover - loop always returns or breaks
-            return self._result(ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE)
+            return (
+                self._result(
+                    ImageClassificationStatus.PROVIDER_TEMPORARILY_UNAVAILABLE
+                ),
+                2,
+            )
 
         if output.status != ImageClassificationStatus.CLASSIFIED:
-            return ImageClassificationResult(
-                status=output.status,
-                image_parse_metadata=output.image_parse_metadata,
-                user_message=_USER_MESSAGES.get(output.status),
+            return (
+                ImageClassificationResult(
+                    status=output.status,
+                    image_parse_metadata=output.image_parse_metadata,
+                    user_message=_USER_MESSAGES.get(output.status),
+                ),
+                attempt + 1,
             )
 
         classification = output.classification
         if classification is None or output.normalized_query is None:
-            return self._result(ImageClassificationStatus.REJECTED_UNREADABLE_IMAGE)
+            return (
+                self._result(ImageClassificationStatus.REJECTED_UNREADABLE_IMAGE),
+                attempt + 1,
+            )
         confidence = min(
             classification.confidence,
             output.image_parse_metadata.extraction_confidence,
             output.image_parse_metadata.classification_confidence,
         )
         if confidence < self._min_confidence:
-            return ImageClassificationResult(
-                status=ImageClassificationStatus.REJECTED_AMBIGUOUS_QUESTION,
-                image_parse_metadata=output.image_parse_metadata,
-                user_message=_USER_MESSAGES[
-                    ImageClassificationStatus.REJECTED_AMBIGUOUS_QUESTION
-                ],
+            return (
+                ImageClassificationResult(
+                    status=ImageClassificationStatus.REJECTED_AMBIGUOUS_QUESTION,
+                    image_parse_metadata=output.image_parse_metadata,
+                    user_message=_USER_MESSAGES[
+                        ImageClassificationStatus.REJECTED_AMBIGUOUS_QUESTION
+                    ],
+                ),
+                attempt + 1,
             )
         if classification.subject == "unknown":
             classification = classification.model_copy(update={"subject": "general"})
         classification = classification.model_copy(update={"classification_source": "llm"})
-        return ImageClassificationResult(
-            status=ImageClassificationStatus.CLASSIFIED,
-            normalized_query=output.normalized_query,
-            classification=classification,
-            image_parse_metadata=output.image_parse_metadata,
+        return (
+            ImageClassificationResult(
+                status=ImageClassificationStatus.CLASSIFIED,
+                normalized_query=output.normalized_query,
+                classification=classification,
+                image_parse_metadata=output.image_parse_metadata,
+            ),
+            attempt + 1,
+        )
+
+    def _record_provider_attempt(
+        self,
+        *,
+        request_id: str,
+        attempt: int,
+        started_at: float,
+        usage: ProviderTokenUsage,
+        status: UsageStatus,
+        error_type: str | None = None,
+    ) -> None:
+        record_llm_call(
+            request_id=request_id,
+            role="image_question_classifier",
+            provider=self._provider_name,
+            model=self._model,
+            deployment=None,
+            attempt_type="primary" if attempt == 0 else "retry",
+            streaming=False,
+            usage=usage,
+            duration_ms=max(int((time.monotonic() - started_at) * 1000), 0),
+            status=status,
+            error_type=error_type,
         )
 
     def _cache_key(self, content_hash: str, instruction: str | None) -> str:
@@ -230,6 +327,7 @@ class ImageQuestionClassifier:
         started_at: float,
         *,
         provider_latency_ms: int,
+        provider_call_count: int,
     ) -> None:
         if result.status == ImageClassificationStatus.CLASSIFIED:
             outcome_class = "success"
@@ -240,7 +338,9 @@ class ImageQuestionClassifier:
         logger.info(
             "image_question_classifier request_id=%s status=%s outcome_class=%s metric_count=1 "
             "cache_hit=%s latency_ms=%d provider_latency_ms=%d confidence=%.3f "
-            "prompt_version=%s schema_version=%s model=%s",
+            "provider_call_count=%d text_classifier_bypassed=true "
+            "prompt_version=%s schema_version=%s provider=gemini model=%s "
+            "need_web_search=%s",
             request_id,
             result.status.value,
             outcome_class,
@@ -248,7 +348,14 @@ class ImageQuestionClassifier:
             int((time.monotonic() - started_at) * 1000),
             provider_latency_ms,
             result.image_parse_metadata.classification_confidence,
+            provider_call_count,
             PROMPT_VERSION,
             SCHEMA_VERSION,
             self._model,
+            str(
+                bool(
+                    result.classification
+                    and result.classification.need_web_search
+                )
+            ).lower(),
         )

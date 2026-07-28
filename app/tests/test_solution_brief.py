@@ -19,7 +19,10 @@ from services.context_retrieval.context_retrieval_service import (
     ContextRetrievalService,
 )
 from services.solution_brief.models import SolutionBrief
-from services.solution_brief.planner_policy import should_run_llm_planner
+from services.solution_brief.planner_policy import (
+    PlannerNeedPolicy,
+    should_run_llm_planner,
+)
 from services.solution_brief.solution_brief_builder import SolutionBriefBuilder
 from tools.web_search.models import WebSearchItem
 
@@ -148,6 +151,40 @@ class TestSolutionBriefBuilderKb:
 
 
 class TestPlannerPolicy:
+    def test_basic_grounded_request_skips_deterministic_brief(self) -> None:
+        decision = PlannerNeedPolicy().decide(
+            _request(difficulty="basic"), kb_item_count=1
+        )
+        assert decision.use_solution_brief is False
+        assert decision.reason == "direct_generator_sufficient"
+
+    def test_intermediate_grounded_request_uses_deterministic_brief(self) -> None:
+        decision = PlannerNeedPolicy().decide(
+            _request(difficulty="intermediate"), kb_item_count=1
+        )
+        assert decision.use_solution_brief is True
+        assert decision.reason == "intermediate_grounded_context"
+
+    def test_default_request_requires_multiple_sources(self) -> None:
+        policy = PlannerNeedPolicy()
+        assert (
+            policy.decide(
+                _request(difficulty="default"), kb_item_count=1
+            ).use_solution_brief
+            is False
+        )
+        assert (
+            policy.decide(
+                _request(difficulty="default"), kb_item_count=2
+            ).use_solution_brief
+            is True
+        )
+
+    def test_advanced_request_uses_deterministic_brief_without_sources(self) -> None:
+        decision = PlannerNeedPolicy().decide(_request(difficulty="advanced"))
+        assert decision.use_solution_brief is True
+        assert decision.reason == "advanced_task"
+
     def test_no_planner_for_basic(self) -> None:
         assert should_run_llm_planner(_request(difficulty="basic")) is False
 
@@ -190,6 +227,16 @@ class TestSolutionBriefWebComposition:
         assert "[Solution Brief]" in composed
         assert "[Web Context]" in composed
         assert "Content:" in composed
+
+    def test_web_source_section_is_not_cut_by_brief_budget(self) -> None:
+        web_section = "[Web Context]\nSource: https://example.com\nContent: verified fact"
+        composed = SolutionBriefBuilder().compose_context_text(
+            brief_text="[Solution Brief]\n" + "x" * 200,
+            web_section=web_section,
+            max_chars=len(web_section) + 30,
+        )
+        assert composed.endswith(web_section)
+        assert "https://example.com" in composed
 
 
 class TestSolutionBriefMetadataRobustness:
@@ -301,6 +348,18 @@ class TestSolutionBriefExtractGivenIndexError:
 
 
 class TestTimeSpeedDistanceSolutionBriefPath:
+    def test_basic_grounded_request_uses_direct_bounded_context(self) -> None:
+        item = _kb_item()
+        service = ContextRetrievalService()
+        context = service._compose_generator_context(
+            _request(difficulty="basic"),
+            kb_items=[item],
+            web_items=[],
+            max_chars=1200,
+        )
+        assert "[Relevant KB Context]" in context
+        assert "[Solution Brief]" not in context
+
     def test_two_selected_items_build_solution_brief_not_fallback(self) -> None:
         items = [
             RetrievedContextItem(

@@ -28,6 +28,7 @@ from schemas.conversation import (
 )
 from schemas.doubt_solver import FinalAnswerResult
 from services.conversation.history_repository import ConversationHistoryRepository
+from services.conversation.memory_hygiene import classify_non_substantive_response
 from services.conversation.recent_context_service import RecentConversationContextService
 from services.conversation.session_repository import ConversationSessionRepository
 from services.conversation.short_term_memory import (
@@ -131,6 +132,14 @@ def evaluate_completed_turn_persistence(
         return PersistenceDecision(persistable=False, skip_reason="not_finalized")
     if not final_answer.content.strip():
         return PersistenceDecision(persistable=False, skip_reason="empty_final_answer")
+    response_rejection = classify_non_substantive_response(final_answer.content)
+    if response_rejection in {
+        "clarification_response",
+        "unresolved_reference_response",
+    }:
+        return PersistenceDecision(persistable=False, skip_reason="clarification_response")
+    if response_rejection is not None:
+        return PersistenceDecision(persistable=False, skip_reason="non_substantive_answer")
     if not final_answer.language_compliant:
         return PersistenceDecision(persistable=False, skip_reason="language_non_compliant")
     if final_answer.quality_status not in _ACCEPTED_QUALITY_STATUSES:

@@ -2,9 +2,40 @@
 
 ## Status
 
-Dev infrastructure, persistence, Memory-first selection, exact two-turn follow-up resolution, and
-independent-query isolation are live verified. Semantically complete live tutoring output remains
-blocked by the deployed mock provider configuration.
+Dev infrastructure, persistence, Memory-first selection, exact-conversation DynamoDB fallback, and
+independent-query isolation were previously live verified. The 2026-07-25 conditional-context
+implementation preserves those storage boundaries and makes reads conditional.
+
+## Conditional-context boundary (2026-07-25)
+
+AgentCore Memory and DynamoDB remain context sources only. `ContextNeedGate` decides only whether a
+read is skipped, required, or uncertain. Required/uncertain requests load Memory first and use the
+exact-conversation DynamoDB fallback on controlled empty/failure. Deterministic hygiene and compact
+card building do not select the final turn.
+
+The existing query classifier owns both academic classification and the minimal
+relation/action/selected-ID decision. Only one validated selected turn reaches generation.
+Root-lineage persistence, frontend reference IDs, summaries, semantic recent-turn retrieval, and
+new storage fields remain excluded.
+
+External pronouns and indirect references are now validated against the same bounded clean candidate
+cards after Memory/DynamoDB loading. This does not change retrieval order, read limits, fallback
+behavior, persistence eligibility, History/Session/Memory schemas, or storage writes. The optional
+resolved-reference string exists only in the internal generation context and is never persisted.
+The classifier projection is capped at 3,200 formatted characters: latest question/answer clues use
+450/300 characters and older clues use 350/240. Read counts, clean-turn eligibility, grounded
+compatibility, and final selected-turn validation are unchanged.
+
+Deterministic hygiene rejects correction/re-solve meta-query pairs from future candidates even when
+the stored answer is substantive. Their History/Memory write contract is unchanged; the filter
+prevents a later “solve it from scratch” request from treating “Your answer is wrong” as the
+original academic problem.
+
+Generic correction/re-solve wording beginning with `previous`, `last`, or `the previous/last`
+selects only the newest already-hygienic substantive candidate. For that narrow case, generic
+reference compatibility cannot reject the newest turn before the correction rule runs; selecting
+an older turn remains invalid. This changes no read count, Memory hygiene, persistence, or storage
+contract.
 
 ## Current behavior
 
@@ -79,31 +110,19 @@ turns. DynamoDB distinguishes not configured, permission denied, query failure, 
 actor/conversation mismatch, and no completed turns. DynamoDB fallback remains an
 exact-conversation GSI query and validates actor and conversation identity before returning data.
 
-Every normal doubt-solver request now loads a maximum of two completed turns before the final
-conversation-relation decision. AgentCore Memory remains primary; empty, unavailable, malformed,
-or rejected Memory results use the exact-conversation DynamoDB fallback. Context availability is
-separate from relevance, so independent requests discard fetched history and inject no
-conversation context.
-
-`ConversationRelation` records independent, follow-up, continuation, correction, clarification,
-regeneration, or ambiguous decisions with confidence, source, matched signals, and referenced
-turn. Selection combines explicit references, English/Hindi/Hinglish typo-tolerant assistant-action
-signals, bounded numeric/entity overlap, substantive academic-concept overlap, ambiguity margin,
-and recency across the latest two turns. Generic action words cannot bind a self-contained new topic
-to unrelated history. Formula symbols and named concepts are rendered naturally in the standalone
-resolution. Academic subject and intent classification runs on the resolved query. Unresolved
-contextual input returns clarification before academic classification or generation and is excluded
-from persistence.
+Clear standalone requests perform no Memory or DynamoDB history read. Contextual/uncertain requests
+normally load at most three completed pairs. An explicit correction/re-solve request may
+exceptionally load up to five pairs so the original substantive question remains selectable through
+a short correction chain; no larger read is allowed. AgentCore Memory remains primary; controlled
+empty/unavailable/malformed results use the exact-conversation DynamoDB fallback.
 
 AgentCore Memory and DynamoDB transport exceptions are normalized into typed, content-free
 failures. Memory transport failure proceeds to DynamoDB; DynamoDB transport failure returns a
 controlled unavailable-context result rather than escaping the boundary.
 
-The readable local log records Memory and DynamoDB attempts, statuses, counts, returned turn IDs,
-latencies, relation, selection, and resolution. Preview mode bounds each fetched user text to 250
-characters and assistant text to 400 characters. Full mode is local-only. Production forcibly
-disables all content previews. Streaming records one readable generation completion per model
-execution; the separate answer-delivery milestone is structured-only.
+The readable local log records gate decision, Memory/DynamoDB attempts, statuses, counts, returned
+turn IDs, candidate counts/size, relation/action/selected ID, selected-context policy/size, and
+generation. Content previews are local-only and bounded; production forcibly disables them.
 
 ## IAM
 
@@ -129,6 +148,11 @@ runtime change.
 
 ## Validation
 
+- The current structural-refactor validation evidence is recorded in
+  `skills/features/classification-pipeline.md`.
+- Generic correction and bounded re-solve behavior is covered by automated tests and the
+  2026-07-25 live Dev smoke evidence in `classification-pipeline.md`. Selection remains
+  probabilistic among semantically similar candidates and is not claimed as general intelligence.
 - Conversation-understanding tests cover the reported percentage typo, English/Hindi/Hinglish
   variants, numeric selection across two turns, unrelated questions, no-history clarification,
   streaming generation, persistence, and readable-log ordering.
@@ -154,7 +178,8 @@ runtime change.
   repository calls.
 - Live User A/User B checks returned one own event each and zero events for both guessed
   cross-user/cross-conversation combinations.
-- Final full Python gate: Ruff passed; pytest 2,255 passed and one credential-gated test skipped.
+- The historical 2,255-test gate is superseded by the current gate recorded in
+  `skills/features/classification-pipeline.md`.
 - Final deployed Runtime-version-9 smoke used a fresh AgentCore session and conversation
   `f1d17cf5-dba1-46a5-9008-0795aff15451`. The first percentage request and exact
   `how did u calculated 75%` follow-up both returned HTTP 200 and `success=true`.
@@ -172,6 +197,21 @@ runtime change.
   percentage history, despite its contextual-looking wording.
 - The deployed generator remains `answer_source=mock`; a semantically complete percentage
   explanation from the real provider remains **[NOT VERIFIED]**.
+- The 2026-07-27 reference-resolution tests verify local pronouns do not trigger reads, external
+  references use bounded candidates, incompatible history is not selected, and clarification
+  responses remain non-substantive under the existing persistence policy.
+- The grounded-reference hardening keeps legacy clarification and missing-referent records in both
+  durable stores while excluding them from read-time academic candidate projections. Typed hygiene
+  reasons distinguish clarification, unresolved reference, acknowledgement, technical failure,
+  failed quality, and other non-substantive responses.
+- Persistence eligibility now evaluates response function as well as accepted quality. A polished
+  missing-reference clarification cannot be written as an academic question-answer pair even when
+  its quality status is accepted. The existing clarification skip leaves History, Session, and
+  Memory unwritten; substantive persistence ordering and idempotency are unchanged.
+- Synthetic live conversation `FA1D7049-5BBB-45AB-8018-0B9EB0C11C98` contained an intentionally
+  seeded missing-reference Memory event alongside persisted substantive Akbar answers. The event
+  remained listable in AgentCore Memory, was rejected only from candidate projection, and did not
+  prevent later History, Session, and Memory writes from succeeding for grounded answers.
 
 ## Deployment security incident
 

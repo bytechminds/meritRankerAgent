@@ -30,20 +30,35 @@ class WebSearchQueryBuilder:
         official_only: bool,
     ) -> list[SearchAttemptPlan]:
         exclude = policy.global_blocked
-        attempts: list[SearchAttemptPlan] = [
-            SearchAttemptPlan(
-                kind="authoritative",
-                include_domains=policy.trusted_domains,
-                exclude_domains=exclude,
-            ),
-            SearchAttemptPlan(
-                kind="authoritative_plus_reputed",
-                include_domains=tuple(
-                    dict.fromkeys([*policy.trusted_domains, *policy.reputed_domains]).keys()
+        if policy.source_need == "practice_current_affairs" and not official_only:
+            attempts: list[SearchAttemptPlan] = [
+                SearchAttemptPlan(
+                    kind="authoritative_plus_reputed",
+                    include_domains=tuple(
+                        dict.fromkeys(
+                            [*policy.trusted_domains, *policy.reputed_domains]
+                        ).keys()
+                    ),
+                    exclude_domains=exclude,
+                )
+            ]
+        else:
+            attempts = [
+                SearchAttemptPlan(
+                    kind="authoritative",
+                    include_domains=policy.trusted_domains,
+                    exclude_domains=exclude,
                 ),
-                exclude_domains=exclude,
-            ),
-        ]
+                SearchAttemptPlan(
+                    kind="authoritative_plus_reputed",
+                    include_domains=tuple(
+                        dict.fromkeys(
+                            [*policy.trusted_domains, *policy.reputed_domains]
+                        ).keys()
+                    ),
+                    exclude_domains=exclude,
+                ),
+            ]
         if (
             allow_exam_prep_fallback
             and exam_prep_suitable

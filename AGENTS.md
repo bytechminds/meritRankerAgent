@@ -177,6 +177,7 @@ See `skills/roles/README.md` for the full role boundary and permission table.
 | `skills/features/README.md` | Feature context index and status meanings |
 | `skills/features/demo-agent.md` | Demo agent feature context (Local Demo) |
 | `skills/features/doubt-solver.md` | Doubt Solver feature context (Planned) |
+| `skills/features/classification-pipeline.md` | Text/image classification ownership, fallback, and validation |
 | `skills/roles/README.md` | Role team overview and workflow rules |
 | `skills/roles/*.md` | Role-specific agent behaviour guides |
 | `skills/templates/README.md` | Template index and label reference |

@@ -88,5 +88,11 @@ class WebSearchResult(BaseModel):
     source_pack_name: str = Field(default="", max_length=64)
     attempt_used: SearchAttemptKind | None = None
     freshness_label: str = Field(default="", max_length=64)
+    executed: bool = False
+    attempt_count: int = Field(default=0, ge=0, le=4)
+    candidate_count: int = Field(default=0, ge=0, le=80)
+    official_count: int = Field(default=0, ge=0, le=20)
+    reputable_count: int = Field(default=0, ge=0, le=20)
+    duration_ms: int = Field(default=0, ge=0)
 
     model_config = {"str_strip_whitespace": True}

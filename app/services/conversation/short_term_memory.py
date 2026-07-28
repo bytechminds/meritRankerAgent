@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError, ParamValidationError
+from pydantic import ValidationError
 
 from schemas.conversation import CompletedConversationTurn, RecentConversationTurn
 
@@ -98,7 +99,7 @@ class AgentCoreShortTermMemory:
     def read_recent_completed_turns(
         self, actor_id: str, conversation_id: str, limit: int = 2
     ) -> ShortTermMemoryReadResult:
-        target = min(max(limit, 1), 3)
+        target = min(max(limit, 1), 5)
         events: list[dict[str, Any]] = []
         next_token: str | None = None
         pages = 0
@@ -187,12 +188,16 @@ class AgentCoreShortTermMemory:
                 saw_malformed = True
                 continue
             timestamp = event.get("eventTimestamp") or datetime.now(UTC)
-            candidate = RecentConversationTurn(
-                turn_id=turn_id,
-                original_query=user_text,
-                final_answer=answer_text,
-                created_at=timestamp,
-            )
+            try:
+                candidate = RecentConversationTurn(
+                    turn_id=turn_id,
+                    original_query=user_text,
+                    final_answer=answer_text,
+                    created_at=timestamp,
+                )
+            except ValidationError:
+                saw_malformed = True
+                continue
             existing = normalized.get(turn_id)
             if existing is None or candidate.created_at > existing.created_at:
                 normalized[turn_id] = candidate

@@ -1250,6 +1250,9 @@ class TestGenerateNodeProviderFailureHandling:
             "final_answer",
             "conversation_context",
             "conversation_relation",
+            "conversation_preparation",
+            "query_classification",
+            "source_modality",
         }, (
             f"OrchestratedDoubtSolverState fields changed: {fields}"
         )
@@ -1473,6 +1476,9 @@ class TestRegressionGuards:
             "final_answer",
             "conversation_context",
             "conversation_relation",
+            "conversation_preparation",
+            "query_classification",
+            "source_modality",
         }
 
 

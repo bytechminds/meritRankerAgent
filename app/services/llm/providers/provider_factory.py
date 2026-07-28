@@ -62,10 +62,12 @@ class ProviderAdapterFactory:
             from services.llm.providers.azure_openai_provider import (  # noqa: PLC0415
                 AzureOpenAIProviderAdapter,
             )
+            from services.llm.providers.gemini_provider import (  # noqa: PLC0415
+                GeminiProviderAdapter,
+            )
             from services.llm.providers.mock_provider import MockProviderAdapter  # noqa: PLC0415
             from services.llm.providers.openai_compatible_adapter import (  # noqa: PLC0415
                 DeepSeekProviderAdapter,
-                GeminiProviderAdapter,
             )
             from services.llm.providers.openai_provider import (  # noqa: PLC0415
                 OpenAIProviderAdapter,

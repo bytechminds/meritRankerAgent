@@ -148,6 +148,10 @@ class LlmProviderResponseError(LlmProviderAdapterError):
     - message.content is None or blank
     """
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.provider_usage: object | None = None
+
 
 class LlmProviderUnsupportedFeatureError(LlmProviderAdapterError):
     """Raised when a requested feature is not supported by the adapter.

@@ -48,7 +48,7 @@ class TestProviderAdapterFactoryDefault:
     def test_returns_gemini_adapter(self) -> None:
         factory = ProviderAdapterFactory()
         adapter = factory.get_provider("gemini")
-        from services.llm.providers.openai_compatible_adapter import GeminiProviderAdapter
+        from services.llm.providers.gemini_provider import GeminiProviderAdapter
 
         assert isinstance(adapter, GeminiProviderAdapter)
 

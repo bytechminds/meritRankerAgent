@@ -217,16 +217,16 @@ def _parse_freshness(
 
     if "today" in lower:
         iso = today.isoformat()
-        return iso, iso, "day", today.strftime("%B %Y")
+        return iso, iso, None, today.strftime("%B %Y")
 
     if "yesterday" in lower:
         day = today - timedelta(days=1)
         iso = day.isoformat()
-        return iso, iso, "day", day.strftime("%B %Y")
+        return iso, iso, None, day.strftime("%B %Y")
 
     if "last week" in lower or "past week" in lower:
         start = today - timedelta(days=7)
-        return start.isoformat(), today.isoformat(), "week", today.strftime("%B %Y")
+        return start.isoformat(), today.isoformat(), None, today.strftime("%B %Y")
 
     month_match = re.search(
         r"\b(january|february|march|april|may|june|july|august|september|october|november|december)"
@@ -241,12 +241,12 @@ def _parse_freshness(
             end = date(int(year_str), 12, 31)
         else:
             end = date(int(year_str), month_num + 1, 1) - timedelta(days=1)
-        return start.isoformat(), end.isoformat(), "month", start.strftime("%B %Y")
+        return start.isoformat(), end.isoformat(), None, start.strftime("%B %Y")
 
     year_match = re.search(r"\b(20\d{2})\b", lower)
     if year_match and any(token in lower for token in ("year", "annual", "yearly")):
         year = int(year_match.group(1))
-        return f"{year}-01-01", f"{year}-12-31", "year", str(year)
+        return f"{year}-01-01", f"{year}-12-31", None, str(year)
 
     if any(token in lower for token in ("recent", "latest", "current", "this month", "this year")):
         start = today - timedelta(days=default_recent_days)

@@ -8,6 +8,13 @@ from observability.context import (
 )
 from observability.events import log_event
 from observability.lifecycle import observe_invocation
+from observability.llm_usage import (
+    bind_llm_attempt_type,
+    count_generator_calls,
+    current_llm_attempt_type,
+    record_llm_call,
+    snapshot_llm_usage_records,
+)
 from observability.readable_log import configure_runtime_identity, record_local_preview
 from observability.summary import (
     RequestExecutionSummary,
@@ -23,14 +30,19 @@ __all__ = [
     "RequestExecutionSummary",
     "begin_request_summary",
     "bind_request_context",
+    "bind_llm_attempt_type",
+    "count_generator_calls",
     "configure_tracing",
     "configure_runtime_identity",
     "current_request_context",
     "current_request_summary",
+    "current_llm_attempt_type",
     "emit_request_summary",
     "log_event",
     "observe_invocation",
     "record_local_preview",
+    "record_llm_call",
+    "snapshot_llm_usage_records",
     "stage_span",
     "update_request_type",
     "update_request_summary",

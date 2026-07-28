@@ -220,7 +220,8 @@ class PromptResolver:
             )
             sections.append(exam_profile.compact_instruction)
         language_policy = self._language_policy_resolver.resolve(language)
-        sections.append(language_policy.instruction)
+        if language_policy.instruction:
+            sections.append(language_policy.instruction)
         return _SECTION_SEP.join(sections)
 
     # ------------------------------------------------------------------

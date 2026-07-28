@@ -7,6 +7,7 @@ from typing import Any
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import BotoCoreError, ClientError
+from pydantic import ValidationError
 
 from schemas.conversation import CompletedConversationTurn, RecentConversationTurn
 
@@ -115,7 +116,7 @@ class ConversationHistoryRepository:
     def list_recent_completed_turns(
         self, actor_id: str, conversation_id: str, limit: int = 2
     ) -> list[RecentConversationTurn]:
-        target = min(max(limit, 1), 3)
+        target = min(max(limit, 1), 5)
         items: list[RecentConversationTurn] = []
         saw_incomplete_turn = False
         start_key: dict[str, Any] | None = None
@@ -172,14 +173,17 @@ class ConversationHistoryRepository:
                 if not data.get("originalQuery") or not data.get("finalAnswer"):
                     saw_incomplete_turn = True
                     continue
-                items.append(
-                    RecentConversationTurn(
+                try:
+                    candidate = RecentConversationTurn(
                         turn_id=str(data.get("turnId") or data.get("id")),
                         original_query=str(data["originalQuery"]),
                         final_answer=str(data["finalAnswer"]),
                         created_at=datetime.fromisoformat(str(data["createdAt"])),
                     )
-                )
+                except (TypeError, ValueError, ValidationError):
+                    saw_incomplete_turn = True
+                    continue
+                items.append(candidate)
                 if len(items) >= target:
                     break
             start_key = response.get("LastEvaluatedKey")

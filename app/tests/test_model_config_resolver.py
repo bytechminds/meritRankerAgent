@@ -214,6 +214,57 @@ def test_thinking_true_rejected_when_model_does_not_support_thinking(
         )
 
 
+def test_reasoning_effort_allowed_when_model_supports_reasoning(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    reasoning_model = registry.model_map["gemini_flash_reasoning_light"]
+    registry.model_map["gemini_flash_reasoning_light"] = reasoning_model.model_copy(
+        update={"supports_reasoning": True}
+    )
+    resolver = ModelConfigResolver(registry=registry)
+
+    resolved = resolver.resolve(
+        _route_decision(
+            model="gemini_flash_reasoning_light",
+            provider_options={"reasoning_effort": "low"},
+        )
+    )
+
+    assert resolved.supports_reasoning is True
+
+
+def test_reasoning_effort_rejected_when_model_does_not_support_reasoning(
+    tmp_path: Path,
+) -> None:
+    resolver = ModelConfigResolver(registry=_registry(tmp_path))
+
+    with pytest.raises(ModelExecutionConfigError, match="does not support"):
+        resolver.resolve(
+            _route_decision(
+                model="gemini_flash_light",
+                provider_options={"reasoning_effort": "low"},
+            )
+        )
+
+
+def test_invalid_reasoning_effort_rejected(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    reasoning_model = registry.model_map["gemini_flash_reasoning_light"]
+    registry.model_map["gemini_flash_reasoning_light"] = reasoning_model.model_copy(
+        update={"supports_reasoning": True}
+    )
+    resolver = ModelConfigResolver(registry=registry)
+
+    with pytest.raises(ModelExecutionConfigError, match="must be one of"):
+        resolver.resolve(
+            _route_decision(
+                model="gemini_flash_reasoning_light",
+                provider_options={"reasoning_effort": "extreme"},
+            )
+        )
+
+
 def test_unsupported_provider_option_raises_config_error(tmp_path: Path) -> None:
     resolver = ModelConfigResolver(registry=_registry(tmp_path))
 

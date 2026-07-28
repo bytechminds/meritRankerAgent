@@ -451,7 +451,7 @@ Part 6 adds concrete provider adapter implementations under
 | `MockProviderAdapter` | `mock_provider.py` | In-process fake for tests; records `last_request`/`call_count` |
 | `OpenAIProviderAdapter` | `openai_provider.py` | Wraps `openai.OpenAI`; requires `api_key` + `model_id` |
 | `AzureOpenAIProviderAdapter` | `azure_openai_provider.py` | Supports `azure_deployment_chat_completions` (AzureOpenAI SDK) and `azure_openai_v1` (OpenAI SDK + base_url). Requires `api_key`, `endpoint`, `deployment`. `api_version` required only in classic mode. |
-| `GeminiProviderAdapter` | `openai_compatible_adapter.py` | OpenAI-compatible Gemini endpoint; text + optional `generate_with_image()` (adapter-level). |
+| `GeminiProviderAdapter` | `gemini_provider.py` | Native Google Gen AI SDK; structured text output and streaming. |
 | `DeepSeekProviderAdapter` | `openai_compatible_adapter.py` | OpenAI-compatible DeepSeek chat/reasoner endpoint. |
 | `ProviderAdapterFactory` | `provider_factory.py` | Maps provider names → adapter instances; supports custom injection |
 | `ProviderAdapterExecutor` | `llm_orchestration/model_execution.py` | Resolves credentials → gets adapter → calls `generate()` |
@@ -690,7 +690,7 @@ Previously, `QueryClassification` had no `difficulty` field, so `_map_to_orchest
 
 | Route | Model alias | When used |
 |---|---|---|
-| `general.classifier.default` | `doubt_solver_classifier` | Primary classifier (always first) |
+| `general.classifier.default` | `doubt_solver_classifier_gemini` | Native Gemini 3.1 Flash-Lite primary classifier |
 | When primary confidence < **0.92** (configurable via `DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD`) | `doubt_solver_classifier_strong` | One retry max |
 
 Task role `classifier_strong` is a system task role — not a generator intent overlay.
@@ -699,7 +699,7 @@ Task role `classifier_strong` is a system task role — not a generator intent o
 
 ```
 student query
-  → primary LLM classifier (doubt_solver_classifier)
+  → primary LLM classifier (doubt_solver_classifier_gemini)
   → if confidence < threshold (default 0.92): strong classifier (doubt_solver_classifier_strong)
   → _map_to_orchestrated_classification()
       passes raw.difficulty through to DoubtSolverClassification.difficulty
@@ -803,4 +803,3 @@ an image or external graphic.
 - `output_mode` field (e.g. `"diagram"`, `"table"`) — deferred.
 - Real provider streaming for visual responses — deferred.
 - `task_role` is NOT affected by intent — it remains `"generator"` for all intents.
-

@@ -8,6 +8,7 @@ dependencies = [
     "aws-opentelemetry-distro>=0.18.0",
     "bedrock-agentcore",
     "boto3>=1.26",
+    "google-genai>=2.14.0",
     "langgraph>=0.2",
     "openai>=2.38.0",
     "pillow>=12.3.0",
