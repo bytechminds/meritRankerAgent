@@ -120,6 +120,7 @@ def _run_with_one_transient_retry(operation: Callable[[], _T]) -> _T:
 def evaluate_completed_turn_persistence(
     final_answer: FinalAnswerResult,
     *,
+    response_type: str | None = None,
     finalized: bool = True,
     request_cancelled: bool = False,
     clarification_response: bool = False,
@@ -132,7 +133,11 @@ def evaluate_completed_turn_persistence(
         return PersistenceDecision(persistable=False, skip_reason="not_finalized")
     if not final_answer.content.strip():
         return PersistenceDecision(persistable=False, skip_reason="empty_final_answer")
-    response_rejection = classify_non_substantive_response(final_answer.content)
+    response_rejection = (
+        None
+        if response_type == "practice_generation"
+        else classify_non_substantive_response(final_answer.content)
+    )
     if response_rejection in {
         "clarification_response",
         "unresolved_reference_response",
@@ -207,6 +212,7 @@ class ConversationPersistenceService:
     ) -> ConversationPersistenceResult:
         decision = evaluate_completed_turn_persistence(
             final_answer,
+            response_type=turn.response_type,
             finalized=finalized,
             request_cancelled=request_cancelled,
             clarification_response=clarification_response,
@@ -232,9 +238,7 @@ class ConversationPersistenceService:
 
             if history_future in done:
                 try:
-                    history_status, session_status, history_ms, session_ms = (
-                        history_future.result()
-                    )
+                    history_status, session_status, history_ms, session_ms = history_future.result()
                 except Exception as exc:  # noqa: BLE001
                     history_status = _status_for_exception(exc)
                     session_status = "skipped"
@@ -288,9 +292,7 @@ class ConversationPersistenceService:
                 lambda: self.history_repository.save_completed_turn(turn)
             )
         history_ms = int((time.monotonic() - history_started) * 1000)
-        history_status: PersistenceStatus = (
-            "idempotent_replay" if created is False else "succeeded"
-        )
+        history_status: PersistenceStatus = "idempotent_replay" if created is False else "succeeded"
         if self.session_repository is None:
             return history_status, "skipped", history_ms, 0
 
@@ -307,19 +309,15 @@ class ConversationPersistenceService:
                 int((time.monotonic() - session_started) * 1000),
             )
         session_ms = int((time.monotonic() - session_started) * 1000)
-        session_status: PersistenceStatus = (
-            "idempotent_replay" if updated is False else "succeeded"
-        )
+        session_status: PersistenceStatus = "idempotent_replay" if updated is False else "succeeded"
         return history_status, session_status, history_ms, session_ms
 
-    def _persist_memory(
-        self, turn: CompletedConversationTurn
-    ) -> tuple[PersistenceStatus, int]:
+    def _persist_memory(self, turn: CompletedConversationTurn) -> tuple[PersistenceStatus, int]:
+        if turn.response_type == "practice_generation":
+            return "skipped", 0
         started = time.monotonic()
         with stage_span("doubt_solver.persist_memory"):
-            _run_with_one_transient_retry(
-                lambda: self.short_term_memory.save_completed_turn(turn)
-            )
+            _run_with_one_transient_retry(lambda: self.short_term_memory.save_completed_turn(turn))
         return "succeeded", int((time.monotonic() - started) * 1000)
 
     @staticmethod

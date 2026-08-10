@@ -103,13 +103,11 @@ def _encoded_turn(turn: CompletedConversationTurn) -> dict[str, Any]:
         "topic": turn.topic,
         "qualityStatus": turn.quality_status,
         "wasRegenerated": turn.was_regenerated,
+        "responseType": turn.response_type,
+        "practiceTestId": turn.practice_test_id,
         "createdAt": turn.created_at.isoformat(),
     }
-    return {
-        key: _serializer.serialize(value)
-        for key, value in raw.items()
-        if value is not None
-    }
+    return {key: _serializer.serialize(value) for key, value in raw.items() if value is not None}
 
 
 def _client_error(code: str, operation: str = "PutItem") -> ClientError:
@@ -306,9 +304,7 @@ def test_missing_memory_configuration_still_resolves_dynamodb(
         ]
     }
 
-    config = load_conversation_runtime_config(
-        ssm_client=ssm, region_name="ap-south-1"
-    )
+    config = load_conversation_runtime_config(ssm_client=ssm, region_name="ap-south-1")
 
     assert config.memory_id is None
     assert config.table_name == "ConversationHistory-abc"
@@ -335,9 +331,7 @@ def test_bootstrap_without_memory_keeps_dynamodb_and_skips_agentcore_client(
     dynamodb = MagicMock()
     agentcore_factory = MagicMock()
     monkeypatch.setattr(bootstrap, "load_conversation_runtime_config", lambda: config)
-    monkeypatch.setattr(
-        bootstrap, "get_conversation_dynamodb_client", lambda _region: dynamodb
-    )
+    monkeypatch.setattr(bootstrap, "get_conversation_dynamodb_client", lambda _region: dynamodb)
     monkeypatch.setattr(bootstrap, "get_bedrock_agentcore_client", agentcore_factory)
 
     service = bootstrap.build_conversation_persistence_service()
@@ -368,11 +362,30 @@ def test_history_repository_writes_conditional_minimal_item() -> None:
     assert kwargs["TableName"] == "history-table"
     assert kwargs["ConditionExpression"] == "attribute_not_exists(#id)"
     assert kwargs["Item"]["id"] == {"S": "turn-1"}
-    assert kwargs["Item"]["finalAnswer"] == {
-        "S": "A ratio compares two quantities."
-    }
+    assert kwargs["Item"]["finalAnswer"] == {"S": "A ratio compares two quantities."}
     assert "prompt" not in kwargs["Item"]
     assert "retrievalContext" not in kwargs["Item"]
+
+
+def test_history_repository_round_trips_only_typed_practice_card_fields() -> None:
+    client = MagicMock()
+    turn = _turn(
+        response_type="practice_generation",
+        practice_test_id="practice-123",
+        final_answer="Your practice is being prepared.",
+    )
+    client.get_item.return_value = {"Item": _encoded_turn(turn)}
+    repository = ConversationHistoryRepository(table_name="history-table", client=client)
+
+    repository.save_completed_turn(turn)
+    restored = repository.get_completed_turn("student-1", "conversation-1", "turn-1")
+
+    item = client.put_item.call_args.kwargs["Item"]
+    assert item["responseType"] == {"S": "practice_generation"}
+    assert item["practiceTestId"] == {"S": "practice-123"}
+    assert restored is not None
+    assert restored.response_type == "practice_generation"
+    assert restored.practice_test_id == "practice-123"
 
 
 def test_history_repository_get_enforces_actor_and_conversation_isolation() -> None:
@@ -404,9 +417,7 @@ def test_recent_history_queries_exact_conversation_and_orders_oldest_first() -> 
     client.query.return_value = {
         "Items": [
             _encoded_turn(_turn(turn_id="turn-3", created_at=_NOW)),
-            _encoded_turn(
-                _turn(turn_id="turn-2", created_at=_NOW - timedelta(minutes=2))
-            ),
+            _encoded_turn(_turn(turn_id="turn-2", created_at=_NOW - timedelta(minutes=2))),
         ]
     }
     repository = ConversationHistoryRepository(table_name="history-table", client=client)
@@ -416,11 +427,30 @@ def test_recent_history_queries_exact_conversation_and_orders_oldest_first() -> 
     assert [item.turn_id for item in recent] == ["turn-2", "turn-3"]
     query = client.query.call_args.kwargs
     assert query["IndexName"] == "ConversationHistoryByConversation"
-    assert query["ExpressionAttributeValues"][":conversation"] == {
-        "S": "conversation-1"
-    }
+    assert query["ExpressionAttributeValues"][":conversation"] == {"S": "conversation-1"}
     assert query["ExpressionAttributeValues"][":actor"] == {"S": "student-1"}
     assert client.query.call_args.kwargs["ScanIndexForward"] is False
+
+
+def test_recent_academic_context_excludes_practice_card_notices() -> None:
+    client = MagicMock()
+    client.query.return_value = {
+        "Items": [
+            _encoded_turn(
+                _turn(
+                    response_type="practice_generation",
+                    practice_test_id="practice-123",
+                    final_answer="Your practice is being prepared.",
+                )
+            ),
+            _encoded_turn(_turn(turn_id="turn-2")),
+        ]
+    }
+    repository = ConversationHistoryRepository(table_name="history-table", client=client)
+
+    recent = repository.list_recent_completed_turns("student-1", "conversation-1", 2)
+
+    assert [turn.turn_id for turn in recent] == ["turn-2"]
 
 
 @pytest.mark.parametrize(
@@ -431,9 +461,7 @@ def test_recent_history_queries_exact_conversation_and_orders_oldest_first() -> 
         ("A" * 61, f"{'A' * 59}…"),
     ],
 )
-def test_session_title_is_deterministic_unicode_safe_and_bounded(
-    query: str, expected: str
-) -> None:
+def test_session_title_is_deterministic_unicode_safe_and_bounded(query: str, expected: str) -> None:
     assert build_conversation_title(query) == expected
 
 
@@ -782,9 +810,7 @@ def test_typed_memory_failure_uses_dynamodb_fallback(
     assert result.memory_failure_reason == memory_reason
     assert result.memory_status == memory_status
     assert result.dynamodb_status == "succeeded"
-    history.list_recent_completed_turns.assert_called_once_with(
-        "student-1", "conversation-1", 2
-    )
+    history.list_recent_completed_turns.assert_called_once_with("student-1", "conversation-1", 2)
 
 
 def test_memory_transport_timeout_uses_dynamodb_fallback() -> None:
@@ -943,9 +969,7 @@ def test_both_recent_context_sources_empty_returns_typed_reason() -> None:
         ("history_no_completed_turns", "failed_validation"),
     ],
 )
-def test_recent_context_preserves_dynamodb_failure_reason(
-    reason: str, status: str
-) -> None:
+def test_recent_context_preserves_dynamodb_failure_reason(reason: str, status: str) -> None:
     memory = MagicMock()
     memory.read_recent_completed_turns.return_value = ShortTermMemoryReadResult(
         turns=(), failure_reason="memory_no_events"
@@ -968,9 +992,7 @@ def test_recent_context_preserves_dynamodb_failure_reason(
 
 
 def test_transient_failure_retries_once_but_permission_failure_does_not() -> None:
-    transient = MagicMock(
-        side_effect=[_client_error("ThrottlingException"), "completed"]
-    )
+    transient = MagicMock(side_effect=[_client_error("ThrottlingException"), "completed"])
     denied = MagicMock(side_effect=_client_error("AccessDeniedException"))
 
     assert _run_with_one_transient_retry(transient) == "completed"
@@ -998,15 +1020,42 @@ def test_persisted_completed_turn_upserts_session_after_history() -> None:
         language_compliant=True,
     )
 
-    result = service.persist_completed_turn(
-        _turn(), final_answer, request_id="request-1"
-    )
+    result = service.persist_completed_turn(_turn(), final_answer, request_id="request-1")
 
     assert call_order == ["history", "session"]
     memory.save_completed_turn.assert_called_once()
     assert result.history_write_status == "succeeded"
     assert result.session_write_status == "succeeded"
     assert result.memory_write_status == "succeeded"
+
+
+def test_practice_card_persists_history_and_session_without_academic_memory() -> None:
+    history = MagicMock()
+    session = MagicMock()
+    memory = MagicMock()
+    service = ConversationPersistenceService(
+        history_repository=history,
+        session_repository=session,
+        short_term_memory=memory,
+    )
+    turn = _turn(
+        response_type="practice_generation",
+        practice_test_id="practice-123",
+        final_answer="Your practice is being prepared.",
+        quality_status="checked",
+    )
+    final_answer = FinalAnswerResult(
+        content=turn.final_answer,
+        quality_status="checked",
+        language_compliant=True,
+    )
+
+    result = service.persist_completed_turn(turn, final_answer)
+
+    history.save_completed_turn.assert_called_once_with(turn)
+    session.upsert_from_completed_turn.assert_called_once_with(turn)
+    memory.save_completed_turn.assert_not_called()
+    assert result.memory_write_status == "skipped"
 
 
 def test_persistence_timeout_bounds_terminal_coordination() -> None:
@@ -1193,8 +1242,7 @@ def test_quality_passed_missing_reference_response_is_not_persisted() -> None:
 def test_valid_academic_answer_with_question_words_remains_persistable() -> None:
     final_answer = FinalAnswerResult(
         content=(
-            "The question asks who founded the Mauryan Empire. "
-            "The answer is Chandragupta Maurya."
+            "The question asks who founded the Mauryan Empire. The answer is Chandragupta Maurya."
         ),
         quality_status="passed_quality_gate",
         language_compliant=True,
@@ -1250,9 +1298,7 @@ def test_session_failure_retries_once_without_failing_completed_answer(
 def test_missing_session_resource_is_controlled_configuration_failure() -> None:
     history = MagicMock()
     session = MagicMock()
-    session.upsert_from_completed_turn.side_effect = _client_error(
-        "ResourceNotFoundException"
-    )
+    session.upsert_from_completed_turn.side_effect = _client_error("ResourceNotFoundException")
     memory = MagicMock()
     service = ConversationPersistenceService(
         history_repository=history,
@@ -1351,9 +1397,7 @@ def test_immediate_follow_up_uses_history_when_memory_write_failed() -> None:
         )
     ]
     memory = MagicMock()
-    memory.save_completed_turn.side_effect = ShortTermMemoryError(
-        "safe", reason="memory_timeout"
-    )
+    memory.save_completed_turn.side_effect = ShortTermMemoryError("safe", reason="memory_timeout")
     memory.read_recent_completed_turns.return_value = ShortTermMemoryReadResult(
         turns=(), failure_reason="memory_timeout"
     )
@@ -1461,8 +1505,7 @@ def test_graph_prefetches_before_academic_classification(
             RecentConversationTurn(
                 turn_id="percentage-turn",
                 original_query=(
-                    "A student scored 150 marks out of 200. "
-                    "What percentage did the student score?"
+                    "A student scored 150 marks out of 200. What percentage did the student score?"
                 ),
                 final_answer="75%",
                 created_at=_NOW,
@@ -1490,9 +1533,7 @@ def test_graph_prefetches_before_academic_classification(
 
     result = graph.invoke(_graph_state("how did u calculated 75%"))
 
-    persistence.load_recent_context.assert_called_once_with(
-        "student-1", "conversation-1", 3
-    )
+    persistence.load_recent_context.assert_called_once_with("student-1", "conversation-1", 3)
     assert classify.call_count == 0
     assert result["conversation_relation"]["relation"] == "FOLLOW_UP"
     assert "75%" in adapter.last_query
@@ -1618,9 +1659,7 @@ def test_isolated_follow_up_flow_resolves_reclassifies_and_generates(
     assert adapter.last_query == result["query"]
     assert adapter.last_conversation_context is not None
     assert "Solve the ratio 2:3 with total 15" in adapter.last_conversation_context
-    persistence.load_recent_context.assert_called_once_with(
-        "student-1", "conversation-1", 3
-    )
+    persistence.load_recent_context.assert_called_once_with("student-1", "conversation-1", 3)
     assert classify.call_count == 0
 
 
@@ -1694,13 +1733,10 @@ def test_prompt_includes_recent_context_once_and_current_preferences() -> None:
         create_mock_orchestrator_for_tests,
     )
 
-    orchestrator, executor = create_mock_orchestrator_for_tests(
-        content="Current answer"
-    )
+    orchestrator, executor = create_mock_orchestrator_for_tests(content="Current answer")
     adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
     conversation_reference = (
-        "RECENT CONVERSATION REFERENCE (UNTRUSTED DATA)\n"
-        "Previous USER:\nHistorical question"
+        "RECENT CONVERSATION REFERENCE (UNTRUSTED DATA)\nPrevious USER:\nHistorical question"
     )
 
     adapter.generate(

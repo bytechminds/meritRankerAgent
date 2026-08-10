@@ -5,13 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from schemas.doubt_solver import (
     CanonicalLanguage,
     ConversationClassificationAction,
     ConversationClassificationRelation,
     QualityStatus,
+    ResponseType,
 )
 
 PersistenceStatus = Literal[
@@ -160,6 +161,14 @@ class CompletedConversationTurn(RecentConversationTurn):
     topic: str | None = Field(default=None, max_length=256)
     quality_status: QualityStatus
     was_regenerated: bool = False
+    response_type: ResponseType | None = None
+    practice_test_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def _validate_practice_contract(self) -> CompletedConversationTurn:
+        if (self.response_type is None) != (self.practice_test_id is None):
+            raise ValueError("response_type and practice_test_id must be provided together")
+        return self
 
     @classmethod
     def now(cls, **values: object) -> CompletedConversationTurn:

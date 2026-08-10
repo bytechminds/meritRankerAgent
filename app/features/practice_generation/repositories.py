@@ -1,0 +1,1370 @@
+"""DynamoDB repositories mapped to existing MockTestQuiz, QuestionBank, and Question."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import ClientError
+
+from features.practice_generation.events import emit_practice_event
+from features.practice_generation.generation import deterministic_question_id
+from features.practice_generation.matching import ReusableQuestion
+from features.practice_generation.option_distribution import (
+    reorder_options,
+    target_correct_positions,
+    validate_answer_position_distribution,
+)
+from features.practice_generation.planning import request_idempotency_key
+from features.practice_generation.question_contract import validate_persisted_playable_question
+from features.practice_generation.resource_validation import IndexProjection
+from features.practice_generation.schemas import (
+    AssessmentProgress,
+    GeneratedQuestion,
+    InternalPhase,
+    PracticeBlueprint,
+    PracticeGenerationRequest,
+)
+
+_SERIALIZER = TypeSerializer()
+_DESERIALIZER = TypeDeserializer()
+_SUBJECTS = {
+    "math": "MATH",
+    "reasoning": "REASONING",
+    "science": "SCIENCE",
+    "history": "HISTORY",
+    "geography": "GEOGRAPHY",
+    "english": "ENGLISH",
+    "physics": "PHYSICS",
+    "chemistry": "CHEMISTRY",
+    "biology": "BIOLOGY",
+    "computer_science": "COMPUTER_SCIENCE",
+    "economics": "ECONOMICS",
+    "polity": "POLITY",
+    "general": "GENERAL",
+}
+logger = logging.getLogger(__name__)
+_ASSESSMENT_SIZE_ENVELOPE: dict[str, Any] = {
+    "testId": "x" * 128,
+    "userId": "x" * 128,
+    "name": "x" * 180,
+    "subject": "COMPUTER_SCIENCE",
+    "topic": "x" * 128,
+    "type": "mockTest",
+    "activityKind": "MINI_MOCK",
+    "status": "GENERATING",
+    "visibility": "PRIVATE",
+    "origin": "AI_CUSTOM",
+    "language": "en",
+    "durationMinutes": 180,
+    "totalQuestions": 100,
+    "exams": ["x" * 128],
+    "live": False,
+    "createdAt": "2026-07-28T00:00:00.000000Z",
+    "updatedAt": "2026-07-28T00:00:00.000000Z",
+    "__typename": "MockTestQuiz",
+}
+
+
+class PracticeRepositoryError(RuntimeError):
+    """Typed practice persistence failure."""
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _item(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {key: _SERIALIZER.serialize(entry) for key, entry in value.items()}
+
+
+def _plain(value: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {key: _DESERIALIZER.deserialize(entry) for key, entry in value.items()}
+
+
+def _is_conditional_failure(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+def _parse_meta(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _json(value: dict[str, Any]) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _attribute_value_size(value: dict[str, Any]) -> int:
+    if "S" in value:
+        return len(str(value["S"]).encode("utf-8")) + 1
+    if "N" in value:
+        return len(str(value["N"]).encode("utf-8")) + 1
+    if "B" in value:
+        return len(bytes(value["B"])) + 1
+    if "BOOL" in value or "NULL" in value:
+        return 2
+    if "SS" in value or "NS" in value or "BS" in value:
+        key = next(key for key in ("SS", "NS", "BS") if key in value)
+        return 3 + sum(
+            _attribute_value_size(
+                {
+                    {"SS": "S", "NS": "N", "BS": "B"}[key]: entry,
+                }
+            )
+            + 1
+            for entry in value[key]
+        )
+    if "L" in value:
+        return 3 + sum(_attribute_value_size(entry) + 1 for entry in value["L"])
+    if "M" in value:
+        return 3 + sum(
+            len(str(name).encode("utf-8")) + _attribute_value_size(entry) + 1
+            for name, entry in value["M"].items()
+        )
+    raise PracticeRepositoryError("DYNAMODB_ITEM_SIZE_ESTIMATION_FAILED")
+
+
+def estimate_dynamodb_item_size(item: dict[str, Any]) -> int:
+    """Conservatively estimate DynamoDB item bytes from encoded attribute values."""
+    encoded = _item(item)
+    return sum(
+        len(name.encode("utf-8")) + _attribute_value_size(value) + 1
+        for name, value in encoded.items()
+    )
+
+
+@dataclass(frozen=True)
+class IndexedQueryResult:
+    items: tuple[dict[str, Any], ...]
+    page_count: int
+    has_more_pages: bool
+    consumed_capacity: float | None
+    duration_ms: int
+    continuation_key: dict[str, Any] | None = None
+    evaluated_count: int = 0
+
+
+class AssessmentRepository:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        table_name: str,
+        meta_safe_size_bytes: int = 280_000,
+    ) -> None:
+        self._client = client
+        self._table = table_name
+        self._meta_safe_size_bytes = min(max(meta_safe_size_bytes, 64_000), 290_000)
+
+    def _guard_meta(self, meta: dict[str, Any]) -> None:
+        intended = dict(_ASSESSMENT_SIZE_ENVELOPE)
+        intended["meta"] = meta
+        if estimate_dynamodb_item_size(intended) >= self._meta_safe_size_bytes:
+            raise PracticeRepositoryError("ASSESSMENT_META_SIZE_LIMIT_EXCEEDED")
+
+    def _guard_item(self, item: dict[str, Any]) -> None:
+        if estimate_dynamodb_item_size(item) >= self._meta_safe_size_bytes:
+            raise PracticeRepositoryError("ASSESSMENT_ITEM_SIZE_LIMIT_EXCEEDED")
+
+    def get(self, test_id: str, *, consistent: bool = True) -> dict[str, Any] | None:
+        try:
+            response = self._client.get_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                ConsistentRead=consistent,
+            )
+        except ClientError as exc:
+            raise PracticeRepositoryError("ASSESSMENT_READ_FAILED") from exc
+        raw = response.get("Item")
+        return _plain(raw) if raw else None
+
+    def create_or_get(
+        self,
+        test_id: str,
+        request: PracticeGenerationRequest,
+    ) -> tuple[dict[str, Any], bool]:
+        timestamp = _now()
+        key = request_idempotency_key(request)
+        progress = AssessmentProgress(
+            requested_count=request.requested_count,
+            accepted_count=request.accepted_count,
+        )
+        meta = {
+            "schemaVersion": "1",
+            "idempotencyKey": key,
+            "conversationId": request.conversation_id,
+            "turnId": request.turn_id,
+            "practiceType": request.practice_type.value,
+            "requestedCount": request.requested_count,
+            "acceptedCount": request.accepted_count,
+            "examStage": request.exam_stage,
+            "examProfileId": request.exam_profile_id,
+            "requestedLanguage": request.language,
+            "phase": progress.phase.value,
+            "playable": False,
+            "progressPercent": 0,
+            "readyQuestionCount": 0,
+            "questionManifestVersion": 1,
+            "readyQuestionIds": [],
+            "readyCount": 0,
+            "reusedCount": 0,
+            "generatedCount": 0,
+            "verifiedCount": 0,
+            "failedCount": 0,
+            "generationVersion": 1,
+            "startedAt": timestamp,
+            "lastProgressAt": timestamp,
+            "recoveryAttemptCount": 0,
+            "lastCompletedStage": "INITIALIZED",
+            "replacementWaveCount": 0,
+            "slotReadyCounts": {},
+            "practiceRequest": {
+                "requestId": request.request_id,
+                "conversationId": request.conversation_id,
+                "turnId": request.turn_id,
+                "practiceType": request.practice_type.value,
+                "requestedCount": request.requested_count,
+                "acceptedCount": request.accepted_count,
+                "subject": request.subject,
+                "topic": request.topic,
+                "difficulty": request.difficulty.value,
+                "mixedDifficultyRequested": request.mixed_difficulty_requested,
+                "explicitDifficultyRequested": request.explicit_difficulty_requested,
+                "language": request.language,
+                "examId": request.exam_id,
+                "examStage": request.exam_stage,
+                "examProfileId": request.exam_profile_id,
+                "sourceQuestionReference": request.source_question_reference,
+                "includeSolutions": request.include_solutions,
+                "assessmentTitle": request.assessment_title,
+            },
+            "resourceAliases": {
+                "assessment": "MockTestQuiz",
+                "questions": "Question",
+                "questionBank": "QuestionBank",
+            },
+        }
+        is_mock = request.practice_type.value in {
+            "SECTIONAL_TEST",
+            "FULL_MOCK",
+            "TOPIC_TEST",
+        }
+        item = {
+            "testId": test_id,
+            "userId": request.user_id,
+            "name": request.assessment_title,
+            "subject": _SUBJECTS.get(request.subject.casefold(), "OTHER"),
+            "topic": request.topic or request.subject,
+            "type": "mockTest" if is_mock else "quiz",
+            "activityKind": "MINI_MOCK" if is_mock else "QUICK_QUIZ",
+            "status": "GENERATING",
+            "visibility": "PRIVATE",
+            "origin": "AI_CUSTOM",
+            "language": "hi" if request.language == "hindi" else "en",
+            "durationMinutes": max(1, min(request.accepted_count * 2, 180)),
+            "totalQuestions": request.accepted_count,
+            "exams": [request.exam_id] if request.exam_id else ["General"],
+            "live": False,
+            "meta": meta,
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "__typename": "MockTestQuiz",
+        }
+        self._guard_meta(meta)
+        self._guard_item(item)
+        try:
+            self._client.put_item(
+                TableName=self._table,
+                Item=_item(item),
+                ConditionExpression="attribute_not_exists(testId)",
+            )
+            return item, False
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise PracticeRepositoryError("ASSESSMENT_CREATE_FAILED") from exc
+        existing = self.get(test_id)
+        if existing is None or _parse_meta(existing.get("meta")).get("idempotencyKey") != key:
+            raise PracticeRepositoryError("ASSESSMENT_IDEMPOTENCY_CONFLICT")
+        return existing, True
+
+    def update(
+        self,
+        test_id: str,
+        *,
+        meta_updates: dict[str, Any],
+        status: str | None = None,
+        live: bool | None = None,
+        expected_updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        self._guard_meta(meta_updates)
+        timestamp = _now()
+        names = {"#meta": "meta", "#updated": "updatedAt"}
+        values: dict[str, Any] = {":updated": timestamp}
+        assignments = ["#updated = :updated"]
+        for index, (key, value) in enumerate(meta_updates.items()):
+            name_key = f"#field{index}"
+            value_key = f":value{index}"
+            names[name_key] = key
+            values[value_key] = value
+            assignments.append(f"#meta.{name_key} = {value_key}")
+        if status is not None:
+            names["#status"] = "status"
+            values[":status"] = status
+            assignments.append("#status = :status")
+        if live is not None:
+            names["#live"] = "live"
+            values[":live"] = live
+            assignments.append("#live = :live")
+        condition = "attribute_exists(testId)"
+        if expected_updated_at is not None:
+            values[":previous"] = expected_updated_at
+            condition += " AND #updated = :previous"
+        try:
+            response = self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression="SET " + ", ".join(assignments),
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_item(values),
+                ReturnValues="ALL_NEW",
+            )
+            return _plain(response["Attributes"])
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                raise PracticeRepositoryError("ASSESSMENT_CONCURRENT_UPDATE") from exc
+            raise PracticeRepositoryError("ASSESSMENT_UPDATE_FAILED") from exc
+
+    def set_blueprint(
+        self,
+        test_id: str,
+        blueprint: PracticeBlueprint,
+        *,
+        planner_calls: int,
+        planner_tier: str,
+        planner_repaired: bool,
+        deterministic_fallback: bool,
+    ) -> None:
+        self.update(
+            test_id,
+            meta_updates={
+                "phase": InternalPhase.MATCHING_EXISTING.value,
+                "blueprint": blueprint.model_dump(mode="json"),
+                "plannerCalls": planner_calls,
+                "plannerTier": planner_tier,
+                "plannerRepaired": planner_repaired,
+                "plannerDeterministicFallback": deterministic_fallback,
+                "progressPercent": 5,
+                "bucketReadyCounts": {bucket.bucket_id: 0 for bucket in blueprint.buckets},
+            },
+        )
+
+    def mark_failed(self, test_id: str, error_code: str) -> None:
+        timestamp = _now()
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=(
+                    "SET #meta.#phase = :phase, #meta.#playable = :false, "
+                    "#meta.#error = :error, "
+                    "#meta.#failed = if_not_exists(#meta.#failed, :zero) + :one, "
+                    "#status = :failed_status, #live = :false, #updated = :updated"
+                ),
+                ConditionExpression=("attribute_exists(testId) AND #status = :generating_status"),
+                ExpressionAttributeNames={
+                    "#meta": "meta",
+                    "#phase": "phase",
+                    "#playable": "playable",
+                    "#error": "errorCode",
+                    "#failed": "failedCount",
+                    "#status": "status",
+                    "#live": "live",
+                    "#updated": "updatedAt",
+                },
+                ExpressionAttributeValues=_item(
+                    {
+                        ":phase": InternalPhase.FAILED.value,
+                        ":false": False,
+                        ":error": error_code,
+                        ":zero": 0,
+                        ":one": 1,
+                        ":failed_status": "FAILED",
+                        ":generating_status": "GENERATING",
+                        ":updated": timestamp,
+                    }
+                ),
+            )
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise PracticeRepositoryError("ASSESSMENT_FAILURE_UPDATE_FAILED") from exc
+
+    def claim_group(self, test_id: str, group_id: str) -> dict[str, Any] | None:
+        now_value = _now()
+        names = {
+            "#meta": "meta",
+            "#groups": "generationGroups",
+            "#group": group_id,
+            "#state": "state",
+            "#claims": "claimCount",
+            "#phase": "phase",
+            "#status": "status",
+            "#updated": "updatedAt",
+        }
+        try:
+            response = self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=(
+                    "SET #meta.#groups.#group.#state = :running, "
+                    "#meta.#groups.#group.#claims = "
+                    "if_not_exists(#meta.#groups.#group.#claims, :zero) + :one, "
+                    "#meta.#phase = :phase, #updated = :now"
+                ),
+                ConditionExpression=(
+                    "#status = :generating AND "
+                    "attribute_exists(#meta.#groups.#group) AND "
+                    "#meta.#groups.#group.#state = :pending"
+                ),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_item(
+                    {
+                        ":running": "RUNNING",
+                        ":pending": "PENDING",
+                        ":generating": "GENERATING",
+                        ":now": now_value,
+                        ":zero": 0,
+                        ":one": 1,
+                        ":phase": InternalPhase.GENERATING.value,
+                    }
+                ),
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return None
+            raise PracticeRepositoryError("GENERATION_GROUP_CLAIM_FAILED") from exc
+        meta = _parse_meta(_plain(response["Attributes"]).get("meta"))
+        group = meta.get("generationGroups", {}).get(group_id)
+        return dict(group) if isinstance(group, dict) else None
+
+    def create_retry_group(
+        self,
+        test_id: str,
+        *,
+        group_id: str,
+        parent_group_id: str,
+        bucket_id: str,
+        attempt_stage: str,
+        attempt: int,
+        replacement: bool,
+    ) -> bool:
+        timestamp = _now()
+        group = {
+            "groupId": group_id,
+            "bucketId": bucket_id,
+            "requiredCount": 1,
+            "attempt": attempt,
+            "attemptStage": attempt_stage,
+            "itemRetryCount": 1,
+            "replacementCount": 1 if replacement else 0,
+            "replacement": replacement,
+            "lastReasonCode": "PARTIAL_GROUP_DEFICIT",
+            "state": "PENDING",
+        }
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=("SET #meta.#groups.#group = :group, #updated = :updated"),
+                ConditionExpression=(
+                    "#status = :generating AND "
+                    "attribute_not_exists(#meta.#groups.#group) AND "
+                    "#meta.#groups.#parent.#state = :running"
+                ),
+                ExpressionAttributeNames={
+                    "#meta": "meta",
+                    "#groups": "generationGroups",
+                    "#group": group_id,
+                    "#parent": parent_group_id,
+                    "#state": "state",
+                    "#status": "status",
+                    "#updated": "updatedAt",
+                },
+                ExpressionAttributeValues=_item(
+                    {
+                        ":group": group,
+                        ":generating": "GENERATING",
+                        ":running": "RUNNING",
+                        ":updated": timestamp,
+                    }
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("GENERATION_RETRY_GROUP_CREATE_FAILED") from exc
+
+    def record_finalization_retry(
+        self,
+        test_id: str,
+        *,
+        next_attempt: int,
+        reason_code: str,
+    ) -> bool:
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=(
+                    "SET #meta.#phase = :phase, #meta.#final_attempt = :attempt, "
+                    "#meta.#final_reason = :reason, #updated = :updated"
+                ),
+                ConditionExpression=(
+                    "#status = :generating AND "
+                    "(attribute_not_exists(#meta.#final_attempt) OR "
+                    "#meta.#final_attempt < :attempt)"
+                ),
+                ExpressionAttributeNames={
+                    "#meta": "meta",
+                    "#phase": "phase",
+                    "#final_attempt": "finalizationAttempt",
+                    "#final_reason": "finalizationReasonCode",
+                    "#status": "status",
+                    "#updated": "updatedAt",
+                },
+                ExpressionAttributeValues=_item(
+                    {
+                        ":phase": InternalPhase.FINALIZING.value,
+                        ":attempt": next_attempt,
+                        ":reason": reason_code,
+                        ":generating": "GENERATING",
+                        ":updated": _now(),
+                    }
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("FINALIZATION_RETRY_RECORD_FAILED") from exc
+
+    def update_group(
+        self,
+        test_id: str,
+        group_id: str,
+        *,
+        state: str,
+        required_count: int | None = None,
+        attempt: int | None = None,
+        error_code: str | None = None,
+        attempt_stage: str | None = None,
+        item_retry_count: int | None = None,
+        replacement_count: int | None = None,
+        replacement: bool | None = None,
+        last_reason_code: str | None = None,
+    ) -> None:
+        names = {
+            "#meta": "meta",
+            "#groups": "generationGroups",
+            "#group": group_id,
+            "#state": "state",
+            "#updated": "updatedAt",
+        }
+        values: dict[str, Any] = {
+            ":state": state,
+            ":updated": _now(),
+        }
+        condition = "attribute_exists(#meta.#groups.#group)"
+        assignments = [
+            "#meta.#groups.#group.#state = :state",
+            "#updated = :updated",
+        ]
+        for field, value in {
+            "requiredCount": required_count,
+            "attempt": attempt,
+            "errorCode": error_code,
+            "attemptStage": attempt_stage,
+            "itemRetryCount": item_retry_count,
+            "replacementCount": replacement_count,
+            "replacement": replacement,
+            "lastReasonCode": last_reason_code,
+        }.items():
+            if value is not None:
+                alias = f"#{field}"
+                token = f":{field}"
+                names[alias] = field
+                values[token] = value
+                assignments.append(f"#meta.#groups.#group.{alias} = {token}")
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression="SET " + ", ".join(assignments),
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_item(values),
+            )
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                raise PracticeRepositoryError("GENERATION_GROUP_NOT_FOUND") from exc
+            raise PracticeRepositoryError("GENERATION_GROUP_UPDATE_FAILED") from exc
+
+    def mark_ready(self, test_id: str, accepted_count: int, meta_updates: dict[str, Any]) -> bool:
+        self._guard_meta(meta_updates)
+        names = {
+            "#meta": "meta",
+            "#ready_count": "readyQuestionCount",
+            "#manifest_ready": "readyCount",
+            "#manifest": "readyQuestionIds",
+            "#failed_count": "failedCount",
+            "#status": "status",
+            "#live": "live",
+            "#updated": "updatedAt",
+        }
+        values: dict[str, Any] = {
+            ":accepted": accepted_count,
+            ":zero": 0,
+            ":generating": "GENERATING",
+            ":ready_status": "READY",
+            ":true": True,
+            ":updated": _now(),
+        }
+        assignments = [
+            "#status = :ready_status",
+            "#live = :true",
+            "#updated = :updated",
+        ]
+        for index, (key, value) in enumerate(meta_updates.items()):
+            name = f"#ready_field{index}"
+            token = f":ready_value{index}"
+            names[name] = key
+            values[token] = value
+            assignments.append(f"#meta.{name} = {token}")
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression="SET " + ", ".join(assignments),
+                ConditionExpression=(
+                    "#status = :generating AND "
+                    "#meta.#ready_count = :accepted AND "
+                    "#meta.#manifest_ready = :accepted AND "
+                    "size(#meta.#manifest) = :accepted AND "
+                    "#meta.#failed_count = :zero"
+                ),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_item(values),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("ASSESSMENT_READY_UPDATE_FAILED") from exc
+
+    def cancel(self, test_id: str) -> None:
+        self.update(
+            test_id,
+            meta_updates={
+                "phase": InternalPhase.CANCELLED.value,
+                "playable": False,
+            },
+            status="ARCHIVED",
+            live=False,
+        )
+
+
+class QuestionRepository:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        assessment_table: str,
+        question_table: str,
+        question_bank_table: str,
+        question_test_index: str,
+        question_bank_category_index: str,
+        question_bank_reuse_index: str = "",
+        question_bank_reuse_projection: IndexProjection | None = None,
+        question_bank_category_projection: IndexProjection | None = None,
+        query_page_size: int = 25,
+        query_max_pages: int = 2,
+        query_latency_warning_ms: int = 1_000,
+    ) -> None:
+        self._client = client
+        self._assessment_table = assessment_table
+        self._question_table = question_table
+        self._question_bank_table = question_bank_table
+        self._question_test_index = question_test_index
+        self._question_bank_category_index = question_bank_category_index
+        self._question_bank_reuse_index = question_bank_reuse_index
+        self._question_bank_reuse_projection = question_bank_reuse_projection
+        self._question_bank_category_projection = question_bank_category_projection
+        self._query_page_size = min(max(query_page_size, 1), 50)
+        self._query_max_pages = min(max(query_max_pages, 1), 5)
+        self._query_latency_warning_ms = min(
+            max(query_latency_warning_ms, 100),
+            10_000,
+        )
+
+    def _query_reuse_candidates(
+        self,
+        *,
+        index_name: str,
+        key_name: str,
+        key_value: str,
+        projection: IndexProjection | None,
+        limit: int,
+        sort_key_name: str | None = None,
+        sort_key_prefix: str | None = None,
+        exclusive_start_key: dict[str, Any] | None = None,
+    ) -> IndexedQueryResult:
+        if not index_name:
+            raise PracticeRepositoryError("QUESTION_BANK_INDEX_NOT_CONFIGURED")
+        remaining = min(max(limit, 1), 100)
+        items: list[dict[str, Any]] = []
+        start_key = exclusive_start_key
+        page_count = 0
+        evaluated_count = 0
+        consumed_capacity = 0.0
+        consumed_reported = False
+        started = time.monotonic()
+        try:
+            while remaining and page_count < self._query_max_pages:
+                kwargs: dict[str, Any] = {
+                    "TableName": self._question_bank_table,
+                    "IndexName": index_name,
+                    "KeyConditionExpression": "#lookup = :lookup",
+                    "ExpressionAttributeNames": {"#lookup": key_name},
+                    "ExpressionAttributeValues": _item({":lookup": key_value}),
+                    "Limit": min(remaining, self._query_page_size),
+                    "ScanIndexForward": False,
+                    "ReturnConsumedCapacity": "TOTAL",
+                }
+                if sort_key_prefix is not None:
+                    if not sort_key_name:
+                        raise PracticeRepositoryError("QUESTION_BANK_SORT_KEY_NOT_CONFIGURED")
+                    kwargs["KeyConditionExpression"] += (
+                        " AND begins_with(#sort_key, :sort_key_prefix)"
+                    )
+                    kwargs["ExpressionAttributeNames"]["#sort_key"] = sort_key_name
+                    kwargs["ExpressionAttributeValues"].update(
+                        _item({":sort_key_prefix": sort_key_prefix})
+                    )
+                metadata_projected = (
+                    projection is None or projection.query_mode == "PROJECTED_METADATA"
+                )
+                if metadata_projected:
+                    kwargs["ProjectionExpression"] = (
+                        "qbId, category, difficulty, tags, #meta, updatedAt, #source"
+                    )
+                    kwargs["ExpressionAttributeNames"].update(
+                        {"#meta": "meta", "#source": "source"}
+                    )
+                else:
+                    kwargs["ProjectionExpression"] = "qbId"
+                if start_key:
+                    kwargs["ExclusiveStartKey"] = start_key
+                response = self._client.query(**kwargs)
+                page_count += 1
+                page = [_plain(raw) for raw in response.get("Items", [])]
+                evaluated_count += len(page)
+                if metadata_projected:
+                    items.extend(page)
+                else:
+                    hydrated = self.get_reuse_candidates(
+                        [str(item.get("qbId") or "") for item in page]
+                    )
+                    items.extend(hydrated)
+                remaining -= len(page)
+                start_key = response.get("LastEvaluatedKey")
+                capacity = response.get("ConsumedCapacity")
+                if isinstance(capacity, dict) and capacity.get("CapacityUnits") is not None:
+                    consumed_capacity += float(capacity["CapacityUnits"])
+                    consumed_reported = True
+                if not start_key or not page:
+                    break
+        except ClientError as exc:
+            raise PracticeRepositoryError("QUESTION_BANK_QUERY_FAILED") from exc
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if (
+            page_count >= self._query_max_pages and start_key
+        ) or duration_ms >= self._query_latency_warning_ms:
+            logger.warning(
+                "bounded practice QuestionBank query warning pages=%d duration_ms=%d",
+                page_count,
+                duration_ms,
+            )
+        return IndexedQueryResult(
+            items=tuple(items[:limit]),
+            page_count=page_count,
+            has_more_pages=bool(start_key),
+            consumed_capacity=consumed_capacity if consumed_reported else None,
+            duration_ms=duration_ms,
+            continuation_key=start_key,
+            evaluated_count=evaluated_count,
+        )
+
+    def query_topic_reuse_candidates(
+        self,
+        *,
+        reuse_bucket_key: str,
+        limit: int,
+        difficulty_prefix: str | None = None,
+        exclusive_start_key: dict[str, Any] | None = None,
+    ) -> IndexedQueryResult:
+        return self._query_reuse_candidates(
+            index_name=self._question_bank_reuse_index,
+            key_name="reuseBucketKey",
+            key_value=reuse_bucket_key,
+            projection=self._question_bank_reuse_projection,
+            limit=limit,
+            sort_key_name="reuseSortKey",
+            sort_key_prefix=difficulty_prefix,
+            exclusive_start_key=exclusive_start_key,
+        )
+
+    def query_reuse_candidates(
+        self,
+        *,
+        category: str,
+        limit: int,
+        exclusive_start_key: dict[str, Any] | None = None,
+    ) -> IndexedQueryResult:
+        return self._query_reuse_candidates(
+            index_name=self._question_bank_category_index,
+            key_name="category",
+            key_value=category,
+            projection=self._question_bank_category_projection,
+            limit=limit,
+            exclusive_start_key=exclusive_start_key,
+        )
+
+    def get_reuse_candidates(
+        self,
+        question_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(question_ids))[:100]
+        if not unique_ids:
+            return []
+        request_items = {
+            self._question_bank_table: {
+                "Keys": [_item({"qbId": question_id}) for question_id in unique_ids],
+                "ConsistentRead": True,
+            }
+        }
+        records: list[dict[str, Any]] = []
+        try:
+            for _attempt in range(2):
+                response = self._client.batch_get_item(RequestItems=request_items)
+                records.extend(
+                    dict(response.get("Responses") or {}).get(
+                        self._question_bank_table,
+                        [],
+                    )
+                )
+                unprocessed = dict(response.get("UnprocessedKeys") or {})
+                if not unprocessed:
+                    break
+                request_items = unprocessed
+        except ClientError as exc:
+            raise PracticeRepositoryError("QUESTION_BANK_BATCH_GET_FAILED") from exc
+        return [_plain(raw) for raw in records]
+
+    def list_linked(
+        self,
+        test_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        start_key: dict[str, Any] | None = None
+        page_count = 0
+        consumed_capacity = 0.0
+        consumed_reported = False
+        started = time.monotonic()
+        try:
+            while len(results) < min(max(limit, 1), 100) and page_count < 5:
+                kwargs: dict[str, Any] = {
+                    "TableName": self._question_table,
+                    "IndexName": self._question_test_index,
+                    "KeyConditionExpression": "#test = :test",
+                    "ExpressionAttributeNames": {"#test": "testId"},
+                    "ExpressionAttributeValues": _item({":test": test_id}),
+                    "Limit": min(25, max(limit - len(results), 1)),
+                    "ConsistentRead": False,
+                    "ReturnConsumedCapacity": "TOTAL",
+                }
+                if start_key:
+                    kwargs["ExclusiveStartKey"] = start_key
+                response = self._client.query(**kwargs)
+                page_count += 1
+                for raw in response.get("Items", []):
+                    item = _plain(raw)
+                    item["_practiceMeta"] = _parse_meta(item.get("meta"))
+                    results.append(item)
+                capacity = response.get("ConsumedCapacity")
+                if isinstance(capacity, dict) and capacity.get("CapacityUnits") is not None:
+                    consumed_capacity += float(capacity["CapacityUnits"])
+                    consumed_reported = True
+                start_key = response.get("LastEvaluatedKey")
+                if not start_key or not response.get("Items"):
+                    break
+        except ClientError as exc:
+            raise PracticeRepositoryError("ASSESSMENT_QUESTIONS_QUERY_FAILED") from exc
+        duration_ms = int((time.monotonic() - started) * 1000)
+        emit_practice_event(
+            "ASSESSMENT_QUESTIONS_QUERY_COMPLETED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "logicalTable": "Question",
+                "logicalIndex": "Question.testId",
+                "pageCount": page_count,
+                "candidateCount": len(results),
+                "selectedCount": len(results),
+                "hasMorePages": bool(start_key),
+                "durationMs": duration_ms,
+                "consumedCapacity": (consumed_capacity if consumed_reported else None),
+            },
+        )
+        return results[:limit]
+
+    def list_playable(
+        self,
+        test_id: str,
+        *,
+        user_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        try:
+            response = self._client.get_item(
+                TableName=self._assessment_table,
+                Key=_item({"testId": test_id}),
+                ConsistentRead=True,
+            )
+        except ClientError as exc:
+            raise PracticeRepositoryError("ASSESSMENT_READ_FAILED") from exc
+        assessment = _plain(response["Item"]) if response.get("Item") else {}
+        meta = _parse_meta(assessment.get("meta"))
+        if (
+            assessment.get("status") != "READY"
+            or assessment.get("userId") != user_id
+            or assessment.get("live") is not True
+            or meta.get("playable") is not True
+        ):
+            return []
+        accepted_count = int(meta.get("acceptedCount") or 0)
+        manifest_count = int(meta.get("readyCount") or 0)
+        manifest_ids = [
+            str(question_id)
+            for question_id in list(meta.get("readyQuestionIds") or [])
+            if str(question_id)
+        ]
+        if (
+            accepted_count < 1
+            or manifest_count != accepted_count
+            or len(manifest_ids) != accepted_count
+            or len(set(manifest_ids)) != accepted_count
+        ):
+            raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
+        linked = self.list_linked(test_id, limit=limit)
+        linked_ids = {
+            str(item.get("questionId") or "")
+            for item in linked
+            if str(item.get("questionId") or "")
+        }
+        if len(linked) == accepted_count and linked_ids == set(manifest_ids):
+            by_id = {str(item.get("questionId") or ""): item for item in linked}
+        else:
+            resolved = self.get_questions_by_ids(manifest_ids)
+            by_id = {
+                str(item.get("questionId") or ""): item
+                for item in resolved
+                if str(item.get("testId") or "") == test_id
+            }
+            if len(by_id) != accepted_count:
+                raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
+        practice_request = meta.get("practiceRequest")
+        requested_language = (
+            str(practice_request.get("language") or "")
+            if isinstance(practice_request, dict)
+            else ""
+        )
+        if not requested_language:
+            raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
+        solution_required = bool(practice_request.get("includeSolutions", True))
+        playable: list[dict[str, Any]] = []
+        for question_id in manifest_ids:
+            item = by_id[question_id]
+            item["_practiceMeta"] = _parse_meta(item.get("meta"))
+            contract = validate_persisted_playable_question(
+                item,
+                expected_question_type="mcq",
+                expected_language=requested_language,
+                solution_required=solution_required,
+            )
+            if not contract.valid:
+                raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
+            playable.append(item)
+        return sorted(
+            playable,
+            key=lambda item: int(item.get("position") or 0),
+        )
+
+    def get_questions_by_ids(
+        self,
+        question_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(question_ids))[:100]
+        if not unique_ids:
+            return []
+        records: list[dict[str, Any]] = []
+        for offset in range(0, len(unique_ids), 100):
+            request_items = {
+                self._question_table: {
+                    "Keys": [
+                        _item({"questionId": question_id})
+                        for question_id in unique_ids[offset : offset + 100]
+                    ],
+                    "ConsistentRead": True,
+                }
+            }
+            try:
+                for _attempt in range(2):
+                    response = self._client.batch_get_item(RequestItems=request_items)
+                    records.extend(
+                        dict(response.get("Responses") or {}).get(
+                            self._question_table,
+                            [],
+                        )
+                    )
+                    unprocessed = dict(response.get("UnprocessedKeys") or {})
+                    if not unprocessed:
+                        break
+                    request_items = unprocessed
+            except ClientError as exc:
+                raise PracticeRepositoryError("ASSESSMENT_QUESTIONS_BATCH_GET_FAILED") from exc
+        return [_plain(raw) for raw in records]
+
+    def link_reused(
+        self,
+        *,
+        test_id: str,
+        bucket_id: str,
+        question: ReusableQuestion,
+        slot_id: str | None = None,
+    ) -> bool:
+        question_id = deterministic_question_id(
+            test_id,
+            source_id=question.question_id,
+            bucket_id=bucket_id,
+        )
+        return self._put_question(
+            question_id=question_id,
+            test_id=test_id,
+            question=question.question,
+            options=list(question.options),
+            correct_answer=question.correct_answer,
+            solution=question.solution,
+            subject=question.subject,
+            topic=question.topic,
+            difficulty=question.difficulty,
+            answer_contract={
+                "schemaVersion": "2",
+                "optionIdentity": "INDEX_V1",
+                "options": [
+                    {"optionId": index, "value": value}
+                    for index, value in enumerate(question.options)
+                ],
+                "correctOptionId": list(question.options).index(question.correct_answer),
+                "correctAnswer": question.correct_answer,
+                "answerExplanation": question.solution,
+                "answerStatus": "VERIFIED",
+                "answerVersion": 1,
+            },
+            meta={
+                "schemaVersion": "2" if slot_id else "1",
+                "source": "REUSED",
+                "sourceType": "QUESTION_BANK",
+                "sourceQuestionBankId": question.question_id,
+                "sourceVersion": question.source_updated_at,
+                "bucketId": bucket_id,
+                **({"slotId": slot_id} if slot_id else {}),
+                "verified": True,
+                "verificationPolicy": "STORED_AUTHORITY",
+                "verificationMethod": "QUESTION_BANK_QUALITY",
+                "questionType": question.question_type,
+                "optionIdentity": "INDEX_V1",
+                "language": question.language,
+                "status": "READY",
+            },
+        )
+
+    def link_generated(
+        self,
+        *,
+        test_id: str,
+        question: GeneratedQuestion,
+        verified: bool,
+        group_id: str,
+        generator_route: str,
+        generator_model: str,
+        verification_policy: str,
+        verification_method: str,
+        language: str,
+    ) -> bool:
+        if not verified:
+            raise PracticeRepositoryError("UNVERIFIED_QUESTION_REJECTED")
+        question_id = deterministic_question_id(
+            test_id,
+            source_id=question.slot_id or question.generation_item_id,
+            bucket_id=question.bucket_id,
+        )
+        canonical_solution = (
+            question.answer_explanation
+            if question.schema_version == "2"
+            else question.solution
+        )
+        return self._put_question(
+            question_id=question_id,
+            test_id=test_id,
+            question=question.question,
+            options=question.options,
+            correct_answer=question.correct_answer,
+            solution=canonical_solution,
+            subject=question.subject,
+            topic=question.topic,
+            difficulty=question.difficulty.value,
+            answer_contract=(
+                {
+                    "schemaVersion": "2",
+                    "optionIdentity": "INDEX_V1",
+                    "options": [
+                        {"optionId": int(option.option_id), "value": option.value}
+                        for option in question.canonical_options
+                    ],
+                    "correctOptionId": int(question.correct_option_id),
+                    "correctAnswer": question.correct_answer,
+                    "answerExplanation": question.answer_explanation,
+                    "answerStatus": "VERIFIED",
+                    "answerVersion": 1,
+                }
+                if question.schema_version == "2"
+                else None
+            ),
+            meta={
+                "schemaVersion": question.schema_version,
+                "source": "GENERATED",
+                "sourceType": "AI_GENERATED",
+                "generationItemId": question.generation_item_id,
+                "generationGroupId": group_id,
+                "generatorRoute": generator_route,
+                "generatorModel": generator_model,
+                "bucketId": question.bucket_id,
+                **({"slotId": question.slot_id} if question.slot_id else {}),
+                "verified": True,
+                "verificationPolicy": verification_policy,
+                "verificationMethod": verification_method,
+                "questionType": question.question_type.value,
+                "optionIdentity": "INDEX_V1",
+                "language": language,
+                "status": "READY",
+                "reusable": False,
+                "visibility": "PRIVATE",
+            },
+        )
+
+    def _put_question(
+        self,
+        *,
+        question_id: str,
+        test_id: str,
+        question: str,
+        options: list[str],
+        correct_answer: str,
+        solution: str,
+        subject: str,
+        topic: str,
+        difficulty: str,
+        meta: dict[str, Any],
+        answer_contract: dict[str, Any] | None = None,
+    ) -> bool:
+        timestamp = _now()
+        item = {
+            "questionId": question_id,
+            "testId": test_id,
+            "question": question,
+            "options": options,
+            "answers": _json(
+                answer_contract
+                or {"correctAnswer": correct_answer, "options": options}
+            ),
+            "correctAnswer": correct_answer,
+            "marks": 1,
+            "negativeMarks": 0,
+            "section": subject,
+            "difficulty": difficulty.upper(),
+            "topic": topic,
+            "subject": _SUBJECTS.get(subject.casefold(), "OTHER"),
+            "format": "standard",
+            "meta": meta,
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "__typename": "Question",
+        }
+        if solution:
+            item["explanation"] = solution
+        try:
+            self._client.put_item(
+                TableName=self._question_table,
+                Item=_item(item),
+                ConditionExpression="attribute_not_exists(questionId)",
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("QUESTION_LINK_FAILED") from exc
+
+    def assign_positions(self, questions: list[dict[str, Any]]) -> None:
+        ordered = sorted(
+            questions,
+            key=lambda item: (
+                str(item.get("_practiceMeta", {}).get("bucketId") or ""),
+                str(item.get("questionId") or ""),
+            ),
+        )
+        for position, question in enumerate(ordered, start=1):
+            try:
+                self._client.update_item(
+                    TableName=self._question_table,
+                    Key=_item({"questionId": str(question["questionId"])}),
+                    UpdateExpression="SET #position = :position, #updated = :updated",
+                    ExpressionAttributeNames={
+                        "#position": "position",
+                        "#updated": "updatedAt",
+                    },
+                    ExpressionAttributeValues=_item({":position": position, ":updated": _now()}),
+                    ConditionExpression="attribute_exists(questionId)",
+                )
+            except ClientError as exc:
+                raise PracticeRepositoryError("QUESTION_ORDERING_FAILED") from exc
+
+    def rebalance_answer_positions(
+        self,
+        test_id: str,
+        questions: list[dict[str, Any]],
+    ) -> tuple[bool, tuple[int, ...]]:
+        ordered = sorted(
+            questions,
+            key=lambda item: (
+                str(item.get("_practiceMeta", {}).get("bucketId") or ""),
+                str(item.get("questionId") or ""),
+            ),
+        )
+        question_ids = [str(item.get("questionId") or "") for item in ordered]
+        if not all(question_ids) or len(question_ids) != len(set(question_ids)):
+            raise PracticeRepositoryError("ANSWER_POSITION_DISTRIBUTION_INVALID")
+        changed = False
+        for item, target_position in zip(
+            ordered,
+            target_correct_positions(test_id, question_ids),
+            strict=True,
+        ):
+            options = item.get("options")
+            if not isinstance(options, list):
+                raise PracticeRepositoryError("ANSWER_POSITION_DISTRIBUTION_INVALID")
+            reordered = reorder_options(
+                test_id=test_id,
+                question_id=str(item["questionId"]),
+                options=[str(option) for option in options],
+                correct_answer=str(item.get("correctAnswer") or ""),
+                target_position=target_position,
+            )
+            if reordered is None:
+                raise PracticeRepositoryError("ANSWER_POSITION_DISTRIBUTION_INVALID")
+            if reordered != options:
+                practice_meta = item.get("_practiceMeta")
+                is_schema_v2 = (
+                    isinstance(practice_meta, dict)
+                    and str(practice_meta.get("schemaVersion") or "") == "2"
+                )
+                if is_schema_v2:
+                    correct_answer = str(item.get("correctAnswer") or "")
+                    correct_option_id = reordered.index(correct_answer)
+                    current_answer_version = 1
+                    raw_answers = item.get("answers")
+                    if isinstance(raw_answers, str):
+                        try:
+                            parsed_answers = json.loads(raw_answers)
+                        except (TypeError, ValueError):
+                            parsed_answers = {}
+                        if isinstance(parsed_answers, dict):
+                            current_answer_version = int(
+                                parsed_answers.get("answerVersion") or 1
+                            )
+                    answer_contract = {
+                        "schemaVersion": "2",
+                        "optionIdentity": "INDEX_V1",
+                        "options": [
+                            {"optionId": index, "value": value}
+                            for index, value in enumerate(reordered)
+                        ],
+                        "correctOptionId": correct_option_id,
+                        "correctAnswer": correct_answer,
+                        "answerExplanation": str(item.get("explanation") or ""),
+                        "answerStatus": "VERIFIED",
+                        "answerVersion": current_answer_version + 1,
+                    }
+                else:
+                    answer_contract = {
+                        "correctAnswer": item.get("correctAnswer"),
+                        "options": reordered,
+                    }
+                try:
+                    self._client.update_item(
+                        TableName=self._question_table,
+                        Key=_item({"questionId": str(item["questionId"])}),
+                        UpdateExpression=(
+                            "SET #options = :options, #answers = :answers, #updated = :updated"
+                        ),
+                        ExpressionAttributeNames={
+                            "#options": "options",
+                            "#answers": "answers",
+                            "#updated": "updatedAt",
+                        },
+                        ExpressionAttributeValues=_item(
+                            {
+                                ":options": reordered,
+                                ":answers": _json(answer_contract),
+                                ":updated": _now(),
+                            }
+                        ),
+                        ConditionExpression="attribute_exists(questionId)",
+                    )
+                except ClientError as exc:
+                    raise PracticeRepositoryError(
+                        "ANSWER_POSITION_DISTRIBUTION_INVALID"
+                    ) from exc
+                item["options"] = reordered
+                item["answers"] = _json(answer_contract)
+                changed = True
+        validation = validate_answer_position_distribution(ordered)
+        if not validation.valid:
+            raise PracticeRepositoryError(validation.reason_code)
+        return changed, validation.correct_positions

@@ -35,6 +35,18 @@ from typing import TypedDict, cast
 from langgraph.graph import END, START, StateGraph
 
 from config import get_settings
+from features.practice_generation.agentcore_async import PracticeLaunchError
+from features.practice_generation.planning import (
+    PRACTICE_ASYNC_NOT_CONFIGURED,
+    decide_practice_launch,
+    practice_async_unavailable_message,
+    practice_route_enabled,
+    resolve_practice_request,
+)
+from features.practice_generation.schemas import (
+    PracticeGenerationRequest,
+    PracticeLaunchResult,
+)
 from observability import log_event, update_request_summary
 from schemas.conversation import ConversationCandidateCard, ConversationPreparation
 from schemas.doubt_solver import (
@@ -86,23 +98,26 @@ class DoubtSolverGraphState(TypedDict):
     language: str
     exam_id: str | None
     exam_stage: str | None
-    classification: dict | None       # serialised QueryClassification
+    exam_profile_id: str | None
+    classification: dict | None  # serialised QueryClassification
     answer: str | None
     final_answer: dict | None
-    answer_source: str | None         # "mock" | "llm" | "fallback"
+    response_type: str | None
+    practice_test_id: str | None
+    answer_source: str | None  # "mock" | "llm" | "fallback"
     is_truncated: bool
-    response: dict | None             # serialised DoubtSolverResponse
+    response: dict | None  # serialised DoubtSolverResponse
     # Part 9 context-pipeline fields
-    should_retrieve: bool             # set by plan_context_node
-    kb_results: list | None           # list of serialised KnowledgeBaseResult dicts
-    dynamodb_records: list | None     # list of raw DynamoDB record dicts
-    answer_context: str | None        # bounded context string for answer generator
-    context_source_count: int         # number of sources included in context
-    used_retrieval: bool              # True if KB returned ≥1 result
-    context_used: bool                # True if context was passed to answer generator
-    service_error: bool               # True if KB or DynamoDB service error occurred
-    retrieval_context: dict | None    # internal S3 Vector retrieval contract
-    conversation_context: str         # selected recent turn context, when relevant
+    should_retrieve: bool  # set by plan_context_node
+    kb_results: list | None  # list of serialised KnowledgeBaseResult dicts
+    dynamodb_records: list | None  # list of raw DynamoDB record dicts
+    answer_context: str | None  # bounded context string for answer generator
+    context_source_count: int  # number of sources included in context
+    used_retrieval: bool  # True if KB returned ≥1 result
+    context_used: bool  # True if context was passed to answer generator
+    service_error: bool  # True if KB or DynamoDB service error occurred
+    retrieval_context: dict | None  # internal S3 Vector retrieval contract
+    conversation_context: str  # selected recent turn context, when relevant
     conversation_relation: dict | None
 
 
@@ -121,9 +136,7 @@ def classify_query_node(state: DoubtSolverGraphState) -> dict:
     )
     relation = state.get("conversation_relation") or {}
     if relation and not relation.get("requires_recent_conversation"):
-        classification = classification.model_copy(
-            update={"requires_recent_conversation": False}
-        )
+        classification = classification.model_copy(update={"requires_recent_conversation": False})
     logger.debug(
         "request_id=%s  classify_query  intent=%s  confidence=%.2f",
         state["request_id"],
@@ -391,15 +404,16 @@ def generate_answer_node(
     # Convert empty string to None so generate_answer treats it as no context.
     retrieval_context = state.get("answer_context") or ""
     conversation_context = state.get("conversation_context") or ""
-    context = "\n\n".join(
-        value for value in (conversation_context, retrieval_context) if value
-    ) or None
+    context = (
+        "\n\n".join(value for value in (conversation_context, retrieval_context) if value) or None
+    )
     output = generate_answer(
         state["query"],
         classification,
         context=context,
         exam_id=state.get("exam_id"),
         exam_stage=state.get("exam_stage"),
+        exam_profile_id=state.get("exam_profile_id"),
         language=state.get("language", "english"),
         request_id=state.get("request_id", ""),
     )
@@ -452,12 +466,7 @@ def build_response_node(state: DoubtSolverGraphState) -> dict:
     #   • generator used the fallback path (LLM failed)
     #   • model answer was truncated
     #   • KB or DynamoDB service error occurred during this request
-    needs_review = (
-        confidence < 0.6
-        or answer_source == "fallback"
-        or is_truncated
-        or service_error
-    )
+    needs_review = confidence < 0.6 or answer_source == "fallback" or is_truncated or service_error
 
     classification = QueryClassification.model_validate(raw_classification)
     final_answer_raw = state.get("final_answer")
@@ -467,14 +476,11 @@ def build_response_node(state: DoubtSolverGraphState) -> dict:
         else state.get("answer") or ""
     )
     final_answer_model = (
-        FinalAnswerResult.model_validate(final_answer_raw)
-        if final_answer_raw is not None
-        else None
+        FinalAnswerResult.model_validate(final_answer_raw) if final_answer_raw is not None else None
     )
     response = DoubtSolverResponse(
         success=bool(
-            final_answer_model is None
-            or final_answer_model.quality_status != "failed_quality_gate"
+            final_answer_model is None or final_answer_model.quality_status != "failed_quality_gate"
         ),
         request_id=state["request_id"],
         mode="doubt_solver",
@@ -600,11 +606,14 @@ class OrchestratedDoubtSolverState(TypedDict):
     language: str
     exam_id: str | None
     exam_stage: str | None
-    classification: dict | None   # serialised DoubtSolverClassification
-    retrieval_context: dict       # structured internal student retrieval context
-    context_text: str             # compact context string (may be "")
+    exam_profile_id: str | None
+    classification: dict | None  # serialised DoubtSolverClassification
+    retrieval_context: dict  # structured internal student retrieval context
+    context_text: str  # compact context string (may be "")
     answer: str | None
     final_answer: dict | None
+    response_type: str | None
+    practice_test_id: str | None
     conversation_context: str
     conversation_relation: dict | None
     conversation_preparation: dict | None
@@ -615,6 +624,7 @@ class OrchestratedDoubtSolverState(TypedDict):
 # ---------------------------------------------------------------------------
 # Subject/intent normalisation helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_graph_classifier(
     query: str,
@@ -638,9 +648,7 @@ def _run_graph_classifier(
     )
 
 
-_classification_coordinator = ClassificationCoordinator(
-    classifier=_run_graph_classifier
-)
+_classification_coordinator = ClassificationCoordinator(classifier=_run_graph_classifier)
 
 # Safe fallback classification used when the classifier fails.
 _ORCHESTRATED_FALLBACK_CLASSIFICATION: dict = {
@@ -695,12 +703,10 @@ def orchestrated_classify_query(
 
     Shared by the orchestrated classify graph node and streaming service.
     """
-    classification, _confidence, _fallback = (
-        orchestrated_classify_query_with_delivery_signals(
-            query,
-            request_id=request_id,
-            on_before_strong_classifier=on_before_strong_classifier,
-        )
+    classification, _confidence, _fallback = orchestrated_classify_query_with_delivery_signals(
+        query,
+        request_id=request_id,
+        on_before_strong_classifier=on_before_strong_classifier,
     )
     return classification
 
@@ -821,6 +827,8 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
     if raw_classification is not None:
         update["query_classification"] = raw_classification
     return update
+
+
 # ---------------------------------------------------------------------------
 # Node 2: collect_context
 # ---------------------------------------------------------------------------
@@ -846,9 +854,9 @@ def _orchestrated_collect_context_node(
 
         return {
             "context_text": "",
-            "retrieval_context": StudentRetrievalContext.fresh_solve(
-                "empty_query"
-            ).model_dump(by_alias=True),
+            "retrieval_context": StudentRetrievalContext.fresh_solve("empty_query").model_dump(
+                by_alias=True
+            ),
         }
 
     classification_dict = state.get("classification") or {}
@@ -874,8 +882,7 @@ def _orchestrated_collect_context_node(
         context_text = result.context_text or ""
 
         logger.debug(
-            "request_id=%s  orchestrated_collect_context  items=%d  "
-            "context_chars=%d  reason=%s",
+            "request_id=%s  orchestrated_collect_context  items=%d  context_chars=%d  reason=%s",
             state.get("request_id", ""),
             result.item_count,
             len(context_text),
@@ -941,9 +948,9 @@ def _orchestrated_collect_context_node(
         )
         return {
             "context_text": "",
-            "retrieval_context": StudentRetrievalContext.fresh_solve(
-                "retrieval_error"
-            ).model_dump(by_alias=True),
+            "retrieval_context": StudentRetrievalContext.fresh_solve("retrieval_error").model_dump(
+                by_alias=True
+            ),
         }
 
 
@@ -958,6 +965,7 @@ def build_orchestrated_doubt_solver_graph(
     conversation_persistence=None,
     follow_up_resolver=None,
     conversation_understanding=None,
+    practice_launcher: Callable[[PracticeGenerationRequest], PracticeLaunchResult] | None = None,
 ):
     """Construct and compile the lean Orchestrated Doubt Solver StateGraph.
 
@@ -981,6 +989,7 @@ def build_orchestrated_doubt_solver_graph(
         Only call when ENABLE_ORCHESTRATED_DOUBT_SOLVER=true.
         Default path is build_doubt_solver_graph().
     """
+
     def _understand_conversation_node(
         state: OrchestratedDoubtSolverState,
     ) -> dict:
@@ -1129,34 +1138,35 @@ def build_orchestrated_doubt_solver_graph(
             )
             return {"answer": answer, "final_answer": final_answer.model_dump()}
         try:
+            generation_kwargs = {
+                "request_id": state["request_id"],
+                "query": state["query"],
+                "subject": subject,
+                "intent": intent,
+                "difficulty": difficulty,
+                "context": context_text,
+                "web_search_reason": (
+                    str(classification_dict.get("web_search_reason"))
+                    if classification_dict.get("web_search_reason")
+                    else None
+                ),
+                "exam_id": state.get("exam_id"),
+                "exam_stage": state.get("exam_stage"),
+                "language": language,
+                "conversation_context": state.get("conversation_context") or None,
+            }
+            if state.get("exam_profile_id"):
+                generation_kwargs["exam_profile_id"] = state["exam_profile_id"]
             generate_final = getattr(adapter, "generate_final", None)
             if generate_final is not None:
-                final_answer = generate_final(
-                    request_id=state["request_id"],
-                    query=state["query"],
-                    subject=subject,
-                    intent=intent,
-                    difficulty=difficulty,
-                    context=context_text,
-                    web_search_reason=str(classification_dict.get("web_search_reason"))
-                    if classification_dict.get("web_search_reason")
-                    else None,
-                    exam_id=state.get("exam_id"),
-                    exam_stage=state.get("exam_stage"),
-                    language=language,
-                    conversation_context=state.get("conversation_context") or None,
-                )
+                final_answer = generate_final(**generation_kwargs)
                 answer = final_answer.content
                 relation = state.get("conversation_relation") or {}
-                verification_required = (
-                    requires_independent_correctness_verification(
-                        subject=subject,
-                        difficulty=difficulty,
-                        intent=intent,
-                        requested_action=str(
-                            relation.get("requested_action") or "ANSWER_CURRENT"
-                        ),
-                    )
+                verification_required = requires_independent_correctness_verification(
+                    subject=subject,
+                    difficulty=difficulty,
+                    intent=intent,
+                    requested_action=str(relation.get("requested_action") or "ANSWER_CURRENT"),
                 )
                 correctness_verifier = getattr(adapter, "correctness_verifier", None)
                 if (
@@ -1180,23 +1190,7 @@ def build_orchestrated_doubt_solver_graph(
                             quality_status="failed_quality_gate",
                         )
             else:
-                answer = adapter.generate(
-                    request_id=state["request_id"],
-                    query=state["query"],
-                    subject=subject,
-                    intent=intent,
-                    difficulty=difficulty,
-                    context=context_text,
-                    web_search_reason=str(
-                        classification_dict.get("web_search_reason")
-                    )
-                    if classification_dict.get("web_search_reason")
-                    else None,
-                    exam_id=state.get("exam_id"),
-                    exam_stage=state.get("exam_stage"),
-                    language=language,
-                    conversation_context=state.get("conversation_context") or None,
-                )
+                answer = adapter.generate(**generation_kwargs)
                 final_answer = build_final_answer_result(
                     content=answer,
                     language=language,
@@ -1268,21 +1262,113 @@ def build_orchestrated_doubt_solver_graph(
         )
         return {"answer": answer, "final_answer": final_answer.model_dump()}
 
+    def _practice_launch_node(state: OrchestratedDoubtSolverState) -> dict:
+        if practice_launcher is not None:
+            classification = state.get("classification") or {}
+            try:
+                request = resolve_practice_request(
+                    request_id=state["request_id"],
+                    user_id=state["actor_id"],
+                    conversation_id=state["conversation_id"],
+                    turn_id=state["turn_id"],
+                    query=state.get("original_query") or state["query"],
+                    subject=str(classification.get("subject") or "general"),
+                    topic=(str(classification["topic"]) if classification.get("topic") else None),
+                    difficulty=str(classification.get("difficulty") or "default"),
+                    language=state.get("language", "english"),
+                    exam_id=state.get("exam_id"),
+                    exam_stage=state.get("exam_stage"),
+                    exam_profile_id=state.get("exam_profile_id"),
+                    source_question_reference=str(
+                        (state.get("query_classification") or {}).get("selected_turn_id") or ""
+                    )
+                    or None,
+                )
+                launch = practice_launcher(request)
+            except PracticeLaunchError:
+                message = "Practice generation could not be started. Please try again."
+                final = build_final_answer_result(
+                    content=message,
+                    language=cast(
+                        CanonicalLanguage,
+                        state.get("language", "english"),
+                    ),
+                    quality_status="failed_quality_gate",
+                )
+                return {"answer": message, "final_answer": final.model_dump()}
+            final = build_final_answer_result(
+                content=launch.message,
+                language=cast(CanonicalLanguage, state.get("language", "english")),
+                quality_status="checked",
+            )
+            return {
+                "answer": launch.message,
+                "final_answer": final.model_dump(),
+                "response_type": "practice_generation",
+                "practice_test_id": launch.test_id,
+            }
+        message = practice_async_unavailable_message(state.get("language", "english"))
+        final = build_final_answer_result(
+            content=message,
+            language=cast(CanonicalLanguage, state.get("language", "english")),
+            quality_status="failed_quality_gate",
+        )
+        log_event(
+            "PRACTICE_LAUNCH_DECISION",
+            component="practice.routing",
+            stage="route",
+            status="disabled",
+            error_code=PRACTICE_ASYNC_NOT_CONFIGURED,
+        )
+        return {
+            "answer": message,
+            "final_answer": final.model_dump(),
+        }
+
+    def _route_after_follow_up(state: OrchestratedDoubtSolverState) -> str:
+        if state.get("final_answer"):
+            return "complete"
+        classification = state.get("classification") or {}
+        decision = decide_practice_launch(state["query"], classification)
+        if practice_route_enabled() and classification.get("intent") == "practice":
+            log_event(
+                "PRACTICE_LAUNCH_DECISION",
+                component="practice.routing",
+                stage="route",
+                status="eligible" if decision.eligible else "ineligible",
+                details={
+                    "eligible": decision.eligible,
+                    "reasonCode": decision.reason_code,
+                    "requestedArtifact": decision.requested_artifact,
+                },
+            )
+        if practice_route_enabled() and decision.eligible:
+            return "practice"
+        return "retrieve"
+
     builder: StateGraph = StateGraph(OrchestratedDoubtSolverState)
     builder.add_node("understand_conversation", _understand_conversation_node)
     builder.add_node("classify", _orchestrated_classify_node)
     builder.add_node("prepare_follow_up", _prepare_follow_up_node)
     builder.add_node("collect_context", _orchestrated_collect_context_node)
     builder.add_node("generate", _generate_node)
+    if practice_route_enabled():
+        builder.add_node("practice_launch", _practice_launch_node)
 
     builder.add_edge(START, "understand_conversation")
     builder.add_edge("understand_conversation", "classify")
     builder.add_edge("classify", "prepare_follow_up")
     builder.add_conditional_edges(
         "prepare_follow_up",
-        lambda state: "complete" if state.get("final_answer") else "retrieve",
-        {"complete": END, "retrieve": "collect_context"},
+        _route_after_follow_up,
+        {
+            "complete": END,
+            "practice": "practice_launch" if practice_route_enabled() else "collect_context",
+            "retrieve": "collect_context",
+        },
     )
+    if practice_route_enabled():
+        builder.add_edge("practice_launch", END)
     builder.add_edge("collect_context", "generate")
     builder.add_edge("generate", END)
 

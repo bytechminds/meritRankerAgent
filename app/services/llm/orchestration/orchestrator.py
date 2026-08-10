@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MAX_QUERY_CHARS: int = 4_000
+MAX_STRUCTURED_INPUT_CHARS: int = 50_000
 
 # ---------------------------------------------------------------------------
 # ModelExecutor Protocol
@@ -450,6 +451,87 @@ class LlmOrchestrator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def generate_structured(
+        self,
+        *,
+        route_request: RouteRequest,
+        user_content: str,
+        prompt: str,
+        overlays: list[str] | None = None,
+    ) -> OrchestrationResult:
+        """Execute a bounded structured-output call through the shared runtime."""
+        if not user_content or not user_content.strip():
+            raise LlmOrchestratorError("Structured input must not be empty.")
+        if len(user_content) > MAX_STRUCTURED_INPUT_CHARS:
+            raise LlmOrchestratorError(
+                "Structured input exceeds maximum allowed length of "
+                f"{MAX_STRUCTURED_INPUT_CHARS} characters."
+            )
+
+        start_ms = int(time.monotonic() * 1000)
+        route_decision = self._route_resolver_fn(route_request).model_copy(
+            update={
+                "prompt": prompt,
+                "overlays": list(overlays or []),
+                "intent_overlays": {},
+            }
+        )
+        messages = self._prompt_resolver.resolve_structured(
+            route_decision,
+            user_content,
+        )
+        try:
+            with bind_llm_attempt_type(current_llm_attempt_type()):
+                execution_result = self._model_executor.execute(
+                    route_decision=route_decision,
+                    messages=messages,
+                )
+        except LlmOrchestrationError:
+            raise
+        except Exception as exc:
+            raise LlmExecutionError(
+                f"Model executor raised an unexpected error for route "
+                f"'{route_decision.route_id}': {type(exc).__name__}"
+            ) from exc
+
+        elapsed_ms = int(time.monotonic() * 1000) - start_ms
+        logger.info(
+            "llm_orchestrator.generate_structured  request_id=%s  route_id=%s  "
+            "subject=%s  task_role=%s  difficulty=%s  model=%s  "
+            "model_config_source=yaml  fallback_used=%s  latency_ms=%d",
+            route_request.request_id,
+            route_decision.route_id,
+            route_decision.subject,
+            route_decision.task_role,
+            route_decision.difficulty,
+            route_decision.model,
+            execution_result.fallback_used,
+            elapsed_ms,
+        )
+        return OrchestrationResult(
+            content=execution_result.content,
+            route_decision=route_decision,
+            model=execution_result.model,
+            provider=execution_result.provider,
+            fallback_used=execution_result.fallback_used,
+            finish_reason=execution_result.finish_reason,
+            input_tokens=execution_result.input_tokens,
+            output_tokens=execution_result.output_tokens,
+            total_tokens=execution_result.total_tokens,
+            cached_input_tokens=execution_result.cached_input_tokens,
+            reasoning_tokens=execution_result.reasoning_tokens,
+            usage_source=execution_result.usage_source,
+            latency_ms=execution_result.latency_ms,
+            answer_source=_derive_answer_source(execution_result),
+            metadata={},
+            final_answer=None,
+            execution_deployment=(
+                str(execution_result.metadata.get("deployment"))
+                if execution_result.metadata.get("deployment")
+                else None
+            ),
+        )
 
     def generate(
         self,

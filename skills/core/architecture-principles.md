@@ -210,3 +210,39 @@ Every integration point should be swappable without touching the graph:
   no fallback verifier, no correctness-repair generation, and the shared two-generator-call cap.
   Rationale: fail-closed typed outcomes preserve public contracts and prevent exception-handling
   defects from becoming raw request failures.
+- `2026-07-28` — Map durable practice generation onto the existing `MockTestQuiz` assessment and
+  assessment-owned `Question` relationship without changing Amplify schemas. Keep detailed phases,
+  counters, blueprint, and bounded group leases in `MockTestQuiz.meta`; use deterministic IDs and
+  conditional writes, with DynamoDB as authority and SQS only as delivery. PatternGraph stays behind
+  a disabled no-op provider. Rationale: this supplies resumability and exact-count readiness without
+  adding a database, cache, Step Functions workflow, duplicate persistence service, or frontend
+  contract.
+- `2026-07-28` — Store practice job metadata as a compact DynamoDB document and mutate only atomic
+  document paths. Question creation and authoritative aggregate/bucket counters share a
+  transaction; the existing Question GSI is used only to prove final invariants, and a short
+  projection remains `FINALIZING`. Rationale: prevent concurrent metadata loss and false failure
+  from eventual consistency without adding a job table or orchestration service.
+- `2026-07-28` — Require practice reuse and assessment reads to use configured GSIs, validating
+  their live status/key schemas before feature enablement. Query only projected QuestionBank
+  metadata per demand bucket, batch-read shortlisted records, bind generated-question transactions
+  to unexpired group leases, and coordinate execution/lease/SQS visibility budgets. Rationale:
+  preserve the existing tables and queue while preventing scans, stale-worker commits, stuck
+  finalization, and unbounded candidate reads.
+- `2026-08-01` — Run every explicit playable practice request as an AgentCore-tracked background
+  task inside the existing runtime. The existing completion envelope returns the deterministic
+  assessment ID immediately, while the retained PracticeGenerationGraph and DynamoDB manifest stay
+  authoritative. Rationale: one runtime and one persistence path provide durable progress without
+  reintroducing SQS, Lambda workers, containers, task tables, or frontend notification services.
+- `2026-08-02` — Supersede direct ongoing `MockTestQuiz` document/transaction updates with the
+  deployed IAM-authorized `updatePracticeGenerationProgress` mutation. Retain direct DynamoDB only
+  for initial assessment create/recover/read and Question/QuestionBank access; recalculate the
+  complete manifest from persisted Questions before one group-boundary or terminal publication.
+  Register the AgentCore task before acknowledgement but start it only after conversation linkage
+  succeeds. Rationale: one validated parent-update path preserves the existing AppSync subscription
+  contract without adding infrastructure, credentials, schema fields, or a second protocol.
+- `2026-08-04` — Treat an empty structured practice-generator response as a model-execution
+  failure only when the configured completion budget is exhausted (`finish_reason=length` and the
+  reasoning budget consumed it). Advance through the existing model-registry fallback chain before
+  any practice repair branch. Rationale: fallback selection belongs to the shared ModelExecutor;
+  a usable-but-invalid question remains the only input eligible for validation repair, preserving
+  accepted questions and preventing unchanged primary-model retries.

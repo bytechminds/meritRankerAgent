@@ -99,3 +99,14 @@ class ModelExecutionConfigError(LlmOrchestrationError):
 
 class ProviderExecutionError(LlmOrchestrationError):
     """Raised when the injected ProviderExecutor fails."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: str = "unknown_provider_error",
+        attempted_aliases: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.attempted_aliases = attempted_aliases

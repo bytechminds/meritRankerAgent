@@ -420,6 +420,46 @@ print(json.dumps({{
     assert not log_path.exists()
 
 
+def test_local_logging_writes_safe_structured_events_to_a_separate_file(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "agent-runtime.log"
+    script = f"""
+import logging
+from observability.events import log_event
+from observability.logging import configure_logging
+configure_logging(
+    "INFO",
+    environment="local",
+    log_format="pretty_and_json_file",
+    file_enabled=True,
+    file_path={str(log_path)!r},
+)
+log_event(
+    "practice_failed",
+    component="practice_generation",
+    status="failed",
+    details={{"reasonCode": "SAFE_FAILURE", "prompt": "PRIVATE"}},
+)
+for handler in logging.getLogger().handlers:
+    handler.flush()
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    event_path = tmp_path / "agent-events.jsonl"
+    event = json.loads(event_path.read_text(encoding="utf-8").strip())
+
+    assert event["event"] == "practice_failed"
+    assert event["details"] == {"reasoncode": "SAFE_FAILURE"}
+    assert "PRIVATE" not in event_path.read_text(encoding="utf-8")
+
+
 def test_observed_invocation_emits_summary_and_terminal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

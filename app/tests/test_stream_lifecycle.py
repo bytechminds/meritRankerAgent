@@ -17,6 +17,7 @@ import services.doubt_solver.streaming_doubt_solver_service as streaming_module
 from schemas.doubt_solver import (
     DoubtSolverFinalResponse,
     DoubtSolverStreamEvent,
+    PracticeGenerationStartedData,
     ResponseContent,
 )
 from services.doubt_solver.markdown_replay import iter_markdown_replay_chunks
@@ -119,6 +120,20 @@ def _complete_event() -> DoubtSolverStreamEvent:
         label="Done",
         metadata={"request_id": _REQUEST_ID},
         response=response,
+    )
+
+
+def _practice_started_event() -> DoubtSolverStreamEvent:
+    return DoubtSolverStreamEvent(
+        type="practice_generation_started",
+        request_id=_REQUEST_ID,
+        stage="practice_generation_started",
+        label="Your practice test is being prepared.",
+        metadata={"request_id": _REQUEST_ID},
+        data=PracticeGenerationStartedData(
+            practice_test_id="practice-123",
+            message="Your practice test is being prepared.",
+        ),
     )
 
 
@@ -273,6 +288,138 @@ def test_close_after_complete_does_not_reclassify_as_disconnect() -> None:
     assert cancellation.reason is None
 
 
+def test_terminal_frame_commits_only_after_consumer_resumes_and_exactly_once() -> None:
+    committed: list[str] = []
+    abandoned: list[str] = []
+
+    async def consume() -> dict:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=StreamCancellation(),
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_committed=lambda event: committed.append(event.type),
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        payload = _parse_data_frame(await anext(body))
+        assert committed == []
+        with pytest.raises(StopAsyncIteration):
+            await anext(body)
+        return payload
+
+    payload = asyncio.run(consume())
+
+    assert committed == ["practice_generation_started"]
+    assert abandoned == []
+    assert payload == _practice_started_event().model_dump(mode="json", by_alias=True)
+
+
+def test_uncommitted_terminal_frame_is_abandoned_exactly_once() -> None:
+    committed: list[str] = []
+    abandoned: list[str] = []
+
+    async def close_before_commit() -> None:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=StreamCancellation(),
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_committed=lambda event: committed.append(event.type),
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        assert _parse_data_frame(await anext(body))["type"] == "practice_generation_started"
+        await body.aclose()
+
+    asyncio.run(close_before_commit())
+
+    assert committed == []
+    assert abandoned == ["practice_generation_started"]
+
+
+def test_cancelled_worker_abandons_deferred_terminal_before_queueing() -> None:
+    cancellation = StreamCancellation()
+    abandoned: list[str] = []
+    cancellation.cancel("user_cancelled")
+
+    async def consume() -> list[bytes]:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=cancellation,
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        frames = [frame async for frame in body]
+        await asyncio.sleep(0.01)
+        return frames
+
+    assert asyncio.run(consume()) == []
+    assert abandoned == ["practice_generation_started"]
+
+
+def test_cancel_after_terminal_queueing_abandons_pending_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancellation = StreamCancellation()
+    abandoned: list[str] = []
+    original_put = transport_module.queue.Queue.put
+
+    def put_then_cancel(queue_instance, item, *args, **kwargs):
+        result = original_put(queue_instance, item, *args, **kwargs)
+        if isinstance(item, DoubtSolverStreamEvent):
+            cancellation.cancel("client_disconnected")
+        return result
+
+    def start_inline(thread) -> None:
+        thread.run()
+
+    monkeypatch.setattr(transport_module.queue.Queue, "put", put_then_cancel)
+    monkeypatch.setattr(transport_module.threading.Thread, "start", start_inline)
+
+    async def consume() -> list[bytes]:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=cancellation,
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        return [frame async for frame in body]
+
+    assert asyncio.run(consume()) == []
+    assert abandoned == ["practice_generation_started"]
+
+
+def test_commit_callback_failure_emits_no_second_terminal_and_does_not_abandon(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    abandoned: list[str] = []
+
+    def fail_commit(_event: DoubtSolverStreamEvent) -> None:
+        raise RuntimeError("start failed")
+
+    async def consume() -> list[bytes]:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=StreamCancellation(),
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_committed=fail_commit,
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        return [frame async for frame in body]
+
+    with caplog.at_level(logging.ERROR):
+        frames = asyncio.run(consume())
+
+    payloads = [payload for frame in frames if (payload := _parse_data_frame(frame))]
+    assert [payload["type"] for payload in payloads] == ["practice_generation_started"]
+    assert abandoned == []
+    assert "terminal_frame_commit_callback_failed" in " ".join(
+        record.message for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("stage", ["generating", "verifying"])
 def test_heartbeat_is_sse_comment_and_stops_after_complete(stage: str) -> None:
     def source() -> Iterator[DoubtSolverStreamEvent]:
@@ -328,6 +475,67 @@ def test_serialization_failure_emits_controlled_terminal_error(
 
     assert payload["type"] == "error"
     assert payload["metadata"]["code"] == "ANSWER_SERIALIZATION_FAILED"
+
+
+def test_practice_terminal_serialization_failure_abandons_without_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = transport_module._serialize_event
+    committed: list[str] = []
+    abandoned: list[str] = []
+
+    def fail_practice(event: DoubtSolverStreamEvent) -> bytes:
+        if event.type == "practice_generation_started":
+            raise ValueError("serialization")
+        return original(event)
+
+    async def consume() -> list[bytes]:
+        body = stream_events_as_sse(
+            iter([_practice_started_event()]),
+            request_id=_REQUEST_ID,
+            cancellation=StreamCancellation(),
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_committed=lambda event: committed.append(event.type),
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        return [frame async for frame in body]
+
+    monkeypatch.setattr(transport_module, "_serialize_event", fail_practice)
+    frames = asyncio.run(consume())
+    payloads = [payload for frame in frames if (payload := _parse_data_frame(frame))]
+
+    assert [payload["type"] for payload in payloads] == ["error"]
+    assert payloads[0]["metadata"]["code"] == "ANSWER_SERIALIZATION_FAILED"
+    assert committed == []
+    assert abandoned == ["practice_generation_started"]
+
+
+def test_wrong_request_practice_terminal_abandons_original_without_commit() -> None:
+    committed: list[str] = []
+    abandoned: list[str] = []
+    wrong_request_event = _practice_started_event().model_copy(
+        update={"request_id": "wrong-request-id"}
+    )
+
+    async def consume() -> list[bytes]:
+        body = stream_events_as_sse(
+            iter([wrong_request_event]),
+            request_id=_REQUEST_ID,
+            cancellation=StreamCancellation(),
+            heartbeat_interval_seconds=0.01,
+            on_terminal_frame_committed=lambda event: committed.append(event.type),
+            on_terminal_frame_abandoned=lambda event: abandoned.append(event.type),
+        )
+        return [frame async for frame in body]
+
+    frames = asyncio.run(consume())
+    payloads = [payload for frame in frames if (payload := _parse_data_frame(frame))]
+
+    assert [payload["type"] for payload in payloads] == ["error"]
+    assert payloads[0]["request_id"] == _REQUEST_ID
+    assert payloads[0]["metadata"]["code"] == "ANSWER_STREAM_FAILED"
+    assert committed == []
+    assert abandoned == ["practice_generation_started"]
 
 
 def test_client_disconnect_cancels_worker_and_logs_reason(
@@ -524,12 +732,14 @@ def test_agentcore_invocations_preserves_event_contract(
         conversation_persistence=None,
         follow_up_resolver=None,
         conversation_understanding=None,
+        practice_launcher=None,
     ) -> Iterator[DoubtSolverStreamEvent]:
         del (
             adapter,
             conversation_persistence,
             follow_up_resolver,
             conversation_understanding,
+            practice_launcher,
         )
         response = DoubtSolverFinalResponse(
             request_id=input.request_id,

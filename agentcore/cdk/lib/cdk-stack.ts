@@ -40,6 +40,22 @@ function removeDefaultMemoryGrant(role: iam.IRole): void {
   }
 }
 
+function practiceProgressMutationArn(stack: Stack, endpoint: string): string {
+  let apiId: string;
+  try {
+    apiId = new URL(endpoint).hostname.split('.')[0] ?? '';
+  } catch {
+    throw new Error('APPSYNC_GRAPHQL_ENDPOINT must be a valid AppSync endpoint');
+  }
+  if (!/^[a-z0-9]+$/.test(apiId)) {
+    throw new Error('APPSYNC_GRAPHQL_ENDPOINT must identify an AppSync API');
+  }
+  return stack.formatArn({
+    service: 'appsync',
+    resource: `apis/${apiId}/types/Mutation/fields/updatePracticeGenerationProgress`,
+  });
+}
+
 export interface AgentCoreStackProps extends StackProps {
   /**
    * The AgentCore project specification containing agents, memories, and credentials.
@@ -57,6 +73,8 @@ export interface AgentCoreStackProps extends StackProps {
    * Credential provider ARNs from deployed state, keyed by credential name.
    */
   credentials?: Record<string, { credentialProviderArn: string; clientSecretArn?: string }>;
+  /** Explicit non-secret environment values supplied by the deployment target. */
+  runtimeEnvironment?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -72,7 +90,7 @@ export class AgentCoreStack extends Stack {
   constructor(scope: Construct, id: string, props: AgentCoreStackProps) {
     super(scope, id, props);
 
-    const { spec, deploymentEnvironment, mcpSpec, credentials } = props;
+    const { spec, deploymentEnvironment, mcpSpec, credentials, runtimeEnvironment = {} } = props;
 
     // Create AgentCoreApplication with all agents
     this.application = new AgentCoreApplication(this, 'Application', {
@@ -100,11 +118,52 @@ export class AgentCoreStack extends Stack {
       this,
       '/meritranker/agent-runtime/v1/conversation-session/table-arn'
     );
+    const examProfileTableArn = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/exam-profile/table-arn'
+    );
+    const practiceAssessmentTableArn = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/mock-test-quiz/table-arn'
+    );
+    const practiceQuestionTableArn = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/question/table-arn'
+    );
+    const practiceQuestionBankTableArn = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/question-bank/table-arn'
+    );
+    const practiceQuestionTestIndex = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/question/test-id-index-name'
+    );
+    const practiceQuestionBankCategoryIndex = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/question-bank/category-index-name'
+    );
+    const practiceQuestionBankReuseIndex = StringParameter.valueForStringParameter(
+      this,
+      '/meritranker/agent-runtime/v1/practice/question-bank/reuse-index-name'
+    );
     const ssmParameterArns = [
       'conversation-history/table-name',
       'conversation-history/table-arn',
       'conversation-session/table-name',
       'conversation-session/table-arn',
+      'exam-profile/table-name',
+      'exam-profile/table-arn',
+      'practice/resource-contract-version',
+      'practice/reuse-key-contract-version',
+      'practice/mock-test-quiz/table-name',
+      'practice/mock-test-quiz/table-arn',
+      'practice/question/table-name',
+      'practice/question/table-arn',
+      'practice/question/test-id-index-name',
+      'practice/question-bank/table-name',
+      'practice/question-bank/table-arn',
+      'practice/question-bank/category-index-name',
+      'practice/question-bank/reuse-index-name',
     ].map(resourceName =>
       this.formatArn({
         service: 'ssm',
@@ -112,7 +171,19 @@ export class AgentCoreStack extends Stack {
         resourceName: `meritranker/agent-runtime/v1/${resourceName}`,
       })
     );
+    const practiceEnabled = runtimeEnvironment.PRACTICE_GENERATION_ENABLED === 'true';
+    const practiceEndpoint = runtimeEnvironment.APPSYNC_GRAPHQL_ENDPOINT;
+    if (practiceEnabled && !practiceEndpoint) {
+      throw new Error('APPSYNC_GRAPHQL_ENDPOINT is required when practice generation is enabled');
+    }
     for (const environment of this.application.environments.values()) {
+      const runtimeResource = environment.runtime.node.findChild('Resource');
+      if (!(runtimeResource instanceof aws_bedrockagentcore.CfnRuntime)) {
+        throw new Error('AgentCore Runtime resource is unavailable');
+      }
+      for (const [name, value] of Object.entries(runtimeEnvironment)) {
+        runtimeResource.addPropertyOverride(`EnvironmentVariables.${name}`, value);
+      }
       removeDefaultMemoryGrant(environment.runtime.role);
       for (const memory of this.application.memories.values()) {
         environment.runtime.addToPolicy(
@@ -130,6 +201,12 @@ export class AgentCoreStack extends Stack {
       );
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
+          actions: ['dynamodb:Scan'],
+          resources: [examProfileTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
           actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query'],
           resources: [historyTableArn, `${historyTableArn}/index/ConversationHistoryByConversation`],
         })
@@ -140,6 +217,53 @@ export class AgentCoreStack extends Stack {
           resources: [sessionTableArn],
         })
       );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:DescribeTable'],
+          resources: [practiceAssessmentTableArn, practiceQuestionTableArn, practiceQuestionBankTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
+          resources: [practiceAssessmentTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:BatchGetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
+          resources: [practiceQuestionTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:Query'],
+          resources: [`${practiceQuestionTableArn}/index/${practiceQuestionTestIndex}`],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:BatchGetItem'],
+          resources: [practiceQuestionBankTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['dynamodb:Query'],
+          resources: [
+            `${practiceQuestionBankTableArn}/index/${practiceQuestionBankCategoryIndex}`,
+            `${practiceQuestionBankTableArn}/index/${practiceQuestionBankReuseIndex}`,
+          ],
+        })
+      );
+      if (practiceEnabled && practiceEndpoint) {
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['appsync:GraphQL'],
+            resources: [practiceProgressMutationArn(this, practiceEndpoint)],
+          })
+        );
+      }
     }
 
     // Create AgentCoreMcp if there are gateways configured

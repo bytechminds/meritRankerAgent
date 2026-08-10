@@ -16,8 +16,9 @@ This is not the final advanced tutoring system. This feature context defines the
 
 Status: **Dev deployed — bounded AgentCore Memory-first follow-up understanding and DynamoDB
 fallback are active. The exact percentage follow-up and independent-query isolation pass in Dev.
-The deployed generator remains mock, actor identity is not yet bound to a trusted runtime
-principal, and multi-account deployment remains [NOT VERIFIED].**
+The deployed generator remains mock. The Cognito-verifying SSR and IAM-signed Runtime identity chain
+is implemented locally; Sandbox role attachment and live proof remain [NOT VERIFIED] because no
+non-production Amplify Hosting branch exists. Multi-account deployment remains [NOT VERIFIED].**
 
 The four V1 planning documents are complete and implementation is done:
 
@@ -28,7 +29,39 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-07-27
+**Last updated:** 2026-08-01
+
+---
+
+## Latest Changes - Admin-Managed Exam Profiles (2026-08-07)
+
+- `exam_profile_id` is an optional preferred request field. Existing `exam_id` and `exam_stage`
+  remain unchanged and resolve by exact cached pair when a matching active profile exists.
+- The new AgentCore ExamProfile startup cache is an immutable O(1) lookup. It contributes only a
+  compact matching-section projection to generator context and falls back to the existing bundled
+  response-profile resolver when unavailable or unmatched.
+- Prompt templates, route selection, model providers, retrieval, and the existing legacy exam
+  mapping are unchanged. No per-request DynamoDB read is performed.
+
+---
+
+## Latest Changes - Trusted Cognito Actor Boundary (2026-08-01)
+
+- The existing text and image SSR proxies verify Cognito access tokens with one shared
+  `aws-jwt-verify` verifier before parsing request content.
+- Body `user_id` remains temporarily for request compatibility but is ignored. Verified Cognito
+  `sub` is the sole value sent as `request.user_id`.
+- The proxy uses AWS SDK v3 `InvokeAgentRuntimeCommand` with Amplify SSR temporary credentials and
+  a deterministic SHA-256 Runtime session ID derived from actor plus conversation. It does not send
+  the token or `runtimeUserId`.
+- `resolve_actor_id()` remains the single Python seam and returns the validated, server-inserted
+  actor. Missing or malformed `user_id` fails at the Pydantic boundary; no anonymous fallback exists.
+- Local body-actor compatibility requires an explicit development-only localhost flag. It is
+  rejected in deployed mode and emits a warning.
+- This identity change adds no schemas, persistence fields, tables, indexes, queues, authorizers,
+  GraphQL operations, or AgentCore authentication-mode changes.
+- Production activation remains blocked until the exact SSR role is attached and the full chain is
+  live-verified on a non-production Hosting branch.
 
 ---
 

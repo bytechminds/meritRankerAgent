@@ -19,6 +19,7 @@ No real provider calls. No AWS calls. No network access.
 
 from __future__ import annotations
 
+import json
 import textwrap
 import types
 from collections.abc import Iterator
@@ -27,9 +28,11 @@ from typing import Any
 
 import pytest
 
+import services.llm.orchestration.model_execution as model_execution_module
+from observability import bind_execution_context, bind_request_context
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
-from schemas.llm_routing import ModelConfig, RouteDecision
+from schemas.llm_routing import ModelConfig, RouteDecision, RouteRequest
 from services.llm.orchestration.config_registry import LlmConfigRegistry
 from services.llm.orchestration.errors import (
     LlmConfigValidationError,
@@ -40,6 +43,7 @@ from services.llm.orchestration.model_execution import (
     FakeProviderExecutor,
     RegistryBackedModelExecutor,
 )
+from services.llm.orchestration.route_resolver import resolve_route
 from services.llm.providers.azure_openai_provider import (
     AzureOpenAIProviderAdapter,
     _classify_azure_openai_error,
@@ -48,6 +52,7 @@ from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderConfigurationError,
     LlmProviderExecutionError,
+    LlmProviderResponseError,
 )
 from services.llm.providers.openai_provider import (
     OpenAIProviderAdapter,
@@ -156,6 +161,7 @@ def _messages() -> list[LlmMessage]:
 # Helper: multi-alias fake executor
 # ---------------------------------------------------------------------------
 
+
 class _AliasedFakeProviderExecutor:
     """Fake executor that raises or returns based on the model alias."""
 
@@ -190,6 +196,7 @@ class _AliasedFakeProviderExecutor:
 # ===========================================================================
 # 1. ModelConfig schema — fallback_models validation
 # ===========================================================================
+
 
 class TestModelConfigFallbackModelsSchema:
     def test_fallback_models_empty_by_default(self) -> None:
@@ -280,9 +287,11 @@ class TestModelConfigFallbackModelsSchema:
 # 2. Registry cross-validation
 # ===========================================================================
 
+
 class TestRegistryCrossValidation:
     def _yaml_with_models(self, models_section: str) -> str:
-        return textwrap.dedent("""\
+        return (
+            textwrap.dedent("""\
             version: 1
             routes:
               general:
@@ -292,7 +301,9 @@ class TestRegistryCrossValidation:
                     prompt: subjects/general_generator.md
                     temperature: 0.3
                     max_tokens: 800
-            """) + models_section + textwrap.dedent("""\
+            """)
+            + models_section
+            + textwrap.dedent("""\
             provider_profiles:
               openai_primary:
                 provider: openai
@@ -305,9 +316,11 @@ class TestRegistryCrossValidation:
               local_mock:
                 provider: mock
             """)
+        )
 
     def test_valid_azure_primary_openai_fallback_loads(self, tmp_path: Path) -> None:
-        yaml = self._yaml_with_models(textwrap.dedent("""\
+        yaml = self._yaml_with_models(
+            textwrap.dedent("""\
             models:
               primary_model:
                 provider: azure_openai
@@ -332,7 +345,8 @@ class TestRegistryCrossValidation:
                 supports_streaming: false
                 supports_thinking: false
                 timeout_seconds: 1
-            """))
+            """)
+        )
         p = tmp_path / "llm.yaml"
         p.write_text(yaml, encoding="utf-8")
         registry = LlmConfigRegistry(yaml_path=p)
@@ -341,7 +355,8 @@ class TestRegistryCrossValidation:
         assert "openai_fallback" in registry.model_map
 
     def test_unknown_fallback_alias_rejected(self, tmp_path: Path) -> None:
-        yaml = self._yaml_with_models(textwrap.dedent("""\
+        yaml = self._yaml_with_models(
+            textwrap.dedent("""\
             models:
               primary_model:
                 provider: openai
@@ -359,14 +374,16 @@ class TestRegistryCrossValidation:
                 supports_streaming: false
                 supports_thinking: false
                 timeout_seconds: 1
-            """))
+            """)
+        )
         p = tmp_path / "llm.yaml"
         p.write_text(yaml, encoding="utf-8")
         with pytest.raises(LlmConfigValidationError, match="nonexistent_alias"):
             LlmConfigRegistry(yaml_path=p)
 
     def test_self_fallback_rejected(self, tmp_path: Path) -> None:
-        yaml = self._yaml_with_models(textwrap.dedent("""\
+        yaml = self._yaml_with_models(
+            textwrap.dedent("""\
             models:
               primary_model:
                 provider: openai
@@ -384,14 +401,16 @@ class TestRegistryCrossValidation:
                 supports_streaming: false
                 supports_thinking: false
                 timeout_seconds: 1
-            """))
+            """)
+        )
         p = tmp_path / "llm.yaml"
         p.write_text(yaml, encoding="utf-8")
         with pytest.raises(LlmConfigValidationError, match="itself"):
             LlmConfigRegistry(yaml_path=p)
 
     def test_cyclic_fallback_rejected(self, tmp_path: Path) -> None:
-        yaml = self._yaml_with_models(textwrap.dedent("""\
+        yaml = self._yaml_with_models(
+            textwrap.dedent("""\
             models:
               primary_model:
                 provider: openai
@@ -418,7 +437,8 @@ class TestRegistryCrossValidation:
                 supports_streaming: false
                 supports_thinking: false
                 timeout_seconds: 1
-            """))
+            """)
+        )
         p = tmp_path / "llm.yaml"
         p.write_text(yaml, encoding="utf-8")
         with pytest.raises(LlmConfigValidationError, match="[Cc]ycl"):
@@ -431,13 +451,11 @@ class TestRegistryCrossValidation:
         route = registry.get_route("math", "generator", "default")
         assert route is not None
         assert route.model == "azure_fast"
-        assert "openai_native_fallback" not in [
-            r.model
-            for r in registry.route_map.values()
-        ]
+        assert "openai_native_fallback" not in [r.model for r in registry.route_map.values()]
 
     def test_fallback_alias_provider_profile_must_exist(self, tmp_path: Path) -> None:
-        yaml = self._yaml_with_models(textwrap.dedent("""\
+        yaml = self._yaml_with_models(
+            textwrap.dedent("""\
             models:
               primary_model:
                 provider: openai
@@ -462,7 +480,8 @@ class TestRegistryCrossValidation:
                 supports_streaming: false
                 supports_thinking: false
                 timeout_seconds: 1
-            """))
+            """)
+        )
         p = tmp_path / "llm.yaml"
         p.write_text(yaml, encoding="utf-8")
         with pytest.raises(LlmConfigValidationError, match="nonexistent_profile"):
@@ -473,7 +492,238 @@ class TestRegistryCrossValidation:
 # 3. Model execution fallback — primary fails, fallback succeeds
 # ===========================================================================
 
+
 class TestModelExecutionFallback:
+    def test_real_math_advanced_empty_response_advances_to_second_fallback(self) -> None:
+        empty_response = LlmProviderResponseError(
+            "response unavailable",
+            failure_kind="empty_answer",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={
+                "math_advanced_generator": empty_response,
+                "openai_o3": LlmProviderExecutionError(
+                    "fallback unavailable",
+                    failure_kind="provider_unavailable",
+                ),
+            },
+            return_for={"openai_gpt_5_4": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(provider_executor=fake_executor)
+        decision = resolve_route(
+            RouteRequest(
+                request_id="practice-math-fallback",
+                subject="math",
+                task_role="generator",
+                difficulty="advanced",
+                intent="practice",
+                language="english",
+            )
+        )
+
+        result = executor.execute(route_decision=decision, messages=_messages())
+
+        assert decision.model == "math_advanced_generator"
+        assert fake_executor.call_log == [
+            "math_advanced_generator",
+            "openai_o3",
+            "openai_gpt_5_4",
+        ]
+        assert result.model == "openai_gpt_5_4"
+        assert result.fallback_used is True
+
+    def test_empty_response_uses_configured_fallback_with_safe_attempt_events(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        empty_response = LlmProviderResponseError(
+            "response unavailable",
+            failure_kind="empty_answer",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": empty_response},
+            return_for={"openai_native_fallback": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        events: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            model_execution_module,
+            "log_event",
+            lambda event_name, **kwargs: events.append(
+                (event_name, dict(kwargs.get("details") or {}))
+            ),
+        )
+
+        with bind_request_context(
+            request_id="request-fallback",
+            conversation_id="conversation-fallback",
+            turn_id="turn-fallback",
+        ):
+            with bind_execution_context(
+                activity_id="practice-test-1",
+                batch_id="slot-group-001",
+                slot_ids=("slot-001",),
+            ):
+                result = executor.execute(
+                    route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                    messages=_messages(),
+                )
+
+        assert result.model == "openai_native_fallback"
+        assert fake_executor.call_log == ["azure_fast", "openai_native_fallback"]
+        attempt_events = [
+            (name, details) for name, details in events if name.startswith("generator_")
+        ]
+        assert [name for name, _details in attempt_events] == [
+            "generator_model_attempt_started",
+            "generator_model_attempt_failed",
+            "generator_fallback_selected",
+            "generator_fallback_started",
+            "generator_fallback_succeeded",
+        ]
+        for _name, details in attempt_events:
+            assert details["activityId"] == "practice-test-1"
+            assert details["batchId"] == "slot-group-001"
+            assert details["slotIds"] == "slot-001"
+            assert details["slotCount"] == 1
+            assert "Student question." not in str(details)
+
+    def test_real_reasoning_advanced_chain_completes_five_question_manifest(self) -> None:
+        exhausted = LlmProviderResponseError("response unavailable")
+        exhausted.finish_reason = "length"
+        exhausted.output_tokens = 3200
+        exhausted.reasoning_tokens = 3200
+        manifest = json.dumps(
+            {
+                "questions": [
+                    {
+                        "generation_item_id": f"reasoning-{index}",
+                        "bucket_id": "reasoning-advanced",
+                        "question": f"Reasoning question {index}?",
+                        "question_type": "mcq",
+                        "options": ["A", "B", "C", "D"],
+                        "correct_answer": "A",
+                        "solution": "Concise solution.",
+                        "subject": "reasoning",
+                        "topic": "logical_reasoning",
+                        "difficulty": "advanced",
+                    }
+                    for index in range(1, 6)
+                ]
+            }
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={
+                "reasoning_advanced_generator": exhausted,
+                "openai_o3": LlmProviderExecutionError(
+                    "fallback unavailable",
+                    failure_kind="provider_unavailable",
+                ),
+            },
+            return_for={"deepseek_v4pro": manifest},
+        )
+        executor = RegistryBackedModelExecutor(provider_executor=fake_executor)
+        decision = resolve_route(
+            RouteRequest(
+                request_id="practice-reasoning-fallback",
+                subject="reasoning",
+                task_role="generator",
+                difficulty="advanced",
+                intent="practice",
+                language="english",
+            )
+        )
+
+        result = executor.execute(route_decision=decision, messages=_messages())
+
+        assert decision.model == "reasoning_advanced_generator"
+        assert fake_executor.call_log == [
+            "reasoning_advanced_generator",
+            "openai_o3",
+            "deepseek_v4pro",
+        ]
+        assert result.model == "deepseek_v4pro"
+        assert result.fallback_used is True
+        assert len(json.loads(result.content)["questions"]) == 5
+
+    def test_safety_refusal_does_not_attempt_a_fallback(self, tmp_path: Path) -> None:
+        refusal = LlmProviderResponseError(
+            "response refused",
+            failure_kind="safety_blocked",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": refusal},
+            return_for={"openai_native_fallback": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        with pytest.raises(ProviderExecutionError) as raised:
+            executor.execute(route_decision=_route_decision(), messages=_messages())
+
+        assert raised.value.failure_kind == "safety_blocked"
+        assert fake_executor.call_log == ["azure_fast"]
+
+    def test_practice_token_exhaustion_from_empty_response_uses_configured_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        exhausted = LlmProviderResponseError("response unavailable")
+        exhausted.finish_reason = "length"
+        exhausted.output_tokens = 800
+        exhausted.reasoning_tokens = 800
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": exhausted},
+            return_for={"openai_native_fallback": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        decision = _route_decision().model_copy(update={"intent": "practice"})
+
+        result = executor.execute(route_decision=decision, messages=_messages())
+
+        assert fake_executor.call_log == ["azure_fast", "openai_native_fallback"]
+        assert result.model == "openai_native_fallback"
+        assert result.fallback_used is True
+        assert result.metadata["failure_kind"] == "output_token_exhausted"
+
+    def test_exhausted_fallback_chain_retains_attempted_aliases(self, tmp_path: Path) -> None:
+        exhausted = LlmProviderResponseError("response unavailable")
+        exhausted.finish_reason = "length"
+        exhausted.output_tokens = 800
+        exhausted.reasoning_tokens = 800
+        fallback_failure = LlmProviderExecutionError(
+            "fallback unavailable",
+            failure_kind="provider_unavailable",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={
+                "azure_fast": exhausted,
+                "openai_native_fallback": fallback_failure,
+            }
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        decision = _route_decision().model_copy(update={"intent": "practice"})
+
+        with pytest.raises(ProviderExecutionError) as raised:
+            executor.execute(route_decision=decision, messages=_messages())
+
+        assert raised.value.failure_kind == "output_token_exhausted"
+        assert raised.value.attempted_aliases == (
+            "azure_fast",
+            "openai_native_fallback",
+        )
+
     def test_primary_quota_failure_triggers_fallback(self, tmp_path: Path) -> None:
         """Azure primary raises insufficient_quota; OpenAI fallback succeeds."""
         quota_error = LlmProviderExecutionError(
@@ -575,9 +825,7 @@ class TestModelExecutionFallback:
         assert fake_executor.last_request is not None
         assert fake_executor.last_request.provider_options == {}
 
-    def test_all_fallbacks_fail_raises_provider_execution_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_all_fallbacks_fail_raises_provider_execution_error(self, tmp_path: Path) -> None:
         error = LlmProviderExecutionError(
             "quota",
             failure_kind="rate_limited",
@@ -717,6 +965,7 @@ class TestModelExecutionFallback:
 # 4. No fallback for non-eligible errors
 # ===========================================================================
 
+
 class TestNoFallbackForConfigErrors:
     def test_invalid_request_does_not_trigger_fallback(self, tmp_path: Path) -> None:
         """invalid_request is not fallback-eligible — fails immediately."""
@@ -795,11 +1044,13 @@ class TestNoFallbackForConfigErrors:
 # 5. Provider error mapping
 # ===========================================================================
 
+
 class TestOpenAIErrorMapping:
     def _make_openai_exc(self, exc_type_name: str, **kwargs: Any) -> BaseException:
         """Build a minimal fake openai exception of the given type."""
         try:
             import openai  # noqa: PLC0415
+
             exc_class = getattr(openai, exc_type_name, None)
             if exc_class is not None:
                 # Build a minimal response mock
@@ -1029,6 +1280,7 @@ class TestProviderExecutionErrorAttributes:
 # 6. max_retries=0 / retry behaviour
 # ===========================================================================
 
+
 class TestRetryBehavior:
     def test_openai_adapter_client_factory_receives_credentials(self) -> None:
         """The client_factory is called with the credentials object."""
@@ -1154,6 +1406,7 @@ class TestRetryBehavior:
 # 7. Graph _generate_node — safe answer on ProviderExecutionError
 # ===========================================================================
 
+
 class TestGenerateNodeProviderFailureHandling:
     """Test that _generate_node returns safe fallback answer on ProviderExecutionError."""
 
@@ -1197,9 +1450,7 @@ class TestGenerateNodeProviderFailureHandling:
         assert answer, "Answer must not be empty"
         answer_lower = answer.lower()
         assert (
-            "unavailable" in answer_lower
-            or "quota" in answer_lower
-            or "try again" in answer_lower
+            "unavailable" in answer_lower or "quota" in answer_lower or "try again" in answer_lower
         ), f"Expected safe fallback message, got: {answer!r}"
 
     def test_provider_failure_does_not_expose_raw_error(self) -> None:
@@ -1243,6 +1494,7 @@ class TestGenerateNodeProviderFailureHandling:
             "language",
             "exam_id",
             "exam_stage",
+            "exam_profile_id",
             "classification",
             "retrieval_context",
             "context_text",
@@ -1253,9 +1505,9 @@ class TestGenerateNodeProviderFailureHandling:
             "conversation_preparation",
             "query_classification",
             "source_modality",
-        }, (
-            f"OrchestratedDoubtSolverState fields changed: {fields}"
-        )
+            "response_type",
+            "practice_test_id",
+        }, f"OrchestratedDoubtSolverState fields changed: {fields}"
 
     def test_unexpected_error_propagates_loudly(self) -> None:
         """Non-ProviderExecutionError exceptions must propagate, not be silenced."""
@@ -1293,6 +1545,7 @@ class TestGenerateNodeProviderFailureHandling:
 # 8. ModelConfigResolver.resolve_for_alias
 # ===========================================================================
 
+
 class TestResolveForAlias:
     def test_resolve_for_alias_returns_correct_config(self, tmp_path: Path) -> None:
         resolver = _resolver(tmp_path)
@@ -1317,6 +1570,7 @@ class TestResolveForAlias:
 # ===========================================================================
 # 9. Production model registry — Azure-first aliases
 # ===========================================================================
+
 
 class TestProductionModelRegistry:
     """Verify the live model_registry.yaml has Azure-first structure."""
@@ -1415,9 +1669,7 @@ class TestProductionModelRegistry:
                 continue
             if alias in optional_blank:
                 continue
-            assert cfg.deployment, (
-                f"Azure model '{alias}' is missing the deployment field"
-            )
+            assert cfg.deployment, f"Azure model '{alias}' is missing the deployment field"
 
     def test_openai_native_fallbacks_have_model_id(self) -> None:
         registry = self._live_registry()
@@ -1431,6 +1683,7 @@ class TestProductionModelRegistry:
 # ===========================================================================
 # 10. Regression — existing paths unaffected
 # ===========================================================================
+
 
 class TestRegressionGuards:
     def test_mock_path_still_works(self, tmp_path: Path) -> None:
@@ -1469,6 +1722,7 @@ class TestRegressionGuards:
             "language",
             "exam_id",
             "exam_stage",
+            "exam_profile_id",
             "classification",
             "retrieval_context",
             "context_text",
@@ -1479,6 +1733,8 @@ class TestRegressionGuards:
             "conversation_preparation",
             "query_classification",
             "source_modality",
+            "response_type",
+            "practice_test_id",
         }
 
 

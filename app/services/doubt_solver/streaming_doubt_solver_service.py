@@ -6,9 +6,20 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from config import get_settings
+from features.practice_generation.agentcore_async import PracticeLaunchError
+from features.practice_generation.planning import (
+    PRACTICE_ASYNC_NOT_CONFIGURED,
+    decide_practice_launch,
+    practice_route_enabled,
+    resolve_practice_request,
+)
+from features.practice_generation.schemas import (
+    PracticeGenerationRequest,
+    PracticeLaunchResult,
+)
 from graphs.doubt_solver_graph import (
     _ORCHESTRATED_FALLBACK_CLASSIFICATION,
     _orchestrated_collect_context_node,
@@ -34,6 +45,7 @@ from schemas.doubt_solver import (
     CanonicalLanguage,
     DoubtSolverFinalResponse,
     DoubtSolverStreamEvent,
+    PracticeGenerationStartedData,
     ResponseContent,
 )
 from schemas.llm_usage import LLMUsageRecord
@@ -77,6 +89,19 @@ logger = logging.getLogger(__name__)
 __all__ = ["orchestrated_classify_query_with_delivery_signals"]
 
 
+class PracticeLauncher(Protocol):
+    def launch(self, request: PracticeGenerationRequest) -> PracticeLaunchResult: ...
+
+    def start(self, test_id: str, delivery_id: str | None = None) -> bool: ...
+
+    def abort(
+        self,
+        test_id: str,
+        code: str,
+        delivery_id: str | None = None,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class StreamDoubtSolverInput:
     """Safe input for orchestrated doubt solver streaming."""
@@ -97,9 +122,11 @@ class StreamDoubtSolverInput:
     classifier_fallback: bool = False
     exam_id: str | None = None
     exam_stage: str | None = None
+    exam_profile_id: str | None = None
     should_cancel: Callable[[], bool] | None = None
     cancellation_reason: Callable[[], str | None] | None = None
     request_started_logged: bool = False
+    defer_practice_start_until_committed: bool = False
     initial_llm_usage_records: tuple[LLMUsageRecord, ...] = ()
 
 
@@ -129,6 +156,7 @@ def _iter_stream_doubt_solver(
     conversation_persistence=None,
     follow_up_resolver=None,
     conversation_understanding=None,
+    practice_launcher: PracticeLauncher | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Yield live chunks only for low risk requests, otherwise replay approval."""
     request_id = input.request_id
@@ -184,6 +212,7 @@ def _iter_stream_doubt_solver(
         "language": input.language,
         "exam_id": input.exam_id,
         "exam_stage": input.exam_stage,
+        "exam_profile_id": input.exam_profile_id,
         "classification": None,
         "retrieval_context": {},
         "context_text": "",
@@ -285,8 +314,7 @@ def _iter_stream_doubt_solver(
         if input.source_modality == "image"
         else (
             "follow_up"
-            if raw_classification is not None
-            and raw_classification.relation != "NEW_QUESTION"
+            if raw_classification is not None and raw_classification.relation != "NEW_QUESTION"
             else "standalone"
         )
     )
@@ -317,9 +345,7 @@ def _iter_stream_doubt_solver(
             "classifier_source": "fallback" if classifier_fallback else "llm",
             "strong_classifier_used": careful_status_pending,
             "relation": (
-                raw_classification.relation
-                if raw_classification is not None
-                else "NEW_QUESTION"
+                raw_classification.relation if raw_classification is not None else "NEW_QUESTION"
             ),
             "action": (
                 raw_classification.requested_action
@@ -327,9 +353,7 @@ def _iter_stream_doubt_solver(
                 else "ANSWER_CURRENT"
             ),
             "selected_turn_id": (
-                raw_classification.selected_turn_id
-                if raw_classification is not None
-                else None
+                raw_classification.selected_turn_id if raw_classification is not None else None
             ),
             "confidence": classifier_confidence,
             "need_web_search": bool(classification_dict.get("need_web_search")),
@@ -359,6 +383,157 @@ def _iter_stream_doubt_solver(
         logger.debug("standalone_request_count count=1")
     elif request_type == "follow_up":
         logger.debug("follow_up_request_count count=1")
+
+    practice_decision = decide_practice_launch(query, classification_dict)
+    if practice_route_enabled() and classification_dict.get("intent") == "practice":
+        log_event(
+            "PRACTICE_LAUNCH_DECISION",
+            component="practice.routing",
+            stage="route",
+            status="eligible" if practice_decision.eligible else "ineligible",
+            details={
+                "eligible": practice_decision.eligible,
+                "reasonCode": practice_decision.reason_code,
+                "requestedArtifact": practice_decision.requested_artifact,
+            },
+        )
+    if practice_route_enabled() and practice_decision.eligible:
+        log_event(
+            "practice_request_classified",
+            component="practice.routing",
+            stage="route",
+            status="eligible",
+            details={
+                "requestedCountPresent": bool(practice_decision.requested_artifact),
+                "language": input.language,
+            },
+        )
+        if practice_launcher is None:
+            if conversation_persistence is not None:
+                conversation_persistence.record_skip(
+                    request_id=request_id,
+                    conversation_id=input.conversation_id,
+                    turn_id=input.turn_id,
+                    skip_reason="practice_agentcore_async_not_configured",
+                )
+            log_event(
+                "PRACTICE_LAUNCH_DECISION",
+                component="practice.routing",
+                stage="route",
+                status="disabled",
+                error_code=PRACTICE_ASYNC_NOT_CONFIGURED,
+            )
+            yield _error_event(
+                request_id,
+                code=PRACTICE_ASYNC_NOT_CONFIGURED,
+                retryable=False,
+            )
+            return
+        try:
+            practice_request = resolve_practice_request(
+                request_id=request_id,
+                user_id=input.actor_id,
+                conversation_id=input.conversation_id,
+                turn_id=input.turn_id,
+                query=input.original_query or input.query,
+                subject=str(classification_dict.get("subject") or "general"),
+                topic=(
+                    str(classification_dict["topic"]) if classification_dict.get("topic") else None
+                ),
+                difficulty=str(classification_dict.get("difficulty") or "default"),
+                language=input.language,
+                exam_id=input.exam_id,
+                exam_stage=input.exam_stage,
+                exam_profile_id=input.exam_profile_id,
+                source_question_reference=(
+                    raw_classification.selected_turn_id if raw_classification is not None else None
+                ),
+            )
+            launch = practice_launcher.launch(practice_request)
+        except PracticeLaunchError as exc:
+            if conversation_persistence is not None:
+                conversation_persistence.record_skip(
+                    request_id=request_id,
+                    conversation_id=input.conversation_id,
+                    turn_id=input.turn_id,
+                    skip_reason=exc.code.casefold(),
+                )
+            yield _error_event(request_id, code=exc.code, retryable=False)
+            return
+        except (TypeError, ValueError):
+            yield _error_event(
+                request_id,
+                code="INVALID_PRACTICE_REQUEST",
+                retryable=False,
+            )
+            return
+
+        final_answer = build_final_answer_result(
+            content=launch.message,
+            language=input.language,
+            quality_status="checked",
+        )
+        record_local_preview("response_type", "practice_generation")
+        record_local_preview("response", launch.message)
+        persistence_result = None
+        if conversation_persistence is not None:
+            turn = CompletedConversationTurn.now(
+                actor_id=input.actor_id,
+                conversation_id=input.conversation_id,
+                turn_id=input.turn_id,
+                original_query=input.original_query or input.query,
+                final_answer=launch.message,
+                exam_id=input.exam_id,
+                exam_stage=input.exam_stage,
+                language=input.language,
+                subject=str(classification_dict.get("subject") or "general"),
+                topic=(
+                    str(classification_dict["topic"]) if classification_dict.get("topic") else None
+                ),
+                quality_status=final_answer.quality_status,
+                was_regenerated=False,
+                response_type="practice_generation",
+                practice_test_id=launch.test_id,
+            )
+            persistence_result = conversation_persistence.persist_completed_turn(
+                turn,
+                final_answer,
+                request_id=request_id,
+            )
+        history_linked = (
+            persistence_result is not None
+            and persistence_result.history_write_status in {"succeeded", "idempotent_replay"}
+        )
+        if not history_linked:
+            practice_launcher.abort(
+                launch.test_id,
+                "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                request_id,
+            )
+            yield _error_event(
+                request_id,
+                code="PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                retryable=False,
+            )
+            return
+        if not input.defer_practice_start_until_committed:
+            try:
+                practice_launcher.start(launch.test_id, request_id)
+            except PracticeLaunchError as exc:
+                yield _error_event(request_id, code=exc.code, retryable=False)
+                return
+        yield DoubtSolverStreamEvent(
+            type="practice_generation_started",
+            request_id=request_id,
+            stage="practice_generation_started",
+            label=launch.message,
+            metadata={"request_id": request_id},
+            data=PracticeGenerationStartedData(
+                practice_test_id=launch.test_id,
+                message=launch.message,
+            ),
+        )
+        return
 
     event = emit_status(stage="thinking", reason_code="thinking")
     if event is not None:
@@ -406,13 +581,11 @@ def _iter_stream_doubt_solver(
         if raw_classification is not None
         else str(classification_dict.get("requested_action") or "ANSWER_CURRENT")
     )
-    correctness_verification_required = (
-        requires_independent_correctness_verification(
-            subject=subject,
-            difficulty=difficulty,
-            intent=intent,
-            requested_action=requested_action,
-        )
+    correctness_verification_required = requires_independent_correctness_verification(
+        subject=subject,
+        difficulty=difficulty,
+        intent=intent,
+        requested_action=requested_action,
     )
     context_text = str(state.get("context_text") or "")
     web_verified = required_web_context_verified(classification_dict, state)
@@ -432,9 +605,7 @@ def _iter_stream_doubt_solver(
             retrieval_used=retrieval_used,
             retrieval_mode=retrieval_mode,
             pattern_confidence=retrieval_context.get("confidence"),
-            pattern_candidate_conflict=bool(
-                retrieval_context.get("materialConflicts") or []
-            ),
+            pattern_candidate_conflict=bool(retrieval_context.get("materialConflicts") or []),
             provider_fallback=False,
             needs_review=correctness_verification_required,
             language=input.language,
@@ -470,34 +641,37 @@ def _iter_stream_doubt_solver(
         answer_parts: list[str] = []
         visible_answer_emitted = False
         try:
-            for chunk in adapter.generate_stream(
-                request_id=request_id,
-                query=query,
-                subject=subject,
-                intent=intent,
-                difficulty=difficulty,
-                context_text=context_text,
-                web_search_reason=(
+            stream_kwargs = {
+                "request_id": request_id,
+                "query": query,
+                "subject": subject,
+                "intent": intent,
+                "difficulty": difficulty,
+                "context_text": context_text,
+                "web_search_reason": (
                     str(classification_dict["web_search_reason"])
                     if classification_dict.get("web_search_reason")
                     else None
                 ),
-                on_before_generator_fallback=status_tracker.hook(
+                "on_before_generator_fallback": status_tracker.hook(
                     stage="generating",
                     label=LABEL_GENERATOR_FALLBACK,
                     reason_code="generator_fallback",
                 ),
-                on_before_continuation=status_tracker.hook(
+                "on_before_continuation": status_tracker.hook(
                     stage="generating",
                     label=LABEL_ANSWER_CONTINUATION,
                     reason_code="answer_continuation",
                 ),
-                verify_before_stream=False,
-                exam_id=input.exam_id,
-                exam_stage=input.exam_stage,
-                language=input.language,
-                conversation_context=conversation_context or None,
-            ):
+                "verify_before_stream": False,
+                "exam_id": input.exam_id,
+                "exam_stage": input.exam_stage,
+                "language": input.language,
+                "conversation_context": conversation_context or None,
+            }
+            if input.exam_profile_id:
+                stream_kwargs["exam_profile_id"] = input.exam_profile_id
+            for chunk in adapter.generate_stream(**stream_kwargs):
                 yield from emit_pending_statuses()
                 if _cancelled(input):
                     return
@@ -512,9 +686,7 @@ def _iter_stream_doubt_solver(
                         request_id,
                         len(chunk),
                     )
-                yield DoubtSolverStreamEvent(
-                    type="chunk", request_id=request_id, content=chunk
-                )
+                yield DoubtSolverStreamEvent(type="chunk", request_id=request_id, content=chunk)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "answer_delivery request_id=%s stage=live_stream terminal_reason=%s",
@@ -538,23 +710,26 @@ def _iter_stream_doubt_solver(
         answer = "".join(answer_parts)
     else:
         try:
-            draft = adapter.generate(
-                request_id=request_id,
-                query=query,
-                subject=subject,
-                intent=intent,
-                difficulty=difficulty,
-                context=context_text,
-                web_search_reason=(
+            generation_kwargs = {
+                "request_id": request_id,
+                "query": query,
+                "subject": subject,
+                "intent": intent,
+                "difficulty": difficulty,
+                "context": context_text,
+                "web_search_reason": (
                     str(classification_dict["web_search_reason"])
                     if classification_dict.get("web_search_reason")
                     else None
                 ),
-                exam_id=input.exam_id,
-                exam_stage=input.exam_stage,
-                language=input.language,
-                conversation_context=conversation_context or None,
-            )
+                "exam_id": input.exam_id,
+                "exam_stage": input.exam_stage,
+                "language": input.language,
+                "conversation_context": conversation_context or None,
+            }
+            if input.exam_profile_id:
+                generation_kwargs["exam_profile_id"] = input.exam_profile_id
+            draft = adapter.generate(**generation_kwargs)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "answer_delivery request_id=%s stage=private_generate terminal_reason=%s",
@@ -602,33 +777,14 @@ def _iter_stream_doubt_solver(
         if _cancelled(input):
             return
         if settings.answer_verifier_enabled and not verification.is_valid:
-            if (
-                settings.answer_verifier_max_repair_attempts == 1
-                and count_generator_calls() < 2
-            ):
+            if settings.answer_verifier_max_repair_attempts == 1 and count_generator_calls() < 2:
                 repair_attempted = True
                 logger.debug("repair_started request_id=%s stage=verifying", request_id)
                 if _cancelled(input):
                     return
                 try:
                     with bind_llm_attempt_type("repair"):
-                        draft = adapter.generate(
-                            request_id=request_id,
-                            query=query,
-                            subject=subject,
-                            intent=intent,
-                            difficulty=difficulty,
-                            context=context_text,
-                            web_search_reason=(
-                                str(classification_dict["web_search_reason"])
-                                if classification_dict.get("web_search_reason")
-                                else None
-                            ),
-                            exam_id=input.exam_id,
-                            exam_stage=input.exam_stage,
-                            language=input.language,
-                            conversation_context=conversation_context or None,
-                        )
+                        draft = adapter.generate(**generation_kwargs)
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "answer_delivery request_id=%s stage=repair terminal_reason=%s",
@@ -751,9 +907,7 @@ def _iter_stream_doubt_solver(
                     request_id,
                     len(chunk),
                 )
-                yield DoubtSolverStreamEvent(
-                    type="chunk", request_id=request_id, content=chunk
-                )
+                yield DoubtSolverStreamEvent(type="chunk", request_id=request_id, content=chunk)
         logger.debug("replay_completed request_id=%s stage=verifying", request_id)
 
     if web_verified and decision.strategy == "live_stream":
@@ -841,9 +995,7 @@ def _iter_stream_doubt_solver(
         stage="validate_quality",
         status=final_answer.quality_status,
         error_code=(
-            "QUALITY_GATE_FAILED"
-            if final_answer.quality_status == "failed_quality_gate"
-            else None
+            "QUALITY_GATE_FAILED" if final_answer.quality_status == "failed_quality_gate" else None
         ),
         details={
             "repair_attempted": repair_attempted,
@@ -899,9 +1051,7 @@ def _iter_stream_doubt_solver(
             language=input.language,
             subject=subject,
             topic=(
-                str(classification_dict.get("topic"))
-                if classification_dict.get("topic")
-                else None
+                str(classification_dict.get("topic")) if classification_dict.get("topic") else None
             ),
             quality_status=final_answer.quality_status,
             was_regenerated=final_answer.was_regenerated,
@@ -938,6 +1088,7 @@ def stream_doubt_solver(
     conversation_persistence=None,
     follow_up_resolver=None,
     conversation_understanding=None,
+    practice_launcher: PracticeLauncher | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Enforce a terminal event unless cancellation is confirmed."""
     started_at = time.monotonic()
@@ -972,6 +1123,7 @@ def stream_doubt_solver(
                     conversation_persistence=conversation_persistence,
                     follow_up_resolver=follow_up_resolver,
                     conversation_understanding=conversation_understanding,
+                    practice_launcher=practice_launcher,
                 ):
                     if _cancelled(input):
                         terminal_reason = (
@@ -996,12 +1148,20 @@ def stream_doubt_solver(
                         return
                     if event.type == "chunk":
                         visible = True
-                    elif event.type in {"complete", "error"}:
+                    elif event.type in {
+                        "complete",
+                        "error",
+                        "practice_generation_started",
+                    }:
                         terminal = True
                         terminal_reason = (
-                            str(event.metadata.get("terminal_reason") or "completed")
-                            if event.type == "complete"
-                            else str(event.metadata.get("code") or "stream_failed")
+                            "practice_generation_started"
+                            if event.type == "practice_generation_started"
+                            else (
+                                str(event.metadata.get("terminal_reason") or "completed")
+                                if event.type == "complete"
+                                else str(event.metadata.get("code") or "stream_failed")
+                            )
                         )
                     yield event
         except Exception as exc:  # noqa: BLE001
@@ -1025,11 +1185,9 @@ def stream_doubt_solver(
                 if cancelled
                 else (
                     "completed"
-                    if terminal_reason == "completed"
+                    if terminal_reason in {"completed", "practice_generation_started"}
                     else (
-                        "clarification"
-                        if terminal_reason == "clarification_required"
-                        else "failed"
+                        "clarification" if terminal_reason == "clarification_required" else "failed"
                     )
                 )
             )
@@ -1051,9 +1209,7 @@ def stream_doubt_solver(
                 duration_ms=duration_ms,
                 error_code=None if status == "completed" else terminal_reason.upper(),
                 details=(
-                    {"error_type": terminal_error_type}
-                    if terminal_error_type is not None
-                    else None
+                    {"error_type": terminal_error_type} if terminal_error_type is not None else None
                 ),
                 level=logging.ERROR if status == "failed" else logging.INFO,
             )

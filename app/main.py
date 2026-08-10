@@ -34,6 +34,8 @@ from pydantic import ValidationError
 from starlette.responses import Response, StreamingResponse
 
 from config import ConfigurationError, get_settings
+from features.practice_generation.agentcore_async import build_practice_async_launcher
+from features.practice_generation.planning import decide_practice_launch
 from graphs.demo_graph import build_demo_graph
 from graphs.doubt_solver_graph import (
     build_doubt_solver_graph,
@@ -86,6 +88,7 @@ from services.conversation.history_repository import (
 from services.conversation.runtime_config import ConversationConfigurationError
 from services.doubt_solver.actor_identity import resolve_actor_id
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
+from services.doubt_solver.exam_profile_cache import get_exam_profile_runtime
 from services.doubt_solver.exam_response_profile import (
     ExamResponseProfileConfigError,
     get_exam_response_profile_resolver,
@@ -98,6 +101,7 @@ from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
 )
+from services.llm.runtime_factory import build_model_executor
 
 # ---------------------------------------------------------------------------
 # Bootstrap — runs once when the module is imported
@@ -119,7 +123,15 @@ try:
 except ExamResponseProfileConfigError as exc:
     raise ConfigurationError(str(exc)) from exc
 
+if settings.app_env != "test":
+    # Profiles are advisory during migration.  A failed startup load preserves
+    # the existing bundled exam-response guidance rather than failing requests.
+    get_exam_profile_runtime().load()
+
 logger = logging.getLogger(__name__)
+
+# The single AgentCore application owns both doubt solving and tracked practice tasks.
+app = BedrockAgentCoreApp()
 
 conversation_persistence = None
 if settings.app_env != "test":
@@ -174,6 +186,7 @@ if settings.image_classifier_enabled:
 orchestrated_doubt_solver_graph = None
 orchestrated_adapter: AnswerGenerationAdapter | None = None
 follow_up_resolver = None
+practice_async_launcher = None
 if settings.enable_orchestrated_doubt_solver:
     from services.llm.orchestration.orchestrator import LlmOrchestrator  # noqa: PLC0415
 
@@ -194,64 +207,13 @@ if settings.enable_orchestrated_doubt_solver:
                 "mock (only for controlled internal testing — not normal production)."
             )
 
-        # Mock path — no real provider calls, no network I/O.
-        # Used when ENABLE_REAL_LLM=false (default, tests, local dev).
-        # The LlmOrchestrator still resolves routes and builds prompts
-        # (file reads only); MockModelExecutor short-circuits provider calls.
-        from services.llm.orchestration.orchestrator import (  # noqa: PLC0415
-            MockModelExecutor,
-        )
-
-        _model_executor = MockModelExecutor(
-            content=(
-                "**Final Answer:** [orchestrated-mock] Mock answer — set ENABLE_REAL_LLM=true "
-                "for a real LLM response."
-            )
-        )
-    else:
-        # Real provider chain — wired for production use.
-        from services.llm.orchestration.model_config_resolver import (  # noqa: PLC0415
-            ModelConfigResolver,
-        )
-        from services.llm.orchestration.model_execution import (  # noqa: PLC0415
-            ProviderAdapterExecutor,
-            RegistryBackedModelExecutor,
-        )
-        from services.llm.providers.provider_factory import (  # noqa: PLC0415
-            ProviderAdapterFactory,
-        )
-        from services.secrets.env_secret_resolver import EnvSecretResolver  # noqa: PLC0415
-        from services.secrets.provider_credentials import (  # noqa: PLC0415
-            ProviderCredentialResolver,
-        )
-
-        _secret_resolver = EnvSecretResolver()
-        _credential_resolver = ProviderCredentialResolver(
-            secret_resolver=_secret_resolver
-        )
-        _adapter_executor = ProviderAdapterExecutor(
-            credential_resolver=_credential_resolver,
-            provider_factory=ProviderAdapterFactory(),
-        )
-        _model_executor = RegistryBackedModelExecutor(
-            provider_executor=_adapter_executor,
-            model_config_resolver=ModelConfigResolver(),
-        )
-
-        # Preflight: block startup if any Azure deployment name is still a
-        # placeholder (YOUR_*, TODO*, REPLACE_ME*, PLACEHOLDER*).
-        # This catches misconfiguration before the first real provider call.
-        # [SECURITY] Error message includes only model alias names — no keys,
-        # endpoints, prompts, or query content.
-        from services.llm.orchestration.config_registry import (  # noqa: PLC0415
-            get_registry,
-        )
-        from services.llm.orchestration.errors import LlmConfigValidationError  # noqa: PLC0415
-
-        try:
-            get_registry().validate_real_mode_deployments()
-        except LlmConfigValidationError as _preflight_err:
-            raise ConfigurationError(str(_preflight_err)) from _preflight_err
+    _model_executor = build_model_executor(
+        settings,
+        mock_content=(
+            "**Final Answer:** [orchestrated-mock] Mock answer — set ENABLE_REAL_LLM=true "
+            "for a real LLM response."
+        ),
+    )
 
     _orchestrator = LlmOrchestrator(model_executor=_model_executor)
     from services.conversation.follow_up_query_resolver import (  # noqa: PLC0415
@@ -261,22 +223,26 @@ if settings.enable_orchestrated_doubt_solver:
     follow_up_resolver = FollowUpQueryResolver(orchestrator=_orchestrator)
     _adapter = AnswerGenerationAdapter(orchestrator=_orchestrator)
     orchestrated_adapter = _adapter
+    practice_async_launcher = build_practice_async_launcher(
+        task_tracker=app,
+        llm_orchestrator=_orchestrator,
+    )
     orchestrated_doubt_solver_graph = build_orchestrated_doubt_solver_graph(
         _adapter,
         conversation_persistence=conversation_persistence,
         follow_up_resolver=follow_up_resolver,
         conversation_understanding=conversation_understanding,
+        practice_launcher=(
+            practice_async_launcher.launch if practice_async_launcher is not None else None
+        ),
     )
     logger.info(
         "Orchestrated graph built  enable_real_llm=%s",
         settings.enable_real_llm,
     )
 
-# AgentCore application object
-app = BedrockAgentCoreApp()
-
 logger.info(
-    "Agent initialised  app_env=%s  model_provider=%s",
+    "Agent initialised app_env=%s default_model_provider=%s routing=dynamic",
     settings.app_env,
     settings.model_provider,
 )
@@ -311,7 +277,7 @@ def _load_completed_replay(
 
 
 def _replay_response(turn: CompletedConversationTurn, request_id: str) -> dict:
-    return {
+    response = {
         "schema_version": "1",
         "status": "completed",
         "success": True,
@@ -327,6 +293,10 @@ def _replay_response(turn: CompletedConversationTurn, request_id: str) -> dict:
             "classification_source": "fallback",
         },
     }
+    if turn.response_type == "practice_generation" and turn.practice_test_id:
+        response["responseType"] = turn.response_type
+        response["practiceTestId"] = turn.practice_test_id
+    return response
 
 
 def _stream_replayed_turn(
@@ -386,6 +356,8 @@ def _stream_replayed_turn(
                     content=ResponseContent(value=turn.final_answer),
                     answer=turn.final_answer,
                     final_answer=final_answer,
+                    response_type=turn.response_type,
+                    practice_test_id=turn.practice_test_id,
                 ),
             )
         finally:
@@ -397,11 +369,7 @@ def _stream_replayed_turn(
             )
             emit_request_summary()
             log_event(
-                (
-                    "request_completed"
-                    if terminal_status == "completed"
-                    else "request_cancelled"
-                ),
+                ("request_completed" if terminal_status == "completed" else "request_cancelled"),
                 component="request.lifecycle",
                 stage="complete" if terminal_status == "completed" else "cancelled",
                 status=terminal_status,
@@ -417,7 +385,23 @@ def _persist_completed_result(
     original_query: str,
     result: dict,
     request_id: str,
-) -> None:
+):
+    classification = result.get("classification") or {}
+    final_raw = result.get("final_answer")
+    practice_disabled = (
+        final_raw is not None
+        and str(final_raw.get("quality_status") or "") == "failed_quality_gate"
+        and decide_practice_launch(original_query, classification).eligible
+    )
+    if practice_disabled:
+        if conversation_persistence is not None:
+            conversation_persistence.record_skip(
+                request_id=request_id,
+                conversation_id=request.conversation_id,
+                turn_id=request.turn_id,
+                skip_reason="practice_agentcore_async_not_configured",
+            )
+        return
     if conversation_persistence is None:
         log_event(
             "conversation_persistence_skipped",
@@ -452,8 +436,10 @@ def _persist_completed_result(
         topic=(str(classification["topic"]) if classification.get("topic") else None),
         quality_status=final_answer.quality_status,
         was_regenerated=final_answer.was_regenerated,
+        response_type=result.get("response_type"),
+        practice_test_id=result.get("practice_test_id"),
     )
-    conversation_persistence.persist_completed_turn(
+    return conversation_persistence.persist_completed_turn(
         turn,
         final_answer,
         request_id=request_id,
@@ -638,9 +624,7 @@ def invoke(payload: dict) -> dict | Response:
                         "classifier_source": entry_classification.classification_source,
                         "need_web_search": entry_classification.need_web_search,
                         "web_search_reason": entry_classification.web_search_reason,
-                        "search_term_present": bool(
-                            entry_classification.web_search_query
-                        ),
+                        "search_term_present": bool(entry_classification.web_search_query),
                     },
                 )
 
@@ -676,37 +660,44 @@ def invoke(payload: dict) -> dict | Response:
                         else None
                     )
                     cancellation = StreamCancellation()
-                    events = stream_doubt_solver(
-                        StreamDoubtSolverInput(
-                            request_id=request_id,
-                            trace_id=(
-                                current_request_context().trace_id
-                                if current_request_context() is not None
-                                else None
-                            ),
-                            actor_id=actor_id,
-                            conversation_id=ds_request.conversation_id,
-                            turn_id=ds_request.turn_id,
-                            query=query,
-                            original_query=original_query,
-                            language=ds_request.language,
-                            classification=mapped_classification,
-                            source_modality=source_modality,
-                            image_confidence=image_confidence,
-                            image_uncertain=image_uncertain,
-                            classifier_confidence=classifier_confidence,
-                            classifier_fallback=classifier_fallback,
-                            exam_id=ds_request.exam_id,
-                            exam_stage=ds_request.exam_stage,
-                            should_cancel=cancellation.is_cancelled,
-                            cancellation_reason=lambda: cancellation.reason,
-                            request_started_logged=True,
-                            initial_llm_usage_records=snapshot_llm_usage_records(),
+                    stream_input = StreamDoubtSolverInput(
+                        request_id=request_id,
+                        trace_id=(
+                            current_request_context().trace_id
+                            if current_request_context() is not None
+                            else None
                         ),
-                        adapter=orchestrated_adapter,
-                        conversation_persistence=conversation_persistence,
-                        follow_up_resolver=follow_up_resolver,
-                        conversation_understanding=conversation_understanding,
+                        actor_id=actor_id,
+                        conversation_id=ds_request.conversation_id,
+                        turn_id=ds_request.turn_id,
+                        query=query,
+                        original_query=original_query,
+                        language=ds_request.language,
+                        classification=mapped_classification,
+                        source_modality=source_modality,
+                        image_confidence=image_confidence,
+                        image_uncertain=image_uncertain,
+                        classifier_confidence=classifier_confidence,
+                        classifier_fallback=classifier_fallback,
+                        exam_id=ds_request.exam_id,
+                        exam_stage=ds_request.exam_stage,
+                        exam_profile_id=ds_request.exam_profile_id,
+                        should_cancel=cancellation.is_cancelled,
+                        cancellation_reason=lambda: cancellation.reason,
+                        request_started_logged=True,
+                        defer_practice_start_until_committed=True,
+                        initial_llm_usage_records=snapshot_llm_usage_records(),
+                    )
+                    stream_kwargs = {
+                        "adapter": orchestrated_adapter,
+                        "conversation_persistence": conversation_persistence,
+                        "follow_up_resolver": follow_up_resolver,
+                        "conversation_understanding": conversation_understanding,
+                        "practice_launcher": (practice_async_launcher),
+                    }
+                    events = stream_doubt_solver(
+                        stream_input,
+                        **stream_kwargs,
                     )
                     return StreamingResponse(
                         stream_events_as_sse(
@@ -715,6 +706,27 @@ def invoke(payload: dict) -> dict | Response:
                             cancellation=cancellation,
                             heartbeat_interval_seconds=(
                                 get_settings().answer_stream_heartbeat_interval_seconds
+                            ),
+                            on_terminal_frame_committed=(
+                                lambda event: practice_async_launcher.start(
+                                    event.data.practice_test_id,
+                                    event.request_id,
+                                )
+                                if practice_async_launcher is not None
+                                and event.type == "practice_generation_started"
+                                and event.data is not None
+                                else None
+                            ),
+                            on_terminal_frame_abandoned=(
+                                lambda event: practice_async_launcher.abort(
+                                    event.data.practice_test_id,
+                                    "PRACTICE_START_EVENT_DELIVERY_FAILED",
+                                    event.request_id,
+                                )
+                                if practice_async_launcher is not None
+                                and event.type == "practice_generation_started"
+                                and event.data is not None
+                                else None
                             ),
                         ),
                         media_type="text/event-stream",
@@ -734,6 +746,7 @@ def invoke(payload: dict) -> dict | Response:
                     "language": ds_request.language,
                     "exam_id": ds_request.exam_id,
                     "exam_stage": ds_request.exam_stage,
+                    "exam_profile_id": ds_request.exam_profile_id,
                     "classification": (
                         entry_classification_result.classification
                         if entry_classification_result is not None
@@ -750,6 +763,8 @@ def invoke(payload: dict) -> dict | Response:
                     "context_text": "",
                     "answer": None,
                     "final_answer": None,
+                    "response_type": None,
+                    "practice_test_id": None,
                     "conversation_context": "",
                     "conversation_relation": None,
                     "conversation_preparation": None,
@@ -784,9 +799,7 @@ def invoke(payload: dict) -> dict | Response:
                     "checked",
                     "passed_quality_gate",
                 }
-                generation_duration_ms = int(
-                    (time.monotonic() - generation_started) * 1000
-                )
+                generation_duration_ms = int((time.monotonic() - generation_started) * 1000)
                 classification = orchestrated_result.get("classification") or {}
                 current_summary = current_request_summary()
                 resolved_request_type = (
@@ -805,9 +818,7 @@ def invoke(payload: dict) -> dict | Response:
                     subject=str(classification.get("subject") or "general"),
                     intent=str(classification.get("intent") or "explain"),
                     difficulty=str(classification.get("difficulty") or "default"),
-                    classifier_source=str(
-                        classification.get("classification_source") or "llm"
-                    ),
+                    classifier_source=str(classification.get("classification_source") or "llm"),
                     generation_route=(
                         current_summary.generation_route
                         if current_summary and current_summary.generation_route
@@ -834,22 +845,45 @@ def invoke(payload: dict) -> dict | Response:
                     stage="validate_quality",
                     status=str(final_answer.get("quality_status") or "unknown"),
                     error_code=None if accepted else "QUALITY_GATE_FAILED",
-                    details={
-                        "repair_attempted": bool(final_answer.get("was_regenerated"))
-                    },
+                    details={"repair_attempted": bool(final_answer.get("was_regenerated"))},
                 )
                 logger.debug(
                     "request_id=%s  generation_path=orchestrated_non_stream — invoke succeeded",
                     request_id,
                 )
-                _persist_completed_result(
+                persistence_result = _persist_completed_result(
                     request=ds_request,
                     actor_id=actor_id,
                     original_query=original_query,
                     result=orchestrated_result,
                     request_id=request_id,
                 )
-                return {
+                response_type = orchestrated_result.get("response_type")
+                practice_test_id = orchestrated_result.get("practice_test_id")
+                if (
+                    response_type == "practice_generation"
+                    and practice_test_id
+                    and practice_async_launcher is not None
+                ):
+                    history_linked = (
+                        persistence_result is not None
+                        and persistence_result.history_write_status
+                        in {"succeeded", "idempotent_replay"}
+                    )
+                    if not history_linked:
+                        practice_async_launcher.abort(
+                            practice_test_id,
+                            "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                            request_id,
+                        )
+                        return {
+                            "success": False,
+                            "request_id": request_id,
+                            "mode": "doubt_solver",
+                            "error": "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                        }
+                    practice_async_launcher.start(practice_test_id, request_id)
+                response = {
                     "schema_version": "1",
                     "status": "completed" if accepted else "failed",
                     "success": accepted,
@@ -862,6 +896,10 @@ def invoke(payload: dict) -> dict | Response:
                     },
                     "classification": orchestrated_result.get("classification"),
                 }
+                if response_type == "practice_generation" and practice_test_id:
+                    response["responseType"] = response_type
+                    response["practiceTestId"] = practice_test_id
+                return response
 
             # Legacy path — ENABLE_ORCHESTRATED_DOUBT_SOLVER=false (default)
             graph_input = {
@@ -875,10 +913,9 @@ def invoke(payload: dict) -> dict | Response:
                 "language": ds_request.language,
                 "exam_id": ds_request.exam_id,
                 "exam_stage": ds_request.exam_stage,
+                "exam_profile_id": ds_request.exam_profile_id,
                 "classification": (
-                    entry_classification.model_dump()
-                    if entry_classification is not None
-                    else None
+                    entry_classification.model_dump() if entry_classification is not None else None
                 ),
                 "answer": None,
                 "final_answer": None,
@@ -937,9 +974,7 @@ def invoke(payload: dict) -> dict | Response:
                 subject=str(result_classification.get("subject") or "general"),
                 intent=str(result_classification.get("intent") or "explain"),
                 difficulty=str(result_classification.get("difficulty") or "default"),
-                classifier_source=str(
-                    result_classification.get("classification_source") or "rule"
-                ),
+                classifier_source=str(result_classification.get("classification_source") or "rule"),
                 generation_route=(
                     current_summary.generation_route
                     if current_summary and current_summary.generation_route

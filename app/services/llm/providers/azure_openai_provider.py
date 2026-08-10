@@ -434,16 +434,15 @@ class AzureOpenAIProviderAdapter:
             content = self._extract_content(completion, request)
         except LlmProviderResponseError as exc:
             exc.provider_usage = usage
+            exc.finish_reason = finish_reason
+            exc.output_tokens = usage.output_tokens
+            exc.reasoning_tokens = usage.reasoning_tokens
             logger.warning(
                 "azure_openai_provider_adapter.generate  response_unavailable  "
-                "model_alias=%s  finish_reason=%s  usage_available=%s  "
-                "input_tokens=%s  output_tokens=%s  reasoning_tokens=%s",
+                "model_alias=%s  finish_reason=%s  usage_available=%s",
                 request.model_resolution.model_alias,
                 finish_reason or "none",
                 usage.available,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.reasoning_tokens,
             )
             raise
 
@@ -666,7 +665,8 @@ class AzureOpenAIProviderAdapter:
         if refusal:
             raise LlmProviderResponseError(
                 "Azure OpenAI response was refused "
-                f"(model_alias={request.model_resolution.model_alias!r})."
+                f"(model_alias={request.model_resolution.model_alias!r}).",
+                failure_kind="safety_blocked",
             )
         content = getattr(message, "content", None)
         if isinstance(content, str):

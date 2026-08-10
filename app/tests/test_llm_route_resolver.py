@@ -492,7 +492,7 @@ class TestUnsupportedTaskRole:
         self, registry: LlmConfigRegistry
     ) -> None:
         """Unsupported task_role (no routes configured) must raise LlmRouteNotFoundError."""
-        req = _request("math", "planner", "default")
+        req = _request("math", "formatter", "default")
         with pytest.raises(LlmRouteNotFoundError):
             resolve_route(req, registry)
 

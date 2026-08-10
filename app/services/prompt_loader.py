@@ -67,7 +67,9 @@ def load_prompt(prompt_name: str) -> str:
             f"Unknown prompt name {prompt_name!r}. "
             f"Allowed names: {sorted(_ALLOWED_PROMPTS)}"
         )
-    path = _PROMPTS_DIR / f"{prompt_name}.md"
+    path = (_PROMPTS_DIR / f"{prompt_name}.md").resolve()
+    if _PROMPTS_DIR.resolve() not in path.parents:
+        raise PromptLoadError("Prompt path escapes the prompt directory.")
     if not path.exists():
         raise PromptLoadError(f"Prompt file not found: {path.name}")
     return path.read_text(encoding="utf-8")

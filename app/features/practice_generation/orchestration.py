@@ -1,0 +1,2164 @@
+"""DynamoDB-backed practice-generation orchestration used by the graph."""
+
+from __future__ import annotations
+
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+from features.practice_generation.config import PracticeGenerationConfig
+from features.practice_generation.events import emit_practice_event
+from features.practice_generation.generation import (
+    QuestionGenerator,
+    QuestionVerifier,
+    build_generation_groups,
+    build_slot_generation_groups,
+    deterministic_question_id,
+    parse_partial_generation,
+    validate_final_set,
+    verification_required,
+)
+from features.practice_generation.matching import (
+    build_reuse_bucket_key,
+    build_reuse_difficulty_prefix,
+    build_slot_reuse_bucket_key,
+    match_existing_questions,
+    match_existing_questions_to_slots,
+    normalize_question_text,
+    reusable_question_from_item,
+    shortlist_reuse_candidate_ids,
+)
+from features.practice_generation.pattern_context import PatternContextProvider
+from features.practice_generation.planning import (
+    BlueprintManager,
+    BlueprintPlanningError,
+    apply_system_bucket_policy,
+    select_planner_family,
+)
+from features.practice_generation.progress import AppSyncAssessmentProgressRepository
+from features.practice_generation.repositories import (
+    AssessmentRepository,
+    PracticeRepositoryError,
+    QuestionRepository,
+)
+from features.practice_generation.schemas import (
+    DemandBucket,
+    GeneratedQuestion,
+    GenerationGroup,
+    InternalPhase,
+    PlannerSlot,
+    PracticeBlueprint,
+    PracticeGenerationRequest,
+    VerificationDecision,
+    VerificationResult,
+)
+from observability import bind_execution_context
+from services.llm.orchestration.errors import ProviderExecutionError
+from services.llm.providers.errors import FALLBACK_ELIGIBLE_FAILURE_KINDS
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SlotGenerationContext:
+    test_id: str
+    request: PracticeGenerationRequest
+    blueprint: PracticeBlueprint
+    group: GenerationGroup
+    bucket: DemandBucket
+    slots: tuple[PlannerSlot, ...]
+    excluded_texts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _VerifiedSlotQuestion:
+    slot: PlannerSlot
+    question: GeneratedQuestion
+    verification: VerificationResult
+
+
+@dataclass(frozen=True)
+class _SlotGenerationOutcome:
+    context: _SlotGenerationContext
+    accepted: tuple[_VerifiedSlotQuestion, ...]
+    unresolved_slot_ids: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    route_id: str
+    model: str
+    replacement_wave_count: int
+    terminal_rejection: bool = False
+    provider_failure_recoverable: bool = False
+    provider_failure_stage: str | None = None
+
+
+def _meta(assessment: dict[str, Any]) -> dict[str, Any]:
+    value = assessment.get("meta")
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
+    meta = _meta(assessment)
+    value = meta.get("practiceRequest")
+    if not isinstance(value, dict):
+        raise PracticeRepositoryError("PRACTICE_REQUEST_META_MISSING")
+    mixed_difficulty_requested = bool(value.get("mixedDifficultyRequested"))
+    explicit_difficulty_requested = bool(value.get("explicitDifficultyRequested"))
+    return PracticeGenerationRequest.model_validate(
+        {
+            "request_id": value.get("requestId"),
+            "user_id": assessment.get("userId"),
+            "conversation_id": value.get("conversationId"),
+            "turn_id": value.get("turnId"),
+            "original_query": (
+                value.get("querySummary")
+                or (
+                    "Mixed difficulty practice request"
+                    if mixed_difficulty_requested
+                    else "Practice generation request"
+                )
+            ),
+            "practice_type": value.get("practiceType"),
+            "requested_count": value.get("requestedCount"),
+            "accepted_count": value.get("acceptedCount"),
+            "subject": value.get("subject"),
+            "topic": value.get("topic"),
+            "difficulty": value.get("difficulty"),
+            "mixed_difficulty_requested": mixed_difficulty_requested,
+            "explicit_difficulty_requested": explicit_difficulty_requested,
+            "language": value.get("language"),
+            "exam_id": value.get("examId"),
+            "exam_stage": value.get("examStage"),
+            "exam_profile_id": value.get("examProfileId"),
+            "source_question_reference": value.get("sourceQuestionReference"),
+            "include_solutions": value.get("includeSolutions", True),
+            "assessment_title": value.get("assessmentTitle") or assessment.get("name"),
+        }
+    )
+
+
+class PracticeGenerationOrchestrator:
+    def __init__(
+        self,
+        *,
+        config: PracticeGenerationConfig,
+        assessments: AssessmentRepository,
+        progress: AppSyncAssessmentProgressRepository,
+        questions: QuestionRepository,
+        blueprint_manager: BlueprintManager,
+        generator: QuestionGenerator,
+        verifier: QuestionVerifier,
+        pattern_context: PatternContextProvider,
+    ) -> None:
+        self._config = config
+        self._assessments = assessments
+        self._progress_updates = progress
+        self._questions = questions
+        self._blueprints = blueprint_manager
+        self._generator = generator
+        self._verifier = verifier
+        self._pattern_context = pattern_context
+
+    def _mark_failed(
+        self,
+        test_id: str,
+        reason_code: str,
+        *,
+        meta_updates: dict[str, Any] | None = None,
+    ) -> None:
+        self._progress_updates.mark_failed(
+            test_id,
+            reason_code,
+            meta_updates=meta_updates,
+        )
+        emit_practice_event(
+            "practice_failed",
+            test_id=test_id,
+            status="failed",
+            details={"reasonCode": reason_code},
+            level=logging.ERROR,
+        )
+        emit_practice_event(
+            "ASSESSMENT_FAILED",
+            test_id=test_id,
+            status="failed",
+            details={"reasonCode": reason_code},
+            level=logging.ERROR,
+        )
+        emit_practice_event(
+            "practice_failed_published",
+            test_id=test_id,
+            status="failed",
+            details={"reasonCode": reason_code},
+            level=logging.ERROR,
+        )
+        emit_practice_event(
+            "practice_generation_terminal",
+            test_id=test_id,
+            status="failed",
+            details={"reasonCode": reason_code, "businessStatus": "FAILED"},
+            level=logging.ERROR,
+        )
+
+    def plan_and_fill(self, test_id: str) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None:
+            raise PracticeRepositoryError("ASSESSMENT_NOT_FOUND")
+        if assessment.get("status") in {"READY", "FAILED", "ARCHIVED"}:
+            return
+        request = _request(assessment)
+        meta = _meta(assessment)
+        blueprint_payload = meta.get("blueprint")
+        existing_groups = meta.get("generationGroups")
+        plan_meta: dict[str, Any] = {}
+        if isinstance(blueprint_payload, dict) and isinstance(existing_groups, dict):
+            return
+        if isinstance(blueprint_payload, dict):
+            blueprint = apply_system_bucket_policy(
+                PracticeBlueprint.model_validate(blueprint_payload),
+                request,
+            )
+        else:
+            emit_practice_event(
+                "BLUEPRINT_STARTED",
+                test_id=test_id,
+                status="started",
+                details={"phase": InternalPhase.PLANNING.value},
+            )
+            references = self._pattern_context.discover_catalog(request)
+            if references:
+                self._pattern_context.hydrate_context(references)
+            try:
+                plan = self._blueprints.build(request)
+            except BlueprintPlanningError as exc:
+                self._mark_failed(test_id, str(exc))
+                return
+            blueprint = plan.blueprint
+            planner_difficulty = {
+                "light": "basic",
+                "standard": "intermediate",
+                "strong": "advanced",
+            }[plan.tier]
+            planner_event_details = {
+                "reasonCode": plan.validation_reason_code or "PLANNER_SCHEMA_VALID",
+                "expectedSlotCount": request.accepted_count,
+                "actualSlotCount": plan.validation_actual_slot_count,
+                "routeId": f"{select_planner_family(request).value}.planner.{planner_difficulty}",
+                "plannerTier": plan.tier,
+                "repairAttempt": int(plan.planner_calls > 1),
+                "durationMs": plan.validation_duration_ms,
+            }
+            if plan.validation_reason_code is not None:
+                emit_practice_event(
+                    "planner_validation_failed",
+                    test_id=test_id,
+                    status="failed",
+                    details=planner_event_details,
+                    level=logging.WARNING,
+                )
+                if plan.planner_calls > 1:
+                    emit_practice_event(
+                        "planner_repair_started",
+                        test_id=test_id,
+                        status="started",
+                        details=planner_event_details,
+                    )
+            if plan.deterministic_fallback and plan.validation_reason_code is not None:
+                emit_practice_event(
+                    "planner_repair_failed",
+                    test_id=test_id,
+                    status="fallback",
+                    details=planner_event_details,
+                    level=logging.WARNING,
+                )
+            elif plan.repaired:
+                emit_practice_event(
+                    "planner_repair_completed",
+                    test_id=test_id,
+                    status="completed",
+                    details=planner_event_details,
+                )
+            plan_meta = {
+                "blueprint": blueprint.model_dump(mode="json"),
+                "plannerCalls": plan.planner_calls,
+                "plannerTier": plan.tier,
+                "plannerRepaired": plan.repaired,
+                "plannerDeterministicFallback": plan.deterministic_fallback,
+            }
+            emit_practice_event(
+                "BLUEPRINT_COMPLETED",
+                test_id=test_id,
+                status="completed",
+                details={
+                    "phase": InternalPhase.MATCHING_EXISTING.value,
+                    "plannerCalls": plan.planner_calls,
+                    "plannerTier": plan.tier,
+                    "bucketCount": len(blueprint.buckets),
+                    "repaired": plan.repaired,
+                    "deterministicFallback": plan.deterministic_fallback,
+                },
+            )
+            if plan.repaired and not plan.deterministic_fallback:
+                emit_practice_event(
+                    "BLUEPRINT_REPAIRED",
+                    test_id=test_id,
+                    status="completed",
+                    details={
+                        "plannerCalls": plan.planner_calls,
+                        "plannerTier": plan.tier,
+                    },
+                )
+
+        emit_practice_event(
+            "EXISTING_MATCH_STARTED",
+            test_id=test_id,
+            status="started",
+            details={"phase": InternalPhase.MATCHING_EXISTING.value},
+        )
+        if blueprint.schema_version == "2":
+            self._plan_and_fill_slots(
+                test_id,
+                request=request,
+                blueprint=blueprint,
+                plan_meta=plan_meta,
+            )
+            return
+        linked = self._questions.list_linked(test_id)
+        already_linked_source_ids = {
+            str(item.get("_practiceMeta", {}).get("sourceQuestionBankId") or "") for item in linked
+        }
+        selected_ids: list[str] = []
+        selected_id_set = set(already_linked_source_ids)
+        total_candidates = 0
+        for bucket in blueprint.buckets:
+            remaining_total = max(
+                self._config.question_bank_max_total_candidates - total_candidates,
+                0,
+            )
+            if remaining_total == 0:
+                emit_practice_event(
+                    "QUESTION_BANK_REUSE_LIMIT_REACHED",
+                    test_id=test_id,
+                    status="bounded",
+                    details={
+                        "bucketId": bucket.bucket_id,
+                        "reasonCode": "ASSESSMENT_CANDIDATE_LIMIT_REACHED",
+                    },
+                )
+                break
+            bucket_limit = min(
+                self._config.question_bank_max_candidates_per_bucket,
+                remaining_total,
+            )
+            reuse_bucket_key = build_reuse_bucket_key(
+                category=bucket.subject,
+                topic=bucket.topic,
+                question_type=bucket.question_type.value,
+                language=request.language,
+            )
+            emit_practice_event(
+                "QUESTION_BANK_REUSE_QUERY_STARTED",
+                test_id=test_id,
+                status="started",
+                details={
+                    "logicalTable": "QuestionBank",
+                    "logicalIndex": "QuestionBank.reuse",
+                    "bucketId": bucket.bucket_id,
+                    "pageCount": 0,
+                    "candidateCount": 0,
+                    "selectedCount": 0,
+                    "hasMorePages": False,
+                    "durationMs": 0,
+                    "consumedCapacity": None,
+                },
+            )
+            bucket_blueprint = PracticeBlueprint(
+                practice_type=blueprint.practice_type,
+                accepted_count=bucket.required_count,
+                buckets=[bucket],
+            )
+            bucket_candidates: list[dict[str, Any]] = []
+            bucket_selected: list[str] = []
+            bucket_evaluated = 0
+            page_count = 0
+            duration_ms = 0
+            consumed_capacity = 0.0
+            capacity_reported = False
+            continuation_key: dict[str, Any] | None = None
+            has_more_pages = True
+            while (
+                len(bucket_selected) < bucket.required_count
+                and page_count < self._config.question_bank_max_pages
+                and bucket_evaluated < bucket_limit
+                and total_candidates < self._config.question_bank_max_total_candidates
+                and has_more_pages
+            ):
+                page_limit = min(
+                    self._config.question_bank_query_page_size,
+                    bucket_limit - bucket_evaluated,
+                    self._config.question_bank_max_total_candidates - total_candidates,
+                )
+                query_result = self._questions.query_topic_reuse_candidates(
+                    reuse_bucket_key=reuse_bucket_key,
+                    limit=page_limit,
+                    exclusive_start_key=continuation_key,
+                )
+                evaluated = max(
+                    query_result.evaluated_count,
+                    len(query_result.items),
+                )
+                total_candidates += evaluated
+                bucket_evaluated += evaluated
+                page_count += query_result.page_count
+                duration_ms += query_result.duration_ms
+                if query_result.consumed_capacity is not None:
+                    consumed_capacity += query_result.consumed_capacity
+                    capacity_reported = True
+                bucket_candidates.extend(query_result.items)
+                bucket_selected = shortlist_reuse_candidate_ids(
+                    bucket_blueprint,
+                    tuple(bucket_candidates),
+                    requested_language=request.language,
+                    already_linked_ids=selected_id_set,
+                )
+                continuation_key = query_result.continuation_key
+                has_more_pages = query_result.has_more_pages
+                if evaluated == 0:
+                    break
+            if len(bucket_selected) < bucket.required_count:
+                fallback_remaining = min(
+                    bucket_limit - bucket_evaluated,
+                    self._config.question_bank_max_total_candidates - total_candidates,
+                )
+                if fallback_remaining > 0 and page_count < self._config.question_bank_max_pages:
+                    emit_practice_event(
+                        "QUESTION_BANK_CATEGORY_FALLBACK",
+                        test_id=test_id,
+                        status="started",
+                        details={
+                            "logicalIndex": "QuestionBank.category",
+                            "bucketId": bucket.bucket_id,
+                            "unresolvedDeficit": (bucket.required_count - len(bucket_selected)),
+                        },
+                    )
+                    continuation_key = None
+                    has_more_pages = True
+                    while (
+                        len(bucket_selected) < bucket.required_count
+                        and page_count < self._config.question_bank_max_pages
+                        and fallback_remaining > 0
+                        and has_more_pages
+                    ):
+                        page_limit = min(
+                            self._config.question_bank_query_page_size,
+                            fallback_remaining,
+                        )
+                        fallback = self._questions.query_reuse_candidates(
+                            category=bucket.subject,
+                            limit=page_limit,
+                            exclusive_start_key=continuation_key,
+                        )
+                        evaluated = max(
+                            fallback.evaluated_count,
+                            len(fallback.items),
+                        )
+                        total_candidates += evaluated
+                        bucket_evaluated += evaluated
+                        fallback_remaining -= evaluated
+                        page_count += fallback.page_count
+                        duration_ms += fallback.duration_ms
+                        if fallback.consumed_capacity is not None:
+                            consumed_capacity += fallback.consumed_capacity
+                            capacity_reported = True
+                        bucket_candidates.extend(fallback.items)
+                        bucket_selected = shortlist_reuse_candidate_ids(
+                            bucket_blueprint,
+                            tuple(bucket_candidates),
+                            requested_language=request.language,
+                            already_linked_ids=selected_id_set,
+                        )
+                        continuation_key = fallback.continuation_key
+                        has_more_pages = fallback.has_more_pages
+                        if evaluated == 0:
+                            break
+            selected_ids.extend(bucket_selected)
+            selected_id_set.update(bucket_selected)
+            emit_practice_event(
+                "QUESTION_BANK_REUSE_QUERY_COMPLETED",
+                test_id=test_id,
+                status="completed",
+                details={
+                    "logicalTable": "QuestionBank",
+                    "logicalIndex": "QuestionBank.reuse",
+                    "bucketId": bucket.bucket_id,
+                    "pageCount": page_count,
+                    "candidateCount": bucket_evaluated,
+                    "selectedCount": len(bucket_selected),
+                    "hasMorePages": has_more_pages,
+                    "durationMs": duration_ms,
+                    "consumedCapacity": (consumed_capacity if capacity_reported else None),
+                },
+            )
+        raw_candidates = self._questions.get_reuse_candidates(selected_ids)
+        candidates = [
+            candidate
+            for item in raw_candidates
+            if (
+                candidate := reusable_question_from_item(
+                    item,
+                    requested_language=request.language,
+                )
+            )
+            is not None
+        ]
+        matches = match_existing_questions(
+            blueprint,
+            candidates,
+            already_linked_ids=already_linked_source_ids,
+        )
+        accepted_reuse_ids: list[str] = []
+        for match in matches:
+            for candidate in match.selected:
+                linked_now = self._questions.link_reused(
+                    test_id=test_id,
+                    bucket_id=match.bucket.bucket_id,
+                    question=candidate,
+                )
+                if linked_now:
+                    accepted_reuse_ids.append(
+                        deterministic_question_id(
+                            test_id,
+                            source_id=candidate.question_id,
+                            bucket_id=match.bucket.bucket_id,
+                        )
+                    )
+                    emit_practice_event(
+                        "QUESTION_LINKED",
+                        test_id=test_id,
+                        status="linked",
+                        details={
+                            "bucketId": match.bucket.bucket_id,
+                            "source": "REUSED",
+                        },
+                    )
+        refreshed_meta = self._progress_updates.calculate_authoritative_meta(
+            test_id,
+            meta_updates={
+                **plan_meta,
+                "phase": InternalPhase.MATCHING_EXISTING.value,
+                "progressPercent": 5,
+                "bucketReadyCounts": {bucket.bucket_id: 0 for bucket in blueprint.buckets},
+            },
+            authoritative_question_ids=tuple(accepted_reuse_ids),
+        )
+        counts = {
+            str(key): int(value)
+            for key, value in dict(refreshed_meta.get("bucketReadyCounts") or {}).items()
+        }
+        deficits = {
+            bucket.bucket_id: max(
+                bucket.required_count - counts.get(bucket.bucket_id, 0),
+                0,
+            )
+            for bucket in blueprint.buckets
+        }
+        groups = build_generation_groups(
+            blueprint,
+            deficits,
+            group_size=self._config.generation_group_size,
+            group_max=self._config.generation_group_max,
+        )
+        generation_groups = {
+            group.group_id: {
+                "groupId": group.group_id,
+                "bucketId": group.bucket_id,
+                "requiredCount": group.required_count,
+                "tokenBudget": group.token_budget,
+                "attempt": group.attempt,
+                "state": "PENDING",
+            }
+            for group in groups
+        }
+        reused_count = int(refreshed_meta.get("reusedCount") or 0)
+        ready_count = int(refreshed_meta.get("readyQuestionCount") or 0)
+        progress = self._progress(ready_count, request.accepted_count)
+        self._progress_updates.update(
+            test_id,
+            meta_updates={
+                **plan_meta,
+                "phase": (
+                    InternalPhase.FINALIZING.value if not groups else InternalPhase.GENERATING.value
+                ),
+                "progressPercent": progress,
+                "deficits": deficits,
+                "generationGroups": generation_groups,
+            },
+            live=False,
+            recalculate_manifest=True,
+            authoritative_question_ids=tuple(accepted_reuse_ids),
+        )
+        emit_practice_event(
+            "EXISTING_MATCH_COMPLETED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "reusedCount": reused_count,
+                "deficitCount": sum(deficits.values()),
+            },
+        )
+        emit_practice_event(
+            "practice_reuse_completed",
+            test_id=test_id,
+            status="completed",
+            details={
+                "reusedCount": reused_count,
+                "deficitCount": sum(deficits.values()),
+            },
+        )
+        emit_practice_event(
+            "DEFICIT_CALCULATED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "reusedCount": reused_count,
+                "deficitCount": sum(deficits.values()),
+                "groupCount": len(groups),
+            },
+        )
+        if not groups:
+            self._finalize(test_id, request, blueprint, attempt=0)
+            return
+        for group in groups:
+            emit_practice_event(
+                "GENERATION_GROUP_CREATED",
+                test_id=test_id,
+                status="created",
+                details={
+                    "groupId": group.group_id,
+                    "bucketId": group.bucket_id,
+                    "requiredCount": group.required_count,
+                },
+            )
+
+    def _plan_and_fill_slots(
+        self,
+        test_id: str,
+        *,
+        request: PracticeGenerationRequest,
+        blueprint: PracticeBlueprint,
+        plan_meta: dict[str, Any],
+    ) -> None:
+        """Fill schema-v2 slots by exact indexed reuse, then persist exact deficits."""
+        linked = self._questions.list_linked(test_id)
+        linked_meta = [
+            item.get("_practiceMeta")
+            if isinstance(item.get("_practiceMeta"), dict)
+            else _meta({"meta": item.get("meta")})
+            for item in linked
+        ]
+        filled_slot_ids = {
+            str(value.get("slotId") or "") for value in linked_meta if value.get("slotId")
+        }
+        already_linked_source_ids = {
+            str(value.get("sourceQuestionBankId") or "")
+            for value in linked_meta
+            if value.get("sourceQuestionBankId")
+        }
+        candidate_ids: list[str] = []
+        lane_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        total_evaluated = 0
+        for slot in blueprint.slots:
+            if slot.slot_id in filled_slot_ids:
+                continue
+            reuse_key = build_slot_reuse_bucket_key(slot, language=request.language)
+            difficulty_prefix = build_reuse_difficulty_prefix(slot.difficulty.value)
+            if reuse_key is None or difficulty_prefix is None:
+                continue
+            lane = (reuse_key, difficulty_prefix)
+            if lane not in lane_cache:
+                lane_items: list[dict[str, Any]] = []
+                continuation: dict[str, Any] | None = None
+                for _page in range(self._config.question_bank_max_pages):
+                    remaining = min(
+                        self._config.question_bank_max_candidates_per_bucket,
+                        self._config.question_bank_max_total_candidates - total_evaluated,
+                    )
+                    if remaining <= 0:
+                        break
+                    result = self._questions.query_topic_reuse_candidates(
+                        reuse_bucket_key=reuse_key,
+                        difficulty_prefix=difficulty_prefix,
+                        limit=min(self._config.question_bank_query_page_size, remaining),
+                        exclusive_start_key=continuation,
+                    )
+                    lane_items.extend(result.items)
+                    evaluated = max(result.evaluated_count, len(result.items))
+                    total_evaluated += evaluated
+                    continuation = result.continuation_key
+                    if not result.has_more_pages or evaluated == 0:
+                        break
+                lane_cache[lane] = lane_items
+            for item in lane_cache[lane]:
+                question_id = str(item.get("qbId") or "")
+                if question_id and question_id not in already_linked_source_ids:
+                    candidate_ids.append(question_id)
+
+        raw_candidates = self._questions.get_reuse_candidates(
+            list(dict.fromkeys(candidate_ids))
+        )
+        candidates = [
+            candidate
+            for item in raw_candidates
+            if (
+                candidate := reusable_question_from_item(
+                    item,
+                    requested_language=request.language,
+                )
+            )
+            is not None
+        ]
+        matches = match_existing_questions_to_slots(
+            blueprint,
+            candidates,
+            requested_language=request.language,
+            already_linked_ids=already_linked_source_ids,
+        )
+        accepted_ids: list[str] = []
+        for match in matches:
+            if match.slot.slot_id in filled_slot_ids or match.selected is None:
+                continue
+            bucket = next(
+                bucket
+                for bucket in blueprint.buckets
+                if bucket.subject == match.slot.subject_id
+                and bucket.topic == match.slot.topic_id
+                and bucket.difficulty is match.slot.difficulty
+                and bucket.question_type is match.slot.question_type
+            )
+            if self._questions.link_reused(
+                test_id=test_id,
+                bucket_id=bucket.bucket_id,
+                slot_id=match.slot.slot_id,
+                question=match.selected,
+            ):
+                filled_slot_ids.add(match.slot.slot_id)
+                accepted_ids.append(
+                    deterministic_question_id(
+                        test_id,
+                        source_id=match.selected.question_id,
+                        bucket_id=bucket.bucket_id,
+                    )
+                )
+
+        deficit_slot_ids = {
+            slot.slot_id for slot in blueprint.slots if slot.slot_id not in filled_slot_ids
+        }
+        groups = build_slot_generation_groups(
+            blueprint,
+            deficit_slot_ids,
+            group_size=self._config.generation_group_size,
+            group_max=self._config.generation_group_max,
+        )
+        generation_groups = {
+            group.group_id: {
+                "groupId": group.group_id,
+                "bucketId": group.bucket_id,
+                "requiredCount": group.required_count,
+                "slotIds": list(group.slot_ids),
+                "tokenBudget": group.token_budget,
+                "attempt": 0,
+                "replacementWave": 0,
+                "state": "PENDING",
+            }
+            for group in groups
+        }
+        slot_ready_counts = {
+            slot.slot_id: int(slot.slot_id in filled_slot_ids) for slot in blueprint.slots
+        }
+        self._progress_updates.update(
+            test_id,
+            meta_updates={
+                **plan_meta,
+                "phase": (
+                    InternalPhase.FINALIZING.value
+                    if not groups
+                    else InternalPhase.GENERATING.value
+                ),
+                "progressPercent": self._progress(
+                    len(filled_slot_ids),
+                    request.accepted_count,
+                ),
+                "deficits": {slot_id: 1 for slot_id in sorted(deficit_slot_ids)},
+                "slotReadyCounts": slot_ready_counts,
+                "generationGroups": generation_groups,
+                "lastCompletedStage": "SLOT_REUSE_MATCHED",
+            },
+            live=False,
+            recalculate_manifest=True,
+            authoritative_question_ids=tuple(accepted_ids),
+        )
+        emit_practice_event(
+            "DEFICIT_CALCULATED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "reusedCount": len(filled_slot_ids),
+                "deficitCount": len(deficit_slot_ids),
+                "groupCount": len(groups),
+            },
+        )
+        if not groups:
+            self._finalize(test_id, request, blueprint, attempt=0)
+
+    def generate_group(self, test_id: str, group_id: str) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") in {"READY", "FAILED", "ARCHIVED"}:
+            return
+        request = _request(assessment)
+        claimed = self._assessments.claim_group(test_id, group_id)
+        if claimed is None:
+            return
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") != "GENERATING":
+            return
+        meta = _meta(assessment)
+        groups = deepcopy(dict(meta.get("generationGroups") or {}))
+        persisted_group = groups.get(group_id)
+        if not isinstance(persisted_group, dict) or persisted_group.get("state") != "RUNNING":
+            return
+        claimed = persisted_group
+        blueprint = apply_system_bucket_policy(
+            PracticeBlueprint.model_validate(meta.get("blueprint")),
+            request,
+        )
+        bucket_id = str(claimed.get("bucketId") or "")
+        bucket = next(
+            (value for value in blueprint.buckets if value.bucket_id == bucket_id),
+            None,
+        )
+        if bucket is None:
+            self._mark_failed(test_id, "GENERATION_BUCKET_UNKNOWN")
+            return
+        attempt = int(claimed.get("attempt") or 0)
+        attempt_stage = str(claimed.get("attemptStage") or "GROUP")
+        replacement = bool(claimed.get("replacement"))
+        current_count = int(dict(meta.get("bucketReadyCounts") or {}).get(bucket_id, 0))
+        deficit = max(bucket.required_count - current_count, 0)
+        requested = min(int(claimed.get("requiredCount") or 0), deficit)
+        if requested <= 0:
+            groups[group_id]["state"] = "COMPLETED"
+            self._update_progress(
+                test_id,
+                request,
+                meta_updates={"generationGroups": groups},
+            )
+            self._maybe_finalize(test_id, request, blueprint)
+            return
+
+        emit_practice_event(
+            "GENERATION_GROUP_STARTED",
+            test_id=test_id,
+            status="started",
+            details={
+                "groupId": group_id,
+                "bucketId": bucket_id,
+                "attempt": attempt,
+                "requiredCount": requested,
+            },
+        )
+        linked = self._questions.list_linked(test_id)
+        existing_texts = {
+            normalize_question_text(str(item.get("question") or "")) for item in linked
+        }
+        from features.practice_generation.schemas import GenerationGroup  # noqa: PLC0415
+
+        group = GenerationGroup(
+            group_id=group_id,
+            bucket_id=bucket_id,
+            required_count=requested,
+            attempt=attempt,
+        )
+        try:
+            batch = self._generator.generate(
+                request=request,
+                bucket=bucket,
+                group=group,
+                exclude_normalized_texts=tuple(sorted(existing_texts)),
+            )
+            parsed = parse_partial_generation(
+                batch.content,
+                group=group,
+                bucket=bucket,
+                existing_normalized_texts=existing_texts,
+            )
+        except ProviderExecutionError as exc:
+            reason_code = (
+                "PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED"
+                if exc.failure_kind == "output_token_exhausted"
+                else "PRACTICE_GENERATOR_PROVIDER_FAILED"
+            )
+            groups[group_id].update(
+                {
+                    "state": "FAILED",
+                    "requiredCount": requested,
+                    "attempt": attempt,
+                    "errorCode": reason_code,
+                    "attemptStage": "MODEL_FALLBACK",
+                    "lastReasonCode": reason_code,
+                    "attemptedModelAliases": list(exc.attempted_aliases),
+                }
+            )
+            emit_practice_event(
+                "practice_model_execution_failed",
+                test_id=test_id,
+                status="failed",
+                details={
+                    "groupId": group_id,
+                    "bucketId": bucket_id,
+                    "attempt": attempt,
+                    "failureClass": exc.failure_kind,
+                    "modelAlias": (
+                        exc.attempted_aliases[-1] if exc.attempted_aliases else ""
+                    ),
+                    "remainingCount": requested,
+                },
+                level=logging.WARNING,
+            )
+            self._mark_failed(
+                test_id,
+                reason_code,
+                meta_updates={"generationGroups": groups},
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "practice generation failed unexpectedly test_id=%s group_id=%s error_type=%s",
+                test_id,
+                group_id,
+                type(exc).__name__,
+            )
+            groups[group_id].update(
+                {
+                    "state": "FAILED",
+                    "requiredCount": requested,
+                    "attempt": attempt,
+                    "errorCode": "PRACTICE_GENERATION_UNEXPECTED_FAILURE",
+                    "lastReasonCode": "PRACTICE_GENERATION_UNEXPECTED_FAILURE",
+                }
+            )
+            self._mark_failed(
+                test_id,
+                "PRACTICE_GENERATION_UNEXPECTED_FAILURE",
+                meta_updates={"generationGroups": groups},
+            )
+            return
+
+        accepted_count = 0
+        accepted_question_ids: list[str] = []
+        if parsed is not None:
+            for reason_code in parsed.rejection_reason_codes:
+                emit_practice_event(
+                    "question_contract_rejected",
+                    test_id=test_id,
+                    status="rejected",
+                    details={
+                        "groupId": group_id,
+                        "bucketId": bucket_id,
+                        "reasonCode": reason_code,
+                    },
+                )
+            for index, question in enumerate(parsed.accepted):
+                emit_practice_event(
+                    "question_contract_validation",
+                    test_id=test_id,
+                    status="validated",
+                    details={
+                        "groupId": group_id,
+                        "bucketId": bucket_id,
+                        "reasonCode": "PLAYABLE",
+                    },
+                )
+                approved = True
+                reason = "STRUCTURE_VALID"
+                required_verification = verification_required(
+                    bucket,
+                    index,
+                    replacement=replacement,
+                )
+                if required_verification:
+                    try:
+                        result = self._verifier.verify(
+                            request=request,
+                            bucket=bucket,
+                            question=question,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        result = VerificationResult(
+                            generation_item_id=question.generation_item_id,
+                            approved=False,
+                            reason_code="VERIFIER_UNAVAILABLE",
+                        )
+                        logger.warning(
+                            "practice verifier unavailable test_id=%s group_id=%s error_type=%s",
+                            test_id,
+                            group_id,
+                            type(exc).__name__,
+                        )
+                    approved = result.approved
+                    reason = "VERIFIER_APPROVED" if approved else "VERIFIER_REJECTED"
+                    emit_practice_event(
+                        "QUESTION_VERIFICATION_RESULT",
+                        test_id=test_id,
+                        status="approved" if approved else "rejected",
+                        details={
+                            "groupId": group_id,
+                            "bucketId": bucket_id,
+                            "reasonCode": reason,
+                        },
+                    )
+                if approved and self._questions.link_generated(
+                    test_id=test_id,
+                    question=question,
+                    verified=True,
+                    group_id=group_id,
+                    generator_route=batch.route_id,
+                    generator_model=batch.model,
+                    verification_policy=(
+                        "MANDATORY"
+                        if replacement and bucket.subject in {"math", "reasoning"}
+                        else bucket.verification_policy.value
+                    ),
+                    verification_method=("MODEL" if required_verification else "STRUCTURAL"),
+                    language=request.language,
+                ):
+                    accepted_count += 1
+                    accepted_question_ids.append(
+                        deterministic_question_id(
+                            test_id,
+                            source_id=question.generation_item_id,
+                            bucket_id=question.bucket_id,
+                        )
+                    )
+                    emit_practice_event(
+                        "question_contract_accepted",
+                        test_id=test_id,
+                        status="accepted",
+                        details={
+                            "groupId": group_id,
+                            "bucketId": bucket_id,
+                            "reasonCode": "PLAYABLE",
+                        },
+                    )
+                    emit_practice_event(
+                        "QUESTION_LINKED",
+                        test_id=test_id,
+                        status="linked",
+                        details={
+                            "groupId": group_id,
+                            "bucketId": bucket_id,
+                            "source": "GENERATED",
+                        },
+                    )
+                    emit_practice_event(
+                        "GENERATION_ITEM_ACCEPTED",
+                        test_id=test_id,
+                        status="accepted",
+                        details={
+                            "groupId": group_id,
+                            "bucketId": bucket_id,
+                            "reasonCode": reason,
+                        },
+                    )
+                else:
+                    emit_practice_event(
+                        "GENERATION_ITEM_REJECTED",
+                        test_id=test_id,
+                        status="rejected",
+                        details={
+                            "groupId": group_id,
+                            "bucketId": bucket_id,
+                            "reasonCode": reason,
+                        },
+                    )
+
+        missing = max(requested - accepted_count, 0)
+        if missing:
+            emit_practice_event(
+                "question_repair_requested",
+                test_id=test_id,
+                status="requested",
+                details={
+                    "groupId": group_id,
+                    "bucketId": bucket_id,
+                    "reasonCode": (
+                        parsed.rejection_reason_codes[0]
+                        if parsed is not None and parsed.rejection_reason_codes
+                        else "PARTIAL_GROUP_DEFICIT"
+                    ),
+                },
+            )
+            emit_practice_event(
+                "practice_validation_repair_started",
+                test_id=test_id,
+                status="started",
+                details={
+                    "groupId": group_id,
+                    "bucketId": bucket_id,
+                    "attempt": attempt,
+                    "remainingCount": missing,
+                },
+            )
+        emit_practice_event(
+            "practice_validation_completed",
+            test_id=test_id,
+            status="completed",
+            details={
+                "groupId": group_id,
+                "acceptedCount": accepted_count,
+                "deficitCount": missing,
+            },
+        )
+        if missing:
+            if attempt_stage == "GROUP":
+                retry_group_ids: list[str] = []
+                for item_index in range(missing):
+                    retry_group_id = f"{group_id}-retry-{item_index + 1}"
+                    if retry_group_id not in groups:
+                        groups[retry_group_id] = {
+                            "groupId": retry_group_id,
+                            "bucketId": bucket_id,
+                            "requiredCount": 1,
+                            "attempt": 1,
+                            "attemptStage": "ITEM_RETRY",
+                            "itemRetryCount": 1,
+                            "replacementCount": 0,
+                            "replacement": False,
+                            "lastReasonCode": "PARTIAL_GROUP_DEFICIT",
+                            "state": "PENDING",
+                        }
+                    retry_group_ids.append(retry_group_id)
+                    emit_practice_event(
+                        "GENERATION_ITEM_RETRY",
+                        test_id=test_id,
+                        status="retry",
+                        details={
+                            "groupId": retry_group_id,
+                            "bucketId": bucket_id,
+                            "attempt": 1,
+                            "attemptStage": "ITEM_RETRY",
+                            "deficitCount": 1,
+                        },
+                    )
+                groups[group_id].update(
+                    {
+                        "state": "COMPLETED",
+                        "requiredCount": requested,
+                        "attempt": attempt,
+                        "errorCode": "PARTIAL_GROUP_DEFICIT",
+                        "attemptStage": "GROUP",
+                        "lastReasonCode": "PARTIAL_GROUP_DEFICIT",
+                    }
+                )
+                self._update_progress(
+                    test_id,
+                    request,
+                    authoritative_question_ids=tuple(accepted_question_ids),
+                    meta_updates={"generationGroups": groups},
+                )
+                return
+            if attempt_stage == "ITEM_RETRY":
+                emit_practice_event(
+                    "practice_replacement_started",
+                    test_id=test_id,
+                    status="started",
+                    details={
+                        "groupId": group_id,
+                        "bucketId": bucket_id,
+                        "attempt": 2,
+                        "remainingCount": missing,
+                    },
+                )
+                groups[group_id].update(
+                    {
+                        "state": "PENDING",
+                        "requiredCount": 1,
+                        "attempt": 2,
+                        "errorCode": "ITEM_RETRY_FAILED",
+                        "attemptStage": "REPLACEMENT",
+                        "itemRetryCount": 1,
+                        "replacementCount": 1,
+                        "replacement": True,
+                        "lastReasonCode": "ITEM_RETRY_FAILED",
+                    }
+                )
+                self._update_progress(
+                    test_id,
+                    request,
+                    authoritative_question_ids=tuple(accepted_question_ids),
+                    meta_updates={"generationGroups": groups},
+                )
+                emit_practice_event(
+                    "GENERATION_ITEM_RETRY",
+                    test_id=test_id,
+                    status="replacement",
+                    details={
+                        "groupId": group_id,
+                        "bucketId": bucket_id,
+                        "attempt": 2,
+                        "attemptStage": "REPLACEMENT",
+                        "deficitCount": 1,
+                    },
+                )
+                return
+            groups[group_id].update(
+                {
+                    "state": "FAILED",
+                    "requiredCount": missing,
+                    "attempt": attempt,
+                    "errorCode": "GENERATION_DEFICIT_EXHAUSTED",
+                    "attemptStage": "REPLACEMENT",
+                    "itemRetryCount": 1,
+                    "replacementCount": 1,
+                    "replacement": True,
+                    "lastReasonCode": "GENERATION_DEFICIT_EXHAUSTED",
+                }
+            )
+            self._mark_failed(
+                test_id,
+                "GENERATION_DEFICIT_EXHAUSTED",
+                meta_updates={"generationGroups": groups},
+            )
+            return
+        groups[group_id]["state"] = "COMPLETED"
+        self._update_progress(
+            test_id,
+            request,
+            authoritative_question_ids=tuple(accepted_question_ids),
+            meta_updates={"generationGroups": groups},
+        )
+        self._maybe_finalize(test_id, request, blueprint)
+
+    def generate_wave(self, test_id: str, group_ids: list[str]) -> None:
+        """Run at most two immutable schema-v2 workers; commit only in coordinator."""
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") != "GENERATING":
+            return
+        request = _request(assessment)
+        blueprint = apply_system_bucket_policy(
+            PracticeBlueprint.model_validate(_meta(assessment).get("blueprint")),
+            request,
+        )
+        if blueprint.schema_version != "2":
+            for group_id in group_ids[:1]:
+                self.generate_group(test_id, group_id)
+            return
+        contexts: list[_SlotGenerationContext] = []
+        selected_bucket_ids: set[str] = set()
+        queued_groups = dict(_meta(assessment).get("generationGroups") or {})
+        for group_id in list(dict.fromkeys(group_ids)):
+            if len(contexts) >= 2:
+                break
+            queued_group = queued_groups.get(group_id)
+            queued_bucket_id = (
+                str(queued_group.get("bucketId") or "")
+                if isinstance(queued_group, dict)
+                else ""
+            )
+            # Parallel prompts cannot share an exclusion snapshot. Serialize groups from
+            # one canonical bucket so their committed questions become exclusions first.
+            if not queued_bucket_id or queued_bucket_id in selected_bucket_ids:
+                continue
+            if self._progress_updates.claim_group(test_id, group_id) is None:
+                continue
+            current = self._assessments.get(test_id)
+            if current is None or current.get("status") != "GENERATING":
+                return
+            meta = _meta(current)
+            persisted = dict(meta.get("generationGroups") or {}).get(group_id)
+            if not isinstance(persisted, dict) or persisted.get("state") != "RUNNING":
+                continue
+            slot_ids = [str(value) for value in list(persisted.get("slotIds") or [])]
+            slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+            try:
+                slots = tuple(slots_by_id[slot_id] for slot_id in slot_ids)
+            except KeyError:
+                self._mark_failed(test_id, "GENERATION_SLOT_UNKNOWN")
+                return
+            if not slots:
+                self._mark_failed(test_id, "GENERATION_SLOT_MISSING")
+                return
+            bucket_id = str(persisted.get("bucketId") or "")
+            bucket = next(
+                (value for value in blueprint.buckets if value.bucket_id == bucket_id),
+                None,
+            )
+            if bucket is None:
+                self._mark_failed(test_id, "GENERATION_BUCKET_UNKNOWN")
+                return
+            linked = self._questions.list_linked(test_id)
+            excluded = tuple(
+                sorted(
+                    normalize_question_text(str(item.get("question") or ""))
+                    for item in linked
+                    if item.get("question")
+                )
+            )
+            contexts.append(
+                _SlotGenerationContext(
+                    test_id=test_id,
+                    request=request,
+                    blueprint=blueprint,
+                    group=GenerationGroup(
+                        group_id=group_id,
+                        bucket_id=bucket_id,
+                        required_count=len(slots),
+                        slot_ids=slot_ids,
+                    ),
+                    bucket=bucket,
+                    slots=slots,
+                    excluded_texts=excluded,
+                )
+            )
+            selected_bucket_ids.add(bucket_id)
+        if not contexts:
+            return
+        with ThreadPoolExecutor(
+            max_workers=min(2, len(contexts)),
+            thread_name_prefix="practice-slot-wave",
+        ) as executor:
+            outcomes = list(executor.map(self._execute_slot_group, contexts))
+        for outcome in outcomes:
+            if not self._commit_slot_outcome(outcome):
+                return
+        current = self._assessments.get(test_id)
+        if current is not None and current.get("status") == "GENERATING":
+            self._maybe_finalize(test_id, request, blueprint)
+
+    def _execute_slot_group(
+        self,
+        context: _SlotGenerationContext,
+    ) -> _SlotGenerationOutcome:
+        pending = {slot.slot_id: slot for slot in context.slots}
+        accepted: dict[str, _VerifiedSlotQuestion] = {}
+        reasons: list[str] = []
+        excluded = set(context.excluded_texts)
+        route_id = ""
+        model = ""
+        terminal = False
+        provider_failure_recoverable = False
+        provider_failure_stage: str | None = None
+        completed_wave = 0
+        replacement_wave = 0
+        while replacement_wave <= 2:
+            if not pending or terminal:
+                break
+            completed_wave = replacement_wave
+            force_regeneration = False
+            wave_slots = tuple(pending.values())
+            wave_group = context.group.model_copy(
+                update={
+                    "required_count": len(wave_slots),
+                    "attempt": replacement_wave,
+                    "slot_ids": [slot.slot_id for slot in wave_slots],
+                }
+            )
+            emit_practice_event(
+                "GENERATION_GROUP_STARTED",
+                test_id=context.test_id,
+                status="started",
+                details={
+                    "groupId": context.group.group_id,
+                    "batchId": context.group.group_id,
+                    "bucketId": context.bucket.bucket_id,
+                    "replacementWave": replacement_wave,
+                    "requiredCount": len(wave_slots),
+                    "slotCount": len(wave_slots),
+                    "slotIds": ",".join(slot.slot_id for slot in wave_slots),
+                    "routeId": wave_slots[0].generator_route_hint,
+                },
+            )
+            try:
+                with bind_execution_context(
+                    activity_id=context.test_id,
+                    batch_id=context.group.group_id,
+                    slot_ids=tuple(slot.slot_id for slot in wave_slots),
+                ):
+                    batch = self._generator.generate_slots(
+                        request=context.request,
+                        bucket=context.bucket,
+                        group=wave_group,
+                        slots=wave_slots,
+                        exclude_normalized_texts=tuple(sorted(excluded)),
+                        repair_feedback=tuple(reasons[-8:]),
+                        replacement_wave=replacement_wave,
+                    )
+                route_id = batch.route_id
+                model = batch.model
+                wave_excluded = set(excluded)
+                parsed = parse_partial_generation(
+                    batch.content,
+                    group=wave_group,
+                    bucket=context.bucket,
+                    existing_normalized_texts=wave_excluded,
+                    slots=wave_slots,
+                )
+            except ProviderExecutionError as exc:
+                provider_failure_recoverable = (
+                    exc.failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
+                )
+                reason_code = (
+                    "PRACTICE_GENERATOR_FALLBACK_EXHAUSTED"
+                    if provider_failure_recoverable
+                    else "PRACTICE_GENERATOR_PROVIDER_FAILED"
+                )
+                reasons.append(reason_code)
+                emit_practice_event(
+                    "practice_model_execution_failed",
+                    test_id=context.test_id,
+                    status="failed",
+                    details={
+                        "groupId": context.group.group_id,
+                        "batchId": context.group.group_id,
+                        "bucketId": context.bucket.bucket_id,
+                        "replacementWave": replacement_wave,
+                        "reasonCode": reason_code,
+                        "errorClass": type(exc).__name__,
+                        "errorCode": exc.failure_kind,
+                        "fallbackEligible": provider_failure_recoverable,
+                        "retryEligible": provider_failure_recoverable,
+                        "modelAlias": (
+                            exc.attempted_aliases[-1] if exc.attempted_aliases else ""
+                        ),
+                        "routeId": wave_slots[0].generator_route_hint,
+                        "slotCount": len(wave_slots),
+                        "slotIds": ",".join(slot.slot_id for slot in wave_slots),
+                    },
+                    level=logging.WARNING,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "slot generation wave failed test_id=%s group_id=%s error_type=%s",
+                    context.test_id,
+                    context.group.group_id,
+                    type(exc).__name__,
+                )
+                reasons.append("PRACTICE_GENERATION_UNEXPECTED_FAILURE")
+                emit_practice_event(
+                    "practice_model_execution_failed",
+                    test_id=context.test_id,
+                    status="failed",
+                    details={
+                        "groupId": context.group.group_id,
+                        "bucketId": context.bucket.bucket_id,
+                        "replacementWave": replacement_wave,
+                        "reasonCode": "PRACTICE_GENERATION_UNEXPECTED_FAILURE",
+                    },
+                    level=logging.WARNING,
+                )
+                break
+            for reason_code in parsed.rejection_reason_codes:
+                emit_practice_event(
+                    "question_contract_rejected",
+                    test_id=context.test_id,
+                    status="rejected",
+                    details={
+                        "groupId": context.group.group_id,
+                        "bucketId": context.bucket.bucket_id,
+                        "replacementWave": replacement_wave,
+                        "reasonCode": reason_code,
+                    },
+                )
+            reasons.extend(parsed.rejection_reason_codes)
+            for question in parsed.accepted:
+                slot = pending.get(str(question.slot_id or ""))
+                if slot is None:
+                    reasons.append("VERIFIER_SLOT_BINDING_MISMATCH")
+                    continue
+                try:
+                    verification = self._verifier.verify_slot(
+                        request=context.request,
+                        bucket=context.bucket,
+                        slot=slot,
+                        question=question,
+                    )
+                except ProviderExecutionError as exc:
+                    provider_failure_recoverable = (
+                        exc.failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
+                    )
+                    provider_failure_stage = "VERIFIER"
+                    reason_code = (
+                        "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED"
+                        if provider_failure_recoverable
+                        else "PRACTICE_VERIFIER_PROVIDER_FAILED"
+                    )
+                    reasons.append(reason_code)
+                    emit_practice_event(
+                        "practice_model_execution_failed",
+                        test_id=context.test_id,
+                        status="failed",
+                        details={
+                            "groupId": context.group.group_id,
+                            "batchId": context.group.group_id,
+                            "bucketId": context.bucket.bucket_id,
+                            "replacementWave": replacement_wave,
+                            "reasonCode": reason_code,
+                            "errorClass": type(exc).__name__,
+                            "errorCode": exc.failure_kind,
+                            "failureStage": provider_failure_stage,
+                            "fallbackEligible": provider_failure_recoverable,
+                            "retryEligible": provider_failure_recoverable,
+                            "modelAlias": (
+                                exc.attempted_aliases[-1] if exc.attempted_aliases else ""
+                            ),
+                            "slotCount": len(wave_slots),
+                            "slotIds": ",".join(
+                                candidate.slot_id for candidate in wave_slots
+                            ),
+                        },
+                        level=logging.WARNING,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "slot verifier unavailable test_id=%s group_id=%s error_type=%s",
+                        context.test_id,
+                        context.group.group_id,
+                        type(exc).__name__,
+                    )
+                    reasons.append("VERIFIER_UNAVAILABLE")
+                    emit_practice_event(
+                        "QUESTION_VERIFICATION_RESULT",
+                        test_id=context.test_id,
+                        status="rejected",
+                        details={
+                            "groupId": context.group.group_id,
+                            "bucketId": context.bucket.bucket_id,
+                            "replacementWave": replacement_wave,
+                            "reasonCode": "VERIFIER_UNAVAILABLE",
+                        },
+                    )
+                    continue
+                binding_valid = (
+                    verification.schema_version == "2"
+                    and verification.generation_item_id == question.generation_item_id
+                    and verification.slot_id == slot.slot_id
+                )
+                answer_valid = (
+                    verification.independently_solved_option_id
+                    == question.correct_option_id
+                )
+                if (
+                    binding_valid
+                    and answer_valid
+                    and verification.is_approved
+                ):
+                    accepted[slot.slot_id] = _VerifiedSlotQuestion(
+                        slot=slot,
+                        question=question,
+                        verification=verification,
+                    )
+                    excluded.add(normalize_question_text(question.question))
+                    pending.pop(slot.slot_id, None)
+                    emit_practice_event(
+                        "QUESTION_VERIFICATION_RESULT",
+                        test_id=context.test_id,
+                        status="approved",
+                        details={
+                            "groupId": context.group.group_id,
+                            "bucketId": context.bucket.bucket_id,
+                            "replacementWave": replacement_wave,
+                            "reasonCode": "VERIFIER_APPROVED",
+                        },
+                    )
+                    continue
+                reasons.extend(verification.reason_codes)
+                emit_practice_event(
+                    "QUESTION_VERIFICATION_RESULT",
+                    test_id=context.test_id,
+                    status="rejected",
+                    details={
+                        "groupId": context.group.group_id,
+                        "bucketId": context.bucket.bucket_id,
+                        "replacementWave": replacement_wave,
+                        "reasonCode": (
+                            verification.reason_codes[0]
+                            if verification.reason_codes
+                            else "VERIFIER_REJECTED"
+                        ),
+                    },
+                )
+                if verification.decision is VerificationDecision.TERMINAL_REJECTION:
+                    terminal = True
+                    break
+                if verification.decision is VerificationDecision.REGENERATE:
+                    force_regeneration = True
+            if provider_failure_stage is not None:
+                break
+            if pending and not terminal:
+                replacement_wave = 2 if force_regeneration else replacement_wave + 1
+        emit_practice_event(
+            "practice_validation_completed",
+            test_id=context.test_id,
+            status="completed",
+            details={
+                "groupId": context.group.group_id,
+                "acceptedCount": len(accepted),
+                "remainingCount": len(pending),
+                "reasonCode": reasons[-1] if reasons else "VERIFIED",
+            },
+        )
+        return _SlotGenerationOutcome(
+            context=context,
+            accepted=tuple(accepted.values()),
+            unresolved_slot_ids=tuple(pending),
+            reason_codes=tuple(dict.fromkeys(reasons)),
+            route_id=route_id,
+            model=model,
+            replacement_wave_count=completed_wave,
+            terminal_rejection=terminal,
+            provider_failure_recoverable=provider_failure_recoverable,
+            provider_failure_stage=provider_failure_stage,
+        )
+
+    def _commit_slot_outcome(self, outcome: _SlotGenerationOutcome) -> bool:
+        test_id = outcome.context.test_id
+        current = self._assessments.get(test_id)
+        if current is None or current.get("status") != "GENERATING":
+            return False
+        if outcome.terminal_rejection:
+            self._mark_failed(test_id, "VERIFIER_TERMINAL_REJECTION")
+            return False
+        meta = _meta(current)
+        groups = deepcopy(dict(meta.get("generationGroups") or {}))
+        group = groups.get(outcome.context.group.group_id)
+        if not isinstance(group, dict) or group.get("state") != "RUNNING":
+            return False
+        existing_slot_ids = {
+            str(
+                (
+                    item.get("_practiceMeta")
+                    if isinstance(item.get("_practiceMeta"), dict)
+                    else _meta({"meta": item.get("meta")})
+                ).get("slotId")
+                or ""
+            )
+            for item in self._questions.list_linked(test_id)
+        }
+        accepted_question_ids: list[str] = []
+        for verified in outcome.accepted:
+            if verified.slot.slot_id in existing_slot_ids:
+                continue
+            linked = self._questions.link_generated(
+                test_id=test_id,
+                question=verified.question,
+                verified=True,
+                group_id=outcome.context.group.group_id,
+                generator_route=outcome.route_id,
+                generator_model=outcome.model,
+                verification_policy="MANDATORY",
+                verification_method="INDEPENDENT_MODEL_V2",
+                language=outcome.context.request.language,
+            )
+            if linked:
+                existing_slot_ids.add(verified.slot.slot_id)
+                accepted_question_ids.append(
+                    deterministic_question_id(
+                        test_id,
+                        source_id=verified.slot.slot_id,
+                        bucket_id=verified.question.bucket_id,
+                    )
+                )
+        unresolved = [
+            slot_id
+            for slot_id in outcome.unresolved_slot_ids
+            if slot_id not in existing_slot_ids
+        ]
+        slot_ready_counts = dict(meta.get("slotReadyCounts") or {})
+        for slot_id in existing_slot_ids:
+            if slot_id:
+                slot_ready_counts[slot_id] = 1
+        last_reason_code = (
+            outcome.reason_codes[-1] if outcome.reason_codes else "VERIFIED"
+        )
+        group.update(
+            {
+                "replacementWave": outcome.replacement_wave_count,
+                "lastReasonCode": last_reason_code,
+                "state": "FAILED" if unresolved else "COMPLETED",
+            }
+        )
+        if unresolved:
+            provider_replacement_count = int(group.get("providerReplacementCount") or 0)
+            provider_replacement_budget = self._config.item_retry_limit
+            provider_failure_reason_code = (
+                "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED"
+                if outcome.provider_failure_stage == "VERIFIER"
+                else "PRACTICE_GENERATOR_FALLBACK_EXHAUSTED"
+            )
+            if (
+                outcome.provider_failure_recoverable
+                and provider_replacement_count < provider_replacement_budget
+            ):
+                next_provider_replacement_count = provider_replacement_count + 1
+                replacement_groups: list[dict[str, object]] = []
+                primary_replacement_slot_id = unresolved[0]
+                group.update(
+                    {
+                        "state": "PENDING",
+                        "slotIds": [primary_replacement_slot_id],
+                        "requiredCount": 1,
+                        "attempt": int(group.get("attempt") or 0) + 1,
+                        "attemptStage": "PROVIDER_REPLACEMENT",
+                        "providerReplacementCount": next_provider_replacement_count,
+                        "replacement": False,
+                        "lastReasonCode": provider_failure_reason_code,
+                    }
+                )
+                for item_index, slot_id in enumerate(unresolved[1:], start=2):
+                    replacement_group_id = (
+                        f"{outcome.context.group.group_id[:146]}"
+                        f"-p{next_provider_replacement_count}-{item_index}"
+                    )
+                    if replacement_group_id in groups:
+                        self._mark_failed(
+                            test_id,
+                            "PRACTICE_PROVIDER_REPLACEMENT_CONFLICT",
+                        )
+                        return False
+                    replacement_group = dict(group)
+                    replacement_group.update(
+                        {
+                            "groupId": replacement_group_id,
+                            "slotIds": [slot_id],
+                            "requiredCount": 1,
+                        }
+                    )
+                    groups[replacement_group_id] = replacement_group
+                    replacement_groups.append(replacement_group)
+                self._update_progress(
+                    test_id,
+                    outcome.context.request,
+                    authoritative_question_ids=tuple(accepted_question_ids),
+                    meta_updates={
+                        "generationGroups": groups,
+                        "slotReadyCounts": slot_ready_counts,
+                        "replacementWaveCount": max(
+                            int(meta.get("replacementWaveCount") or 0),
+                            outcome.replacement_wave_count,
+                        ),
+                        "lastCompletedStage": "SLOT_GROUP_PROVIDER_REPLACEMENT_SCHEDULED",
+                    },
+                )
+                emit_practice_event(
+                    "practice_provider_replacement_scheduled",
+                    test_id=test_id,
+                    status="scheduled",
+                    details={
+                        "groupId": outcome.context.group.group_id,
+                        "batchId": outcome.context.group.group_id,
+                        "slotCount": len(unresolved),
+                        "slotIds": ",".join(unresolved),
+                        "routeId": outcome.context.slots[0].generator_route_hint,
+                        "splitGroupCount": len(replacement_groups) + 1,
+                        "acceptedCount": len(existing_slot_ids),
+                        "reusedCount": int(meta.get("reusedCount") or 0),
+                        "remainingCount": len(unresolved),
+                        "attempt": next_provider_replacement_count,
+                        "reasonCode": provider_failure_reason_code,
+                    },
+                    level=logging.WARNING,
+                )
+                emit_practice_event(
+                    "DEFICIT_CALCULATED",
+                    test_id=test_id,
+                    status="recalculated",
+                    details={
+                        "reusedCount": int(meta.get("reusedCount") or 0),
+                        "acceptedCount": len(existing_slot_ids),
+                        "deficitCount": len(unresolved),
+                        "groupId": outcome.context.group.group_id,
+                    },
+                )
+                return True
+
+            if outcome.provider_failure_recoverable:
+                terminal_reason_code = "PRACTICE_REPLACEMENT_EXHAUSTED"
+            elif "STRUCTURED_PARSE_INVALID" in outcome.reason_codes:
+                terminal_reason_code = "PRACTICE_GENERATOR_OUTPUT_INVALID"
+            else:
+                terminal_reason_code = "GENERATION_DEFICIT_EXHAUSTED"
+            group.update(
+                {
+                    "state": "FAILED",
+                    "errorCode": terminal_reason_code,
+                    "lastReasonCode": terminal_reason_code,
+                }
+            )
+            self._update_progress(
+                test_id,
+                outcome.context.request,
+                authoritative_question_ids=tuple(accepted_question_ids),
+                meta_updates={
+                    "generationGroups": groups,
+                    "slotReadyCounts": slot_ready_counts,
+                    "replacementWaveCount": max(
+                        int(meta.get("replacementWaveCount") or 0),
+                        outcome.replacement_wave_count,
+                    ),
+                    "lastCompletedStage": "SLOT_GROUP_FAILED_AFTER_COMMIT",
+                },
+            )
+            self._mark_failed(
+                test_id,
+                terminal_reason_code,
+            )
+            return False
+        self._update_progress(
+            test_id,
+            outcome.context.request,
+            authoritative_question_ids=tuple(accepted_question_ids),
+            meta_updates={
+                "generationGroups": groups,
+                "slotReadyCounts": slot_ready_counts,
+                "replacementWaveCount": max(
+                    int(meta.get("replacementWaveCount") or 0),
+                    outcome.replacement_wave_count,
+                ),
+                "lastCompletedStage": "SLOT_GROUP_COMMITTED",
+            },
+        )
+        return True
+
+    def _maybe_finalize(
+        self,
+        test_id: str,
+        request: PracticeGenerationRequest,
+        blueprint: PracticeBlueprint,
+    ) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") != "GENERATING":
+            return
+        groups = _meta(assessment).get("generationGroups")
+        if isinstance(groups, dict) and any(
+            str(group.get("state")) not in {"COMPLETED"}
+            for group in groups.values()
+            if isinstance(group, dict)
+        ):
+            return
+        self._finalize(test_id, request, blueprint, attempt=0)
+
+    def _finalize(
+        self,
+        test_id: str,
+        request: PracticeGenerationRequest,
+        blueprint: PracticeBlueprint,
+        *,
+        attempt: int,
+    ) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") != "GENERATING":
+            return
+        meta = _meta(assessment)
+        groups = meta.get("generationGroups")
+        if isinstance(groups, dict) and any(
+            not isinstance(group, dict) or group.get("state") != "COMPLETED"
+            for group in groups.values()
+        ):
+            return
+        ready_count = int(meta.get("readyQuestionCount") or 0)
+        failed_count = int(meta.get("failedCount") or 0)
+        reused_count = int(meta.get("reusedCount") or 0)
+        generated_count = int(meta.get("generatedCount") or 0)
+        verified_count = int(meta.get("verifiedCount") or 0)
+        bucket_counts = {
+            str(key): int(value) for key, value in dict(meta.get("bucketReadyCounts") or {}).items()
+        }
+        counters_agree = (
+            reused_count + generated_count == ready_count
+            and verified_count == ready_count
+            and sum(bucket_counts.values()) == ready_count
+        )
+        if ready_count != request.accepted_count or failed_count != 0 or not counters_agree:
+            self._mark_failed(
+                test_id,
+                "AUTHORITATIVE_COUNTER_MISMATCH",
+            )
+            return
+        emit_practice_event(
+            "final_manifest_validation_started",
+            test_id=test_id,
+            status="started",
+            details={"acceptedCount": request.accepted_count},
+        )
+        emit_practice_event(
+            "ASSESSMENT_FINALIZING",
+            test_id=test_id,
+            status="finalizing",
+            details={
+                "readyCount": int(meta.get("readyCount") or 0),
+                "acceptedCount": request.accepted_count,
+            },
+        )
+        manifest_ids = [
+            str(question_id)
+            for question_id in list(meta.get("readyQuestionIds") or [])
+            if str(question_id)
+        ]
+        manifest_count = int(meta.get("readyCount") or 0)
+        if (
+            manifest_count != request.accepted_count
+            or len(manifest_ids) != request.accepted_count
+            or len(set(manifest_ids)) != request.accepted_count
+        ):
+            self._mark_failed(test_id, "QUESTION_MANIFEST_MISMATCH")
+            return
+        linked = self._questions.get_questions_by_ids(manifest_ids)
+        if len(linked) != request.accepted_count:
+            next_attempt = attempt + 1
+            if next_attempt < self._config.finalization_max_attempts:
+                retry_recorded = self._progress_updates.record_finalization_retry(
+                    test_id,
+                    next_attempt=next_attempt,
+                    reason_code="MANIFEST_QUESTIONS_NOT_YET_RESOLVED",
+                )
+                if not retry_recorded:
+                    return
+                return
+            self._mark_failed(
+                test_id,
+                "FINALIZATION_CONSISTENCY_TIMEOUT",
+            )
+            return
+        if any(str(item.get("testId") or "") != test_id for item in linked):
+            self._mark_failed(
+                test_id,
+                "QUESTION_MANIFEST_OWNERSHIP_MISMATCH",
+            )
+            return
+        for item in linked:
+            if "_practiceMeta" not in item:
+                item["_practiceMeta"] = _meta({"meta": item.get("meta")})
+        validation = validate_final_set(
+            blueprint=blueprint,
+            linked_questions=linked,
+            requested_language=request.language,
+        )
+        if not validation.ready:
+            emit_practice_event(
+                "final_manifest_validation_failed",
+                test_id=test_id,
+                status="failed",
+                details={"reasonCode": validation.reason_code},
+            )
+            self._mark_failed(test_id, validation.reason_code)
+            return
+        try:
+            rebalanced, correct_positions = self._questions.rebalance_answer_positions(
+                test_id,
+                linked,
+            )
+        except PracticeRepositoryError as exc:
+            self._mark_failed(test_id, str(exc))
+            return
+        revalidated = validate_final_set(
+            blueprint=blueprint,
+            linked_questions=linked,
+            requested_language=request.language,
+        )
+        if not revalidated.ready:
+            self._mark_failed(test_id, revalidated.reason_code)
+            return
+        emit_practice_event(
+            (
+                "practice_answer_distribution_rebalanced"
+                if rebalanced
+                else "practice_answer_distribution_validated"
+            ),
+            test_id=test_id,
+            status="completed",
+            details={
+                "questionCount": len(linked),
+                **{
+                    f"correctPosition{position}Count": correct_positions.count(position)
+                    for position in range(4)
+                },
+            },
+        )
+        self._questions.assign_positions(linked)
+        reused_count, generated_count = self._source_counts(linked)
+        ready_updated = self._progress_updates.mark_ready(
+            test_id,
+            request.accepted_count,
+            {
+                "phase": InternalPhase.READY.value,
+                "playable": True,
+                "progressPercent": 100,
+                "readyQuestionCount": request.accepted_count,
+                "readyCount": request.accepted_count,
+                "verifiedCount": request.accepted_count,
+                "reusedCount": reused_count,
+                "generatedCount": generated_count,
+                "readyAt": datetime.now(UTC).isoformat(),
+                "errorCode": None,
+            },
+        )
+        if not ready_updated:
+            return
+        emit_practice_event(
+            "final_manifest_playable",
+            test_id=test_id,
+            status="ready",
+            details={"acceptedCount": request.accepted_count},
+        )
+        emit_practice_event(
+            "practice_ready",
+            test_id=test_id,
+            status="ready",
+            details={
+                "acceptedCount": request.accepted_count,
+                "reusedCount": reused_count,
+                "generatedCount": generated_count,
+            },
+        )
+        emit_practice_event(
+            "practice_ready_published",
+            test_id=test_id,
+            status="ready",
+            details={
+                "acceptedCount": request.accepted_count,
+                "businessStatus": "READY",
+            },
+        )
+        emit_practice_event(
+            "practice_generation_terminal",
+            test_id=test_id,
+            status="ready",
+            details={
+                "acceptedCount": request.accepted_count,
+                "businessStatus": "READY",
+            },
+        )
+        emit_practice_event(
+            "ASSESSMENT_READY",
+            test_id=test_id,
+            status="ready",
+            details={
+                "acceptedCount": request.accepted_count,
+                "reusedCount": reused_count,
+                "generatedCount": generated_count,
+                "verifiedCount": request.accepted_count,
+            },
+        )
+
+    def _update_progress(
+        self,
+        test_id: str,
+        request: PracticeGenerationRequest,
+        *,
+        authoritative_question_ids: tuple[str, ...] = (),
+        meta_updates: dict[str, Any] | None = None,
+    ) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None:
+            raise PracticeRepositoryError("ASSESSMENT_NOT_FOUND")
+        meta = _meta(assessment)
+        ready_count = int(meta.get("readyQuestionCount") or 0)
+        manifest_count = int(meta.get("readyCount") or 0)
+        progress = self._progress(ready_count, request.accepted_count)
+        self._progress_updates.update(
+            test_id,
+            meta_updates={
+                **(meta_updates or {}),
+                "phase": InternalPhase.GENERATING.value,
+                "progressPercent": progress,
+            },
+            live=False,
+            recalculate_manifest=True,
+            authoritative_question_ids=authoritative_question_ids,
+        )
+        emit_practice_event(
+            "practice_manifest_updated",
+            test_id=test_id,
+            status="updated",
+            details={
+                "readyCount": manifest_count,
+                "acceptedCount": request.accepted_count,
+            },
+        )
+        emit_practice_event(
+            "QUESTION_MANIFEST_UPDATED",
+            test_id=test_id,
+            status="updated",
+            details={
+                "readyCount": manifest_count,
+                "acceptedCount": request.accepted_count,
+            },
+        )
+        emit_practice_event(
+            "ASSESSMENT_PROGRESS",
+            test_id=test_id,
+            status="generating",
+            details={
+                "readyQuestionCount": ready_count,
+                "acceptedCount": request.accepted_count,
+                "progressPercent": progress,
+            },
+        )
+        emit_practice_event(
+            "practice_generation_progress",
+            test_id=test_id,
+            status="generating",
+            details={
+                "readyQuestionCount": ready_count,
+                "acceptedCount": request.accepted_count,
+                "progressPercent": progress,
+            },
+        )
+
+    @staticmethod
+    def _bucket_counts(linked: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in linked:
+            bucket_id = str(item.get("_practiceMeta", {}).get("bucketId") or "")
+            if bucket_id:
+                counts[bucket_id] = counts.get(bucket_id, 0) + 1
+        return counts
+
+    @staticmethod
+    def _source_counts(linked: list[dict[str, Any]]) -> tuple[int, int]:
+        reused = sum(
+            1 for item in linked if item.get("_practiceMeta", {}).get("source") == "REUSED"
+        )
+        generated = sum(
+            1 for item in linked if item.get("_practiceMeta", {}).get("source") == "GENERATED"
+        )
+        return reused, generated
+
+    @staticmethod
+    def _progress(ready: int, accepted: int) -> int:
+        if ready <= 0:
+            return 10
+        return min(95, 10 + int(85 * ready / accepted))
+
+    def finalize(self, test_id: str, *, attempt: int) -> None:
+        assessment = self._assessments.get(test_id)
+        if assessment is None or assessment.get("status") != "GENERATING":
+            return
+        request = _request(assessment)
+        blueprint = apply_system_bucket_policy(
+            PracticeBlueprint.model_validate(_meta(assessment).get("blueprint")),
+            request,
+        )
+        self._finalize(test_id, request, blueprint, attempt=attempt)

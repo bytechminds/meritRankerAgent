@@ -9,6 +9,7 @@ dependencies = [
     "bedrock-agentcore",
     "boto3>=1.26",
     "google-genai>=2.14.0",
+    "httpx>=0.28",
     "langgraph>=0.2",
     "openai>=2.38.0",
     "pillow>=12.3.0",

@@ -149,7 +149,7 @@ def test_verifier_route_has_reasoning_and_json_output_budget() -> None:
     )
 
     assert route.model == "openai_o4_mini"
-    assert route.max_tokens == 3000
+    assert route.max_tokens == 5000
     assert route.provider_options == {"reasoning_effort": "medium"}
     assert route.fallback_attempts == []
 

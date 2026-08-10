@@ -44,6 +44,10 @@ from pydantic import BaseModel, ValidationError
 
 from schemas.llm import LlmMessage
 from schemas.llm_routing import RouteDecision
+from services.doubt_solver.exam_profile_cache import (
+    AgentExamContext,
+    ExamProfileResolution,
+)
 from services.llm_orchestration.errors import (
     PromptNotFoundError,
     PromptPathError,
@@ -92,6 +96,38 @@ def _write(tmp_path: Path, rel_path: str, content: str) -> None:
     full.write_text(content, encoding="utf-8")
 
 
+class _ExamProfileRuntime:
+    def resolve(self, **_: object) -> ExamProfileResolution:
+        return ExamProfileResolution(
+            context=AgentExamContext(
+                exam_profile_id="CAT#2026",
+                exam_id="CAT",
+                exam_name="CAT 2026",
+                stage="2026",
+                description="Admin-managed context.",
+                sections=(
+                    {
+                        "sectionId": "QA",
+                        "subject": "MATH",
+                        "level": "ADVANCED",
+                        "questionStyles": ("mcq",),
+                        "excludeTopics": (),
+                    },
+                ),
+                totals=None,
+            ),
+            source="dynamodb_cache",
+            reason=None,
+            cache_hit=True,
+            duration_us=1,
+        )
+
+
+class _LegacyExamProfileResolver:
+    def resolve(self, *_: object, **__: object) -> object:
+        raise AssertionError("legacy resolver must not run after a cache hit")
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -127,6 +163,40 @@ def test_system_message_contains_main_content(tmp_path: Path) -> None:
     resolver = PromptResolver(prompt_root=tmp_path)
     msgs = resolver.resolve(_make_route("main.md"), query="q")
     assert "My unique main content ABC." in msgs[0].content
+
+
+def test_cached_exam_profile_precedes_the_legacy_exam_resolver(tmp_path: Path) -> None:
+    _write(tmp_path, "main.md", "# Main")
+    route = _make_route("main.md", exam="CAT").model_copy(
+        update={"exam_profile_id": "CAT#2026", "exam_stage": "2026"}
+    )
+    resolver = PromptResolver(
+        prompt_root=tmp_path,
+        exam_profile_runtime=_ExamProfileRuntime(),
+        exam_profile_resolver=_LegacyExamProfileResolver(),  # type: ignore[arg-type]
+    )
+
+    messages = resolver.resolve(route, query="Solve this", request_id="request-1")
+
+    assert '"examProfileId":"CAT#2026"' in messages[0].content
+    assert "Admin-managed context." in messages[0].content
+
+
+def test_resolve_structured_uses_safe_cached_prompts_without_answer_contract(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "structured.md", "STRUCTURED_ROLE")
+    _write(tmp_path, "shared.md", "SHARED_CONTRACT")
+    _write(tmp_path, "generator_answer_contract.md", "ANSWER_CONTRACT")
+    resolver = PromptResolver(prompt_root=tmp_path)
+    route = _make_route("structured.md", overlays=["shared.md"])
+
+    messages = resolver.resolve_structured(route, '{"count":1}')
+
+    assert "STRUCTURED_ROLE" in messages[0].content
+    assert "SHARED_CONTRACT" in messages[0].content
+    assert "ANSWER_CONTRACT" not in messages[0].content
+    assert messages[1].content == '{"count":1}'
 
 
 # ---------------------------------------------------------------------------

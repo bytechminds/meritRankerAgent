@@ -114,6 +114,15 @@ test('runtime conversation policies are scoped to configured tables and SSM path
   const stack = new AgentCoreStack(app, 'ConversationStack', {
     spec,
     deploymentEnvironment: 'dev',
+    runtimeEnvironment: {
+      AWS_REGION: 'ap-south-1',
+      APPSYNC_GRAPHQL_ENDPOINT:
+        'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
+      PRACTICE_GENERATION_ENABLED: 'false',
+      ENABLE_ORCHESTRATED_DOUBT_SOLVER: 'true',
+      ENABLE_REAL_LLM: 'true',
+      PRACTICE_RESOURCE_PARAMETER_ROOT: '/meritranker/agent-runtime/v1/practice',
+    },
   });
   const template = Template.fromStack(stack);
   const rendered = JSON.stringify(template.toJSON());
@@ -126,11 +135,18 @@ test('runtime conversation policies are scoped to configured tables and SSM path
   expect(Object.values(memoryResources)[0].Properties).not.toHaveProperty('MemoryStrategies');
   const memoryLogicalId = Object.keys(memoryResources)[0];
   template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
-    EnvironmentVariables: {
+    EnvironmentVariables: Match.objectLike({
       MEMORY_MERITRANKER_SHORT_TERM_MEMORY_ID: {
         'Fn::GetAtt': [memoryLogicalId, 'MemoryId'],
       },
-    },
+      AWS_REGION: 'ap-south-1',
+      APPSYNC_GRAPHQL_ENDPOINT:
+        'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
+      PRACTICE_GENERATION_ENABLED: 'false',
+      ENABLE_ORCHESTRATED_DOUBT_SOLVER: 'true',
+      ENABLE_REAL_LLM: 'true',
+      PRACTICE_RESOURCE_PARAMETER_ROOT: '/meritranker/agent-runtime/v1/practice',
+    }),
   });
   template.hasResourceProperties('AWS::IAM::Policy', {
     PolicyDocument: {
@@ -149,14 +165,85 @@ test('runtime conversation policies are scoped to configured tables and SSM path
   expect(rendered).toContain('dynamodb:PutItem');
   expect(rendered).toContain('dynamodb:Query');
   expect(rendered).toContain('dynamodb:UpdateItem');
+  expect(rendered).toContain('dynamodb:Scan');
   expect(rendered).toContain('bedrock-agentcore:CreateEvent');
   expect(rendered).toContain('bedrock-agentcore:ListEvents');
   expect(rendered).not.toContain('bedrock-agentcore:DeleteEvent');
   expect(rendered).not.toContain('bedrock-agentcore:ListMemoryRecords');
   expect(rendered).toContain('conversation-history');
   expect(rendered).toContain('conversation-session');
+  expect(rendered).toContain('exam-profile');
   expect(rendered).toContain('ConversationHistoryByConversation');
   expect(rendered).not.toContain('/index/*');
   expect(rendered).not.toContain('dynamodb:*');
   expect(rendered).not.toContain('ssm:*');
+  template.resourceCountIs('AWS::Lambda::Function', 0);
+  template.resourceCountIs('AWS::Lambda::EventSourceMapping', 0);
+  template.resourceCountIs('AWS::Logs::LogGroup', 0);
+  expect(rendered).not.toContain('PracticeGenerationWorker');
+  expect(rendered).not.toContain('PRACTICE_WORKER_TIMEOUT_SECONDS');
+  expect(rendered).not.toContain('PRACTICE_PROVIDER_SECRET_ARN');
+  expect(rendered).not.toContain('secretsmanager:GetSecretValue');
+  expect(rendered).toContain('dynamodb:BatchGetItem');
+  expect(rendered).not.toContain('appsync:*');
+  expect(rendered).not.toContain('dynamodb:TransactWriteItems');
+  expect(rendered).toContain('dynamodb:DescribeTable');
+  expect(rendered).not.toContain('dynamodb:DeleteItem');
+  expect(rendered).not.toContain('sqs:ReceiveMessage');
+  expect(rendered).not.toContain('sqs:DeleteMessage');
+  expect(rendered).not.toContain('sqs:ChangeMessageVisibility');
+  expect(rendered).not.toContain('PracticeGenerationQueue');
+  expect(rendered).not.toContain('PracticeGenerationDLQ');
+  expect(rendered).toContain('/practice/mock-test-quiz/table-arn');
+  expect(rendered).toContain('/practice/question/table-arn');
+  expect(rendered).toContain('/practice/question-bank/table-arn');
+  expect(rendered).toContain('/practice/question/test-id-index-name');
+  expect(rendered).toContain('/practice/question-bank/category-index-name');
+  expect(rendered).toContain('/practice/question-bank/reuse-index-name');
+  expect(rendered).not.toContain('sqs:SendMessage');
+});
+
+test('enabled practice grants only its existing AppSync progress mutation', () => {
+  const app = new cdk.App();
+  const stack = new AgentCoreStack(app, 'PracticeProgressStack', {
+    spec: AgentCoreProjectSpecSchema.parse({
+      name: 'testproject',
+      version: 1,
+      managedBy: 'CDK',
+      runtimes: [
+        {
+          name: 'runtime',
+          build: 'CodeZip',
+          entrypoint: 'main.py',
+          codeLocation: 'app/',
+          runtimeVersion: 'PYTHON_3_14',
+        },
+      ],
+      memories: [],
+      credentials: [],
+      evaluators: [],
+      onlineEvalConfigs: [],
+      policyEngines: [],
+      agentCoreGateways: [],
+      mcpRuntimeTools: [],
+      unassignedTargets: [],
+    }),
+    deploymentEnvironment: 'dev',
+    runtimeEnvironment: {
+      AWS_REGION: 'ap-south-1',
+      APPSYNC_GRAPHQL_ENDPOINT:
+        'https://t37helcceraznaejlcm27uhmwi.appsync-api.ap-south-1.amazonaws.com/graphql',
+      PRACTICE_GENERATION_ENABLED: 'true',
+    },
+  });
+
+  const rendered = JSON.stringify(Template.fromStack(stack).toJSON());
+
+  expect(rendered).toContain('appsync:GraphQL');
+  expect(rendered).toContain(
+    'apis/t37helcceraznaejlcm27uhmwi/types/Mutation/fields/updatePracticeGenerationProgress'
+  );
+  expect(rendered).toContain('dynamodb:UpdateItem');
+  expect(rendered).not.toContain('appsync:*');
+  expect(rendered).not.toContain('/types/Mutation/fields/*');
 });

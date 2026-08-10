@@ -109,7 +109,7 @@ def test_validated_request_is_immutable() -> None:
         request.language = "hindi"  # type: ignore[misc]
 
 
-def test_actor_resolver_returns_validated_compatibility_user_id() -> None:
+def test_actor_resolver_returns_validated_trusted_proxy_user_id() -> None:
     request = DoubtSolverRequest(
         mode="doubt_solver",
         query="Question",

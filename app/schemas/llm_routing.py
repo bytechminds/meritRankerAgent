@@ -79,7 +79,14 @@ TaskRole = Literal[
 
 DifficultyLevel = Literal["default", "basic", "intermediate", "advanced"]
 
-SubjectName = Literal["math", "reasoning", "english", "general"]
+SubjectName = Literal[
+    "math",
+    "reasoning",
+    "english",
+    "general",
+    "quant_reasoning",
+    "factual",
+]
 
 CostTier = Literal["none", "low", "medium", "high"]
 
@@ -648,6 +655,7 @@ class RouteRequest(BaseModel):
     intent: str | None = Field(default=None, max_length=128)
     exam: str | None = Field(default=None, max_length=128)
     exam_stage: str | None = Field(default=None, max_length=64)
+    exam_profile_id: str | None = Field(default=None, max_length=160)
     language: CanonicalLanguage = "english"
 
     model_config = {"str_strip_whitespace": True}
@@ -692,6 +700,7 @@ class RouteDecision(BaseModel):
     intent: str | None = None
     exam: str | None = None
     exam_stage: str | None = None
+    exam_profile_id: str | None = None
     language: CanonicalLanguage = "english"
     model: str = Field(description="Model alias (not the actual provider model_id).")
     prompt: str = Field(description="Relative prompt file path.")

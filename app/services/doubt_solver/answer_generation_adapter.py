@@ -60,6 +60,7 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         exam_id: str | None = None,
         exam_stage: str | None = None,
+        exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
     ) -> str:
@@ -74,6 +75,7 @@ class AnswerGenerationAdapter:
             web_search_reason=web_search_reason,
             exam_id=exam_id,
             exam_stage=exam_stage,
+            exam_profile_id=exam_profile_id,
             language=language,
             conversation_context=conversation_context,
         ).content
@@ -90,6 +92,7 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         exam_id: str | None = None,
         exam_stage: str | None = None,
+        exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
     ) -> FinalAnswerResult:
@@ -107,6 +110,7 @@ class AnswerGenerationAdapter:
             intent=intent,
             exam=exam_id,
             exam_stage=exam_stage,
+            exam_profile_id=exam_profile_id,
             language=language,
         )
 
@@ -165,6 +169,7 @@ class AnswerGenerationAdapter:
         web_search_reason: str | None = None,
         exam_id: str | None = None,
         exam_stage: str | None = None,
+        exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
         on_before_generator_fallback: Callable[[], None] | None = None,
@@ -189,6 +194,7 @@ class AnswerGenerationAdapter:
             intent=intent,
             exam=exam_id,
             exam_stage=exam_stage,
+            exam_profile_id=exam_profile_id,
             language=language,
         )
 

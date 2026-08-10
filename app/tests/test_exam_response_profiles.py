@@ -520,6 +520,7 @@ def test_legacy_graph_passes_state_exam_without_reconstruction(
         "language": "english",
         "exam_id": "SSC_CGL",
         "exam_stage": "TIER_2",
+        "exam_profile_id": "SSC_CGL#TIER_2",
         "classification": QueryClassification(
             intent="solve_question", confidence=0.99
         ).model_dump(),
@@ -531,6 +532,7 @@ def test_legacy_graph_passes_state_exam_without_reconstruction(
     assert captured == {
         "exam_id": "SSC_CGL",
         "exam_stage": "TIER_2",
+        "exam_profile_id": "SSC_CGL#TIER_2",
         "language": "english",
         "request_id": "request-legacy",
     }
@@ -557,6 +559,7 @@ def test_orchestrated_graph_passes_state_exam_without_reconstruction() -> None:
         "language": "english",
         "exam_id": "UPSC_CSE",
         "exam_stage": "PRELIMS",
+        "exam_profile_id": "UPSC_CSE#PRELIMS",
         "classification": {
             "subject": "math",
             "intent": "solve",
@@ -572,6 +575,7 @@ def test_orchestrated_graph_passes_state_exam_without_reconstruction() -> None:
 
     assert adapter.kwargs["exam_id"] == "UPSC_CSE"
     assert adapter.kwargs["exam_stage"] == "PRELIMS"
+    assert adapter.kwargs["exam_profile_id"] == "UPSC_CSE#PRELIMS"
     assert result["answer"] == "Answer"
     assert result["exam_id"] == "UPSC_CSE"
     assert result["exam_stage"] == "PRELIMS"

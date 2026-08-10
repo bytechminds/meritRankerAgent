@@ -21,6 +21,37 @@ function toStackName(projectName: string, targetName: string): string {
   return `AgentCore-${sanitize(projectName)}-${sanitize(targetName)}`;
 }
 
+function booleanEnvironment(name: string, defaultValue: boolean): string {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return String(defaultValue);
+  const normalized = raw.trim().toLowerCase();
+  if (normalized !== 'true' && normalized !== 'false') {
+    throw new Error(`${name} must be true or false`);
+  }
+  return normalized;
+}
+
+function runtimeEnvironment(target: AwsDeploymentTarget): Record<string, string> {
+  const practiceEnabled = booleanEnvironment('PRACTICE_GENERATION_ENABLED', false);
+  const endpoint = process.env.APPSYNC_GRAPHQL_ENDPOINT?.trim();
+  if (practiceEnabled === 'true' && !endpoint) {
+    throw new Error('APPSYNC_GRAPHQL_ENDPOINT is required when practice generation is enabled');
+  }
+  return {
+    AWS_REGION: target.region,
+    ...(endpoint ? { APPSYNC_GRAPHQL_ENDPOINT: endpoint } : {}),
+    PRACTICE_GENERATION_ENABLED: practiceEnabled,
+    ENABLE_ORCHESTRATED_DOUBT_SOLVER: booleanEnvironment(
+      'ENABLE_ORCHESTRATED_DOUBT_SOLVER',
+      true
+    ),
+    ENABLE_REAL_LLM: booleanEnvironment('ENABLE_REAL_LLM', true),
+    PRACTICE_RESOURCE_PARAMETER_ROOT:
+      process.env.PRACTICE_RESOURCE_PARAMETER_ROOT?.trim() ||
+      '/meritranker/agent-runtime/v1/practice',
+  };
+}
+
 async function main() {
   // Config root is parent of cdk/ directory. The CLI sets process.cwd() to agentcore/cdk/.
   const configRoot = path.resolve(process.cwd(), '..');
@@ -76,6 +107,7 @@ async function main() {
       deploymentEnvironment: target.name,
       mcpSpec,
       credentials,
+      runtimeEnvironment: runtimeEnvironment(target),
       env,
       description: `AgentCore stack for ${spec.name} deployed to ${target.name} (${target.region})`,
       tags: {

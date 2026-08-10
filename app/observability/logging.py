@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from pathlib import Path
 
 from rich.logging import RichHandler
 
 from observability.context import current_request_context
 from observability.events import configure_event_metadata
 from observability.readable_log import (
+    SafeRequestBlockHandler,
+    _warn_file_unavailable,
     configure_readable_request_log,
     reset_readable_log_for_tests,
 )
@@ -127,6 +130,19 @@ def configure_logging(
         file_path=file_path,
         content_mode=local_log_content,
     )
+    if file_enabled and selected_format == "pretty_and_json_file":
+        event_path = Path(file_path).with_name("agent-events.jsonl")
+        try:
+            event_handler = SafeRequestBlockHandler(
+                event_path,
+                maxBytes=20 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            event_handler.setFormatter(JsonEventFormatter(environment=normalized_environment))
+            handlers.append(event_handler)
+        except OSError:
+            _warn_file_unavailable()
 
     logging.basicConfig(
         level=level,

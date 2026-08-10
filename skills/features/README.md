@@ -33,6 +33,8 @@ if a fact is unknown.
 | `image-question-classification.md` | Image extraction and classification entry path | Partially Implemented |
 | `agent-observability.md` | Structured events, request summaries, local inspection, and tracing | In Progress |
 | `classification-pipeline.md` | Text/image academic classification ownership and fallback pipeline | In Progress |
+| `practice-generation.md` | Durable quiz, practice, and mock-test generation | In Progress |
+| `exam-profiles.md` | Admin-managed exam/stage profile cache and compact Agent context | In Progress |
 
 ---
 

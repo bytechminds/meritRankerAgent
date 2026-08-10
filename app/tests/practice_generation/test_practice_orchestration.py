@@ -1,0 +1,1173 @@
+"""In-memory integration and reliability tests for durable graph orchestration."""
+
+from __future__ import annotations
+
+import json
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+
+import pytest
+
+from features.practice_generation import orchestration as orchestration_module
+from features.practice_generation.config import PracticeGenerationConfig
+from features.practice_generation.generation import deterministic_question_id
+from features.practice_generation.graph import PracticeGraphRunner
+from features.practice_generation.option_distribution import (
+    reorder_options,
+    target_correct_positions,
+    validate_answer_position_distribution,
+)
+from features.practice_generation.orchestration import PracticeGenerationOrchestrator
+from features.practice_generation.pattern_context import NoOpPatternContextProvider
+from features.practice_generation.planning import BlueprintPlanResult
+from features.practice_generation.repositories import IndexedQueryResult
+from features.practice_generation.schemas import (
+    GeneratedBatch,
+    PracticeBlueprint,
+    PracticeGenerationRequest,
+    PracticeGraphCommand,
+    VerificationResult,
+)
+from services.llm.orchestration.errors import ProviderExecutionError
+
+
+class FakeAssessments:
+    def __init__(self, request: PracticeGenerationRequest, test_id: str = "test-1") -> None:
+        self.phase_history = ["QUEUED"]
+        self.group_progress_publications = 0
+        self.ready_publications = 0
+        self.failed_publications = 0
+        self.claimed_group_ids: list[str] = []
+        self.item = {
+            "testId": test_id,
+            "userId": request.user_id,
+            "name": request.assessment_title,
+            "status": "GENERATING",
+            "live": False,
+            "updatedAt": "1",
+            "meta": json.dumps(
+                {
+                    "phase": "QUEUED",
+                    "practiceRequest": {
+                        "requestId": request.request_id,
+                        "conversationId": request.conversation_id,
+                        "turnId": request.turn_id,
+                        "practiceType": request.practice_type.value,
+                        "requestedCount": request.requested_count,
+                        "acceptedCount": request.accepted_count,
+                        "subject": request.subject,
+                        "topic": request.topic,
+                        "difficulty": request.difficulty.value,
+                        "language": request.language,
+                        "examId": request.exam_id,
+                        "examStage": request.exam_stage,
+                        "includeSolutions": request.include_solutions,
+                        "assessmentTitle": request.assessment_title,
+                        "querySummary": request.original_query,
+                    },
+                    "readyQuestionCount": 0,
+                    "questionManifestVersion": 1,
+                    "readyQuestionIds": [],
+                    "readyCount": 0,
+                    "reusedCount": 0,
+                    "generatedCount": 0,
+                    "verifiedCount": 0,
+                    "failedCount": 0,
+                }
+            ),
+        }
+
+    def get(self, _test_id: str, *, consistent: bool = True):
+        return deepcopy(self.item)
+
+    def update(
+        self,
+        _test_id: str,
+        *,
+        meta_updates,
+        status=None,
+        live=None,
+        expected_updated_at=None,
+        recalculate_manifest=False,
+        authoritative_question_ids=(),
+    ):
+        if expected_updated_at is not None:
+            assert expected_updated_at == self.item["updatedAt"]
+        if recalculate_manifest and authoritative_question_ids:
+            self.group_progress_publications += 1
+        meta = json.loads(self.item["meta"])
+        meta.update(deepcopy(meta_updates))
+        if meta_updates.get("phase"):
+            self.phase_history.append(str(meta_updates["phase"]))
+        self.item["meta"] = json.dumps(meta)
+        self.item["updatedAt"] = str(int(self.item["updatedAt"]) + 1)
+        if status is not None:
+            self.item["status"] = status
+        if live is not None:
+            self.item["live"] = live
+        return deepcopy(self.item)
+
+    def calculate_authoritative_meta(
+        self,
+        _test_id,
+        *,
+        meta_updates=None,
+        authoritative_question_ids=(),
+    ):
+        meta = json.loads(self.item["meta"])
+        updates = deepcopy(meta_updates or {})
+        if meta.get("bucketReadyCounts"):
+            updates.pop("bucketReadyCounts", None)
+        meta.update(updates)
+        return meta
+
+    def set_blueprint(
+        self,
+        test_id,
+        blueprint,
+        *,
+        planner_calls,
+        planner_tier,
+        planner_repaired,
+        deterministic_fallback,
+    ):
+        self.update(
+            test_id,
+            meta_updates={
+                "blueprint": blueprint.model_dump(mode="json"),
+                "plannerCalls": planner_calls,
+                "plannerTier": planner_tier,
+                "plannerRepaired": planner_repaired,
+                "plannerDeterministicFallback": deterministic_fallback,
+                "bucketReadyCounts": {bucket.bucket_id: 0 for bucket in blueprint.buckets},
+            },
+        )
+
+    def claim_group(self, _test_id, group_id):
+        meta = json.loads(self.item["meta"])
+        group = meta["generationGroups"][group_id]
+        if group["state"] in {"RUNNING", "COMPLETED", "FAILED"}:
+            return None
+        group["state"] = "RUNNING"
+        self.claimed_group_ids.append(group_id)
+        self.item["meta"] = json.dumps(meta)
+        return deepcopy(group)
+
+    def update_group(
+        self,
+        test_id,
+        group_id,
+        *,
+        state,
+        required_count=None,
+        attempt=None,
+        error_code=None,
+        attempt_stage=None,
+        item_retry_count=None,
+        replacement_count=None,
+        replacement=None,
+        last_reason_code=None,
+    ):
+        meta = json.loads(self.item["meta"])
+        group = meta["generationGroups"][group_id]
+        group["state"] = state
+        if required_count is not None:
+            group["requiredCount"] = required_count
+        if attempt is not None:
+            group["attempt"] = attempt
+        if error_code is not None:
+            group["errorCode"] = error_code
+        for key, value in {
+            "attemptStage": attempt_stage,
+            "itemRetryCount": item_retry_count,
+            "replacementCount": replacement_count,
+            "replacement": replacement,
+            "lastReasonCode": last_reason_code,
+        }.items():
+            if value is not None:
+                group[key] = value
+        self.item["meta"] = json.dumps(meta)
+
+    def create_retry_group(
+        self,
+        _test_id,
+        *,
+        group_id,
+        parent_group_id,
+        bucket_id,
+        attempt_stage,
+        attempt,
+        replacement,
+    ):
+        meta = json.loads(self.item["meta"])
+        groups = meta["generationGroups"]
+        if group_id in groups:
+            return False
+        groups[group_id] = {
+            "groupId": group_id,
+            "bucketId": bucket_id,
+            "requiredCount": 1,
+            "attempt": attempt,
+            "attemptStage": attempt_stage,
+            "itemRetryCount": 1,
+            "replacementCount": 1 if replacement else 0,
+            "replacement": replacement,
+            "state": "PENDING",
+        }
+        self.item["meta"] = json.dumps(meta)
+        return True
+
+    def record_finalization_retry(self, _test_id, *, next_attempt, reason_code):
+        meta = json.loads(self.item["meta"])
+        if int(meta.get("finalizationAttempt") or 0) >= next_attempt:
+            return False
+        meta["finalizationAttempt"] = next_attempt
+        meta["finalizationReasonCode"] = reason_code
+        self.item["meta"] = json.dumps(meta)
+        return True
+
+    def mark_failed(self, test_id, error_code, *, meta_updates=None):
+        self.failed_publications += 1
+        meta = json.loads(self.item["meta"])
+        meta.update(deepcopy(meta_updates or {}))
+        self.item["meta"] = json.dumps(meta)
+        meta["failedCount"] = int(meta.get("failedCount") or 0) + 1
+        self.item["meta"] = json.dumps(meta)
+        self.update(
+            test_id,
+            meta_updates={"phase": "FAILED", "errorCode": error_code, "playable": False},
+            status="FAILED",
+            live=False,
+        )
+
+    def mark_ready(self, test_id, accepted_count, meta_updates):
+        meta = json.loads(self.item["meta"])
+        if (
+            int(meta.get("readyQuestionCount") or 0) != accepted_count
+            or int(meta.get("readyCount") or 0) != accepted_count
+            or len(meta.get("readyQuestionIds") or []) != accepted_count
+            or int(meta.get("failedCount") or 0) != 0
+        ):
+            return False
+        self.update(
+            test_id,
+            meta_updates=meta_updates,
+            status="READY",
+            live=True,
+        )
+        self.ready_publications += 1
+        return True
+
+    def cancel(self, test_id):
+        self.update(
+            test_id,
+            meta_updates={"phase": "CANCELLED", "playable": False},
+            status="ARCHIVED",
+            live=False,
+        )
+
+
+class FakeQuestions:
+    def __init__(
+        self,
+        assessments,
+        reusable_items=None,
+        *,
+        final_gsi_lag_once: bool = False,
+        final_gsi_lag_always: bool = False,
+        drop_counter_once: bool = False,
+        corrupt_manifest_ownership: bool = False,
+        topic_pages: list[list[dict]] | None = None,
+    ) -> None:
+        self.assessments = assessments
+        self.topic_pages = deepcopy(topic_pages)
+        self.reusable_items = list(reusable_items or [])
+        if self.topic_pages is not None:
+            self.reusable_items = [item for page in self.topic_pages for item in page]
+        self.linked: dict[str, dict] = {}
+        self.final_gsi_lag_once = final_gsi_lag_once
+        self.final_gsi_lag_always = final_gsi_lag_always
+        self.final_gsi_lag_used = False
+        self.drop_counter_once = drop_counter_once
+        self.corrupt_manifest_ownership = corrupt_manifest_ownership
+        self.reuse_query_order: list[str] = []
+
+    def query_reuse_candidates(
+        self,
+        *,
+        category,
+        limit,
+        exclusive_start_key=None,
+    ):
+        assert exclusive_start_key is None
+        self.reuse_query_order.append("category")
+        return IndexedQueryResult(
+            items=tuple(deepcopy(self.reusable_items[:limit])),
+            page_count=1,
+            has_more_pages=False,
+            consumed_capacity=0.5,
+            duration_ms=1,
+        )
+
+    def query_topic_reuse_candidates(
+        self,
+        *,
+        reuse_bucket_key,
+        limit,
+        exclusive_start_key=None,
+    ):
+        self.reuse_query_order.append("topic")
+        if self.topic_pages is not None:
+            page_index = int((exclusive_start_key or {}).get("page") or 0)
+            page = self.topic_pages[page_index][:limit]
+            has_more = page_index + 1 < len(self.topic_pages)
+            return IndexedQueryResult(
+                items=tuple(deepcopy(page)),
+                page_count=1,
+                has_more_pages=has_more,
+                consumed_capacity=0.5,
+                duration_ms=1,
+                continuation_key=({"page": page_index + 1} if has_more else None),
+                evaluated_count=len(page),
+            )
+        assert exclusive_start_key is None
+        return IndexedQueryResult(
+            items=tuple(deepcopy(self.reusable_items[:limit])),
+            page_count=1,
+            has_more_pages=False,
+            consumed_capacity=0.5,
+            duration_ms=1,
+        )
+
+    def get_reuse_candidates(self, question_ids):
+        selected = set(question_ids)
+        return deepcopy(
+            [item for item in self.reusable_items if str(item.get("qbId") or "") in selected]
+        )
+
+    def list_linked(self, _test_id, *, limit=100):
+        items = list(self.linked.values())[:limit]
+        meta = json.loads(self.assessments.item["meta"])
+        if (
+            (self.final_gsi_lag_always or self.final_gsi_lag_once)
+            and (self.final_gsi_lag_always or not self.final_gsi_lag_used)
+            and len(items) == int(meta["practiceRequest"]["acceptedCount"])
+        ):
+            self.final_gsi_lag_used = True
+            items = items[:-1]
+        return deepcopy(items)
+
+    def _increment(self, bucket_id, source):
+        meta = json.loads(self.assessments.item["meta"])
+        question_id = next(reversed(self.linked))
+        meta["readyQuestionCount"] = int(meta.get("readyQuestionCount") or 0) + 1
+        meta["readyCount"] = int(meta.get("readyCount") or 0) + 1
+        meta.setdefault("readyQuestionIds", []).append(question_id)
+        meta["verifiedCount"] = int(meta.get("verifiedCount") or 0) + 1
+        meta[source] = int(meta.get(source) or 0) + 1
+        counts = dict(meta.get("bucketReadyCounts") or {})
+        counts[bucket_id] = int(counts.get(bucket_id) or 0) + 1
+        meta["bucketReadyCounts"] = counts
+        self.assessments.item["meta"] = json.dumps(meta)
+
+    def link_reused(self, *, test_id, bucket_id, question):
+        question_id = deterministic_question_id(
+            test_id,
+            source_id=question.question_id,
+            bucket_id=bucket_id,
+        )
+        if question_id in self.linked:
+            return False
+        self.linked[question_id] = {
+            "questionId": question_id,
+            "testId": test_id,
+            "question": question.question,
+            "options": list(question.options),
+            "answers": json.dumps(
+                {"correctAnswer": question.correct_answer, "options": list(question.options)}
+            ),
+            "correctAnswer": question.correct_answer,
+            "explanation": question.solution,
+            "_practiceMeta": {
+                "source": "REUSED",
+                "sourceType": "QUESTION_BANK",
+                "sourceQuestionBankId": question.question_id,
+                "bucketId": bucket_id,
+                "verified": True,
+                "verificationMethod": "QUESTION_BANK_QUALITY",
+                "questionType": question.question_type,
+                "language": question.language,
+            },
+        }
+        self._increment(bucket_id, "reusedCount")
+        return True
+
+    def get_questions_by_ids(self, question_ids):
+        resolved = deepcopy(
+            [self.linked[question_id] for question_id in question_ids if question_id in self.linked]
+        )
+        if self.corrupt_manifest_ownership and resolved:
+            resolved[0]["testId"] = "other-test"
+        return resolved
+
+    def link_generated(
+        self,
+        *,
+        test_id,
+        question,
+        verified,
+        group_id,
+        generator_route,
+        generator_model,
+        verification_policy,
+        verification_method,
+        language,
+    ):
+        assert verified is True
+        question_id = deterministic_question_id(
+            test_id,
+            source_id=question.generation_item_id,
+            bucket_id=question.bucket_id,
+        )
+        if question_id in self.linked:
+            return False
+        self.linked[question_id] = {
+            "questionId": question_id,
+            "testId": test_id,
+            "question": question.question,
+            "options": list(question.options),
+            "answers": json.dumps(
+                {"correctAnswer": question.correct_answer, "options": question.options}
+            ),
+            "correctAnswer": question.correct_answer,
+            "explanation": question.solution,
+            "_practiceMeta": {
+                "source": "GENERATED",
+                "sourceType": "AI_GENERATED",
+                "bucketId": question.bucket_id,
+                "verified": True,
+                "generationGroupId": group_id,
+                "generatorRoute": generator_route,
+                "generatorModel": generator_model,
+                "verificationPolicy": verification_policy,
+                "verificationMethod": verification_method,
+                "questionType": question.question_type.value,
+                "language": language,
+            },
+        }
+        if self.drop_counter_once:
+            self.drop_counter_once = False
+            meta = json.loads(self.assessments.item["meta"])
+            meta["readyQuestionCount"] = int(meta.get("readyQuestionCount") or 0) + 1
+            meta["readyCount"] = int(meta.get("readyCount") or 0) + 1
+            meta.setdefault("readyQuestionIds", []).append(question_id)
+            meta["verifiedCount"] = int(meta.get("verifiedCount") or 0) + 1
+            counts = dict(meta.get("bucketReadyCounts") or {})
+            counts[question.bucket_id] = int(counts.get(question.bucket_id) or 0) + 1
+            meta["bucketReadyCounts"] = counts
+            self.assessments.item["meta"] = json.dumps(meta)
+        else:
+            self._increment(question.bucket_id, "generatedCount")
+        return True
+
+    def assign_positions(self, questions):
+        for position, question in enumerate(
+            sorted(questions, key=lambda item: item["questionId"]),
+            start=1,
+        ):
+            self.linked[question["questionId"]]["position"] = position
+
+    def rebalance_answer_positions(self, test_id, questions):
+        ordered = sorted(questions, key=lambda item: item["questionId"])
+        question_ids = [question["questionId"] for question in ordered]
+        changed = False
+        for question, target_position in zip(
+            ordered,
+            target_correct_positions(test_id, question_ids),
+            strict=True,
+        ):
+            reordered = reorder_options(
+                test_id=test_id,
+                question_id=question["questionId"],
+                options=list(question["options"]),
+                correct_answer=question["correctAnswer"],
+                target_position=target_position,
+            )
+            assert reordered is not None
+            if reordered != question["options"]:
+                question["options"] = reordered
+                question["answers"] = json.dumps(
+                    {
+                        "correctAnswer": question["correctAnswer"],
+                        "options": reordered,
+                    }
+                )
+                self.linked[question["questionId"]] = deepcopy(question)
+                changed = True
+        validation = validate_answer_position_distribution(ordered)
+        assert validation.valid
+        return changed, validation.correct_positions
+
+
+class Planner:
+    def plan(self, request, *, tier, repair_feedback=None):
+        return json.dumps(
+            {
+                "schema_version": "1",
+                "practice_type": request.practice_type.value,
+                "accepted_count": request.accepted_count,
+                "buckets": [
+                    {
+                        "bucket_id": "bucket-1",
+                        "subject": request.subject,
+                        "topic": request.topic or request.subject,
+                        "difficulty": request.difficulty.value,
+                        "question_type": "mcq",
+                        "required_count": request.accepted_count,
+                        "keywords": [request.topic or request.subject],
+                        "question_intent": "legacy compatibility orchestration test",
+                        "verification_policy": "MANDATORY",
+                    }
+                ],
+            }
+        )
+
+
+class LegacyBlueprintManager:
+    def build(self, request):
+        blueprint = PracticeBlueprint.model_validate(
+            json.loads(Planner().plan(request, tier="light"))
+        )
+        return BlueprintPlanResult(
+            blueprint=blueprint,
+            planner_calls=1,
+            repaired=False,
+            deterministic_fallback=False,
+            tier="light",
+        )
+
+
+class Generator:
+    def __init__(
+        self,
+        *,
+        partial_once: bool = False,
+        fail_always: bool = False,
+        fail_item_retry_once: bool = False,
+    ) -> None:
+        self.partial_once = partial_once
+        self.fail_always = fail_always
+        self.fail_item_retry_once = fail_item_retry_once
+        self.calls: dict[str, int] = {}
+
+    def generate(self, *, request, bucket, group, exclude_normalized_texts):
+        if self.fail_always:
+            raise TimeoutError("injected")
+        if self.fail_item_retry_once and "-retry-" in group.group_id and group.attempt == 1:
+            self.fail_item_retry_once = False
+            raise TimeoutError("injected item retry failure")
+        calls = self.calls.get(group.group_id, 0)
+        self.calls[group.group_id] = calls + 1
+        count = group.required_count
+        if self.partial_once and calls == 0 and count > 1:
+            count -= 1
+        questions = []
+        for index in range(count):
+            item_id = f"{group.group_id}-a{group.attempt}-i{index}"
+            answer = str(index + 2)
+            questions.append(
+                {
+                    "generation_item_id": item_id,
+                    "bucket_id": bucket.bucket_id,
+                    "question": (f"For generated item {item_id}, what is {index + 1} plus one?"),
+                    "question_type": bucket.question_type.value,
+                    "options": [answer, "10", "11", "12"],
+                    "correct_answer": answer,
+                    "solution": "Add one to the stated integer.",
+                    "subject": bucket.subject,
+                    "topic": bucket.topic,
+                    "difficulty": bucket.difficulty.value,
+                }
+            )
+        return GeneratedBatch(
+            content=json.dumps({"questions": questions}),
+            route_id=f"{bucket.subject}.generator.{bucket.difficulty.value}",
+            model="test-generator",
+        )
+
+
+class TokenExhaustedGenerator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, *, request, bucket, group, exclude_normalized_texts):
+        self.calls += 1
+        raise ProviderExecutionError(
+            "configured model fallbacks exhausted",
+            failure_kind="output_token_exhausted",
+            attempted_aliases=("reasoning_advanced_generator", "openai_o3"),
+        )
+
+
+class ProviderFailureGenerator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, *, request, bucket, group, exclude_normalized_texts):
+        self.calls += 1
+        raise ProviderExecutionError(
+            "configured model fallbacks exhausted",
+            failure_kind="timeout",
+            attempted_aliases=("math_generator", "fallback_generator"),
+        )
+
+
+class Verifier:
+    def __init__(self, *, reject_once: bool = False) -> None:
+        self.reject_once = reject_once
+        self.calls = 0
+
+    def verify(self, *, request, bucket, question):
+        self.calls += 1
+        if self.reject_once:
+            self.reject_once = False
+            return VerificationResult(
+                generation_item_id=question.generation_item_id,
+                approved=False,
+                reason_code="INJECTED_REJECTION",
+            )
+        return VerificationResult(
+            generation_item_id=question.generation_item_id,
+            approved=True,
+            reason_code="MATCH",
+        )
+
+
+class SensitiveReasonVerifier:
+    def verify(self, *, request, bucket, question):
+        return VerificationResult(
+            generation_item_id=question.generation_item_id,
+            approved=True,
+            reason_code="THE_ANSWER_IS_SECRET",
+        )
+
+
+def build_orchestrator(
+    assessments,
+    questions,
+    *,
+    partial_once: bool = False,
+    fail_always: bool = False,
+    fail_item_retry_once: bool = False,
+    reject_once: bool = False,
+    verifier=None,
+):
+    return PracticeGenerationOrchestrator(
+        config=PracticeGenerationConfig(
+            enabled=True,
+            pattern_context_enabled=False,
+            assessment_table="assessment",
+            question_table="question",
+            question_bank_table="bank",
+            question_bank_category_index="category-index",
+            question_test_index="test-index",
+            aws_region="ap-south-1",
+            generation_group_size=3,
+            generation_group_max=5,
+            item_retry_limit=1,
+            planner_repair_limit=1,
+        ),
+        assessments=assessments,
+        progress=assessments,
+        questions=questions,
+        blueprint_manager=LegacyBlueprintManager(),
+        generator=Generator(
+            partial_once=partial_once,
+            fail_always=fail_always,
+            fail_item_retry_once=fail_item_retry_once,
+        ),
+        verifier=verifier or Verifier(reject_once=reject_once),
+        pattern_context=NoOpPatternContextProvider(),
+    )
+
+
+def make_request(count: int, *, full_mock: bool = False) -> PracticeGenerationRequest:
+    return PracticeGenerationRequest(
+        request_id=f"request-{count}",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id=f"turn-{count}",
+        original_query=f"Create {count} questions",
+        practice_type="FULL_MOCK" if full_mock else "QUIZ",
+        requested_count=count,
+        accepted_count=min(count, 100),
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        assessment_title="Algebra Practice",
+    )
+
+
+def reusable_item(index: int) -> dict:
+    answer = str(index + 2)
+    return {
+        "qbId": f"bank-{index}",
+        "question": f"Reusable algebra question number {index}?",
+        "answers": json.dumps({"options": [answer, "20", "21", "22"]}),
+        "correctAnswer": answer,
+        "explanation": "Verified reusable solution.",
+        "category": "math",
+        "difficulty": "MEDIUM",
+        "source": "verified-bank",
+        "meta": json.dumps(
+            {
+                "status": "ACTIVE",
+                "qualityStatus": "VERIFIED",
+                "reusable": True,
+                "visibility": "PLATFORM",
+                "language": "english",
+                "subject": "math",
+                "topic": "algebra",
+                "questionType": "mcq",
+            }
+        ),
+    }
+
+
+def run_job(
+    count: int,
+    *,
+    reuse_count: int = 0,
+    partial_once: bool = False,
+    fail_always: bool = False,
+    fail_item_retry_once: bool = False,
+    final_gsi_lag_once: bool = False,
+    final_gsi_lag_always: bool = False,
+    drop_counter_once: bool = False,
+    corrupt_manifest_ownership: bool = False,
+    topic_pages: list[list[dict]] | None = None,
+    reject_once: bool = False,
+    verifier=None,
+):
+    request = make_request(count, full_mock=count >= 50)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(
+        assessments,
+        [reusable_item(index) for index in range(reuse_count)],
+        final_gsi_lag_once=final_gsi_lag_once,
+        final_gsi_lag_always=final_gsi_lag_always,
+        drop_counter_once=drop_counter_once,
+        corrupt_manifest_ownership=corrupt_manifest_ownership,
+        topic_pages=topic_pages,
+    )
+    orchestrator = build_orchestrator(
+        assessments,
+        questions,
+        partial_once=partial_once,
+        fail_always=fail_always,
+        fail_item_retry_once=fail_item_retry_once,
+        reject_once=reject_once,
+        verifier=verifier,
+    )
+    runner = PracticeGraphRunner(orchestrator)
+    runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
+    processed = 1
+    while processed < 500 and assessments.item["status"] == "GENERATING":
+        meta = json.loads(assessments.item["meta"])
+        pending = [
+            (group_id, group)
+            for group_id, group in dict(meta.get("generationGroups") or {}).items()
+            if isinstance(group, dict) and group.get("state") == "PENDING"
+        ]
+        if pending:
+            for group_id, group in pending:
+                command = PracticeGraphCommand(
+                    operation="generate_group",
+                    test_id="test-1",
+                    group_id=group_id,
+                    attempt=int(group.get("attempt") or 0),
+                )
+                runner.process(command)
+                runner.process(command)
+                processed += 1
+            continue
+        next_attempt = int(meta.get("finalizationAttempt") or 0)
+        if next_attempt:
+            runner.process(
+                PracticeGraphCommand(
+                    operation="finalize",
+                    test_id="test-1",
+                    attempt=next_attempt,
+                )
+            )
+            processed += 1
+            continue
+        break
+    return assessments, questions, processed
+
+
+def test_mixed_reuse_and_generation_reaches_exact_ready_count() -> None:
+    assessments, questions, _ = run_job(10, reuse_count=4)
+    assert (assessments.item["status"], assessments.item["live"], len(questions.linked)) == (
+        "READY",
+        True,
+        10,
+    )
+
+
+def test_duplicate_graph_operation_and_restart_are_idempotent() -> None:
+    assessments, questions, processed = run_job(20, reuse_count=5)
+    assert processed > 1
+    assert len(questions.linked) == len(set(questions.linked)) == 20
+    assert assessments.item["status"] == "READY"
+
+
+def test_orchestrator_restart_resumes_persisted_groups_without_duplicate_links() -> None:
+    request = make_request(10)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments)
+    first_runner = PracticeGraphRunner(build_orchestrator(assessments, questions))
+    first_runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
+    meta = json.loads(assessments.item["meta"])
+    first_group_id = next(iter(meta["generationGroups"]))
+    first_runner.process(
+        PracticeGraphCommand(
+            operation="generate_group",
+            test_id="test-1",
+            group_id=first_group_id,
+        )
+    )
+
+    restarted_runner = PracticeGraphRunner(build_orchestrator(assessments, questions))
+    while assessments.item["status"] == "GENERATING":
+        meta = json.loads(assessments.item["meta"])
+        pending = [
+            group_id
+            for group_id, group in meta["generationGroups"].items()
+            if group["state"] == "PENDING"
+        ]
+        if not pending:
+            break
+        for group_id in pending:
+            restarted_runner.process(
+                PracticeGraphCommand(
+                    operation="generate_group",
+                    test_id="test-1",
+                    group_id=group_id,
+                )
+            )
+
+    assert assessments.item["status"] == "READY"
+    assert len(questions.linked) == len(set(questions.linked)) == 10
+
+
+def test_generation_group_is_durably_claimed_before_generation() -> None:
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments)
+    runner = PracticeGraphRunner(build_orchestrator(assessments, questions))
+    runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
+    groups = json.loads(assessments.item["meta"])["generationGroups"]
+    group_id = next(iter(groups))
+
+    runner.process(
+        PracticeGraphCommand(operation="generate_group", test_id="test-1", group_id=group_id)
+    )
+
+    assert assessments.claimed_group_ids == [group_id]
+
+
+def test_partial_group_keeps_valid_items_and_repairs_only_deficit() -> None:
+    assessments, questions, _ = run_job(5, partial_once=True)
+    assert (assessments.item["status"], len(questions.linked)) == ("READY", 5)
+    groups = json.loads(assessments.item["meta"])["generationGroups"]
+    assert any(
+        group.get("attemptStage") == "ITEM_RETRY"
+        and group.get("itemRetryCount") == 1
+        and group.get("state") == "COMPLETED"
+        for group in groups.values()
+    )
+
+
+def test_provider_exception_during_item_retry_fails_without_content_replacement() -> None:
+    assessments, questions, _ = run_job(
+        5,
+        partial_once=True,
+        fail_item_retry_once=True,
+    )
+    groups = json.loads(assessments.item["meta"])["generationGroups"]
+    assert (assessments.item["status"], len(questions.linked)) == ("FAILED", 3)
+    assert json.loads(assessments.item["meta"])["errorCode"] == (
+        "PRACTICE_GENERATION_UNEXPECTED_FAILURE"
+    )
+    assert not any(group.get("attemptStage") == "REPLACEMENT" for group in groups.values())
+
+
+def test_provider_failure_never_makes_short_assessment_playable() -> None:
+    assessments, questions, _ = run_job(5, fail_always=True)
+    assert (assessments.item["status"], assessments.item["live"], len(questions.linked)) == (
+        "FAILED",
+        False,
+        0,
+    )
+    assert assessments.failed_publications == 1
+    assert assessments.ready_publications == 0
+
+
+def test_exhausted_generation_emits_one_standard_failed_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda event_name, **kwargs: events.append((event_name, kwargs.get("details") or {})),
+    )
+
+    assessments, _questions, _ = run_job(5, fail_always=True)
+
+    assert assessments.item["status"] == "FAILED"
+    assert [name for name, _details in events if name == "practice_generation_terminal"] == [
+        "practice_generation_terminal"
+    ]
+    assert [name for name, _details in events if name == "practice_failed"] == [
+        "practice_failed"
+    ]
+
+
+def test_verifier_reason_is_redacted_at_practice_event_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_reason = "THE_ANSWER_IS_SECRET"
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda event_name, **kwargs: events.append((event_name, kwargs.get("details") or {})),
+    )
+
+    assessments, _questions, _ = run_job(5, verifier=SensitiveReasonVerifier())
+
+    assert assessments.item["status"] == "READY"
+    assert raw_reason not in str(events)
+    verification_reasons = [
+        details.get("reasonCode")
+        for name, details in events
+        if name == "QUESTION_VERIFICATION_RESULT"
+    ]
+    assert verification_reasons
+    assert set(verification_reasons) == {"VERIFIER_APPROVED"}
+
+
+def test_token_exhaustion_fails_without_question_repair_or_regeneration() -> None:
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments, [reusable_item(0), reusable_item(1)])
+    orchestrator = build_orchestrator(assessments, questions)
+    generator = TokenExhaustedGenerator()
+    orchestrator._generator = generator
+    runner = PracticeGraphRunner(orchestrator)
+    runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
+    groups = json.loads(assessments.item["meta"])["generationGroups"]
+    group_id = next(iter(groups))
+
+    runner.process(
+        PracticeGraphCommand(operation="generate_group", test_id="test-1", group_id=group_id)
+    )
+
+    meta = json.loads(assessments.item["meta"])
+    assert (assessments.item["status"], len(questions.linked), generator.calls) == (
+        "FAILED",
+        2,
+        1,
+    )
+    assert meta["errorCode"] == "PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED"
+    assert meta["generationGroups"][group_id]["state"] == "FAILED"
+    assert all("-retry-" not in generated_group for generated_group in meta["generationGroups"])
+
+
+def test_provider_failure_fails_without_content_repair_or_regeneration(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda event_name, **_kwargs: events.append(event_name),
+    )
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments, [reusable_item(0), reusable_item(1)])
+    orchestrator = build_orchestrator(assessments, questions)
+    generator = ProviderFailureGenerator()
+    orchestrator._generator = generator
+    runner = PracticeGraphRunner(orchestrator)
+    runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
+    group_id = next(iter(json.loads(assessments.item["meta"])["generationGroups"]))
+
+    runner.process(
+        PracticeGraphCommand(operation="generate_group", test_id="test-1", group_id=group_id)
+    )
+
+    meta = json.loads(assessments.item["meta"])
+    assert (assessments.item["status"], generator.calls) == ("FAILED", 1)
+    assert meta["errorCode"] == "PRACTICE_GENERATOR_PROVIDER_FAILED"
+    assert "practice_model_execution_failed" in events
+    assert "question_repair_requested" not in events
+    assert "practice_validation_repair_started" not in events
+    assert all("-retry-" not in group for group in meta["generationGroups"])
+
+
+def test_each_accepted_generation_group_and_ready_publish_once() -> None:
+    assessments, questions, _ = run_job(5)
+
+    assert len(questions.linked) == 5
+    assert assessments.group_progress_publications == 2
+    assert assessments.ready_publications == 1
+    assert assessments.failed_publications == 0
+
+
+def test_temporary_gsi_lag_does_not_block_manifest_authoritative_ready() -> None:
+    assessments, questions, _ = run_job(5, final_gsi_lag_once=True)
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "READY"
+    assert questions.final_gsi_lag_used is False
+    assert len(meta["readyQuestionIds"]) == 5
+
+
+def test_persistent_gsi_lag_cannot_make_complete_manifest_fail() -> None:
+    assessments, _questions, _ = run_job(5, final_gsi_lag_always=True)
+    meta = json.loads(assessments.item["meta"])
+    assert (assessments.item["status"], meta["errorCode"]) == ("READY", None)
+
+
+def test_duplicate_finalization_attempt_is_harmless() -> None:
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    assert assessments.record_finalization_retry(
+        "test-1",
+        next_attempt=1,
+        reason_code="QUESTION_GSI_NOT_YET_CONSISTENT",
+    )
+    assert not assessments.record_finalization_retry(
+        "test-1",
+        next_attempt=1,
+        reason_code="QUESTION_GSI_NOT_YET_CONSISTENT",
+    )
+
+
+def test_authoritative_counter_mismatch_fails_without_false_ready() -> None:
+    assessments, _questions, _ = run_job(5, drop_counter_once=True)
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "FAILED"
+    assert meta["errorCode"] == "AUTHORITATIVE_COUNTER_MISMATCH"
+
+
+def test_manifest_question_owned_by_another_test_never_becomes_ready() -> None:
+    assessments, _questions, _ = run_job(
+        5,
+        corrupt_manifest_ownership=True,
+    )
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "FAILED"
+    assert meta["errorCode"] == "QUESTION_MANIFEST_OWNERSHIP_MISMATCH"
+
+
+def test_mandatory_verification_rejection_repairs_only_missing_item() -> None:
+    assessments, questions, _ = run_job(5, reject_once=True)
+    assert assessments.item["status"] == "READY"
+    assert len(questions.linked) == 5
+
+
+def test_all_reusable_uses_zero_generation_groups() -> None:
+    assessments, questions, processed = run_job(10, reuse_count=10)
+    meta = json.loads(assessments.item["meta"])
+    assert (assessments.item["status"], len(questions.linked), meta["generatedCount"]) == (
+        "READY",
+        10,
+        0,
+    )
+    assert processed == 1
+    assert questions.reuse_query_order
+    assert questions.reuse_query_order[0] == "topic"
+    assert "category" not in questions.reuse_query_order
+
+
+def test_topic_reuse_paginates_until_later_page_fills_deficit() -> None:
+    ineligible = reusable_item(0)
+    ineligible_meta = json.loads(ineligible["meta"])
+    ineligible_meta["status"] = "INACTIVE"
+    ineligible["meta"] = json.dumps(ineligible_meta)
+    later_matches = [reusable_item(index) for index in range(1, 6)]
+
+    assessments, questions, _ = run_job(
+        5,
+        topic_pages=[[ineligible], later_matches],
+    )
+    meta = json.loads(assessments.item["meta"])
+
+    assert assessments.item["status"] == "READY"
+    assert meta["reusedCount"] == 5
+    assert questions.reuse_query_order == ["topic", "topic"]
+
+
+def test_topic_reuse_page_bound_exhaustion_generates_only_remaining_deficit() -> None:
+    pages: list[list[dict]] = []
+    for index in range(3):
+        item = reusable_item(index)
+        details = json.loads(item["meta"])
+        details["status"] = "INACTIVE"
+        item["meta"] = json.dumps(details)
+        pages.append([item])
+
+    assessments, questions, _ = run_job(5, topic_pages=pages)
+    meta = json.loads(assessments.item["meta"])
+
+    assert assessments.item["status"] == "READY"
+    assert meta["generatedCount"] == 5
+    assert questions.reuse_query_order == ["topic", "topic"]
+
+
+def test_cancellation_stops_future_group_claims() -> None:
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    assessments.cancel("test-1")
+    assert (assessments.item["status"], assessments.item["live"]) == ("ARCHIVED", False)
+
+
+def test_repeated_five_question_reliability_20_runs() -> None:
+    for _ in range(20):
+        assessments, questions, _processed = run_job(5, reuse_count=2, partial_once=True)
+        assert assessments.item["status"] == "READY"
+        assert len(questions.linked) == 5
+
+
+def test_repeated_fifty_question_reliability_10_runs() -> None:
+    def execute(_index):
+        return run_job(
+            50,
+            reuse_count=20,
+            partial_once=True,
+            final_gsi_lag_once=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(execute, range(10)))
+    for assessments, questions, _processed in results:
+        assert assessments.item["status"] == "READY"
+        assert len(questions.linked) == 50
+        assert len(assessments.item["meta"].encode("utf-8")) < 50_000
+
+
+def test_repeated_hundred_question_reliability_3_runs() -> None:
+    for _ in range(3):
+        assessments, questions, _processed = run_job(
+            100,
+            reuse_count=40,
+            partial_once=True,
+            final_gsi_lag_once=True,
+            reject_once=True,
+        )
+        assert assessments.item["status"] == "READY"
+        assert len(questions.linked) == 100
+        assert len(assessments.item["meta"].encode("utf-8")) < 100_000

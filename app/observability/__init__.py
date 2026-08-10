@@ -1,8 +1,11 @@
 """Safe, request-scoped observability primitives for the agent runtime."""
 
 from observability.context import (
+    ExecutionContext,
     RequestContext,
+    bind_execution_context,
     bind_request_context,
+    current_execution_context,
     current_request_context,
     update_request_type,
 )
@@ -27,14 +30,17 @@ from observability.tracing import configure_tracing, stage_span
 
 __all__ = [
     "RequestContext",
+    "ExecutionContext",
     "RequestExecutionSummary",
     "begin_request_summary",
+    "bind_execution_context",
     "bind_request_context",
     "bind_llm_attempt_type",
     "count_generator_calls",
     "configure_tracing",
     "configure_runtime_identity",
     "current_request_context",
+    "current_execution_context",
     "current_request_summary",
     "current_llm_attempt_type",
     "emit_request_summary",

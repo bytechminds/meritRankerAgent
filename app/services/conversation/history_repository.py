@@ -79,13 +79,13 @@ class ConversationHistoryRepository:
             "topic": turn.topic,
             "qualityStatus": turn.quality_status,
             "wasRegenerated": turn.was_regenerated,
+            "responseType": turn.response_type,
+            "practiceTestId": turn.practice_test_id,
             "createdAt": turn.created_at.isoformat(),
             "__typename": "ConversationHistory",
         }
         encoded = {
-            key: _serializer.serialize(value)
-            for key, value in item.items()
-            if value is not None
+            key: _serializer.serialize(value) for key, value in item.items() if value is not None
         }
         try:
             self._client.put_item(
@@ -146,8 +146,7 @@ class ConversationHistoryRepository:
                 code = str(exc.response.get("Error", {}).get("Code") or "")
                 reason = (
                     "history_permission_denied"
-                    if code
-                    in {"AccessDenied", "AccessDeniedException", "UnauthorizedException"}
+                    if code in {"AccessDenied", "AccessDeniedException", "UnauthorizedException"}
                     else "history_query_failed"
                 )
                 raise ConversationHistoryError(
@@ -172,6 +171,8 @@ class ConversationHistoryRepository:
                     )
                 if not data.get("originalQuery") or not data.get("finalAnswer"):
                     saw_incomplete_turn = True
+                    continue
+                if data.get("responseType") == "practice_generation":
                     continue
                 try:
                     candidate = RecentConversationTurn(
@@ -214,6 +215,8 @@ class ConversationHistoryRepository:
                 topic=data.get("topic"),
                 quality_status=data["qualityStatus"],
                 was_regenerated=bool(data.get("wasRegenerated", False)),
+                response_type=data.get("responseType"),
+                practice_test_id=data.get("practiceTestId"),
                 created_at=datetime.fromisoformat(data["createdAt"]),
             )
         except (KeyError, TypeError, ValueError) as exc:

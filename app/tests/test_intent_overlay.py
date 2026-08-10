@@ -389,6 +389,7 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "language",
         "exam_id",
         "exam_stage",
+        "exam_profile_id",
         "classification",
         "retrieval_context",
         "context_text",
@@ -399,6 +400,8 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "conversation_preparation",
         "query_classification",
         "source_modality",
+        "response_type",
+        "practice_test_id",
     }, f"State fields changed: {set(annotations.keys())}"
 
 

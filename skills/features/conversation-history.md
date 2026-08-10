@@ -139,12 +139,12 @@ Public request, JSON, and SSE schemas; retrieval; prompts; language policy; and 
 resource design are unchanged. No cross-conversation retrieval, summaries, or long-term memory was
 added.
 
-The current compatibility actor seam still uses the validated request `user_id`; binding it to a
-trusted AgentCore/Cognito principal is deferred and is a production release blocker. Live
-actor/session partition checks prove that correctly resolved User A and User B cannot read each
-other's events, but they do not make caller-controlled identity trustworthy. DynamoDB history
-retention/deletion policy is also infrastructure-owned and remains **[NOT VERIFIED]** in this
-runtime change.
+The actor seam still uses validated `request.user_id`, but its production contract is now the
+verified Cognito `sub` inserted by the Amplify SSR proxy before IAM-authenticated AgentCore
+invocation. Python intentionally does not repeat JWT verification. Live Sandbox proof of the full
+proxy-to-persistence chain remains **[NOT VERIFIED]** until a non-production Amplify Hosting branch
+exists and receives the approved Compute role. DynamoDB history retention/deletion policy remains
+infrastructure-owned and **[NOT VERIFIED]** in this runtime change.
 
 ## Validation
 

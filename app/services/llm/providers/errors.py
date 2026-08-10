@@ -45,6 +45,7 @@ ProviderFailureKind = Literal[
     "unsupported_parameter",
     "empty_stream",
     "empty_answer",
+    "output_token_exhausted",
     "safety_blocked",
     "unknown_provider_error",
 ]
@@ -63,6 +64,7 @@ FALLBACK_ELIGIBLE_FAILURE_KINDS: frozenset[str] = frozenset({
     "unsupported_parameter",
     "empty_stream",
     "empty_answer",
+    "output_token_exhausted",
     "unknown_provider_error",
 })
 
@@ -148,9 +150,10 @@ class LlmProviderResponseError(LlmProviderAdapterError):
     - message.content is None or blank
     """
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, failure_kind: str = "empty_answer") -> None:
         super().__init__(message)
         self.provider_usage: object | None = None
+        self.failure_kind: str = failure_kind
 
 
 class LlmProviderUnsupportedFeatureError(LlmProviderAdapterError):

@@ -219,6 +219,36 @@ routes:
           - safe_mock
 
   english:
+    planner:
+      default:
+        model: general_fast_generator
+        prompt: practice_generation/planners/english.md
+        temperature: 0.1
+        max_tokens: 1400
+        fallback:
+          - safe_mock
+      basic:
+        inherits: default
+        max_tokens: 1200
+        fallback:
+          - default
+          - safe_mock
+      intermediate:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 1800
+        fallback:
+          - default
+          - safe_mock
+      advanced:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 2600
+        fallback:
+          - intermediate
+          - default
+          - safe_mock
+
     generator:
       default:
         model: english_fast_generator
@@ -270,13 +300,108 @@ routes:
           - general_default
           - safe_mock
 
+  quant_reasoning:
+    planner:
+      default:
+        model: general_fast_generator
+        prompt: practice_generation/planners/quant_reasoning.md
+        temperature: 0.1
+        max_tokens: 1400
+        fallback:
+          - safe_mock
+      basic:
+        inherits: default
+        max_tokens: 1200
+        fallback:
+          - default
+          - safe_mock
+      intermediate:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 1800
+        fallback:
+          - default
+          - safe_mock
+      advanced:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 2600
+        fallback:
+          - intermediate
+          - default
+          - safe_mock
+
+  factual:
+    planner:
+      default:
+        model: general_fast_generator
+        prompt: practice_generation/planners/factual.md
+        temperature: 0.1
+        max_tokens: 1400
+        fallback:
+          - safe_mock
+      basic:
+        inherits: default
+        max_tokens: 1200
+        fallback:
+          - default
+          - safe_mock
+      intermediate:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 1800
+        fallback:
+          - default
+          - safe_mock
+      advanced:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 2600
+        fallback:
+          - intermediate
+          - default
+          - safe_mock
+
   general:
+    planner:
+      default:
+        model: general_fast_generator
+        prompt: practice_generation/blueprint_planner.md
+        temperature: 0.1
+        max_tokens: 1400
+        fallback:
+          - safe_mock
+
+      basic:
+        inherits: default
+        max_tokens: 1200
+        fallback:
+          - default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 1800
+        fallback:
+          - default
+          - safe_mock
+
+      advanced:
+        inherits: default
+        model: openai_gpt_4_1
+        max_tokens: 2600
+        fallback:
+          - intermediate
+          - default
+          - safe_mock
+
     verifier:
       default:
         model: openai_o4_mini
         prompt: answer_correctness_verifier.md
         temperature: 0.0
-        max_tokens: 3000
+        max_tokens: 5000
         provider_options:
           reasoning_effort: medium
         fallback: []

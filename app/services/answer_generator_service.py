@@ -113,6 +113,7 @@ def _build_answer_messages(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> list:
@@ -140,6 +141,8 @@ def _build_answer_messages(
         task_role="generator",
         exam_id=exam_id,
         exam_stage=exam_stage,
+        exam_profile_id=exam_profile_id,
+        subject=classification.subject,
         language=language,
         request_id=request_id,
     )
@@ -184,6 +187,7 @@ def _generate_with_llm(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> AnswerOutput:
@@ -202,6 +206,7 @@ def _generate_with_llm(
         context=context,
         exam_id=exam_id,
         exam_stage=exam_stage,
+        exam_profile_id=exam_profile_id,
         language=language,
         request_id=request_id,
     )
@@ -237,6 +242,7 @@ def generate_answer(
     *,
     exam_id: str | None = None,
     exam_stage: str | None = None,
+    exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
 ) -> AnswerOutput:
@@ -293,6 +299,7 @@ def generate_answer(
             context=context,
             exam_id=exam_id,
             exam_stage=exam_stage,
+            exam_profile_id=exam_profile_id,
             language=language,
             request_id=request_id,
         )

@@ -8,7 +8,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Literal
@@ -18,6 +18,7 @@ from schemas.doubt_solver import DoubtSolverStreamEvent
 logger = logging.getLogger(__name__)
 
 CancellationReason = Literal["client_disconnected", "user_cancelled"]
+TerminalFrameCallback = Callable[[DoubtSolverStreamEvent], None]
 
 _HEARTBEAT_FRAME = b": heartbeat\n\n"
 _WORKER_DONE = object()
@@ -51,6 +52,57 @@ class _WorkerFailure:
     error: BaseException
 
 
+class _TerminalFrameCallbacks:
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        committed: TerminalFrameCallback | None,
+        abandoned: TerminalFrameCallback | None,
+    ) -> None:
+        self._request_id = request_id
+        self._committed = committed
+        self._abandoned = abandoned
+        self._pending_event: DoubtSolverStreamEvent | None = None
+        self._resolved = False
+        self._lock = threading.Lock()
+
+    def register(self, event: DoubtSolverStreamEvent) -> None:
+        with self._lock:
+            if self._resolved or self._pending_event is not None:
+                return
+            self._pending_event = event
+
+    def commit_pending(self) -> None:
+        self._resolve_pending(callback=self._committed, outcome="commit")
+
+    def abandon_pending(self) -> None:
+        self._resolve_pending(callback=self._abandoned, outcome="abandon")
+
+    def _resolve_pending(
+        self,
+        *,
+        callback: TerminalFrameCallback | None,
+        outcome: str,
+    ) -> None:
+        with self._lock:
+            if self._resolved or self._pending_event is None:
+                return
+            self._resolved = True
+            event = self._pending_event
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "terminal_frame_%s_callback_failed request_id=%s error_type=%s",
+                outcome,
+                self._request_id,
+                type(exc).__name__,
+            )
+
+
 def _error_event(
     request_id: str,
     *,
@@ -69,6 +121,8 @@ def _error_event(
 def _terminal_reason(event: DoubtSolverStreamEvent, *, visible: bool) -> str:
     if event.type == "complete":
         return "completed"
+    if event.type == "practice_generation_started":
+        return "practice_generation_started"
     code = str(event.metadata.get("code") or "")
     return {
         "ANSWER_PROVIDER_FAILED": (
@@ -82,7 +136,7 @@ def _terminal_reason(event: DoubtSolverStreamEvent, *, visible: bool) -> str:
 
 
 def _serialize_event(event: DoubtSolverStreamEvent) -> bytes:
-    payload = event.model_dump(mode="json")
+    payload = event.model_dump(mode="json", by_alias=True)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"data: {encoded}\n\n".encode()
 
@@ -92,6 +146,7 @@ def _run_worker(
     output: queue.Queue[object],
     cancellation: StreamCancellation,
     stop: threading.Event,
+    terminal_callbacks: _TerminalFrameCallbacks,
 ) -> None:
     def put(item: object) -> bool:
         while not cancellation.is_cancelled() and not stop.is_set():
@@ -104,11 +159,17 @@ def _run_worker(
 
     try:
         for event in events:
+            if event.type in {"complete", "error", "practice_generation_started"}:
+                terminal_callbacks.register(event)
             if cancellation.is_cancelled() or stop.is_set():
+                if event.type in {"complete", "error", "practice_generation_started"}:
+                    terminal_callbacks.abandon_pending()
                 break
             if not put(event):
+                if event.type in {"complete", "error", "practice_generation_started"}:
+                    terminal_callbacks.abandon_pending()
                 break
-            if event.type in {"complete", "error"}:
+            if event.type in {"complete", "error", "practice_generation_started"}:
                 break
     except BaseException as exc:  # the async boundary converts this to a safe event
         if not cancellation.is_cancelled() and not stop.is_set():
@@ -138,14 +199,21 @@ async def stream_events_as_sse(
     request_id: str,
     cancellation: StreamCancellation,
     heartbeat_interval_seconds: float,
+    on_terminal_frame_committed: TerminalFrameCallback | None = None,
+    on_terminal_frame_abandoned: TerminalFrameCallback | None = None,
 ) -> AsyncIterator[bytes]:
     """Frame application events as SSE and enforce one observable terminal outcome."""
     started_at = time.monotonic()
     output: queue.Queue[object] = queue.Queue(maxsize=1)
     worker_stop = threading.Event()
+    terminal_callbacks = _TerminalFrameCallbacks(
+        request_id=request_id,
+        committed=on_terminal_frame_committed,
+        abandoned=on_terminal_frame_abandoned,
+    )
     worker = threading.Thread(
         target=copy_context().run,
-        args=(_run_worker, events, output, cancellation, worker_stop),
+        args=(_run_worker, events, output, cancellation, worker_stop, terminal_callbacks),
         name=f"stream-{request_id[:12]}",
         daemon=True,
     )
@@ -157,6 +225,9 @@ async def stream_events_as_sse(
     visible = False
     terminal_sent = False
     terminal_reason: str | None = None
+    pending_terminal_event: DoubtSolverStreamEvent | None = None
+    terminal_frame_serialization_failed = False
+    terminal_frame_replaced = False
     current_stage = "started"
     pending_get: asyncio.Future[object] | None = None
 
@@ -204,22 +275,14 @@ async def stream_events_as_sse(
                     return
                 event = _error_event(
                     request_id,
-                    code=(
-                        "ANSWER_PARTIAL_STREAM_FAILED"
-                        if visible
-                        else "ANSWER_STREAM_FAILED"
-                    ),
+                    code=("ANSWER_PARTIAL_STREAM_FAILED" if visible else "ANSWER_STREAM_FAILED"),
                     retryable=not visible,
                 )
                 terminal_reason = "unexpected_internal_error"
             elif isinstance(item, _WorkerFailure):
                 event = _error_event(
                     request_id,
-                    code=(
-                        "ANSWER_PARTIAL_STREAM_FAILED"
-                        if visible
-                        else "ANSWER_STREAM_FAILED"
-                    ),
+                    code=("ANSWER_PARTIAL_STREAM_FAILED" if visible else "ANSWER_STREAM_FAILED"),
                     retryable=not visible,
                 )
                 terminal_reason = "unexpected_internal_error"
@@ -235,6 +298,9 @@ async def stream_events_as_sse(
                     event = item
 
             if event.request_id != request_id:
+                if event.type in {"complete", "error", "practice_generation_started"}:
+                    terminal_callbacks.abandon_pending()
+                    terminal_frame_replaced = True
                 event = _error_event(
                     request_id,
                     code="ANSWER_STREAM_FAILED",
@@ -242,7 +308,7 @@ async def stream_events_as_sse(
                 )
                 terminal_reason = "unexpected_internal_error"
 
-            if event.type in {"complete", "error"}:
+            if event.type in {"complete", "error", "practice_generation_started"}:
                 if terminal_sent:
                     return
                 terminal_sent = True
@@ -253,6 +319,7 @@ async def stream_events_as_sse(
             try:
                 frame = _serialize_event(event)
             except Exception:  # noqa: BLE001
+                failed_terminal_event = event if terminal_sent else None
                 event = _error_event(
                     request_id,
                     code="ANSWER_SERIALIZATION_FAILED",
@@ -261,6 +328,13 @@ async def stream_events_as_sse(
                 frame = _serialize_event(event)
                 terminal_sent = True
                 terminal_reason = "serialization_failed"
+                if failed_terminal_event is not None:
+                    pending_terminal_event = failed_terminal_event
+                    terminal_frame_serialization_failed = True
+                    terminal_callbacks.abandon_pending()
+
+            if event.type in {"complete", "error", "practice_generation_started"}:
+                pending_terminal_event = pending_terminal_event or event
 
             sequence += 1
             if event.stage:
@@ -295,6 +369,12 @@ async def stream_events_as_sse(
                     request_id,
                     sequence,
                 )
+            elif event.type == "practice_generation_started":
+                logger.debug(
+                    "practice_generation_started_sent request_id=%s sequence=%d",
+                    request_id,
+                    sequence,
+                )
             else:
                 logger.debug(
                     "error_sent request_id=%s stage=failed event_type=error sequence=%d "
@@ -304,6 +384,12 @@ async def stream_events_as_sse(
                     terminal_reason,
                 )
             yield frame
+            if (
+                pending_terminal_event is not None
+                and not terminal_frame_serialization_failed
+                and not terminal_frame_replaced
+            ):
+                terminal_callbacks.commit_pending()
     except asyncio.CancelledError:
         if not terminal_sent:
             cancellation.cancel("client_disconnected")
@@ -337,6 +423,7 @@ async def stream_events_as_sse(
         )
         return
     finally:
+        terminal_callbacks.abandon_pending()
         worker_stop.set()
         if terminal_reason is None and cancellation.is_cancelled():
             terminal_reason = cancellation.reason

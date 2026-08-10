@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from observability import (
+    current_execution_context,
     current_llm_attempt_type,
     current_request_context,
     log_event,
@@ -34,6 +35,7 @@ from services.llm.orchestration.model_config_resolver import ModelConfigResolver
 from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderExecutionError,
+    LlmProviderResponseError,
 )
 from services.llm.providers.usage import clear_stream_usage, consume_stream_usage
 
@@ -88,6 +90,142 @@ def _log_model_execution(
 def _is_visible_text(chunk: str) -> bool:
     """True when a stream chunk contains user-visible answer text."""
     return bool(chunk and chunk.strip())
+
+
+def _is_practice_generator_token_exhausted(
+    *,
+    route_decision: RouteDecision,
+    finish_reason: str | None,
+    output_tokens: int | None,
+    reasoning_tokens: int | None,
+) -> bool:
+    """Detect a structured practice response consumed entirely by reasoning."""
+    return (
+        route_decision.task_role == "generator"
+        and route_decision.intent == "practice"
+        and finish_reason == "length"
+        and output_tokens is not None
+        and output_tokens >= route_decision.max_tokens
+        and reasoning_tokens is not None
+        and reasoning_tokens >= output_tokens
+    )
+
+
+def _provider_response_failure_kind(
+    *,
+    route_decision: RouteDecision,
+    response_error: LlmProviderResponseError,
+) -> str:
+    if _is_practice_generator_token_exhausted(
+        route_decision=route_decision,
+        finish_reason=getattr(response_error, "finish_reason", None),
+        output_tokens=getattr(response_error, "output_tokens", None),
+        reasoning_tokens=getattr(response_error, "reasoning_tokens", None),
+    ):
+        return "output_token_exhausted"
+    return response_error.failure_kind
+
+
+def _log_practice_generator_token_exhausted(
+    *,
+    route_decision: RouteDecision,
+    model_alias: str,
+) -> None:
+    log_event(
+        "practice_generator_token_exhausted",
+        component="llm.model_execution",
+        stage="generator",
+        status="failed",
+        error_code="PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED",
+        details={
+            "route": route_decision.route_id,
+            "modelAlias": model_alias,
+            "failureClass": "output_token_exhausted",
+        },
+        level=logging.WARNING,
+    )
+
+
+def _log_practice_model_fallback(
+    *,
+    event_name: str,
+    route_decision: RouteDecision,
+    model_alias: str,
+) -> None:
+    log_event(
+        event_name,
+        component="llm.model_execution",
+        stage="generator",
+        status="started" if event_name.endswith("started") else "completed",
+        details={
+            "route": route_decision.route_id,
+            "modelAlias": model_alias,
+            "failureClass": "output_token_exhausted",
+        },
+    )
+
+
+def _is_practice_generator(route_decision: RouteDecision) -> bool:
+    return (
+        route_decision.task_role == "generator"
+        and route_decision.intent == "practice"
+    )
+
+
+def _log_practice_generator_attempt(
+    *,
+    event_name: str,
+    route_decision: RouteDecision,
+    model_alias: str,
+    provider: str | None,
+    attempt_type: str,
+    fallback_index: int,
+    duration_ms: int,
+    failure_kind: str | None = None,
+    error_class: str | None = None,
+    status: str,
+) -> None:
+    """Emit bounded diagnostics for practice model attempts without content."""
+    if not _is_practice_generator(route_decision):
+        return
+    fallback_eligible = (
+        failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
+        if failure_kind is not None
+        else None
+    )
+    details: dict[str, object] = {
+        "routeId": route_decision.route_id,
+        "modelAlias": model_alias,
+        "provider": provider or "",
+        "attemptType": attempt_type,
+        "fallbackIndex": fallback_index,
+    }
+    execution_context = current_execution_context()
+    if execution_context is not None:
+        if execution_context.activity_id is not None:
+            details["activityId"] = execution_context.activity_id
+        if execution_context.batch_id is not None:
+            details["batchId"] = execution_context.batch_id
+        if execution_context.slot_ids:
+            details["slotCount"] = len(execution_context.slot_ids)
+            details["slotIds"] = ",".join(execution_context.slot_ids)
+    if error_class is not None:
+        details["errorClass"] = error_class
+    if failure_kind is not None:
+        details["errorCode"] = failure_kind
+    if fallback_eligible is not None:
+        details["fallbackEligible"] = fallback_eligible
+        details["retryEligible"] = fallback_eligible
+    log_event(
+        event_name,
+        component="llm.model_execution",
+        stage="generator",
+        status=status,
+        duration_ms=duration_ms,
+        error_code=failure_kind,
+        details=details,
+        level=logging.WARNING if status == "failed" else logging.INFO,
+    )
 
 
 def _validate_model_role(
@@ -245,8 +383,34 @@ class RegistryBackedModelExecutor:
 
         # --- Try primary model ---
         primary_failure_kind: str | None = None
+        _log_practice_generator_attempt(
+            event_name="generator_model_attempt_started",
+            route_decision=route_decision,
+            model_alias=model_resolution.model_alias,
+            provider=model_resolution.provider,
+            attempt_type="primary",
+            fallback_index=0,
+            duration_ms=0,
+            status="started",
+        )
         try:
             raw_result = self._provider_executor.execute(primary_request)
+            if _is_practice_generator_token_exhausted(
+                route_decision=route_decision,
+                finish_reason=raw_result.finish_reason,
+                output_tokens=raw_result.output_tokens,
+                reasoning_tokens=raw_result.reasoning_tokens,
+            ):
+                _log_practice_generator_token_exhausted(
+                    route_decision=route_decision,
+                    model_alias=model_resolution.model_alias,
+                )
+                raise LlmProviderExecutionError(
+                    "Practice generator output token budget was exhausted.",
+                    failure_kind="output_token_exhausted",
+                    provider=model_resolution.provider,
+                    model_alias=primary_alias,
+                )
             if not _is_visible_text(raw_result.content):
                 _log_generation_empty_output(
                     route_id=route_decision.route_id,
@@ -276,12 +440,61 @@ class RegistryBackedModelExecutor:
                 fallback_used=False,
             )
             return raw_result
+        except LlmProviderResponseError as exc:
+            primary_failure_kind = _provider_response_failure_kind(
+                route_decision=route_decision,
+                response_error=exc,
+            )
+            _log_practice_generator_attempt(
+                event_name="generator_model_attempt_failed",
+                route_decision=route_decision,
+                model_alias=model_resolution.model_alias,
+                provider=model_resolution.provider,
+                attempt_type="primary",
+                fallback_index=0,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                failure_kind=primary_failure_kind,
+                error_class=type(exc).__name__,
+                status="failed",
+            )
+            if primary_failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
+                raise ProviderExecutionError(
+                    f"Provider response failed for model '{primary_alias}' "
+                    f"(failure_kind={primary_failure_kind!r}): {type(exc).__name__}",
+                    failure_kind=primary_failure_kind,
+                    attempted_aliases=(primary_alias,),
+                ) from exc
+            if primary_failure_kind == "output_token_exhausted":
+                _log_practice_generator_token_exhausted(
+                    route_decision=route_decision,
+                    model_alias=model_resolution.model_alias,
+                )
+            logger.warning(
+                "registry_backed_model_executor.execute  primary_response_failed  "
+                "model_alias=%s  failure_kind=%s — attempting fallback",
+                primary_alias,
+                primary_failure_kind,
+            )
         except LlmProviderExecutionError as exc:
+            _log_practice_generator_attempt(
+                event_name="generator_model_attempt_failed",
+                route_decision=route_decision,
+                model_alias=model_resolution.model_alias,
+                provider=model_resolution.provider,
+                attempt_type="primary",
+                fallback_index=0,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                failure_kind=exc.failure_kind,
+                error_class=type(exc).__name__,
+                status="failed",
+            )
             if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
                 # Not a retryable provider failure — wrap and raise immediately.
                 raise ProviderExecutionError(
                     f"Provider execution failed for model '{primary_alias}' "
-                    f"(failure_kind={exc.failure_kind!r}): {type(exc).__name__}"
+                    f"(failure_kind={exc.failure_kind!r}): {type(exc).__name__}",
+                    failure_kind=exc.failure_kind,
+                    attempted_aliases=(primary_alias,),
                 ) from exc
             primary_failure_kind = exc.failure_kind
             logger.warning(
@@ -293,9 +506,22 @@ class RegistryBackedModelExecutor:
         except ProviderExecutionError:
             raise
         except Exception as exc:
+            _log_practice_generator_attempt(
+                event_name="generator_model_attempt_failed",
+                route_decision=route_decision,
+                model_alias=model_resolution.model_alias,
+                provider=model_resolution.provider,
+                attempt_type="primary",
+                fallback_index=0,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                failure_kind="unknown_provider_error",
+                error_class=type(exc).__name__,
+                status="failed",
+            )
             raise ProviderExecutionError(
                 f"Provider executor failed for model '{primary_alias}': "
-                f"{type(exc).__name__}"
+                f"{type(exc).__name__}",
+                attempted_aliases=(primary_alias,),
             ) from exc
 
         # --- Fallback loop ---
@@ -304,7 +530,7 @@ class RegistryBackedModelExecutor:
         )
         attempted: list[str] = [primary_alias]
 
-        for fallback_alias in fallback_aliases:
+        for fallback_index, fallback_alias in enumerate(fallback_aliases, start=1):
             try:
                 fallback_resolution = self._model_config_resolver.resolve_for_alias(
                     fallback_alias
@@ -317,6 +543,18 @@ class RegistryBackedModelExecutor:
                     type(cfg_exc).__name__,
                 )
                 attempted.append(fallback_alias)
+                _log_practice_generator_attempt(
+                    event_name="generator_fallback_failed",
+                    route_decision=route_decision,
+                    model_alias=fallback_alias,
+                    provider=None,
+                    attempt_type="fallback",
+                    fallback_index=fallback_index,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    failure_kind="unknown_provider_error",
+                    error_class=type(cfg_exc).__name__,
+                    status="failed",
+                )
                 continue
             _validate_model_role(
                 route_decision,
@@ -340,15 +578,70 @@ class RegistryBackedModelExecutor:
                 fallback_alias,
                 fallback_resolution.provider,
             )
+            _log_practice_generator_attempt(
+                event_name="generator_fallback_selected",
+                route_decision=route_decision,
+                model_alias=fallback_resolution.model_alias,
+                provider=fallback_resolution.provider,
+                attempt_type="fallback",
+                fallback_index=fallback_index,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                failure_kind=primary_failure_kind,
+                status="selected",
+            )
+            _log_practice_generator_attempt(
+                event_name="generator_fallback_started",
+                route_decision=route_decision,
+                model_alias=fallback_resolution.model_alias,
+                provider=fallback_resolution.provider,
+                attempt_type="fallback",
+                fallback_index=fallback_index,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                status="started",
+            )
+            if primary_failure_kind == "output_token_exhausted":
+                _log_practice_model_fallback(
+                    event_name="practice_model_fallback_started",
+                    route_decision=route_decision,
+                    model_alias=fallback_alias,
+                )
 
             try:
                 raw_result = self._provider_executor.execute(fallback_request)
+                if _is_practice_generator_token_exhausted(
+                    route_decision=route_decision,
+                    finish_reason=raw_result.finish_reason,
+                    output_tokens=raw_result.output_tokens,
+                    reasoning_tokens=raw_result.reasoning_tokens,
+                ):
+                    _log_practice_generator_token_exhausted(
+                        route_decision=route_decision,
+                        model_alias=fallback_alias,
+                    )
+                    raise LlmProviderExecutionError(
+                        "Practice generator output token budget was exhausted.",
+                        failure_kind="output_token_exhausted",
+                        provider=fallback_resolution.provider,
+                        model_alias=fallback_alias,
+                    )
                 if not _is_visible_text(raw_result.content):
                     attempted.append(fallback_alias)
                     logger.warning(
                         "registry_backed_model_executor.execute  fallback_empty_answer  "
                         "fallback_alias=%s — skipping",
                         fallback_alias,
+                    )
+                    _log_practice_generator_attempt(
+                        event_name="generator_fallback_failed",
+                        route_decision=route_decision,
+                        model_alias=fallback_resolution.model_alias,
+                        provider=fallback_resolution.provider,
+                        attempt_type="fallback",
+                        fallback_index=fallback_index,
+                        duration_ms=int((time.monotonic() - started_at) * 1000),
+                        failure_kind="empty_answer",
+                        error_class="EmptyProviderResponse",
+                        status="failed",
                     )
                     continue
                 # Build a new result that records the fallback provenance safely.
@@ -389,17 +682,100 @@ class RegistryBackedModelExecutor:
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                     fallback_used=True,
                 )
+                if primary_failure_kind == "output_token_exhausted":
+                    _log_practice_model_fallback(
+                        event_name="practice_model_fallback_succeeded",
+                        route_decision=route_decision,
+                        model_alias=fallback_alias,
+                    )
+                _log_practice_generator_attempt(
+                    event_name="generator_fallback_succeeded",
+                    route_decision=route_decision,
+                    model_alias=fallback_resolution.model_alias,
+                    provider=fallback_resolution.provider,
+                    attempt_type="fallback",
+                    fallback_index=fallback_index,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    status="completed",
+                )
                 return result
+            except LlmProviderResponseError as exc:
+                attempted.append(fallback_alias)
+                failure_kind = _provider_response_failure_kind(
+                    route_decision=route_decision,
+                    response_error=exc,
+                )
+                _log_practice_generator_attempt(
+                    event_name="generator_fallback_failed",
+                    route_decision=route_decision,
+                    model_alias=fallback_resolution.model_alias,
+                    provider=fallback_resolution.provider,
+                    attempt_type="fallback",
+                    fallback_index=fallback_index,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    failure_kind=failure_kind,
+                    error_class=type(exc).__name__,
+                    status="failed",
+                )
+                if failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
+                    raise ProviderExecutionError(
+                        f"Provider response failed for fallback model '{fallback_alias}' "
+                        f"(failure_kind={failure_kind!r}): {type(exc).__name__}",
+                        failure_kind=failure_kind,
+                        attempted_aliases=tuple(attempted),
+                    ) from exc
+                if failure_kind == "output_token_exhausted":
+                    _log_practice_generator_token_exhausted(
+                        route_decision=route_decision,
+                        model_alias=fallback_alias,
+                    )
+                logger.warning(
+                    "registry_backed_model_executor.execute  fallback_response_failed  "
+                    "fallback_alias=%s  failure_kind=%s",
+                    fallback_alias,
+                    failure_kind,
+                )
             except LlmProviderExecutionError as exc:
                 attempted.append(fallback_alias)
+                _log_practice_generator_attempt(
+                    event_name="generator_fallback_failed",
+                    route_decision=route_decision,
+                    model_alias=fallback_resolution.model_alias,
+                    provider=fallback_resolution.provider,
+                    attempt_type="fallback",
+                    fallback_index=fallback_index,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    failure_kind=exc.failure_kind,
+                    error_class=type(exc).__name__,
+                    status="failed",
+                )
                 logger.warning(
                     "registry_backed_model_executor.execute  fallback_failed  "
                     "fallback_alias=%s  failure_kind=%s",
                     fallback_alias,
                     exc.failure_kind,
                 )
+                if exc.failure_kind not in FALLBACK_ELIGIBLE_FAILURE_KINDS:
+                    raise ProviderExecutionError(
+                        f"Provider execution failed for fallback model '{fallback_alias}' "
+                        f"(failure_kind={exc.failure_kind!r}): {type(exc).__name__}",
+                        failure_kind=exc.failure_kind,
+                        attempted_aliases=tuple(attempted),
+                    ) from exc
             except Exception as exc:
                 attempted.append(fallback_alias)
+                _log_practice_generator_attempt(
+                    event_name="generator_fallback_failed",
+                    route_decision=route_decision,
+                    model_alias=fallback_resolution.model_alias,
+                    provider=fallback_resolution.provider,
+                    attempt_type="fallback",
+                    fallback_index=fallback_index,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    failure_kind="unknown_provider_error",
+                    error_class=type(exc).__name__,
+                    status="failed",
+                )
                 logger.warning(
                     "registry_backed_model_executor.execute  fallback_error  "
                     "fallback_alias=%s  error=%s",
@@ -408,10 +784,23 @@ class RegistryBackedModelExecutor:
                 )
 
         # All attempts exhausted.
+        _log_practice_generator_attempt(
+            event_name="generator_fallback_exhausted",
+            route_decision=route_decision,
+            model_alias=attempted[-1],
+            provider=None,
+            attempt_type="fallback",
+            fallback_index=len(fallback_aliases),
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            failure_kind=primary_failure_kind or "unknown_provider_error",
+            status="failed",
+        )
         raise ProviderExecutionError(
             f"All model execution attempts failed. "
             f"Attempted aliases: {attempted}. "
-            f"Primary failure_kind: {primary_failure_kind!r}."
+            f"Primary failure_kind: {primary_failure_kind!r}.",
+            failure_kind=primary_failure_kind or "unknown_provider_error",
+            attempted_aliases=tuple(attempted),
         )
 
     def execute_stream(

@@ -31,16 +31,17 @@ API_KEY = os.getenv("OPENAI_API_KEY", "sk-1234hardcodedkey")
 
 ## Authentication and Trust
 
-**The current system has no authentication. This is a known limitation.**
+The web-to-AgentCore identity boundary is the authenticated Amplify SSR proxy:
 
-- Do not trust frontend-supplied `user_id`, `student_id`, or `session_id` for any
-  access control or personalisation decisions in production. [PROD BLOCKER]
-- Any flow that relies on client-supplied identity without server-side verification
-  must be labelled `[AUTH TODO]` in the feature context doc.
-- Missing auth must not be silently accepted — it must be documented and flagged.
+- The browser sends a Cognito access token in the Bearer header.
+- The proxy verifies signature, User Pool, expiry, access-token use, app client, and `sub`.
+- The proxy ignores client body `user_id` and inserts the verified `sub`.
+- The proxy invokes AgentCore with a least-privilege Amplify SSR role through SigV4.
+- Python trusts `request.user_id` only when the Runtime is reached through that IAM boundary.
 
-**Future auth:** JWT validation, Cognito, or AgentCore gateway auth will be added in
-a later phase. Do not implement auth prematurely — document the gap instead.
+Do not expose the Runtime through an alternate unauthenticated route. Any caller outside this chain
+is `[AUTH TODO]` and must not be enabled for production. Missing or invalid authentication fails
+before Runtime invocation and persistence.
 
 ---
 
@@ -84,7 +85,7 @@ The following are **untrusted** until validated by your code:
 | Model output | Hallucinated, malformed, injected instructions | Schema validation before use |
 | Retrieved KB / RAG context | Prompt injection, misleading content | Isolate from system prompt; validate before use |
 | Tool call results | Unexpected format, injected content | Schema validation before use |
-| Client-supplied user identity | Unverified | `[AUTH TODO]` — not used for access control |
+| Client-supplied user identity | Forged ownership | Ignore it; use only the verified Cognito `sub` inserted by the IAM-authenticated proxy |
 
 **[AI RISK]** Retrieval-augmented content sourced from user-adjacent data (e.g.,
 student notes, forum posts) has elevated prompt-injection risk. It must be injected
@@ -133,7 +134,7 @@ into the prompt as clearly delimited context, not as system instructions.
 
 | Risk | How it applies here |
 |---|---|
-| A01 Broken Access Control | No auth yet — `[AUTH TODO]` for every user-identity-dependent flow |
+| A01 Broken Access Control | Cognito verification at SSR proxy; exact Runtime IAM permission; no body-identity trust |
 | A02 Cryptographic Failures | Secrets in env vars, never in source |
 | A03 Injection | Pydantic validation; no `eval`/`exec`/`subprocess` with user input |
 | A05 Security Misconfiguration | Debug logs and verbose tracebacks off in production |

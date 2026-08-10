@@ -240,11 +240,23 @@ class _FakeAdapter:
     def __init__(self) -> None:
         self.last_kwargs: dict[str, Any] = {}
 
-    def generate(self, *, request_id: str, query: str, subject: str,
-                 intent: str, difficulty: str, context: str) -> str:
+    def generate(
+        self,
+        *,
+        request_id: str,
+        query: str,
+        subject: str,
+        intent: str,
+        difficulty: str,
+        context: str,
+    ) -> str:
         self.last_kwargs = {
-            "request_id": request_id, "query": query, "subject": subject,
-            "intent": intent, "difficulty": difficulty, "context": context,
+            "request_id": request_id,
+            "query": query,
+            "subject": subject,
+            "intent": intent,
+            "difficulty": difficulty,
+            "context": context,
         }
         return "Fake answer."
 
@@ -252,8 +264,12 @@ class _FakeAdapter:
 def test_fake_adapter_receives_difficulty_advanced() -> None:
     adapter = _FakeAdapter()
     adapter.generate(
-        request_id="r1", query="test", subject="math",
-        intent="practice", difficulty="advanced", context="",
+        request_id="r1",
+        query="test",
+        subject="math",
+        intent="practice",
+        difficulty="advanced",
+        context="",
     )
     assert adapter.last_kwargs["difficulty"] == "advanced"
 
@@ -444,17 +460,37 @@ def test_advanced_difficulty_signal_in_solve_query() -> None:
 def test_orchestrated_state_has_internal_retrieval_context() -> None:
     annotations = OrchestratedDoubtSolverState.__annotations__
     assert set(annotations.keys()) == {
-        "request_id", "query", "original_query", "actor_id", "conversation_id", "turn_id",
-        "language", "exam_id",
-        "exam_stage", "classification", "retrieval_context", "context_text", "answer",
-        "final_answer", "conversation_context", "conversation_relation",
-        "conversation_preparation", "query_classification", "source_modality",
+        "request_id",
+        "query",
+        "original_query",
+        "actor_id",
+        "conversation_id",
+        "turn_id",
+        "language",
+        "exam_id",
+        "exam_stage",
+        "exam_profile_id",
+        "classification",
+        "retrieval_context",
+        "context_text",
+        "answer",
+        "final_answer",
+        "conversation_context",
+        "conversation_relation",
+        "conversation_preparation",
+        "query_classification",
+        "source_modality",
+        "response_type",
+        "practice_test_id",
     }
 
 
 def test_task_role_remains_generator() -> None:
     req = RouteRequest(
-        request_id="r1", subject="math", task_role="generator", difficulty="advanced",
+        request_id="r1",
+        subject="math",
+        task_role="generator",
+        difficulty="advanced",
     )
     assert req.task_role == "generator"
 

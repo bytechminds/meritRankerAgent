@@ -29,6 +29,20 @@ _request_context: ContextVar[RequestContext | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class ExecutionContext:
+    """Safe operation correlation for work executed beneath one request."""
+
+    activity_id: str | None = None
+    batch_id: str | None = None
+    slot_ids: tuple[str, ...] = ()
+
+
+_execution_context: ContextVar[ExecutionContext | None] = ContextVar(
+    "agent_execution_context", default=None
+)
+
+
 def safe_identifier(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -52,6 +66,10 @@ def new_trace_id() -> str:
 
 def current_request_context() -> RequestContext | None:
     return _request_context.get()
+
+
+def current_execution_context() -> ExecutionContext | None:
+    return _execution_context.get()
 
 
 def update_request_type(request_type: RequestType) -> RequestContext | None:
@@ -131,3 +149,27 @@ def bind_request_context(
             except Exception:
                 pass
         reset_request_context(token)
+
+
+@contextmanager
+def bind_execution_context(
+    *,
+    activity_id: str | None = None,
+    batch_id: str | None = None,
+    slot_ids: tuple[str, ...] = (),
+) -> Iterator[ExecutionContext]:
+    """Bind server-issued operation identifiers without user content."""
+    context = ExecutionContext(
+        activity_id=safe_identifier(activity_id),
+        batch_id=safe_identifier(batch_id),
+        slot_ids=tuple(
+            safe_slot_id
+            for value in slot_ids[:100]
+            if (safe_slot_id := safe_identifier(value)) is not None
+        ),
+    )
+    token = _execution_context.set(context)
+    try:
+        yield context
+    finally:
+        _execution_context.reset(token)

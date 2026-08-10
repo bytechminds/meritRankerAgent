@@ -19,12 +19,13 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from schemas.image_input import ImageInput
 
 CanonicalLanguage = Literal["english", "hinglish", "hindi"]
 QualityStatus = Literal["checked", "passed_quality_gate", "failed_quality_gate"]
+ResponseType = Literal["practice_generation"]
 _LANGUAGE_ALIASES: dict[str, CanonicalLanguage] = {
     "en": "english",
     "english": "english",
@@ -78,7 +79,7 @@ class DoubtSolverRequest(BaseModel):
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_/-]*(?::[A-Za-z0-9_/-]+)*$",
-        description="Caller identifier — used for tracing.",
+        description="Trusted Cognito subject inserted by the authenticated SSR proxy.",
     )
     conversation_id: str = Field(
         min_length=1,
@@ -100,6 +101,14 @@ class DoubtSolverRequest(BaseModel):
         max_length=128,
         description="Optional selected exam identifier used only for answer presentation.",
     )
+    exam_profile_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("exam_profile_id", "examProfileId"),
+        min_length=3,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_#/-]*$",
+        description="Optional canonical admin-managed exam and stage identity.",
+    )
     exam_stage: str | None = Field(
         default=None,
         min_length=1,
@@ -109,8 +118,8 @@ class DoubtSolverRequest(BaseModel):
     stream: bool = Field(
         default=False,
         description="Request a streaming response with student-friendly status "
-                    "labels and real answer chunks. Only honoured by the "
-                    "orchestrated graph path.",
+        "labels and real answer chunks. Only honoured by the "
+        "orchestrated graph path.",
     )
 
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
@@ -352,9 +361,20 @@ class DoubtSolverResponse(BaseModel):
     content: ResponseContent | None = Field(
         default=None,
         description=(
-            "Canonical Markdown response content. `answer` remains its compatibility "
-            "projection."
+            "Canonical Markdown response content. `answer` remains its compatibility projection."
         ),
+    )
+    response_type: ResponseType | None = Field(
+        default=None,
+        serialization_alias="responseType",
+        exclude_if=lambda value: value is None,
+    )
+    practice_test_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        serialization_alias="practiceTestId",
+        exclude_if=lambda value: value is None,
     )
 
     @model_validator(mode="after")
@@ -485,6 +505,18 @@ class DoubtSolverFinalResponse(BaseModel):
     content: ResponseContent
     answer: str = Field(min_length=1, max_length=8000)
     final_answer: FinalAnswerResult | None = Field(default=None, exclude=True)
+    response_type: ResponseType | None = Field(
+        default=None,
+        serialization_alias="responseType",
+        exclude_if=lambda value: value is None,
+    )
+    practice_test_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        serialization_alias="practiceTestId",
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _project_content_to_answer(self) -> DoubtSolverFinalResponse:
@@ -492,7 +524,27 @@ class DoubtSolverFinalResponse(BaseModel):
             raise ValueError("answer must match content.value")
         if self.final_answer is not None and self.answer != self.final_answer.content:
             raise ValueError("answer must match final_answer.content")
+        if (self.response_type is None) != (self.practice_test_id is None):
+            raise ValueError("response_type and practice_test_id must be provided together")
         return self
+
+
+class PracticeGenerationStartedData(BaseModel):
+    """Safe acknowledgement payload for a registered practice-generation task."""
+
+    response_type: Literal["practice_generation"] = Field(
+        default="practice_generation",
+        serialization_alias="responseType",
+    )
+    practice_test_id: str = Field(
+        min_length=1,
+        max_length=128,
+        serialization_alias="practiceTestId",
+    )
+    status: Literal["GENERATING"] = "GENERATING"
+    message: str = Field(min_length=1, max_length=500)
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
 class DoubtSolverStreamEvent(BaseModel):
@@ -509,7 +561,7 @@ class DoubtSolverStreamEvent(BaseModel):
     in any field.
     """
 
-    type: Literal["status", "chunk", "complete", "error"] = Field(
+    type: Literal["status", "chunk", "complete", "error", "practice_generation_started"] = Field(
         description="Type of streaming event.",
     )
     request_id: str = Field(
@@ -542,6 +594,11 @@ class DoubtSolverStreamEvent(BaseModel):
         default=None,
         description="Authoritative final response, present only on complete events.",
     )
+    data: PracticeGenerationStartedData | None = Field(
+        default=None,
+        description="Practice acknowledgement payload on practice_generation_started.",
+        exclude_if=lambda value: value is None,
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -549,12 +606,12 @@ class DoubtSolverStreamEvent(BaseModel):
     def _validate_event_shape(self) -> DoubtSolverStreamEvent:
         for key in self.metadata:
             if key.lower() in _FORBIDDEN_STREAM_METADATA_KEYS:
-                raise ValueError(
-                    f"metadata must not contain forbidden key: {key!r}"
-                )
+                raise ValueError(f"metadata must not contain forbidden key: {key!r}")
 
         if self.type != "complete" and self.response is not None:
             raise ValueError("response is only allowed on complete events")
+        if self.type != "practice_generation_started" and self.data is not None:
+            raise ValueError("data is only allowed on practice_generation_started events")
 
         if self.type == "chunk":
             if self.content is None:
@@ -570,5 +627,8 @@ class DoubtSolverStreamEvent(BaseModel):
                 raise ValueError("complete event must have response")
             if self.response.request_id != self.request_id:
                 raise ValueError("complete response request_id must match event request_id")
+        elif self.type == "practice_generation_started":
+            if self.data is None:
+                raise ValueError("practice_generation_started event must have data")
 
         return self

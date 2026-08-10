@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from schemas.doubt_solver import CanonicalLanguage
 from schemas.llm import LlmMessage
 from schemas.llm_routing import RouteDecision
+from services.doubt_solver.exam_profile_cache import ExamProfileRuntime, get_exam_profile_runtime
 from services.doubt_solver.exam_response_profile import (
     ExamResponseProfileResolver,
     get_exam_response_profile_resolver,
@@ -95,6 +96,7 @@ class PromptResolver:
         self,
         prompt_root: Path | None = None,
         exam_profile_resolver: ExamResponseProfileResolver | None = None,
+        exam_profile_runtime: ExamProfileRuntime | None = None,
         language_policy_resolver: LanguagePolicyResolver | None = None,
     ) -> None:
         self._prompt_root: Path = (prompt_root or DEFAULT_PROMPT_ROOT).resolve()
@@ -104,9 +106,8 @@ class PromptResolver:
             if exam_profile_resolver is not None
             else get_exam_response_profile_resolver()
         )
-        self._language_policy_resolver = (
-            language_policy_resolver or LanguagePolicyResolver()
-        )
+        self._exam_profile_runtime = exam_profile_runtime or get_exam_profile_runtime()
+        self._language_policy_resolver = language_policy_resolver or LanguagePolicyResolver()
 
     # ------------------------------------------------------------------
     # Public API
@@ -181,6 +182,8 @@ class PromptResolver:
             task_role=route_decision.task_role,
             exam_id=route_decision.exam,
             exam_stage=route_decision.exam_stage,
+            exam_profile_id=route_decision.exam_profile_id,
+            subject=route_decision.subject,
             language=route_decision.language,
             request_id=request_id,
         )
@@ -197,6 +200,26 @@ class PromptResolver:
             LlmMessage(role="user", content=user_content),
         ]
 
+    def resolve_structured(
+        self,
+        route_decision: RouteDecision,
+        user_content: str,
+    ) -> list[LlmMessage]:
+        """Compose messages for structured-output calls without answer policies."""
+        logger.info(
+            "prompt_resolver  resolve_structured  route_id=%s  overlay_count=%d",
+            route_decision.route_id,
+            len(route_decision.overlays),
+        )
+        system_content = self._build_system_prompt(
+            route_decision.prompt,
+            list(route_decision.overlays),
+        )
+        return [
+            LlmMessage(role="system", content=system_content),
+            LlmMessage(role="user", content=user_content),
+        ]
+
     def compose_generator_system_prompt(
         self,
         system_content: str,
@@ -204,7 +227,9 @@ class PromptResolver:
         task_role: str,
         exam_id: str | None,
         exam_stage: str | None,
-        language: CanonicalLanguage,
+        exam_profile_id: str | None = None,
+        subject: str | None = None,
+        language: CanonicalLanguage = "english",
         request_id: str = "",
     ) -> str:
         """Append dynamic answer policies exactly once for generator calls."""
@@ -212,7 +237,16 @@ class PromptResolver:
             return system_content
 
         sections = [system_content]
-        if exam_id:
+        resolution = self._exam_profile_runtime.resolve(
+            exam_profile_id=exam_profile_id,
+            exam_id=exam_id,
+            exam_stage=exam_stage,
+            subject=subject,
+            full_mock=False,
+        )
+        if resolution.context is not None:
+            sections.append(resolution.context.as_prompt_instruction())
+        elif exam_id:
             exam_profile = self._exam_profile_resolver.resolve(
                 exam_id,
                 exam_stage,
@@ -242,26 +276,16 @@ class PromptResolver:
             PromptPathError: On any validation failure.
         """
         if rel_path.startswith(("http://", "https://")):
-            raise PromptPathError(
-                f"Prompt path must not be a URL: {rel_path!r}"
-            )
+            raise PromptPathError(f"Prompt path must not be a URL: {rel_path!r}")
         if ".." in rel_path:
-            raise PromptPathError(
-                f"Prompt path must not contain '..': {rel_path!r}"
-            )
+            raise PromptPathError(f"Prompt path must not contain '..': {rel_path!r}")
         if rel_path.startswith("/"):
-            raise PromptPathError(
-                f"Prompt path must be relative (not absolute): {rel_path!r}"
-            )
+            raise PromptPathError(f"Prompt path must be relative (not absolute): {rel_path!r}")
         if not rel_path.lower().endswith(".md"):
-            raise PromptPathError(
-                f"Prompt path must be a .md file: {rel_path!r}"
-            )
+            raise PromptPathError(f"Prompt path must be a .md file: {rel_path!r}")
         resolved = (self._prompt_root / rel_path).resolve()
         if not resolved.is_relative_to(self._prompt_root):
-            raise PromptPathError(
-                f"Prompt path resolves outside prompt root: {rel_path!r}"
-            )
+            raise PromptPathError(f"Prompt path resolves outside prompt root: {rel_path!r}")
         return resolved
 
     def _load_prompt(self, rel_path: str) -> str:
@@ -285,16 +309,12 @@ class PromptResolver:
         resolved = self._validate_path(rel_path)
 
         if not resolved.exists():
-            raise PromptNotFoundError(
-                f"Prompt file not found: {rel_path!r}"
-            )
+            raise PromptNotFoundError(f"Prompt file not found: {rel_path!r}")
 
         content = resolved.read_text(encoding="utf-8")
 
         if not content.strip():
-            raise PromptValidationError(
-                f"Prompt file is empty or whitespace-only: {rel_path!r}"
-            )
+            raise PromptValidationError(f"Prompt file is empty or whitespace-only: {rel_path!r}")
         if len(content) > MAX_PROMPT_FILE_CHARS:
             raise PromptValidationError(
                 f"Prompt file exceeds {MAX_PROMPT_FILE_CHARS:,} chars: {rel_path!r} "

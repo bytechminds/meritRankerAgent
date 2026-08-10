@@ -425,14 +425,23 @@ START
  -> understand_conversation
  -> classify
  -> prepare_follow_up
- -> collect_context
- -> generate
+ -> intent=practice + explicit creation signal + feature enabled:
+    create/dispatch durable assessment -> END
+ -> otherwise: collect_context -> generate
  -> END
 ```
 
 The `classify` node is thin. Validation, fallback handling, and mapping live in
 `services/classification`. Streaming calls the same coordinator-backed classification wrapper and
 therefore does not maintain a second classification implementation.
+
+The 2026-07-28 practice-generation addition does not change classifier ownership or its public
+schema. The normalized `practice` intent is only eligible when a deterministic predicate also finds
+an explicit create/generate/count/similar-question/quiz/test signal. Advice and strategy questions
+remain in normal doubt solving, and the launcher defensively applies the same predicate before any
+assessment write. Disabled configuration preserves the previous doubt-answer practice behavior;
+eligible enabled requests return the created assessment ID without holding a long generation
+stream.
 
 ## Removed or disabled experimental code
 
@@ -452,6 +461,11 @@ therefore does not maintain a second classification implementation.
   transformation omit the prior answer unless a method excerpt is explicitly requested.
 
 ## Validation
+
+- Practice-routing regression: both compiled graph and SSE paths branch on the existing mapped
+  `practice` intent, call the launcher once, skip normal answer generation, and preserve the
+  existing response envelopes. See `skills/features/practice-generation.md` for the preserved graph
+  validation and unverified live/deployment items.
 
 - Primary-acceptance, prompt, context, web, practice, multilingual, image-bypass, streaming, and
   usage focused gate after materiality changes: 579 passed.

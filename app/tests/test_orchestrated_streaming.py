@@ -7,10 +7,12 @@ Student-friendly orchestrated doubt solver streaming tests.
 from __future__ import annotations
 
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from features.practice_generation.schemas import PracticeLaunchResult
 from graphs.doubt_solver_graph import OrchestratedDoubtSolverState
 from schemas.doubt_solver import (
     DoubtSolverFinalResponse,
@@ -80,6 +82,70 @@ def _collect(
             adapter=adapter,
         )
     )
+
+
+def test_practice_start_can_be_deferred_until_terminal_frame_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "true")
+    ordering: list[str] = []
+
+    class Launcher:
+        def launch(self, _request):
+            return PracticeLaunchResult(
+                test_id="practice-123",
+                status="GENERATING",
+                requested_count=5,
+                accepted_count=5,
+                count_clamped=False,
+                progress_percent=0,
+                playable=False,
+                message="Your practice test is being prepared.",
+            )
+
+        def start(self, _test_id, _delivery_id=None):
+            ordering.append("started")
+            return True
+
+        def abort(self, _test_id, _code, _delivery_id=None):
+            ordering.append("aborted")
+
+    class Persistence:
+        def persist_completed_turn(self, *_args, **_kwargs):
+            ordering.append("persisted")
+            return SimpleNamespace(history_write_status="succeeded")
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                actor_id="user-1",
+                conversation_id="conversation-1",
+                turn_id="turn-1",
+                query="Create a 10-minute Reasoning mini mock for CAT.",
+                original_query="Create a 10-minute Reasoning mini mock for CAT.",
+                language="english",
+                exam_id="CAT",
+                classification={
+                    "subject": "reasoning",
+                    "topic": "reasoning",
+                    "intent": "practice",
+                    "difficulty": "intermediate",
+                    "retrieval_required": False,
+                },
+                classifier_confidence=0.99,
+                defer_practice_start_until_committed=True,
+            ),
+            adapter=_make_adapter(),
+            conversation_persistence=Persistence(),
+            practice_launcher=Launcher(),
+        )
+    )
+
+    assert events[-1].type == "practice_generation_started"
+    assert events[-1].data is not None
+    assert events[-1].data.practice_test_id == "practice-123"
+    assert ordering == ["persisted"]
 
 
 class TestStreamEventSchema:
@@ -204,20 +270,10 @@ class TestStreamingFlow:
         assert "answer_chunk_emission" in messages
         assert "latency_ms=" in messages
         structured = [
-            r.observability_event
-            for r in caplog.records
-            if hasattr(r, "observability_event")
+            r.observability_event for r in caplog.records if hasattr(r, "observability_event")
         ]
-        assert len(
-            [event for event in structured if event["level"] == "INFO"]
-        ) <= 15
-        assert (
-            sum(
-                event["event"] == "request_execution_summary"
-                for event in structured
-            )
-            == 1
-        )
+        assert len([event for event in structured if event["level"] == "INFO"]) <= 15
+        assert sum(event["event"] == "request_execution_summary" for event in structured) == 1
 
     def test_thinking_before_generation(self) -> None:
         events = _collect(_make_adapter())
@@ -244,8 +300,8 @@ class TestStreamingFlow:
     def test_persistence_finishes_before_public_complete_event(self) -> None:
         timeline: list[str] = []
         persistence = MagicMock()
-        persistence.persist_completed_turn.side_effect = lambda *args, **kwargs: (
-            timeline.append("persistence_finished")
+        persistence.persist_completed_turn.side_effect = lambda *args, **kwargs: timeline.append(
+            "persistence_finished"
         )
         events = stream_doubt_solver(
             StreamDoubtSolverInput(
@@ -266,10 +322,7 @@ class TestStreamingFlow:
 
         assert timeline == ["persistence_finished", "public_complete"]
         persistence.persist_completed_turn.assert_called_once()
-        assert (
-            persistence.persist_completed_turn.call_args.kwargs["request_id"]
-            == _REQUEST_ID
-        )
+        assert persistence.persist_completed_turn.call_args.kwargs["request_id"] == _REQUEST_ID
 
     def test_chunk_content_is_provider_chunk_content(self) -> None:
         content = "Let the cost price be ₹100. Marked price = ₹140."
@@ -387,15 +440,15 @@ class TestAzureV1StreamingAdapter:
             def chat(self) -> types.SimpleNamespace:
                 def _create(**kwargs):  # noqa: ANN202
                     self.received_kwargs = kwargs
-                    return iter([
-                        _FakeStreamChunk("Let "),
-                        _FakeStreamChunk("the "),
-                        _FakeStreamChunk("cost"),
-                    ])
+                    return iter(
+                        [
+                            _FakeStreamChunk("Let "),
+                            _FakeStreamChunk("the "),
+                            _FakeStreamChunk("cost"),
+                        ]
+                    )
 
-                return types.SimpleNamespace(
-                    completions=types.SimpleNamespace(create=_create)
-                )
+                return types.SimpleNamespace(completions=types.SimpleNamespace(create=_create))
 
         client = _FakeStreamClient()
         adapter = AzureOpenAIProviderAdapter(client_factory=_factory(client))
@@ -442,11 +495,14 @@ class TestNonStreamRegression:
             "language",
             "exam_id",
             "exam_stage",
+            "exam_profile_id",
             "classification",
             "retrieval_context",
             "context_text",
             "answer",
             "final_answer",
+            "response_type",
+            "practice_test_id",
             "conversation_context",
             "conversation_relation",
             "conversation_preparation",
@@ -549,28 +605,26 @@ class TestWebSearchStreamStatus:
             if on_before_web_search is not None:
                 on_before_web_search()
             return {
-                "context_text": (
-                    "[Web Context]\n"
-                    "Source: https://example.gov/current-affairs"
-                ),
-                "retrieval_context": {
-                    "retrievalTrace": {"fallbackReason": "web_context_selected"}
-                },
+                "context_text": ("[Web Context]\nSource: https://example.gov/current-affairs"),
+                "retrieval_context": {"retrievalTrace": {"fallbackReason": "web_context_selected"}},
             }
 
-        with patch(
-            "graphs.doubt_solver_graph.classify_query",
-            return_value=QueryClassification(
-                intent="general_doubt",
-                subject="general",
-                confidence=0.95,
-                need_web_search=True,
-                web_search_reason="current_affairs",
-                classification_source="llm",
+        with (
+            patch(
+                "graphs.doubt_solver_graph.classify_query",
+                return_value=QueryClassification(
+                    intent="general_doubt",
+                    subject="general",
+                    confidence=0.95,
+                    need_web_search=True,
+                    web_search_reason="current_affairs",
+                    classification_source="llm",
+                ),
             ),
-        ), patch(
-            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
-            side_effect=_collect_with_web_hook,
+            patch(
+                "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+                side_effect=_collect_with_web_hook,
+            ),
         ):
             events = _collect(_make_adapter("Current affairs answer."))
 
@@ -583,26 +637,27 @@ class TestWebSearchStreamStatus:
 
         from schemas.doubt_solver import QueryClassification
 
-        with patch(
-            "graphs.doubt_solver_graph.classify_query",
-            return_value=QueryClassification(
-                intent="practice_question",
-                subject="general",
-                confidence=0.95,
-                need_web_search=True,
-                web_search_reason="current_affairs",
-                web_search_query="current affairs July 2026",
-                classification_source="llm",
+        with (
+            patch(
+                "graphs.doubt_solver_graph.classify_query",
+                return_value=QueryClassification(
+                    intent="practice_question",
+                    subject="general",
+                    confidence=0.95,
+                    need_web_search=True,
+                    web_search_reason="current_affairs",
+                    web_search_query="current affairs July 2026",
+                    classification_source="llm",
+                ),
             ),
-        ), patch(
-            "services.doubt_solver.streaming_doubt_solver_service."
-            "_orchestrated_collect_context_node",
-            return_value={
-                "context_text": "",
-                "retrieval_context": {
-                    "retrievalTrace": {"fallbackReason": "retrieval_error"}
+            patch(
+                "services.doubt_solver.streaming_doubt_solver_service."
+                "_orchestrated_collect_context_node",
+                return_value={
+                    "context_text": "",
+                    "retrieval_context": {"retrievalTrace": {"fallbackReason": "retrieval_error"}},
                 },
-            },
+            ),
         ):
             events = _collect(
                 _make_adapter("INVENTED CURRENT AFFAIRS"),
@@ -634,18 +689,21 @@ class TestWebSearchStreamStatus:
                 on_before_web_search()
             return {"context_text": ""}
 
-        with patch(
-            "graphs.doubt_solver_graph.classify_query",
-            return_value=QueryClassification(
-                intent="general_doubt",
-                subject="general",
-                confidence=0.95,
-                need_web_search=True,
-                classification_source="llm",
+        with (
+            patch(
+                "graphs.doubt_solver_graph.classify_query",
+                return_value=QueryClassification(
+                    intent="general_doubt",
+                    subject="general",
+                    confidence=0.95,
+                    need_web_search=True,
+                    classification_source="llm",
+                ),
             ),
-        ), patch(
-            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
-            side_effect=_collect_with_web_hook,
+            patch(
+                "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+                side_effect=_collect_with_web_hook,
+            ),
         ):
             events = _collect(_make_adapter("Answer."))
 
@@ -706,8 +764,7 @@ class TestExtendedStreamStatuses:
                             title="Economy CA summary adda",
                             url="https://adda247.com/ca",
                             snippet=(
-                                "Exam prep economy current affairs summary "
-                                "with enough content."
+                                "Exam prep economy current affairs summary with enough content."
                             ),
                             source="adda247.com",
                             score=0.8,
@@ -729,19 +786,22 @@ class TestExtendedStreamStatuses:
 
         from schemas.doubt_solver import QueryClassification
 
-        with patch(
-            "graphs.doubt_solver_graph.classify_query",
-            return_value=QueryClassification(
-                intent="general_doubt",
-                subject="general",
-                confidence=0.95,
-                need_web_search=True,
-                web_search_reason="current_economy",
-                classification_source="llm",
+        with (
+            patch(
+                "graphs.doubt_solver_graph.classify_query",
+                return_value=QueryClassification(
+                    intent="general_doubt",
+                    subject="general",
+                    confidence=0.95,
+                    need_web_search=True,
+                    web_search_reason="current_economy",
+                    classification_source="llm",
+                ),
             ),
-        ), patch(
-            "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
-            side_effect=_collect_with_real_web,
+            patch(
+                "services.doubt_solver.streaming_doubt_solver_service._orchestrated_collect_context_node",
+                side_effect=_collect_with_real_web,
+            ),
         ):
             events = _collect(_make_adapter("Answer."))
 

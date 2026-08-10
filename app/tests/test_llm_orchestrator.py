@@ -146,6 +146,32 @@ def test_result_contains_route_decision(tmp_path: Path) -> None:
     assert result.route_decision.subject == "math"
 
 
+def test_generate_structured_returns_json_without_answer_finalization(tmp_path: Path) -> None:
+    _write(tmp_path, "structured.md", "Return JSON only.")
+    _write(tmp_path, "shared.md", "Shared structured contract.")
+    decision = _make_route_decision(prompt="unused.md")
+    executor = MockModelExecutor(content='{"questions":[]}')
+    orchestrator = LlmOrchestrator(
+        model_executor=executor,
+        prompt_resolver=PromptResolver(prompt_root=tmp_path),
+        route_resolver_fn=_fixed_route_resolver(decision),
+    )
+
+    result = orchestrator.generate_structured(
+        route_request=_make_route_request(),
+        user_content='{"count":1}',
+        prompt="structured.md",
+        overlays=["shared.md"],
+    )
+
+    assert result.content == '{"questions":[]}'
+    assert result.final_answer is None
+    assert executor.call_count == 1
+    assert executor.last_messages is not None
+    assert "Return JSON only." in executor.last_messages[0].content
+    assert executor.last_messages[1].content == '{"count":1}'
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — model_executor receives the RouteDecision
 # ---------------------------------------------------------------------------
