@@ -365,6 +365,72 @@ class TestDefaultConfigNoErrors:
         assert settings.doubt_solver_max_context_chars > 0
 
 
+class TestPatternIntelligenceConfig:
+    def test_defaults_are_disabled_and_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("PATTERN_INTELLIGENCE_ENABLED", raising=False)
+        monkeypatch.delenv("PATTERN_INTELLIGENCE_MAX_CANDIDATES", raising=False)
+        monkeypatch.delenv("PATTERN_INTELLIGENCE_MAX_REFERENCES", raising=False)
+        monkeypatch.delenv("PATTERN_INTELLIGENCE_PROMPT_MAX_INPUT_TOKENS", raising=False)
+        _reset_settings()
+
+        settings = cfg_module.get_settings()
+
+        assert settings.pattern_intelligence_enabled is False
+        assert settings.pattern_intelligence_max_candidates == 12
+        assert settings.pattern_intelligence_max_references == 1
+        assert settings.pattern_intelligence_prompt_max_input_tokens == 3800
+
+    def test_active_runtime_reads_pattern_question_access_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_ENABLED", "true")
+        monkeypatch.setenv("DYNAMODB_PATTERN_QUESTION_TABLE", "pattern-questions")
+        monkeypatch.setenv(
+            "DYNAMODB_PATTERN_QUESTION_BY_PATTERN_INDEX", "questionsByPattern"
+        )
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_MAX_CANDIDATES", "16")
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_MAX_REFERENCES", "2")
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_PROMPT_MAX_INPUT_TOKENS", "4096")
+        _reset_settings()
+
+        settings = cfg_module.get_settings()
+
+        assert settings.pattern_intelligence_enabled is True
+        assert settings.dynamodb_pattern_question_table == "pattern-questions"
+        assert settings.dynamodb_pattern_question_by_pattern_index == "questionsByPattern"
+        assert settings.pattern_intelligence_max_candidates == 16
+        assert settings.pattern_intelligence_max_references == 2
+        assert settings.pattern_intelligence_prompt_max_input_tokens == 4096
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("PATTERN_INTELLIGENCE_MAX_CANDIDATES", "-1"),
+            ("PATTERN_INTELLIGENCE_MAX_CANDIDATES", "0"),
+            ("PATTERN_INTELLIGENCE_MAX_CANDIDATES", "51"),
+            ("PATTERN_INTELLIGENCE_MAX_REFERENCES", "3"),
+            ("PATTERN_INTELLIGENCE_PROMPT_MAX_INPUT_TOKENS", "8193"),
+            ("PATTERN_INTELLIGENCE_PROMPT_MAX_INPUT_TOKENS", "not-a-number"),
+        ],
+    )
+    def test_active_runtime_rejects_out_of_bounds_limits(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+    ) -> None:
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_ENABLED", "true")
+        monkeypatch.setenv(name, value)
+        _reset_settings()
+
+        with pytest.raises(cfg_module.ConfigurationError, match=name):
+            cfg_module.get_settings()
+
+    def test_inactive_runtime_ignores_invalid_limits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_ENABLED", "false")
+        monkeypatch.setenv("PATTERN_INTELLIGENCE_MAX_CANDIDATES", "not-a-number")
+        _reset_settings()
+
+        assert cfg_module.get_settings().pattern_intelligence_max_candidates == 12
+
+
 class TestAnswerDeliveryConfig:
     def test_stream_heartbeat_interval_is_configurable(self, monkeypatch) -> None:
         monkeypatch.setenv("ANSWER_STREAM_HEARTBEAT_INTERVAL_SECONDS", "2.5")

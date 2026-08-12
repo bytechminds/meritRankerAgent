@@ -31,6 +31,7 @@ Non-goals (deferred):
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -42,10 +43,15 @@ from observability import (
     count_generator_calls,
     current_llm_attempt_type,
 )
+from retrieval.pattern_intelligence import DoubtPatternContext
 from schemas.doubt_solver import FinalAnswerResult
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, OrchestrationResult
-from schemas.llm_routing import RouteDecision, RouteRequest
+from schemas.llm_routing import (
+    PracticeGenerationWorkload,
+    RouteDecision,
+    RouteRequest,
+)
 from services.doubt_solver.answer_completion import (
     AnswerCompletionPolicy,
     StreamingMarkerFilter,
@@ -74,11 +80,20 @@ from services.doubt_solver.answer_quality import (
     validate_answer_quality,
 )
 from services.doubt_solver.final_answer import build_final_answer_result
+from services.llm.orchestration.config_registry import get_registry
 from services.llm.orchestration.errors import (
     LlmExecutionError,
     LlmOrchestrationError,
     LlmOrchestratorError,
     ProviderExecutionError,
+)
+from services.llm.orchestration.practice_generation_capacity import (
+    PracticeGenerationCapacityPolicy,
+)
+from services.llm.orchestration.prompt_budget import (
+    PromptInputBudget,
+    estimate_text_tokens,
+    measure_prompt_input,
 )
 from services.llm.orchestration.prompt_resolver import PromptResolver, get_prompt_resolver
 from services.llm.orchestration.route_resolver import resolve_route
@@ -452,6 +467,90 @@ class LlmOrchestrator:
     # Public API
     # ------------------------------------------------------------------
 
+    def _resolve_structured_route(
+        self,
+        *,
+        route_request: RouteRequest,
+        prompt: str,
+        overlays: list[str] | None,
+    ) -> RouteDecision:
+        return self._route_resolver_fn(route_request).model_copy(
+            update={
+                "prompt": prompt,
+                "overlays": list(overlays or []),
+                "intent_overlays": {},
+            }
+        )
+
+    @staticmethod
+    def _apply_practice_generation_capacity(
+        route_decision: RouteDecision,
+        workload: PracticeGenerationWorkload | None,
+    ) -> RouteDecision:
+        """Attach one bounded runtime cap plan only to Practice generators."""
+        if workload is None:
+            return route_decision
+        model_config = get_registry().get_model(route_decision.model)
+        if model_config is None:
+            return route_decision
+        capacity = PracticeGenerationCapacityPolicy.resolve(
+            route_decision=route_decision,
+            model_config=model_config,
+            workload=workload,
+        )
+        return route_decision.model_copy(
+            update={
+                "max_tokens": capacity.initial_max_output_tokens,
+                "practice_generation_capacity": capacity,
+            }
+        )
+
+    def measure_structured_input(
+        self,
+        *,
+        route_request: RouteRequest,
+        user_content: str,
+        prompt: str,
+        overlays: list[str] | None = None,
+        exam_context: str | None = None,
+        slot_context: str | None = None,
+        pattern_context: str | None = None,
+        references: str | None = None,
+        other_dynamic_input: str | None = None,
+        max_input_tokens: int | None = None,
+    ) -> PromptInputBudget:
+        """Measure the exact structured system prefix before a model call.
+
+        Component segments are intentionally supplied by the caller so Pattern
+        guidance can be reduced or split without a second prompt framework.
+        The resulting total is never lower than the actual serialized messages.
+        """
+        route_decision = self._resolve_structured_route(
+            route_request=route_request,
+            prompt=prompt,
+            overlays=overlays,
+        )
+        messages = self._prompt_resolver.resolve_structured(route_decision, user_content)
+        budget = measure_prompt_input(
+            static_instructions=messages[0].content,
+            exam_context=exam_context,
+            slot_context=slot_context,
+            pattern_context=pattern_context,
+            references=references,
+            other_dynamic_input=other_dynamic_input,
+            max_input_tokens=max_input_tokens,
+        )
+        actual_total = sum(estimate_text_tokens(message.content) for message in messages)
+        total_input_tokens = max(budget.total_input_tokens, actual_total)
+        return budget.model_copy(
+            update={
+                "total_input_tokens": total_input_tokens,
+                "within_budget": (
+                    max_input_tokens is None or total_input_tokens <= max_input_tokens
+                ),
+            }
+        )
+
     def generate_structured(
         self,
         *,
@@ -459,6 +558,7 @@ class LlmOrchestrator:
         user_content: str,
         prompt: str,
         overlays: list[str] | None = None,
+        practice_generation_workload: PracticeGenerationWorkload | None = None,
     ) -> OrchestrationResult:
         """Execute a bounded structured-output call through the shared runtime."""
         if not user_content or not user_content.strip():
@@ -470,12 +570,14 @@ class LlmOrchestrator:
             )
 
         start_ms = int(time.monotonic() * 1000)
-        route_decision = self._route_resolver_fn(route_request).model_copy(
-            update={
-                "prompt": prompt,
-                "overlays": list(overlays or []),
-                "intent_overlays": {},
-            }
+        route_decision = self._resolve_structured_route(
+            route_request=route_request,
+            prompt=prompt,
+            overlays=overlays,
+        )
+        route_decision = self._apply_practice_generation_capacity(
+            route_decision,
+            practice_generation_workload,
         )
         messages = self._prompt_resolver.resolve_structured(
             route_decision,
@@ -533,6 +635,171 @@ class LlmOrchestrator:
             ),
         )
 
+    def _resolve_doubt_pattern_messages(
+        self,
+        *,
+        route_decision: RouteDecision,
+        route_request: RouteRequest,
+        query: str,
+        classification: Any | None,
+        context: str | None,
+        conversation_context: str | None,
+        doubt_pattern_context: DoubtPatternContext | None,
+    ) -> tuple[list[LlmMessage], PromptInputBudget | None, bool]:
+        """Compose answer messages while dropping only optional doubt references."""
+        current_context = doubt_pattern_context
+        max_input_tokens = (
+            get_settings().pattern_intelligence_prompt_max_input_tokens
+            if current_context is not None
+            else None
+        )
+        while True:
+            prompt_kwargs: dict[str, Any] = {
+                "conversation_context": conversation_context,
+                "request_id": route_request.request_id,
+            }
+            if current_context is not None:
+                prompt_kwargs["doubt_pattern_context"] = current_context
+            messages = self._prompt_resolver.resolve(
+                route_decision,
+                query,
+                classification,
+                context,
+                **prompt_kwargs,
+            )
+            if current_context is None:
+                return messages, None, False
+            budget = self._measure_doubt_pattern_input(
+                messages=messages,
+                route_decision=route_decision,
+                query=query,
+                classification=classification,
+                context=context,
+                conversation_context=conversation_context,
+                doubt_pattern_context=current_context,
+                max_input_tokens=max_input_tokens,
+            )
+            if budget.within_budget:
+                logger.info(
+                    "doubt_pattern_prompt_budget request_id=%s total_input_tokens=%d "
+                    "current_question_tokens=%d pattern_context_tokens=%d "
+                    "reference_tokens=%d within_budget=%s",
+                    route_request.request_id,
+                    budget.total_input_tokens,
+                    budget.current_question_tokens,
+                    budget.pattern_context_tokens,
+                    budget.reference_tokens,
+                    budget.within_budget,
+                )
+                return messages, budget, False
+            if current_context.question_references:
+                current_context = current_context.model_copy(
+                    update={"question_references": current_context.question_references[:-1]}
+                )
+                continue
+
+            # The student's question and core Pattern/SolveFlow are never clipped.
+            # If they cannot fit together, explicitly return to the existing doubt
+            # path instead of sending an oversized Pattern-augmented prompt.
+            logger.warning(
+                "doubt_pattern_guidance_omitted_for_budget request_id=%s "
+                "total_input_tokens=%d max_input_tokens=%d",
+                route_request.request_id,
+                budget.total_input_tokens,
+                max_input_tokens,
+            )
+            messages = self._prompt_resolver.resolve(
+                route_decision,
+                query,
+                classification,
+                context,
+                conversation_context=conversation_context,
+                request_id=route_request.request_id,
+            )
+            baseline_budget = self._measure_doubt_pattern_input(
+                messages=messages,
+                route_decision=route_decision,
+                query=query,
+                classification=classification,
+                context=context,
+                conversation_context=conversation_context,
+                doubt_pattern_context=None,
+                max_input_tokens=max_input_tokens,
+            )
+            return messages, baseline_budget, True
+
+    @staticmethod
+    def _measure_doubt_pattern_input(
+        *,
+        messages: list[LlmMessage],
+        route_decision: RouteDecision,
+        query: str,
+        classification: Any | None,
+        context: str | None,
+        conversation_context: str | None,
+        doubt_pattern_context: DoubtPatternContext | None,
+        max_input_tokens: int | None,
+    ) -> PromptInputBudget:
+        """Measure answer input without retaining question or prompt text in telemetry."""
+        pattern_only = (
+            doubt_pattern_context.model_copy(update={"question_references": ()})
+            if doubt_pattern_context is not None
+            else None
+        )
+        question_references = (
+            doubt_pattern_context.question_references
+            if doubt_pattern_context is not None
+            else ()
+        )
+        budget = measure_prompt_input(
+            static_instructions=messages[0].content,
+            current_question=query,
+            exam_context=json.dumps(
+                {
+                    "exam": route_decision.exam,
+                    "exam_stage": route_decision.exam_stage,
+                    "exam_profile_id": route_decision.exam_profile_id,
+                },
+                sort_keys=True,
+            ),
+            pattern_context=(
+                json.dumps(pattern_only.model_dump(by_alias=True), sort_keys=True)
+                if pattern_only is not None
+                else None
+            ),
+            references=(
+                json.dumps(
+                    [
+                        reference.model_dump(by_alias=True)
+                        for reference in question_references
+                    ],
+                    sort_keys=True,
+                )
+                if question_references
+                else None
+            ),
+            other_dynamic_input="\n".join(
+                value
+                for value in (
+                    context or "",
+                    conversation_context or "",
+                    str(classification) if classification is not None else "",
+                )
+                if value
+            ),
+            max_input_tokens=max_input_tokens,
+        )
+        actual_total = sum(estimate_text_tokens(message.content) for message in messages)
+        total_input_tokens = max(budget.total_input_tokens, actual_total)
+        return budget.model_copy(
+            update={
+                "total_input_tokens": total_input_tokens,
+                "within_budget": (
+                    max_input_tokens is None or total_input_tokens <= max_input_tokens
+                ),
+            }
+        )
+
     def generate(
         self,
         *,
@@ -541,6 +808,7 @@ class LlmOrchestrator:
         classification: Any | None = None,
         context: str | None = None,
         conversation_context: str | None = None,
+        doubt_pattern_context: DoubtPatternContext | None = None,
     ) -> OrchestrationResult:
         """Run the full orchestration pipeline and return a safe result.
 
@@ -579,13 +847,16 @@ class LlmOrchestrator:
         route_decision: RouteDecision = self._route_resolver_fn(route_request)
 
         # --- 3. Prompt composition -----------------------------------------
-        messages: list[LlmMessage] = self._prompt_resolver.resolve(
-            route_decision,
-            query,
-            classification,
-            context,
-            conversation_context=conversation_context,
-            request_id=route_request.request_id,
+        messages, doubt_prompt_budget, doubt_pattern_omitted_for_budget = (
+            self._resolve_doubt_pattern_messages(
+                route_decision=route_decision,
+                route_request=route_request,
+                query=query,
+                classification=classification,
+                context=context,
+                conversation_context=conversation_context,
+                doubt_pattern_context=doubt_pattern_context,
+            )
         )
 
         context_chars = len(context) if context else 0
@@ -750,7 +1021,16 @@ class LlmOrchestrator:
             usage_source=execution_result.usage_source,
             latency_ms=execution_result.latency_ms,
             answer_source=answer_source,
-            metadata={},
+            metadata=(
+                {
+                    "doubtPatternPromptBudget": doubt_prompt_budget.model_dump(
+                        by_alias=True
+                    ),
+                    "doubtPatternGuidanceOmittedForBudget": doubt_pattern_omitted_for_budget,
+                }
+                if doubt_prompt_budget is not None
+                else {}
+            ),
             final_answer=final_answer,
             execution_deployment=(
                 str(execution_result.metadata.get("deployment"))
@@ -767,6 +1047,7 @@ class LlmOrchestrator:
         classification: Any | None = None,
         context: str | None = None,
         conversation_context: str | None = None,
+        doubt_pattern_context: DoubtPatternContext | None = None,
         on_before_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
         verify_before_stream: bool = True,
@@ -781,13 +1062,14 @@ class LlmOrchestrator:
 
         start_ms = int(time.monotonic() * 1000)
         route_decision: RouteDecision = self._route_resolver_fn(route_request)
-        messages: list[LlmMessage] = self._prompt_resolver.resolve(
-            route_decision,
-            query,
-            classification,
-            context,
+        messages, _, _ = self._resolve_doubt_pattern_messages(
+            route_decision=route_decision,
+            route_request=route_request,
+            query=query,
+            classification=classification,
+            context=context,
             conversation_context=conversation_context,
-            request_id=route_request.request_id,
+            doubt_pattern_context=doubt_pattern_context,
         )
 
         context_chars = len(context) if context else 0

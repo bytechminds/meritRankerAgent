@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from features.practice_generation.resource_contract import PracticeResourceContract
 
 
+PRACTICE_RUNTIME_REVISION = "practice-v2-structured-output-capacity-20260811.6"
+
+
 class PracticeConfigurationError(RuntimeError):
     """Raised when an enabled practice runtime lacks required configuration."""
 
@@ -18,6 +21,7 @@ class PracticeConfigurationError(RuntimeError):
 class PracticeGenerationConfig:
     enabled: bool
     pattern_context_enabled: bool
+    pattern_reuse_enabled: bool
     assessment_table: str
     question_table: str
     question_bank_table: str
@@ -126,6 +130,9 @@ def get_practice_config(
         enabled=enabled,
         pattern_context_enabled=(
             os.getenv("PRACTICE_PATTERN_CONTEXT_ENABLED", "false").lower() == "true"
+        ),
+        pattern_reuse_enabled=(
+            os.getenv("PATTERN_INTELLIGENCE_REUSE_ENABLED", "false").lower() == "true"
         ),
         assessment_table=contract.assessment_table if contract else "",
         question_table=contract.question_table if contract else "",

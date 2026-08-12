@@ -192,6 +192,10 @@ def validate_practice_resources(
         details={
             "logicalTable": "MockTestQuiz/Question/QuestionBank",
             "logicalIndex": ("QuestionBank.reuse/QuestionBank.category/Question.testId"),
+            "resourceContractVersion": config.resource_schema_version,
+            "reuseKeyContractVersion": config.reuse_key_contract_version,
+            "patternContextEnabled": config.pattern_context_enabled,
+            "patternReuseEnabled": config.pattern_reuse_enabled,
             "reuseProjectionType": reuse_projection.projection_type,
             "reuseProjectedAttributes": ",".join(sorted(reuse_projection.projected_attributes)),
             "reuseQueryMode": reuse_projection.query_mode,

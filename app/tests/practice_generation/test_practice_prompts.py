@@ -16,11 +16,13 @@ from features.practice_generation.providers import (
     RoutedQuestionVerifier,
 )
 from features.practice_generation.schemas import GeneratedQuestion, GenerationGroup
+from retrieval.pattern_intelligence import PatternGenerationContext
 from services.llm.orchestration.orchestrator import LlmOrchestrator, MockModelExecutor
 from services.llm.orchestration.prompt_resolver import PromptResolver
 
 PROMPT_PATHS = (
     "practice_generation/shared_contract",
+    "practice_generation/generator_output_policy",
     "practice_generation/planners/quant_reasoning",
     "practice_generation/planners/english",
     "practice_generation/planners/factual",
@@ -83,6 +85,61 @@ def test_planner_receives_subject_family_prompt_only(
     assert "Independently verify" not in system
 
 
+def test_planner_repair_payload_is_explicit_and_prompt_instructs_correction() -> None:
+    executor = MockModelExecutor(content=json.dumps({"slots": []}))
+    request = resolve_practice_request(
+        request_id="request-repair",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-repair",
+        query="Create five algebra questions",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        exam_stage=None,
+    )
+
+    RoutedPlannerProvider(LlmOrchestrator(model_executor=executor)).plan(
+        request,
+        tier="light",
+        repair_feedback=(
+            "reason=PLANNER_SLOT_COUNT_MISMATCH;fields=slots;"
+            "types=value_error;schema=PracticeBlueprint"
+        ),
+    )
+
+    assert executor.last_messages is not None
+    assert "If `planner_phase=repair`, correct `repair_reason`" in executor.last_messages[0].content
+    assert json.loads(executor.last_messages[1].content) == {
+        "accepted_count": 5,
+        "difficulty": "intermediate",
+        "exam_id": "CAT",
+        "exam_profile_id": None,
+        "exam_stage": None,
+        "planner_family": "quant_reasoning",
+        "planner_phase": "repair",
+        "practice_type": "QUICK_PRACTICE",
+        "repair_reason": (
+            "reason=PLANNER_SLOT_COUNT_MISMATCH;fields=slots;"
+            "types=value_error;schema=PracticeBlueprint"
+        ),
+        "request_constraints": "Create five algebra questions",
+        "required_slot_ids": [
+            "slot-001",
+            "slot-002",
+            "slot-003",
+            "slot-004",
+            "slot-005",
+        ],
+        "schema_version": "2",
+        "subject": "math",
+        "supported_question_types": ["mcq"],
+        "topic": "algebra",
+    }
+
+
 def test_composed_prompt_estimate_remains_compact() -> None:
     prompt_root = PromptResolver()._prompt_root
     shared = (prompt_root / "practice_generation/shared_contract.md").read_text(
@@ -125,6 +182,10 @@ def test_generator_and_verifier_receive_only_their_role_prompt() -> None:
     assert generator_executor.last_messages is not None
     generator_system = generator_executor.last_messages[0].content
     assert "Generate only the assigned questions" in generator_system
+    assert "shortest complete response" in generator_system
+    assert "never shorten academically required content" in generator_system
+    assert "Minimize tokens" not in generator_system
+    assert "within two lines" not in generator_system
     assert 'Return exactly `{"slots":[...]}`' not in generator_system
     assert "Independently verify" not in generator_system
     assert '"question_type":"mcq"' in generator_system
@@ -159,6 +220,7 @@ def test_generator_and_verifier_receive_only_their_role_prompt() -> None:
     verifier_system = verifier_executor.last_messages[0].content
     assert "Independently verify" in verifier_system
     assert "Generate only the assigned questions" not in verifier_system
+    assert "shortest complete response" not in verifier_system
     assert 'Return exactly `{"slots":[...]}`' not in verifier_system
 
 
@@ -203,7 +265,6 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
         "answer_version": 1,
         "option_ids": ["0", "1", "2", "3"],
     }
-
     question = GeneratedQuestion(
         schema_version="2",
         generation_item_id="item-1",
@@ -252,3 +313,136 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
         "correct_option_id": "3",
         "correct_answer": "4",
     }
+
+
+def test_repair_payload_is_slot_scoped_and_contains_only_the_rejected_candidate() -> None:
+    request = resolve_practice_request(
+        request_id="request-repair-v2",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-repair-v2",
+        query="Create one algebra question",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        exam_stage=None,
+    )
+    blueprint = deterministic_blueprint(request)
+    bucket = blueprint.buckets[0]
+    slot = blueprint.slots[0]
+    candidate = GeneratedQuestion(
+        schema_version="2",
+        generation_item_id="item-rejected",
+        bucket_id=bucket.bucket_id,
+        slot_id=slot.slot_id,
+        question="If x plus one equals two, what is x?",
+        question_type="mcq",
+        options=[
+            {"option_id": "0", "value": "0"},
+            {"option_id": "1", "value": "1"},
+            {"option_id": "2", "value": "2"},
+            {"option_id": "3", "value": "3"},
+        ],
+        correct_option_id="1",
+        correct_answer="1",
+        answer_explanation="The submitted explanation is intentionally incomplete.",
+        solution="Subtract one.",
+        subject=slot.subject_id,
+        topic=slot.topic_id,
+        difficulty=slot.difficulty,
+    )
+    executor = MockModelExecutor(content='{"questions":[]}')
+
+    RoutedQuestionGenerator(LlmOrchestrator(model_executor=executor)).generate_slots(
+        request=request,
+        bucket=bucket,
+        group=GenerationGroup(
+            group_id="repair-group",
+            bucket_id=bucket.bucket_id,
+            required_count=1,
+            slot_ids=[slot.slot_id],
+        ),
+        slots=(slot,),
+        exclude_normalized_texts=(),
+        repair_feedback=("ANSWER_EXPLANATION_MISMATCH",),
+        repair_candidates_by_slot={slot.slot_id: candidate},
+        repair_reason_codes_by_slot={
+            slot.slot_id: ("ANSWER_EXPLANATION_MISMATCH",)
+        },
+        replacement_wave=1,
+    )
+
+    assert executor.last_messages is not None
+    assert "read its `repair_context` entry" in executor.last_messages[0].content
+    payload = json.loads(executor.last_messages[1].content)
+    assert payload["repair_context"] == [
+        {
+            "slot_id": slot.slot_id,
+            "reason_codes": ["ANSWER_EXPLANATION_MISMATCH"],
+            "candidate": candidate.model_dump(mode="json"),
+        }
+    ]
+
+
+def test_slot_generator_receives_one_answer_redacted_pattern_guidance_block() -> None:
+    request = resolve_practice_request(
+        request_id="pattern-request",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+        query="Create one algebra question",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        exam_stage=None,
+    )
+    blueprint = deterministic_blueprint(request)
+    bucket = blueprint.buckets[0]
+    slot = blueprint.slots[0]
+    executor = MockModelExecutor(content='{"questions":[]}')
+
+    RoutedQuestionGenerator(LlmOrchestrator(model_executor=executor)).generate_slots(
+        request=request,
+        bucket=bucket,
+        group=GenerationGroup(
+            group_id="pattern-group",
+            bucket_id=bucket.bucket_id,
+            required_count=1,
+            slot_ids=[slot.slot_id],
+        ),
+        slots=(slot,),
+        exclude_normalized_texts=(),
+        pattern_guidance_by_slot={
+            slot.slot_id: PatternGenerationContext(
+                patternId="pattern-safe-1",
+                target=("isolate the variable",),
+                givens=("one linear equation",),
+                conditions=("preserve equality",),
+                operationHints=("inverse operations",),
+                notSameWhen=("nonlinear equation",),
+            )
+        },
+    )
+
+    assert executor.last_messages is not None
+    payload = json.loads(executor.last_messages[1].content)
+    assert payload["pattern_guidance"] == [
+        {
+            "context": {
+                "complexityLevel": "",
+                "givens": ["one linear equation"],
+                "conditions": ["preserve equality"],
+                "notSameWhen": ["nonlinear equation"],
+                "operationHints": ["inverse operations"],
+                "patternId": "pattern-safe-1",
+                "target": ["isolate the variable"],
+                "trapCues": [],
+                "variationFocus": "",
+            },
+            "slot_ids": [slot.slot_id],
+        }
+    ]

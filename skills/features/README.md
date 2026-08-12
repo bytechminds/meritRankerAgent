@@ -35,6 +35,8 @@ if a fact is unknown.
 | `classification-pipeline.md` | Text/image academic classification ownership and fallback pipeline | In Progress |
 | `practice-generation.md` | Durable quiz, practice, and mock-test generation | In Progress |
 | `exam-profiles.md` | Admin-managed exam/stage profile cache and compact Agent context | In Progress |
+| `pattern-intelligence-runtime.md` | Canonical PatternGraph guidance for practice and doubt flows | Blocked |
+| `ai-usage-metering.md` | Centralized shadow AI usage and credit-cost metering | In Progress |
 
 ---
 

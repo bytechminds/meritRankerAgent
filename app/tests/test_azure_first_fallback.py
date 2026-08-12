@@ -169,11 +169,11 @@ class _AliasedFakeProviderExecutor:
         self,
         *,
         raise_for: dict[str, Exception] | None = None,
-        return_for: dict[str, str] | None = None,
+        return_for: dict[str, str | ModelExecutionResult] | None = None,
         default_content: str = "Default answer.",
     ) -> None:
         self._raise_for: dict[str, Exception] = raise_for or {}
-        self._return_for: dict[str, str] = return_for or {}
+        self._return_for: dict[str, str | ModelExecutionResult] = return_for or {}
         self._default_content = default_content
         self.call_log: list[str] = []
         self.last_request: ProviderExecutionRequest | None = None
@@ -185,6 +185,8 @@ class _AliasedFakeProviderExecutor:
         if alias in self._raise_for:
             raise self._raise_for[alias]
         content = self._return_for.get(alias, self._default_content)
+        if isinstance(content, ModelExecutionResult):
+            return content
         return ModelExecutionResult(
             content=content,
             model=alias,
@@ -494,7 +496,7 @@ class TestRegistryCrossValidation:
 
 
 class TestModelExecutionFallback:
-    def test_real_math_advanced_empty_response_advances_to_second_fallback(self) -> None:
+    def test_real_math_advanced_empty_response_uses_o3_fallback(self) -> None:
         empty_response = LlmProviderResponseError(
             "response unavailable",
             failure_kind="empty_answer",
@@ -502,12 +504,8 @@ class TestModelExecutionFallback:
         fake_executor = _AliasedFakeProviderExecutor(
             raise_for={
                 "math_advanced_generator": empty_response,
-                "openai_o3": LlmProviderExecutionError(
-                    "fallback unavailable",
-                    failure_kind="provider_unavailable",
-                ),
             },
-            return_for={"openai_gpt_5_4": "Fallback answer."},
+            return_for={"openai_o3": "Fallback answer."},
         )
         executor = RegistryBackedModelExecutor(provider_executor=fake_executor)
         decision = resolve_route(
@@ -527,9 +525,8 @@ class TestModelExecutionFallback:
         assert fake_executor.call_log == [
             "math_advanced_generator",
             "openai_o3",
-            "openai_gpt_5_4",
         ]
-        assert result.model == "openai_gpt_5_4"
+        assert result.model == "openai_o3"
         assert result.fallback_used is True
 
     def test_empty_response_uses_configured_fallback_with_safe_attempt_events(
@@ -643,6 +640,7 @@ class TestModelExecutionFallback:
         assert decision.model == "reasoning_advanced_generator"
         assert fake_executor.call_log == [
             "reasoning_advanced_generator",
+            "reasoning_advanced_generator",
             "openai_o3",
             "deepseek_v4pro",
         ]
@@ -689,10 +687,156 @@ class TestModelExecutionFallback:
 
         result = executor.execute(route_decision=decision, messages=_messages())
 
-        assert fake_executor.call_log == ["azure_fast", "openai_native_fallback"]
+        assert fake_executor.call_log == [
+            "azure_fast",
+            "azure_fast",
+            "openai_native_fallback",
+        ]
         assert result.model == "openai_native_fallback"
         assert result.fallback_used is True
         assert result.metadata["failure_kind"] == "output_token_exhausted"
+        assert fake_executor.last_request is not None
+        assert fake_executor.last_request.max_tokens == 1500
+
+    def test_practice_capacity_escalation_retries_primary_once_at_larger_budget(
+        self, tmp_path: Path
+    ) -> None:
+        class _BudgetAwareProvider:
+            def __init__(self) -> None:
+                self.requests: list[ProviderExecutionRequest] = []
+
+            def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+                self.requests.append(request)
+                return ModelExecutionResult(
+                    content=("partial" if len(self.requests) == 1 else "complete"),
+                    model=request.model_resolution.model_alias,
+                    provider=request.model_resolution.provider,
+                    finish_reason=("length" if len(self.requests) == 1 else "stop"),
+                )
+
+            def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+                raise AssertionError("Streaming is not used for structured Practice generation.")
+
+        provider = _BudgetAwareProvider()
+        executor = RegistryBackedModelExecutor(
+            provider_executor=provider,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        result = executor.execute(
+            route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+            messages=_messages(),
+        )
+
+        assert [request.max_tokens for request in provider.requests] == [900, 1500]
+        assert [request.model_resolution.model_alias for request in provider.requests] == [
+            "azure_fast",
+            "azure_fast",
+        ]
+        assert result.content == "complete"
+        assert result.fallback_used is False
+
+    def test_capacity_insufficient_fallback_is_skipped_after_exhaustion(
+        self, tmp_path: Path
+    ) -> None:
+        registry = _registry(tmp_path)
+        fallback_model = registry.get_model("openai_native_fallback")
+        assert fallback_model is not None
+        fallback_model.model_hard_max_output_tokens = 1000
+        resolver = ModelConfigResolver(registry=registry)
+        exhausted = ModelExecutionResult(
+            content="partial",
+            model="azure_fast",
+            provider="azure_openai",
+            finish_reason="length",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            return_for={"azure_fast": exhausted},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=resolver,
+        )
+
+        with pytest.raises(ProviderExecutionError) as raised:
+            executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+            )
+
+        assert raised.value.failure_kind == "output_token_exhausted"
+        assert raised.value.attempted_aliases == (
+            "azure_fast",
+            "openai_native_fallback",
+        )
+        assert fake_executor.call_log == ["azure_fast", "azure_fast"]
+
+    def test_truncated_practice_content_bypasses_contract_parsing_and_logs_safe_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        truncated = ModelExecutionResult(
+            content='{"questions":[{"slot_id":"slot-001","question":"private body"},',
+            model="azure_fast",
+            provider="azure_openai",
+            finish_reason="length",
+            output_tokens=2600,
+            reasoning_tokens=2573,
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            return_for={
+                "azure_fast": truncated,
+                "openai_native_fallback": "Fallback answer.",
+            }
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        events: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            model_execution_module,
+            "log_event",
+            lambda event_name, **kwargs: events.append(
+                (event_name, dict(kwargs.get("details") or {}))
+            ),
+        )
+
+        with bind_execution_context(slot_ids=("slot-001", "slot-002")):
+            result = executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+            )
+
+        assert fake_executor.call_log == [
+            "azure_fast",
+            "azure_fast",
+            "openai_native_fallback",
+        ]
+        assert result.model == "openai_native_fallback"
+        exhausted_events = [
+            details
+            for event_name, details in events
+            if event_name == "practice_generator_token_exhausted"
+        ]
+        assert len(exhausted_events) == 2
+        assert [event["outputTokenLimit"] for event in exhausted_events] == [900, 1500]
+        for event in exhausted_events:
+            assert event["route"] == "math.generator.default"
+            assert event["modelAlias"] == "azure_fast"
+            assert event["failureClass"] == "output_token_exhausted"
+            assert event["finishReason"] == "length"
+            assert event["normalizedFailureReason"] == "output_token_exhausted"
+            assert event["requestedItems"] == 2
+            assert event["completeItemsDetected"] == 1
+            assert event["structuredPayloadComplete"] is False
+            assert event["structuredPayloadStartsWithObject"] is True
+            assert event["structuredPayloadEndsMidObjectOrArray"] is True
+            assert event["outputTokens"] == 2600
+            assert event["reasoningTokens"] == 2573
+            assert event["answerTokens"] == 27
+        assert "private body" not in str(exhausted_events)
 
     def test_exhausted_fallback_chain_retains_attempted_aliases(self, tmp_path: Path) -> None:
         exhausted = LlmProviderResponseError("response unavailable")

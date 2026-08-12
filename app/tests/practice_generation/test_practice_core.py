@@ -14,6 +14,8 @@ from features.practice_generation.config import (
     get_practice_config,
 )
 from features.practice_generation.generation import (
+    RouteOutputCapacity,
+    bucket_for_slot,
     build_generation_groups,
     build_slot_generation_groups,
     parse_partial_generation,
@@ -31,6 +33,7 @@ from features.practice_generation.pattern_context import (
 )
 from features.practice_generation.planning import (
     BlueprintManager,
+    BlueprintPlanningError,
     apply_system_bucket_policy,
     decide_practice_launch,
     deterministic_blueprint,
@@ -54,7 +57,12 @@ from features.practice_generation.schemas import (
     QuestionType,
     VerificationPolicy,
 )
-from schemas.llm_routing import RouteRequest
+from schemas.llm_routing import PracticeGenerationWorkload, RouteRequest
+from services.llm.orchestration.config_registry import get_registry
+from services.llm.orchestration.errors import LlmConfigLoadError
+from services.llm.orchestration.practice_generation_capacity import (
+    PracticeGenerationCapacityPolicy,
+)
 from services.llm.orchestration.route_resolver import resolve_route
 
 
@@ -164,6 +172,7 @@ def test_enabled_runtime_requires_existing_persistence_configuration() -> None:
     config = PracticeGenerationConfig(
         enabled=True,
         pattern_context_enabled=False,
+        pattern_reuse_enabled=False,
         assessment_table="",
         question_table="",
         question_bank_table="",
@@ -345,6 +354,173 @@ def test_invalid_planner_output_gets_one_repair_then_fallback() -> None:
     assert result.validation_reason_code == "PLANNER_SLOT_COUNT_MISMATCH"
 
 
+@pytest.mark.parametrize(
+    ("query", "topic", "count", "expected_topics"),
+    [
+        (
+            "Create 3 questions on Time and Work, Number System",
+            "Time and Work, Number System",
+            3,
+            {"time_and_work", "number_system"},
+        ),
+        (
+            "Create 5 questions on Profit and Loss + Percentage",
+            "Profit and Loss + Percentage",
+            5,
+            {"profit_and_loss", "percentage"},
+        ),
+        (
+            "Create 10 questions on Arithmetic; Algebra",
+            "Arithmetic; Algebra",
+            10,
+            {"arithmetic", "algebra"},
+        ),
+    ],
+)
+def test_deterministic_fallback_distributes_multi_topic_requests(
+    query: str,
+    topic: str,
+    count: int,
+    expected_topics: set[str],
+) -> None:
+    resolved = request(query, count_query=query, topic=topic)
+    assert resolved.accepted_count == count
+
+    blueprint = deterministic_blueprint(resolved)
+    topic_counts = {
+        planned_topic: sum(
+            slot.topic_id == planned_topic for slot in blueprint.slots
+        )
+        for planned_topic in expected_topics
+    }
+
+    assert {slot.topic_id for slot in blueprint.slots} == expected_topics
+    assert len(blueprint.slots) == count
+    assert max(topic_counts.values()) - min(topic_counts.values()) <= 1
+
+
+def test_exact_multi_topic_failure_repairs_once_then_uses_valid_fallback() -> None:
+    class InvalidPlanner:
+        def __init__(self) -> None:
+            self.repair_feedback: list[str | None] = []
+
+        def plan(self, _request, *, tier, repair_feedback=None):
+            del tier
+            self.repair_feedback.append(repair_feedback)
+            return '{"slots": []}'
+
+    resolved = request(
+        (
+            "Create a 5-question Quick Practice on Time and Work, Number System "
+            "in MATH for SSC GD — Pre."
+        ),
+        topic="Time and Work, Number System",
+    ).model_copy(update={"exam_id": "SSC_GD", "exam_stage": "PRE"})
+    planner = InvalidPlanner()
+
+    result = BlueprintManager(planner, repair_limit=1).build(resolved)
+
+    assert (len(planner.repair_feedback), result.deterministic_fallback) == (2, True)
+    assert planner.repair_feedback[0] is None
+    assert planner.repair_feedback[1] == (
+        "reason=PLANNER_SLOT_COUNT_MISMATCH;fields=$;types=value_error;"
+        "schema=PracticeBlueprint"
+    )
+    assert [slot.topic_id for slot in result.blueprint.slots] == [
+        "time_and_work",
+        "number_system",
+        "time_and_work",
+        "number_system",
+        "time_and_work",
+    ]
+    assert result.validation_diagnostics == (
+        result.validation_diagnostics[0],
+        result.validation_diagnostics[1],
+    )
+    assert [diagnostic.phase for diagnostic in result.validation_diagnostics] == [
+        "initial",
+        "repair",
+    ]
+    assert all(
+        diagnostic.schema_name == "PracticeBlueprint"
+        and diagnostic.error_count == 1
+        and diagnostic.field_paths == ("$",)
+        and diagnostic.error_types == ("value_error",)
+        for diagnostic in result.validation_diagnostics
+    )
+
+
+def test_planner_topic_coverage_failure_uses_safe_reason_code() -> None:
+    resolved = request(
+        "Create five questions on Time and Work, Number System",
+        topic="Time and Work, Number System",
+    )
+    payload = deterministic_blueprint(resolved).model_dump(mode="json")
+    for slot in payload["slots"]:
+        slot["topic_id"] = "time_and_work"
+        slot["category_id"] = "time_and_work"
+
+    class IncompletePlanner:
+        def __init__(self) -> None:
+            self.repair_feedback: list[str | None] = []
+
+        def plan(self, _request, *, tier, repair_feedback=None):
+            del tier
+            self.repair_feedback.append(repair_feedback)
+            return json.dumps(payload)
+
+    planner = IncompletePlanner()
+    result = BlueprintManager(planner, repair_limit=1).build(resolved)
+
+    assert result.validation_reason_code == "PLANNER_TOPIC_COVERAGE_INVALID"
+    assert planner.repair_feedback[1] == (
+        "reason=PLANNER_TOPIC_COVERAGE_INVALID;fields=$;types=ValueError;"
+        "schema=PracticeBlueprint"
+    )
+    assert result.deterministic_fallback is True
+
+
+def test_invalid_deterministic_fallback_is_controlled_planning_error() -> None:
+    class InvalidPlanner:
+        def plan(self, *_args, **_kwargs):
+            return '{"slots": []}'
+
+    resolved = request(
+        "Create five questions",
+        topic="///",
+    )
+
+    with pytest.raises(BlueprintPlanningError) as error:
+        BlueprintManager(InvalidPlanner(), repair_limit=1).build(resolved)
+
+    assert error.value.reason_code == "PRACTICE_PLANNER_FALLBACK_INVALID"
+    assert error.value.fallback_invoked is True
+    assert error.value.fallback_result == "invalid"
+    assert error.value.diagnostics[-1].phase == "fallback"
+
+
+def test_unexpected_planner_exception_is_not_silently_recovered() -> None:
+    class BrokenPlanner:
+        def plan(self, *_args, **_kwargs):
+            raise RuntimeError("unexpected planner bug")
+
+    with pytest.raises(RuntimeError, match="unexpected planner bug"):
+        BlueprintManager(BrokenPlanner(), repair_limit=1).build(
+            request("Create three algebra questions")
+        )
+
+
+def test_planner_configuration_error_does_not_use_deterministic_fallback() -> None:
+    class MisconfiguredPlanner:
+        def plan(self, *_args, **_kwargs):
+            raise LlmConfigLoadError("invalid planner configuration")
+
+    with pytest.raises(LlmConfigLoadError, match="invalid planner configuration"):
+        BlueprintManager(MisconfiguredPlanner(), repair_limit=1).build(
+            request("Create three algebra questions")
+        )
+
+
 def test_valid_planner_slot_difficulty_is_not_overridden_by_classifier_difficulty() -> None:
     resolved = request("Create five algebra questions").model_copy(
         update={"difficulty": Difficulty.ADVANCED}
@@ -486,6 +662,61 @@ def test_schema_v2_planner_slots_are_canonical_over_supplied_buckets() -> None:
     assert blueprint.planner_family is PlannerFamily.QUANT_REASONING
     assert all(bucket.subject == "math" for bucket in blueprint.buckets)
     assert all(bucket.bucket_id != "planner-owned-bucket" for bucket in blueprint.buckets)
+
+
+def test_slot_bucket_binding_uses_the_full_compatibility_signature() -> None:
+    resolved = request(
+        "Create three syllogism questions",
+        count_query="Create three syllogism questions",
+        subject="reasoning",
+        topic="syllogism",
+    )
+    slots = [
+        slot.model_dump(mode="json")
+        for slot in deterministic_blueprint(resolved).slots
+    ]
+    slots[0]["category_id"] = "basic_fundamentals"
+    slots[1]["category_id"] = "tricky_concept"
+    slots[2]["category_id"] = "tricky_concept"
+    blueprint = parse_blueprint(json.dumps({"slots": slots}), resolved)
+
+    assert [bucket.required_count for bucket in blueprint.buckets] == [1, 2]
+    assert [
+        bucket_for_slot(blueprint, slot).bucket_id for slot in blueprint.slots
+    ] == ["slot-bucket-001", "slot-bucket-002", "slot-bucket-002"]
+
+    linked = []
+    for slot in blueprint.slots:
+        linked.append(
+            {
+                "questionId": f"q-{slot.slot_id}",
+                "question": f"Question for {slot.slot_id}?",
+                "options": ["A", "B", "C", "D"],
+                "answers": json.dumps(
+                    {"correctAnswer": "A", "options": ["A", "B", "C", "D"]}
+                ),
+                "correctAnswer": "A",
+                "explanation": "A is correct.",
+                "topic": slot.topic_id,
+                "difficulty": slot.difficulty.value,
+                "_practiceMeta": {
+                    "bucketId": "slot-bucket-001",
+                    "slotId": slot.slot_id,
+                    "verified": True,
+                    "sourceType": "AI_GENERATED",
+                    "verificationMethod": "INDEPENDENT_MODEL_V2",
+                    "questionType": "mcq",
+                    "language": "english",
+                },
+            }
+        )
+    validation = validate_final_set(
+        blueprint=blueprint,
+        linked_questions=linked,
+    )
+    assert validation.reason_code == "BLUEPRINT_DISTRIBUTION_MISMATCH"
+    assert validation.failed_slot_ids == ("slot-002", "slot-003")
+    assert validation.recoverable is True
 
 
 def test_schema_v2_rejects_duplicate_slot_ids() -> None:
@@ -734,12 +965,68 @@ def test_advanced_reasoning_generation_groups_allow_two_compatible_questions() -
     assert [group.required_count for group in groups] == [2, 2, 1]
 
 
+def test_practice_capacity_policy_keeps_simple_work_small_and_complex_reasoning_bounded() -> None:
+    registry = get_registry()
+    basic_route = resolve_route(
+        RouteRequest(
+            request_id="practice-capacity-basic",
+            subject="math",
+            task_role="generator",
+            difficulty="basic",
+            intent="practice",
+            language="english",
+        )
+    )
+    advanced_route = resolve_route(
+        RouteRequest(
+            request_id="practice-capacity-advanced",
+            subject="math",
+            task_role="generator",
+            difficulty="advanced",
+            intent="practice",
+            language="english",
+        )
+    )
+    basic_capacity = PracticeGenerationCapacityPolicy.resolve(
+        route_decision=basic_route,
+        model_config=registry.model_map[basic_route.model],
+        workload=PracticeGenerationWorkload(complexity="low", slot_count=1),
+    )
+    advanced_capacity = PracticeGenerationCapacityPolicy.resolve(
+        route_decision=advanced_route,
+        model_config=registry.model_map[advanced_route.model],
+        workload=PracticeGenerationWorkload(complexity="high", slot_count=1),
+    )
+
+    assert basic_capacity.model_dump() == {
+        "initial_max_output_tokens": 900,
+        "escalation_max_output_tokens": 1500,
+        "product_hard_max_output_tokens": 2200,
+        "model_hard_max_output_tokens": 8000,
+        "max_slots_per_batch": 5,
+        "reasoning_effort": "none",
+        "complexity": "low",
+        "slot_count": 1,
+    }
+    assert advanced_capacity.model_dump() == {
+        "initial_max_output_tokens": 4000,
+        "escalation_max_output_tokens": 5600,
+        "product_hard_max_output_tokens": 5600,
+        "model_hard_max_output_tokens": 8000,
+        "max_slots_per_batch": 1,
+        "reasoning_effort": "high",
+        "complexity": "high",
+        "slot_count": 1,
+    }
+
+
 @pytest.mark.parametrize(
     ("subject", "difficulty", "complexity", "expected"),
     [
-        ("math", Difficulty.BASIC, Complexity.LOW, [2, 2, 1]),
+        ("math", Difficulty.BASIC, Complexity.LOW, [5]),
         ("math", Difficulty.INTERMEDIATE, Complexity.MEDIUM, [4, 1]),
         ("math", Difficulty.ADVANCED, Complexity.LOW, [2, 2, 1]),
+        ("math", Difficulty.ADVANCED, Complexity.HIGH, [1, 1, 1, 1, 1]),
         ("reasoning", Difficulty.ADVANCED, Complexity.LOW, [2, 2, 1]),
         ("reasoning", Difficulty.ADVANCED, Complexity.HIGH, [1, 1, 1, 1, 1]),
         ("history", Difficulty.ADVANCED, Complexity.LOW, [5]),
@@ -805,6 +1092,37 @@ def test_slot_batches_expand_only_when_the_shared_route_budget_allows() -> None:
 
     assert [group.required_count for group in groups] == [5]
     assert [group.token_budget for group in groups] == [3_200]
+
+
+def test_advanced_math_high_complexity_reserves_reasoning_before_batching() -> None:
+    original = deterministic_blueprint(request("Create five algebra questions"))
+    payload = original.model_dump(mode="json")
+    for slot in payload["slots"]:
+        slot.update(
+            {
+                "subject_id": "math",
+                "difficulty": Difficulty.ADVANCED.value,
+                "complexity": Complexity.HIGH.value,
+                "generator_route_hint": "math.generator.advanced",
+                "generation_group_hint": 5,
+            }
+        )
+    payload.pop("buckets", None)
+    blueprint = PracticeBlueprint.model_validate(payload)
+
+    groups = build_slot_generation_groups(
+        blueprint,
+        {slot.slot_id for slot in blueprint.slots},
+        group_size=5,
+        group_max=5,
+        token_budget_resolver=lambda _subject, _difficulty: RouteOutputCapacity(
+            configured_output_tokens=3600,
+            expected_reasoning_tokens=2600,
+        ),
+    )
+
+    assert [group.required_count for group in groups] == [1, 1, 1, 1, 1]
+    assert [group.token_budget for group in groups] == [3600] * 5
 
 
 def test_partial_group_retains_valid_sibling_and_reports_deficit() -> None:
@@ -1263,9 +1581,81 @@ def test_final_ready_gate_rejects_a_persisted_unplayable_question() -> None:
     assert validate_final_set(blueprint=blueprint, linked_questions=[invalid]).ready is False
 
 
-def test_pattern_provider_is_noop_when_disabled_and_rejects_unimplemented_enable() -> None:
+@pytest.mark.parametrize("count", [3, 5, 10, 20])
+@pytest.mark.parametrize("subject", ["math", "reasoning"])
+@pytest.mark.parametrize("difficulty", ["basic", "advanced"])
+@pytest.mark.parametrize("multi_topic", [False, True])
+def test_deterministic_32_case_reliability_matrix_reaches_a_valid_manifest(
+    count: int,
+    subject: str,
+    difficulty: str,
+    multi_topic: bool,
+) -> None:
+    topic = (
+        "algebra, number system"
+        if subject == "math" and multi_topic
+        else "syllogism, seating arrangements"
+        if multi_topic
+        else "algebra"
+        if subject == "math"
+        else "syllogism"
+    )
+    resolved = resolve_practice_request(
+        request_id=f"matrix-{subject}-{difficulty}-{count}-{multi_topic}",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+        query=f"Create {count} questions on {topic}",
+        subject=subject,
+        topic=topic,
+        difficulty=difficulty,
+        language="english",
+        exam_id="SSC_GD",
+        exam_stage="PRE",
+    )
+    blueprint = deterministic_blueprint(resolved)
+    linked: list[dict[str, object]] = []
+    for slot in blueprint.slots:
+        linked.append(
+            {
+                "questionId": f"q-{slot.slot_id}",
+                "question": f"Independent matrix question for {slot.slot_id}?",
+                "options": ["A", "B", "C", "D"],
+                "answers": json.dumps(
+                    {"correctAnswer": "A", "options": ["A", "B", "C", "D"]}
+                ),
+                "correctAnswer": "A",
+                "explanation": "A is independently verified.",
+                "topic": slot.topic_id,
+                "difficulty": slot.difficulty.value,
+                "_practiceMeta": {
+                    "bucketId": bucket_for_slot(blueprint, slot).bucket_id,
+                    "slotId": slot.slot_id,
+                    "verified": True,
+                    "sourceType": "AI_GENERATED",
+                    "verificationMethod": "INDEPENDENT_MODEL_V2",
+                    "questionType": "mcq",
+                    "language": "english",
+                },
+            }
+        )
+
+    validation = validate_final_set(
+        blueprint=blueprint,
+        linked_questions=linked,
+    )
+
+    assert validation.ready is True
+    assert validation.expected_question_count == count
+    assert validation.actual_question_count == count
+    assert len({item["questionId"] for item in linked}) == count
+
+
+def test_pattern_provider_is_noop_when_runtime_is_disabled() -> None:
     provider = build_pattern_context_provider(enabled=False)
     assert isinstance(provider, NoOpPatternContextProvider)
-    assert provider.discover_catalog(request("Create one similar question")) == ()
-    with pytest.raises(RuntimeError):
-        build_pattern_context_provider(enabled=True)
+    assert provider.resolve_slots(
+        request=request("Create one similar question"),
+        slots=(),
+    ).guidance_by_slot == {}
+    assert isinstance(build_pattern_context_provider(enabled=True), NoOpPatternContextProvider)

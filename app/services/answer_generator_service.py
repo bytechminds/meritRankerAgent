@@ -31,7 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 
+from retrieval.pattern_intelligence import DoubtPatternContext
 from schemas.doubt_solver import AnswerOutput, CanonicalLanguage, QueryClassification
 
 logger = logging.getLogger(__name__)
@@ -116,6 +118,7 @@ def _build_answer_messages(
     exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
+    doubt_pattern_context: DoubtPatternContext | None = None,
 ) -> list:
     """Build the message list for the answer generator LLM call.
 
@@ -132,6 +135,7 @@ def _build_answer_messages(
     from schemas.llm import LlmMessage  # noqa: PLC0415
     from services.llm.orchestration.prompt_resolver import (  # noqa: PLC0415
         get_prompt_resolver,
+        render_doubt_pattern_context,
     )
     from services.prompt_loader import load_prompt  # noqa: PLC0415
 
@@ -174,10 +178,57 @@ def _build_answer_messages(
             f"\n--- End of Retrieved Context ---"
         )
 
+    if doubt_pattern_context is not None:
+        pattern_context = _fit_doubt_pattern_context_to_budget(
+            system_prompt=system_prompt,
+            user_content=user_content,
+            request_id=request_id,
+            doubt_pattern_context=doubt_pattern_context,
+            render=render_doubt_pattern_context,
+        )
+        if pattern_context:
+            user_content += "\n\n" + pattern_context
+
     return [
         LlmMessage(role="system", content=system_prompt),
         LlmMessage(role="user", content=user_content),
     ]
+
+
+def _fit_doubt_pattern_context_to_budget(
+    *,
+    system_prompt: str,
+    user_content: str,
+    request_id: str,
+    doubt_pattern_context: DoubtPatternContext,
+    render: Callable[[DoubtPatternContext], str],
+) -> str:
+    """Keep the direct legacy path within the same Pattern guidance budget policy."""
+    from config import get_settings  # noqa: PLC0415
+    from services.llm.orchestration.prompt_budget import estimate_text_tokens  # noqa: PLC0415
+
+    max_input_tokens = get_settings().pattern_intelligence_prompt_max_input_tokens
+    current_context = doubt_pattern_context
+    while True:
+        rendered = render(current_context)
+        total_input_tokens = estimate_text_tokens(system_prompt) + estimate_text_tokens(
+            user_content
+        ) + estimate_text_tokens(rendered)
+        if total_input_tokens <= max_input_tokens:
+            return rendered
+        if current_context.question_references:
+            current_context = current_context.model_copy(
+                update={"question_references": current_context.question_references[:-1]}
+            )
+            continue
+        logger.warning(
+            "legacy_doubt_pattern_guidance_omitted_for_budget request_id=%s "
+            "total_input_tokens=%d max_input_tokens=%d",
+            request_id,
+            total_input_tokens,
+            max_input_tokens,
+        )
+        return ""
 
 
 def _generate_with_llm(
@@ -190,6 +241,7 @@ def _generate_with_llm(
     exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
+    doubt_pattern_context: DoubtPatternContext | None = None,
 ) -> AnswerOutput:
     """Call model_router and return a validated AnswerOutput.
 
@@ -209,6 +261,7 @@ def _generate_with_llm(
         exam_profile_id=exam_profile_id,
         language=language,
         request_id=request_id,
+        doubt_pattern_context=doubt_pattern_context,
     )
     response = model_router.generate(_GENERATOR_ROLE, messages)
 
@@ -245,6 +298,7 @@ def generate_answer(
     exam_profile_id: str | None = None,
     language: CanonicalLanguage = "english",
     request_id: str = "",
+    doubt_pattern_context: DoubtPatternContext | None = None,
 ) -> AnswerOutput:
     """Generate a tutoring answer, dispatching to LLM or mock based on config.
 
@@ -302,6 +356,7 @@ def generate_answer(
             exam_profile_id=exam_profile_id,
             language=language,
             request_id=request_id,
+            doubt_pattern_context=doubt_pattern_context,
         )
     except Exception as exc:  # noqa: BLE001
         # Log safe warning — exc may contain partial model output; never log query.

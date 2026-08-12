@@ -383,6 +383,24 @@ class ModelConfig(BaseModel):
         ),
     )
     timeout_seconds: int = Field(ge=1, le=120)
+    model_hard_max_output_tokens: int = Field(
+        default=8000,
+        ge=1,
+        le=8000,
+        description=(
+            "Configured safe completion-token ceiling for this provider/model alias. "
+            "Runtime workload policies must never exceed it."
+        ),
+    )
+    structured_output_reasoning_reserve_tokens: int = Field(
+        default=0,
+        ge=0,
+        le=8000,
+        description=(
+            "Measured completion tokens reserved for provider reasoning before "
+            "batching structured generator output."
+        ),
+    )
     capabilities: dict[str, CapabilityLevel] = Field(
         default_factory=dict,
         description="Subject capability ratings. [NOT VERIFIED] — placeholder until live eval.",
@@ -677,6 +695,40 @@ class FallbackAttempt(BaseModel):
     reason: str = Field(min_length=1, max_length=256)
 
 
+class PracticeGenerationWorkload(BaseModel):
+    """Safe workload inputs for runtime Practice output-cap selection."""
+
+    complexity: Literal["low", "medium", "high"] = "medium"
+    slot_count: int = Field(ge=1, le=5)
+
+
+class PracticeGenerationCapacity(BaseModel):
+    """Resolved bounded capacity for one logical Practice generation work unit."""
+
+    initial_max_output_tokens: int = Field(ge=1, le=8000)
+    escalation_max_output_tokens: int = Field(ge=1, le=8000)
+    product_hard_max_output_tokens: int = Field(ge=1, le=8000)
+    model_hard_max_output_tokens: int = Field(ge=1, le=8000)
+    max_slots_per_batch: int = Field(ge=1, le=5)
+    reasoning_effort: ReasoningEffort = "none"
+    complexity: Literal["low", "medium", "high"] = "medium"
+    slot_count: int = Field(ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_ordered_caps(self) -> PracticeGenerationCapacity:
+        if not (
+            self.initial_max_output_tokens
+            <= self.escalation_max_output_tokens
+            <= self.product_hard_max_output_tokens
+            <= self.model_hard_max_output_tokens
+        ):
+            raise ValueError(
+                "Practice generation capacity must satisfy initial <= escalation "
+                "<= product hard <= model hard."
+            )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # RouteDecision — resolver output (no credentials)
 # ---------------------------------------------------------------------------
@@ -711,6 +763,7 @@ class RouteDecision(BaseModel):
     )
     temperature: float
     max_tokens: int
+    practice_generation_capacity: PracticeGenerationCapacity | None = None
     provider_options: dict[str, Any] = Field(default_factory=dict)
     fallback_attempts: list[FallbackAttempt] = Field(
         default_factory=list,

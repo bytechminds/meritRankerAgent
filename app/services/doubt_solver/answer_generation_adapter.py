@@ -25,6 +25,7 @@ import logging
 from collections.abc import Callable, Iterator
 
 from observability import log_event
+from retrieval.pattern_intelligence import DoubtPatternContext
 from schemas.doubt_solver import CanonicalLanguage, FinalAnswerResult
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_completion import resolve_generator_route_subject
@@ -63,6 +64,7 @@ class AnswerGenerationAdapter:
         exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
+        doubt_pattern_context: DoubtPatternContext | None = None,
     ) -> str:
         """Return the authoritative answer content for compatibility callers."""
         return self.generate_final(
@@ -78,6 +80,7 @@ class AnswerGenerationAdapter:
             exam_profile_id=exam_profile_id,
             language=language,
             conversation_context=conversation_context,
+            doubt_pattern_context=doubt_pattern_context,
         ).content
 
     def generate_final(
@@ -95,6 +98,7 @@ class AnswerGenerationAdapter:
         exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
+        doubt_pattern_context: DoubtPatternContext | None = None,
     ) -> FinalAnswerResult:
         """Build a RouteRequest and call the orchestrator."""
         route_subject = resolve_generator_route_subject(
@@ -114,12 +118,15 @@ class AnswerGenerationAdapter:
             language=language,
         )
 
-        result = self._orchestrator.generate(
-            route_request=route_request,
-            query=query,
-            context=context if context else None,
-            conversation_context=conversation_context,
-        )
+        generation_kwargs = {
+            "route_request": route_request,
+            "query": query,
+            "context": context if context else None,
+            "conversation_context": conversation_context,
+        }
+        if doubt_pattern_context is not None:
+            generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
+        result = self._orchestrator.generate(**generation_kwargs)
 
         logger.debug(
             "answer_generation_adapter.generate  request_id=%s  subject=%s  "
@@ -172,6 +179,7 @@ class AnswerGenerationAdapter:
         exam_profile_id: str | None = None,
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
+        doubt_pattern_context: DoubtPatternContext | None = None,
         on_before_generator_fallback: Callable[[], None] | None = None,
         on_before_continuation: Callable[[], None] | None = None,
         verify_before_stream: bool = True,
@@ -207,12 +215,15 @@ class AnswerGenerationAdapter:
             intent,
         )
 
-        yield from self._orchestrator.generate_stream(
-            route_request=route_request,
-            query=query,
-            context=context_text if context_text else None,
-            conversation_context=conversation_context,
-            on_before_fallback=on_before_generator_fallback,
-            on_before_continuation=on_before_continuation,
-            verify_before_stream=verify_before_stream,
-        )
+        stream_kwargs = {
+            "route_request": route_request,
+            "query": query,
+            "context": context_text if context_text else None,
+            "conversation_context": conversation_context,
+            "on_before_fallback": on_before_generator_fallback,
+            "on_before_continuation": on_before_continuation,
+            "verify_before_stream": verify_before_stream,
+        }
+        if doubt_pattern_context is not None:
+            stream_kwargs["doubt_pattern_context"] = doubt_pattern_context
+        yield from self._orchestrator.generate_stream(**stream_kwargs)

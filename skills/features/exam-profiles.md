@@ -36,6 +36,10 @@ level, styles, and exclusions. It excludes cutoff, timestamps, and marks/timing/
 planner receives the same compact context; only a `FULL_MOCK` gets deterministic format totals
 and section marks/timing/counts. The existing prompt templates remain unchanged.
 
+The section projection includes the immutable section `name` in addition to its
+ID and subject. This keeps a future server-owned real-exam snapshot compatible
+with the backend's exact section mapping; it does not enable Real Exam launch.
+
 ## Compatibility
 
 Resolution precedence is cached exact `examProfileId`, cached exact `(examId, stage)`, then the

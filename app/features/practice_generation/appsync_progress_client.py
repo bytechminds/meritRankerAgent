@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
@@ -14,6 +15,8 @@ import httpx
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from features.practice_generation.progress_contract import PRACTICE_PROGRESS_ALLOWED_META_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -55,53 +58,6 @@ _NON_RETRYABLE_CODES = (
     "GRAPHQL_VALIDATION_FAILED",
 )
 
-_ALLOWED_META_KEYS = frozenset(
-    {
-        "schemaVersion",
-        "idempotencyKey",
-        "conversationId",
-        "turnId",
-        "practiceType",
-        "requestedCount",
-        "acceptedCount",
-        "examStage",
-        "requestedLanguage",
-        "phase",
-        "playable",
-        "progressPercent",
-        "readyQuestionCount",
-        "questionManifestVersion",
-        "readyQuestionIds",
-        "readyCount",
-        "reusedCount",
-        "generatedCount",
-        "verifiedCount",
-        "failedCount",
-        "practiceRequest",
-        "resourceAliases",
-        "blueprint",
-        "plannerCalls",
-        "plannerTier",
-        "plannerRepaired",
-        "plannerDeterministicFallback",
-        "bucketReadyCounts",
-        "deficits",
-        "generationGroups",
-        "finalizationAttempt",
-        "finalizationReasonCode",
-        "readyAt",
-        "errorCode",
-        "generationVersion",
-        "startedAt",
-        "lastProgressAt",
-        "recoveryAttemptCount",
-        "lastCompletedStage",
-        "replacementWaveCount",
-        "slotReadyCounts",
-    }
-)
-
-
 def _json_compatible(value: object) -> object:
     """Convert DynamoDB number values without changing their JSON meaning."""
     if isinstance(value, Decimal):
@@ -127,17 +83,27 @@ def _serialize_meta(meta: dict[str, object]) -> str:
 
 
 def _validate_meta_keys(meta: dict[str, object]) -> None:
-    if any(not isinstance(key, str) or key not in _ALLOWED_META_KEYS for key in meta):
+    if any(
+        not isinstance(key, str) or key not in PRACTICE_PROGRESS_ALLOWED_META_KEYS
+        for key in meta
+    ):
         raise PracticeProgressError("PRACTICE_PROGRESS_UNKNOWN_META_FIELD")
 
 
 class PracticeProgressError(RuntimeError):
     """Controlled AppSync progress-publication failure."""
 
-    def __init__(self, code: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool = False,
+        safe_detail: str | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.safe_detail = safe_detail
 
 
 class PracticeProgressResult(BaseModel):
@@ -280,8 +246,8 @@ class AppSyncPracticeProgressClient:
             raise PracticeProgressError("PRACTICE_PROGRESS_INVALID_RESPONSE") from exc
         errors = payload.get("errors") if isinstance(payload, dict) else None
         if isinstance(errors, list) and errors:
-            code = self._graphql_error_code(errors)
-            raise PracticeProgressError(code, retryable=False)
+            code, safe_detail = self._graphql_error(errors)
+            raise PracticeProgressError(code, retryable=False, safe_detail=safe_detail)
         try:
             result = payload["data"]["updatePracticeGenerationProgress"]
             return PracticeProgressResult.model_validate(result)
@@ -316,7 +282,7 @@ class AppSyncPracticeProgressClient:
             ) from exc
 
     @staticmethod
-    def _graphql_error_code(errors: list[Any]) -> str:
+    def _graphql_error(errors: list[Any]) -> tuple[str, str | None]:
         for error in errors:
             if not isinstance(error, dict):
                 continue
@@ -324,10 +290,19 @@ class AppSyncPracticeProgressClient:
             for token in message.replace(":", " ").split():
                 if token.startswith("PRACTICE_PROGRESS_"):
                     code = token.rstrip(".,")
+                    extensions = error.get("extensions")
+                    safe_detail = None
+                    if isinstance(extensions, dict):
+                        candidate = extensions.get("unknownField")
+                        if isinstance(candidate, str) and re.fullmatch(
+                            r"[A-Za-z][A-Za-z0-9]{0,63}",
+                            candidate,
+                        ):
+                            safe_detail = candidate
                     if any(marker in code for marker in _NON_RETRYABLE_CODES):
-                        return code
-                    return code
+                        return code, safe_detail
+                    return code, safe_detail
             error_type = str(error.get("errorType") or "")
             if error_type:
-                return "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
-        return "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+                return "PRACTICE_PROGRESS_GRAPHQL_REJECTED", None
+        return "PRACTICE_PROGRESS_GRAPHQL_REJECTED", None

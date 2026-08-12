@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from services.llm.orchestration.prompt_budget import PromptInputBudget
+
 
 class PracticeType(StrEnum):
     SIMILAR_QUESTION = "SIMILAR_QUESTION"
@@ -471,6 +473,7 @@ class GeneratedBatch(BaseModel):
     content: str
     route_id: str = Field(min_length=1, max_length=160)
     model: str = Field(min_length=1, max_length=160)
+    prompt_input_budget: PromptInputBudget | None = None
 
 
 class PlannerEnvelope(BaseModel):

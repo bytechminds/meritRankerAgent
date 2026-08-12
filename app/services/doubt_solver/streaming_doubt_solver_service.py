@@ -28,6 +28,7 @@ from graphs.doubt_solver_graph import (
 )
 from observability import (
     begin_request_summary,
+    bind_execution_context,
     bind_llm_attempt_type,
     bind_request_context,
     count_generator_calls,
@@ -40,6 +41,7 @@ from observability import (
     update_request_type,
 )
 from observability.summary import reset_request_summary
+from retrieval.pattern_intelligence import DoubtPatternContext
 from schemas.conversation import CompletedConversationTurn
 from schemas.doubt_solver import (
     CanonicalLanguage,
@@ -84,9 +86,27 @@ from services.doubt_solver.stream_labels import (
     get_stream_label,
 )
 from services.doubt_solver.stream_status import StreamStatusTracker
+from services.llm.billing import (
+    OperationUsageAccumulator,
+    begin_operation,
+    emit_operation_billing_summary,
+)
 
 logger = logging.getLogger(__name__)
 __all__ = ["orchestrated_classify_query_with_delivery_signals"]
+
+
+def _stream_doubt_pattern_context(payload: object) -> DoubtPatternContext | None:
+    """Validate the internal context before handing it to the prompt adapter."""
+    if not isinstance(payload, dict):
+        return None
+    raw_context = payload.get("doubtPatternContext")
+    if not isinstance(raw_context, dict):
+        return None
+    try:
+        return DoubtPatternContext.model_validate(raw_context)
+    except ValueError:
+        return None
 
 
 class PracticeLauncher(Protocol):
@@ -128,6 +148,7 @@ class StreamDoubtSolverInput:
     request_started_logged: bool = False
     defer_practice_start_until_committed: bool = False
     initial_llm_usage_records: tuple[LLMUsageRecord, ...] = ()
+    operation_accumulator: OperationUsageAccumulator | None = None
 
 
 def _cancelled(input: StreamDoubtSolverInput) -> bool:
@@ -590,6 +611,7 @@ def _iter_stream_doubt_solver(
     context_text = str(state.get("context_text") or "")
     web_verified = required_web_context_verified(classification_dict, state)
     retrieval_context = state.get("retrieval_context") or {}
+    doubt_pattern_context = _stream_doubt_pattern_context(retrieval_context)
     retrieval_mode = retrieval_context.get("mode")
     retrieval_used = retrieval_mode not in {None, "fresh_solve"}
     policy = AnswerDeliveryPolicy.from_settings()
@@ -671,6 +693,8 @@ def _iter_stream_doubt_solver(
             }
             if input.exam_profile_id:
                 stream_kwargs["exam_profile_id"] = input.exam_profile_id
+            if doubt_pattern_context is not None:
+                stream_kwargs["doubt_pattern_context"] = doubt_pattern_context
             for chunk in adapter.generate_stream(**stream_kwargs):
                 yield from emit_pending_statuses()
                 if _cancelled(input):
@@ -729,6 +753,8 @@ def _iter_stream_doubt_solver(
             }
             if input.exam_profile_id:
                 generation_kwargs["exam_profile_id"] = input.exam_profile_id
+            if doubt_pattern_context is not None:
+                generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
             draft = adapter.generate(**generation_kwargs)
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -1093,6 +1119,18 @@ def stream_doubt_solver(
     """Enforce a terminal event unless cancellation is confirmed."""
     started_at = time.monotonic()
     initial_type = "image" if input.source_modality == "image" else "pending"
+    operation_accumulator = input.operation_accumulator
+    if operation_accumulator is None:
+        try:
+            operation_accumulator = begin_operation(
+                operation_id=input.request_id,
+                feature="doubt",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ai_usage_meter_unavailable reason=stream_start_failed error_type=%s",
+                type(exc).__name__,
+            )
     with bind_request_context(
         request_id=input.request_id,
         trace_id=input.trace_id,
@@ -1100,120 +1138,130 @@ def stream_doubt_solver(
         turn_id=input.turn_id,
         request_type=initial_type,
     ):
-        summary_token = begin_request_summary(
-            initial_llm_usage_records=input.initial_llm_usage_records
-        )
-        visible = False
-        terminal = False
-        terminal_reason = "unexpected_internal_error"
-        terminal_error_type: str | None = None
-        try:
-            with stage_span("doubt_solver.request"):
-                if not input.request_started_logged:
-                    log_event(
-                        "request_started",
-                        component="request.lifecycle",
-                        stage="started",
-                        status="started",
-                        details={"request_type": initial_type},
-                    )
-                for event in _iter_stream_doubt_solver(
-                    input,
-                    adapter=adapter,
-                    conversation_persistence=conversation_persistence,
-                    follow_up_resolver=follow_up_resolver,
-                    conversation_understanding=conversation_understanding,
-                    practice_launcher=practice_launcher,
-                ):
-                    if _cancelled(input):
-                        terminal_reason = (
-                            input.cancellation_reason()
-                            if input.cancellation_reason is not None
-                            else "user_cancelled"
-                        ) or "user_cancelled"
-                        logger.debug(
-                            "request_cancelled request_id=%s terminal_reason=%s",
-                            input.request_id,
-                            terminal_reason,
-                        )
-                        if conversation_persistence is not None:
-                            conversation_persistence.record_skip(
-                                request_id=input.request_id,
-                                conversation_id=input.conversation_id,
-                                turn_id=input.turn_id,
-                                skip_reason="request_cancelled",
-                            )
-                        return
-                    if terminal:
-                        return
-                    if event.type == "chunk":
-                        visible = True
-                    elif event.type in {
-                        "complete",
-                        "error",
-                        "practice_generation_started",
-                    }:
-                        terminal = True
-                        terminal_reason = (
-                            "practice_generation_started"
-                            if event.type == "practice_generation_started"
-                            else (
-                                str(event.metadata.get("terminal_reason") or "completed")
-                                if event.type == "complete"
-                                else str(event.metadata.get("code") or "stream_failed")
-                            )
-                        )
-                    yield event
-        except Exception as exc:  # noqa: BLE001
-            terminal = True
-            terminal_reason = "unexpected_internal_error"
-            terminal_error_type = type(exc).__name__
-            yield _error_event(
-                input.request_id,
-                code=("ANSWER_PARTIAL_STREAM_FAILED" if visible else "ANSWER_STREAM_FAILED"),
-                retryable=not visible,
+        with bind_execution_context(
+            operation_id=input.request_id,
+            feature="doubt",
+            operation_accumulator=operation_accumulator,
+        ):
+            summary_token = begin_request_summary(
+                initial_llm_usage_records=input.initial_llm_usage_records
             )
-            return
-        finally:
-            duration_ms = int((time.monotonic() - started_at) * 1000)
+            visible = False
+            terminal = False
+            terminal_reason = "unexpected_internal_error"
+            terminal_error_type: str | None = None
             try:
-                cancelled = _cancelled(input)
-            except Exception:  # noqa: BLE001
-                cancelled = False
-            status = (
-                "cancelled"
-                if cancelled
-                else (
-                    "completed"
-                    if terminal_reason in {"completed", "practice_generation_started"}
+                with stage_span("doubt_solver.request"):
+                    if not input.request_started_logged:
+                        log_event(
+                            "request_started",
+                            component="request.lifecycle",
+                            stage="started",
+                            status="started",
+                            details={"request_type": initial_type},
+                        )
+                    for event in _iter_stream_doubt_solver(
+                        input,
+                        adapter=adapter,
+                        conversation_persistence=conversation_persistence,
+                        follow_up_resolver=follow_up_resolver,
+                        conversation_understanding=conversation_understanding,
+                        practice_launcher=practice_launcher,
+                    ):
+                        if _cancelled(input):
+                            terminal_reason = (
+                                input.cancellation_reason()
+                                if input.cancellation_reason is not None
+                                else "user_cancelled"
+                            ) or "user_cancelled"
+                            logger.debug(
+                                "request_cancelled request_id=%s terminal_reason=%s",
+                                input.request_id,
+                                terminal_reason,
+                            )
+                            if conversation_persistence is not None:
+                                conversation_persistence.record_skip(
+                                    request_id=input.request_id,
+                                    conversation_id=input.conversation_id,
+                                    turn_id=input.turn_id,
+                                    skip_reason="request_cancelled",
+                                )
+                            return
+                        if terminal:
+                            return
+                        if event.type == "chunk":
+                            visible = True
+                        elif event.type in {
+                            "complete",
+                            "error",
+                            "practice_generation_started",
+                        }:
+                            terminal = True
+                            terminal_reason = (
+                                "practice_generation_started"
+                                if event.type == "practice_generation_started"
+                                else (
+                                    str(event.metadata.get("terminal_reason") or "completed")
+                                    if event.type == "complete"
+                                    else str(event.metadata.get("code") or "stream_failed")
+                                )
+                            )
+                        yield event
+            except Exception as exc:  # noqa: BLE001
+                terminal = True
+                terminal_reason = "unexpected_internal_error"
+                terminal_error_type = type(exc).__name__
+                yield _error_event(
+                    input.request_id,
+                    code=("ANSWER_PARTIAL_STREAM_FAILED" if visible else "ANSWER_STREAM_FAILED"),
+                    retryable=not visible,
+                )
+                return
+            finally:
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                try:
+                    cancelled = _cancelled(input)
+                except Exception:  # noqa: BLE001
+                    cancelled = False
+                status = (
+                    "cancelled"
+                    if cancelled
                     else (
-                        "clarification" if terminal_reason == "clarification_required" else "failed"
+                        "completed"
+                        if terminal_reason in {"completed", "practice_generation_started"}
+                        else (
+                            "clarification"
+                            if terminal_reason == "clarification_required"
+                            else "failed"
+                        )
                     )
                 )
-            )
-            update_request_summary(
-                terminal_status=status,
-                terminal_reason=terminal_reason,
-                total_duration_ms=duration_ms,
-            )
-            emit_request_summary()
-            log_event(
-                (
-                    "request_cancelled"
-                    if status == "cancelled"
-                    else ("request_completed" if status == "completed" else "request_failed")
-                ),
-                component="request.lifecycle",
-                stage="complete" if status == "completed" else status,
-                status=status,
-                duration_ms=duration_ms,
-                error_code=None if status == "completed" else terminal_reason.upper(),
-                details=(
-                    {"error_type": terminal_error_type} if terminal_error_type is not None else None
-                ),
-                level=logging.ERROR if status == "failed" else logging.INFO,
-            )
-            reset_request_summary(summary_token)
+                update_request_summary(
+                    terminal_status=status,
+                    terminal_reason=terminal_reason,
+                    total_duration_ms=duration_ms,
+                )
+                emit_request_summary()
+                emit_operation_billing_summary(operation_status=status)
+                log_event(
+                    (
+                        "request_cancelled"
+                        if status == "cancelled"
+                        else ("request_completed" if status == "completed" else "request_failed")
+                    ),
+                    component="request.lifecycle",
+                    stage="complete" if status == "completed" else status,
+                    status=status,
+                    duration_ms=duration_ms,
+                    error_code=None if status == "completed" else terminal_reason.upper(),
+                    details=(
+                        {"error_type": terminal_error_type}
+                        if terminal_error_type is not None
+                        else None
+                    ),
+                    level=logging.ERROR if status == "failed" else logging.INFO,
+                )
+                reset_request_summary(summary_token)
         try:
             cancellation_confirmed = _cancelled(input)
         except Exception:  # noqa: BLE001

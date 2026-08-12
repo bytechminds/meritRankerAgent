@@ -14,6 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from retrieval.models import StudentRetrievalContext
+from retrieval.pattern_intelligence import DoubtPatternContext
 
 ContextSourceType = Literal["bedrock_kb", "none"]
 PatternHintStrength = Literal["weak", "medium", "strong"]
@@ -101,6 +102,7 @@ class ContextRetrievalResult(BaseModel):
     retrieval_context: StudentRetrievalContext = Field(
         default_factory=StudentRetrievalContext.fresh_solve
     )
+    doubt_pattern_context: DoubtPatternContext | None = Field(default=None, exclude=True)
     web_search_executed: bool = False
     web_search_status: str = Field(default="skipped", max_length=32)
     web_search_provider: str = Field(default="", max_length=64)

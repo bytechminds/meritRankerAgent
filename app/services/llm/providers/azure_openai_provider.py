@@ -59,6 +59,7 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from services.llm.providers.payload_shaping import build_azure_openai_chat_completion_kwargs
 from services.llm.providers.usage import (
     clear_stream_usage,
@@ -435,6 +436,7 @@ class AzureOpenAIProviderAdapter:
         except LlmProviderResponseError as exc:
             exc.provider_usage = usage
             exc.finish_reason = finish_reason
+            exc.normalized_finish_reason = normalize_completion_outcome(finish_reason)
             exc.output_tokens = usage.output_tokens
             exc.reasoning_tokens = usage.reasoning_tokens
             logger.warning(
@@ -460,6 +462,7 @@ class AzureOpenAIProviderAdapter:
             model=request.route_decision.model,
             provider="azure_openai",
             finish_reason=finish_reason,
+            normalized_finish_reason=normalize_completion_outcome(finish_reason),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,

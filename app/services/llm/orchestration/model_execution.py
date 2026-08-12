@@ -6,6 +6,7 @@ Model execution boundary backed by the LLM config registry.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -25,18 +26,22 @@ from schemas.llm_orchestration import (
     ProviderExecutionRequest,
     ResolvedModelConfig,
 )
-from schemas.llm_routing import RouteDecision
+from schemas.llm_routing import PracticeGenerationWorkload, RouteDecision
 from schemas.llm_usage import ProviderTokenUsage, UsageStatus
 from services.llm.orchestration.errors import (
     ModelExecutionConfigError,
     ProviderExecutionError,
 )
 from services.llm.orchestration.model_config_resolver import ModelConfigResolver
+from services.llm.orchestration.practice_generation_capacity import (
+    PracticeGenerationCapacityPolicy,
+)
 from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from services.llm.providers.usage import clear_stream_usage, consume_stream_usage
 
 if TYPE_CHECKING:
@@ -96,18 +101,12 @@ def _is_practice_generator_token_exhausted(
     *,
     route_decision: RouteDecision,
     finish_reason: str | None,
-    output_tokens: int | None,
-    reasoning_tokens: int | None,
 ) -> bool:
-    """Detect a structured practice response consumed entirely by reasoning."""
+    """Classify all truncated structured practice responses before parsing."""
     return (
         route_decision.task_role == "generator"
         and route_decision.intent == "practice"
-        and finish_reason == "length"
-        and output_tokens is not None
-        and output_tokens >= route_decision.max_tokens
-        and reasoning_tokens is not None
-        and reasoning_tokens >= output_tokens
+        and normalize_completion_outcome(finish_reason) == "output_token_exhausted"
     )
 
 
@@ -116,21 +115,61 @@ def _provider_response_failure_kind(
     route_decision: RouteDecision,
     response_error: LlmProviderResponseError,
 ) -> str:
+    outcome = getattr(
+        response_error, "normalized_finish_reason", None
+    ) or normalize_completion_outcome(getattr(response_error, "finish_reason", None))
     if _is_practice_generator_token_exhausted(
         route_decision=route_decision,
         finish_reason=getattr(response_error, "finish_reason", None),
-        output_tokens=getattr(response_error, "output_tokens", None),
-        reasoning_tokens=getattr(response_error, "reasoning_tokens", None),
     ):
         return "output_token_exhausted"
+    if outcome == "content_filtered":
+        return "safety_blocked"
     return response_error.failure_kind
+
+
+def _model_result_failure_kind(
+    *,
+    route_decision: RouteDecision,
+    result: ModelExecutionResult,
+) -> str | None:
+    outcome = result.normalized_finish_reason
+    if outcome == "unknown":
+        outcome = normalize_completion_outcome(result.finish_reason)
+    if (
+        outcome == "output_token_exhausted"
+        and _is_practice_generator(route_decision)
+    ):
+        return "output_token_exhausted"
+    if outcome == "content_filtered":
+        return "safety_blocked"
+    return None
 
 
 def _log_practice_generator_token_exhausted(
     *,
     route_decision: RouteDecision,
     model_alias: str,
+    content: str | None = None,
+    finish_reason: str | None = None,
+    output_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+    actual_output_budget: int | None = None,
 ) -> None:
+    execution_context = current_execution_context()
+    requested_items = (
+        len(execution_context.slot_ids)
+        if execution_context is not None and execution_context.slot_ids
+        else None
+    )
+    complete_items, structured_payload_complete = _structured_question_payload_status(
+        content
+    )
+    answer_tokens = (
+        max(output_tokens - reasoning_tokens, 0)
+        if output_tokens is not None and reasoning_tokens is not None
+        else None
+    )
     log_event(
         "practice_generator_token_exhausted",
         component="llm.model_execution",
@@ -141,9 +180,92 @@ def _log_practice_generator_token_exhausted(
             "route": route_decision.route_id,
             "modelAlias": model_alias,
             "failureClass": "output_token_exhausted",
+            "finishReason": finish_reason,
+            "normalizedFailureReason": normalize_completion_outcome(finish_reason),
+            "requestedItems": requested_items,
+            "completeItemsDetected": complete_items,
+            "structuredPayloadComplete": structured_payload_complete,
+            "structuredPayloadStartsWithObject": bool(
+                content and content.lstrip().startswith("{")
+            ),
+            "structuredPayloadEndsMidObjectOrArray": _ends_mid_json_structure(content),
+            "outputTokenLimit": actual_output_budget or route_decision.max_tokens,
+            "outputTokens": output_tokens,
+            "reasoningTokens": reasoning_tokens,
+            "answerTokens": answer_tokens,
         },
         level=logging.WARNING,
     )
+
+
+def _structured_question_payload_status(content: str | None) -> tuple[int, bool]:
+    """Inspect structure only; this deliberately never emits provider content."""
+    if not content:
+        return 0, False
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return _count_complete_question_items(content), False
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("questions"), list):
+        return 0, False
+    return len(parsed["questions"]), True
+
+
+def _count_complete_question_items(content: str) -> int:
+    """Count fully decodable array items without retaining their values."""
+    questions_key = content.find('"questions"')
+    if questions_key < 0:
+        return 0
+    array_start = content.find("[", questions_key)
+    if array_start < 0:
+        return 0
+    decoder = json.JSONDecoder()
+    cursor = array_start + 1
+    complete_items = 0
+    while cursor < len(content):
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if cursor >= len(content) or content[cursor] == "]":
+            return complete_items
+        try:
+            item, cursor = decoder.raw_decode(content, cursor)
+        except ValueError:
+            return complete_items
+        if not isinstance(item, dict):
+            return complete_items
+        complete_items += 1
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if cursor < len(content) and content[cursor] == ",":
+            cursor += 1
+            continue
+        return complete_items
+    return complete_items
+
+
+def _ends_mid_json_structure(content: str | None) -> bool:
+    """Report unfinished object/array structure without logging raw output."""
+    if not content:
+        return False
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth = max(depth - 1, 0)
+    return depth > 0 or in_string
 
 
 def _log_practice_model_fallback(
@@ -183,6 +305,8 @@ def _log_practice_generator_attempt(
     duration_ms: int,
     failure_kind: str | None = None,
     error_class: str | None = None,
+    actual_output_budget: int | None = None,
+    capacity_escalated: bool = False,
     status: str,
 ) -> None:
     """Emit bounded diagnostics for practice model attempts without content."""
@@ -199,7 +323,19 @@ def _log_practice_generator_attempt(
         "provider": provider or "",
         "attemptType": attempt_type,
         "fallbackIndex": fallback_index,
+        "actualBudgetSent": actual_output_budget or route_decision.max_tokens,
+        "capacityEscalated": capacity_escalated,
     }
+    capacity = route_decision.practice_generation_capacity
+    if capacity is not None:
+        details.update(
+            {
+                "configuredInitialBudget": capacity.initial_max_output_tokens,
+                "hardProductCap": capacity.product_hard_max_output_tokens,
+                "complexity": capacity.complexity,
+                "capacitySlotCount": capacity.slot_count,
+            }
+        )
     execution_context = current_execution_context()
     if execution_context is not None:
         if execution_context.activity_id is not None:
@@ -225,6 +361,62 @@ def _log_practice_generator_attempt(
         error_code=failure_kind,
         details=details,
         level=logging.WARNING if status == "failed" else logging.INFO,
+    )
+
+
+def _log_practice_generator_completion(
+    *,
+    route_decision: RouteDecision,
+    resolution: ResolvedModelConfig,
+    result: ModelExecutionResult,
+    actual_output_budget: int,
+    fallback_used: bool,
+    capacity_escalated: bool,
+) -> None:
+    """Emit safe actual-usage telemetry; limits are never treated as usage."""
+    if not _is_practice_generator(route_decision):
+        return
+    capacity = route_decision.practice_generation_capacity
+    outcome = result.normalized_finish_reason
+    if outcome == "unknown":
+        outcome = normalize_completion_outcome(result.finish_reason)
+    log_event(
+        "practice_generator_model_completed",
+        component="llm.model_execution",
+        stage="generator",
+        status="completed",
+        details={
+            "route": route_decision.route_id,
+            "modelAlias": resolution.model_alias,
+            "provider": resolution.provider,
+            "subject": route_decision.subject,
+            "difficulty": route_decision.difficulty,
+            "complexity": capacity.complexity if capacity is not None else None,
+            "slotCount": capacity.slot_count if capacity is not None else None,
+            "configuredInitialBudget": (
+                capacity.initial_max_output_tokens
+                if capacity is not None
+                else route_decision.max_tokens
+            ),
+            "actualBudgetSent": actual_output_budget,
+            "hardProductCap": (
+                capacity.product_hard_max_output_tokens if capacity is not None else None
+            ),
+            "inputTokens": result.input_tokens,
+            "completionTokens": result.output_tokens,
+            "reasoningTokens": result.reasoning_tokens,
+            "visibleOutputTokens": (
+                max(result.output_tokens - result.reasoning_tokens, 0)
+                if result.output_tokens is not None and result.reasoning_tokens is not None
+                else None
+            ),
+            "finishReason": result.finish_reason,
+            "normalizedFailureReason": outcome,
+            "fallbackUsed": fallback_used,
+            "capacityEscalated": capacity_escalated,
+            "contractValid": None,
+            "verifierOutcome": None,
+        },
     )
 
 
@@ -344,6 +536,124 @@ class RegistryBackedModelExecutor:
         )
         self.last_stream_finish_reason: str | None = None
 
+    def _try_practice_capacity_escalation(
+        self,
+        *,
+        route_decision: RouteDecision,
+        messages: list[LlmMessage],
+        resolution: ResolvedModelConfig,
+        started_at: float,
+    ) -> tuple[ModelExecutionResult | None, str]:
+        """Retry one exact Practice work unit once at a strictly larger safe cap."""
+        capacity = route_decision.practice_generation_capacity
+        if (
+            capacity is None
+            or capacity.escalation_max_output_tokens <= route_decision.max_tokens
+        ):
+            return None, "output_token_exhausted"
+
+        escalation_budget = capacity.escalation_max_output_tokens
+        escalation_request = ProviderExecutionRequest(
+            route_decision=route_decision,
+            model_resolution=resolution,
+            messages=messages,
+            temperature=route_decision.temperature,
+            max_tokens=escalation_budget,
+            provider_options=dict(route_decision.provider_options),
+        )
+        _log_practice_generator_attempt(
+            event_name="generator_capacity_escalation_started",
+            route_decision=route_decision,
+            model_alias=resolution.model_alias,
+            provider=resolution.provider,
+            attempt_type="capacity_escalation",
+            fallback_index=0,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            actual_output_budget=escalation_budget,
+            capacity_escalated=True,
+            status="started",
+        )
+        error_class: str | None = None
+        try:
+            result = self._provider_executor.execute(escalation_request)
+        except LlmProviderResponseError as exc:
+            failure_kind = _provider_response_failure_kind(
+                route_decision=route_decision,
+                response_error=exc,
+            )
+            error_class = type(exc).__name__
+            if failure_kind == "output_token_exhausted":
+                _log_practice_generator_token_exhausted(
+                    route_decision=route_decision,
+                    model_alias=resolution.model_alias,
+                    finish_reason=getattr(exc, "finish_reason", None),
+                    output_tokens=getattr(exc, "output_tokens", None),
+                    reasoning_tokens=getattr(exc, "reasoning_tokens", None),
+                    actual_output_budget=escalation_budget,
+                )
+        except LlmProviderExecutionError as exc:
+            failure_kind = exc.failure_kind
+            error_class = type(exc).__name__
+        except Exception as exc:  # noqa: BLE001
+            failure_kind = "unknown_provider_error"
+            error_class = type(exc).__name__
+        else:
+            failure_kind = _model_result_failure_kind(
+                route_decision=route_decision,
+                result=result,
+            )
+            if failure_kind == "output_token_exhausted":
+                _log_practice_generator_token_exhausted(
+                    route_decision=route_decision,
+                    model_alias=resolution.model_alias,
+                    content=result.content,
+                    finish_reason=result.finish_reason,
+                    output_tokens=result.output_tokens,
+                    reasoning_tokens=result.reasoning_tokens,
+                    actual_output_budget=escalation_budget,
+                )
+            if failure_kind is None and _is_visible_text(result.content):
+                _log_practice_generator_completion(
+                    route_decision=route_decision,
+                    resolution=resolution,
+                    result=result,
+                    actual_output_budget=escalation_budget,
+                    fallback_used=False,
+                    capacity_escalated=True,
+                )
+                _log_practice_generator_attempt(
+                    event_name="generator_capacity_escalation_succeeded",
+                    route_decision=route_decision,
+                    model_alias=resolution.model_alias,
+                    provider=resolution.provider,
+                    attempt_type="capacity_escalation",
+                    fallback_index=0,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    actual_output_budget=escalation_budget,
+                    capacity_escalated=True,
+                    status="completed",
+                )
+                return result, "completed"
+            if failure_kind is None:
+                failure_kind = "empty_answer"
+            error_class = "EmptyProviderResponse" if not _is_visible_text(result.content) else None
+
+        _log_practice_generator_attempt(
+            event_name="generator_capacity_escalation_failed",
+            route_decision=route_decision,
+            model_alias=resolution.model_alias,
+            provider=resolution.provider,
+            attempt_type="capacity_escalation",
+            fallback_index=0,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            failure_kind=failure_kind,
+            error_class=error_class,
+            actual_output_budget=escalation_budget,
+            capacity_escalated=True,
+            status="failed",
+        )
+        return None, failure_kind
+
     def execute(
         self,
         *,
@@ -353,6 +663,29 @@ class RegistryBackedModelExecutor:
         started_at = time.monotonic()
         primary_alias = route_decision.model
         model_resolution = self._model_config_resolver.resolve(route_decision)
+        if (
+            _is_practice_generator(route_decision)
+            and route_decision.practice_generation_capacity is None
+        ):
+            execution_context = current_execution_context()
+            capacity = PracticeGenerationCapacityPolicy.resolve(
+                route_decision=route_decision,
+                model_config=model_resolution.model_config,
+                workload=PracticeGenerationWorkload(
+                    complexity="medium",
+                    slot_count=(
+                        len(execution_context.slot_ids)
+                        if execution_context is not None and execution_context.slot_ids
+                        else 1
+                    ),
+                ),
+            )
+            route_decision = route_decision.model_copy(
+                update={
+                    "max_tokens": capacity.initial_max_output_tokens,
+                    "practice_generation_capacity": capacity,
+                }
+            )
         _validate_model_role(
             route_decision,
             allowed_task_roles=list(model_resolution.model_config.allowed_task_roles),
@@ -395,19 +728,23 @@ class RegistryBackedModelExecutor:
         )
         try:
             raw_result = self._provider_executor.execute(primary_request)
-            if _is_practice_generator_token_exhausted(
+            result_failure_kind = _model_result_failure_kind(
                 route_decision=route_decision,
-                finish_reason=raw_result.finish_reason,
-                output_tokens=raw_result.output_tokens,
-                reasoning_tokens=raw_result.reasoning_tokens,
-            ):
-                _log_practice_generator_token_exhausted(
-                    route_decision=route_decision,
-                    model_alias=model_resolution.model_alias,
-                )
+                result=raw_result,
+            )
+            if result_failure_kind is not None:
+                if result_failure_kind == "output_token_exhausted":
+                    _log_practice_generator_token_exhausted(
+                        route_decision=route_decision,
+                        model_alias=model_resolution.model_alias,
+                        content=raw_result.content,
+                        finish_reason=raw_result.finish_reason,
+                        output_tokens=raw_result.output_tokens,
+                        reasoning_tokens=raw_result.reasoning_tokens,
+                    )
                 raise LlmProviderExecutionError(
-                    "Practice generator output token budget was exhausted.",
-                    failure_kind="output_token_exhausted",
+                    "Provider completion was not acceptable for structured generation.",
+                    failure_kind=result_failure_kind,
                     provider=model_resolution.provider,
                     model_alias=primary_alias,
                 )
@@ -439,6 +776,14 @@ class RegistryBackedModelExecutor:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
                 fallback_used=False,
             )
+            _log_practice_generator_completion(
+                route_decision=route_decision,
+                resolution=model_resolution,
+                result=raw_result,
+                actual_output_budget=route_decision.max_tokens,
+                fallback_used=False,
+                capacity_escalated=False,
+            )
             return raw_result
         except LlmProviderResponseError as exc:
             primary_failure_kind = _provider_response_failure_kind(
@@ -468,6 +813,9 @@ class RegistryBackedModelExecutor:
                 _log_practice_generator_token_exhausted(
                     route_decision=route_decision,
                     model_alias=model_resolution.model_alias,
+                    finish_reason=getattr(exc, "finish_reason", None),
+                    output_tokens=getattr(exc, "output_tokens", None),
+                    reasoning_tokens=getattr(exc, "reasoning_tokens", None),
                 )
             logger.warning(
                 "registry_backed_model_executor.execute  primary_response_failed  "
@@ -524,6 +872,44 @@ class RegistryBackedModelExecutor:
                 attempted_aliases=(primary_alias,),
             ) from exc
 
+        if primary_failure_kind == "output_token_exhausted":
+            escalated_result, escalation_failure_kind = (
+                self._try_practice_capacity_escalation(
+                    route_decision=route_decision,
+                    messages=messages,
+                    resolution=model_resolution,
+                    started_at=started_at,
+                )
+            )
+            if escalated_result is not None:
+                if route_decision.task_role == "generator":
+                    update_request_summary(
+                        generation_route=route_decision.route_id,
+                        generation_model=model_resolution.model_alias,
+                    )
+                _log_model_execution(
+                    route_decision=route_decision,
+                    resolution=model_resolution,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    fallback_used=False,
+                )
+                return escalated_result
+            primary_failure_kind = escalation_failure_kind
+
+        capacity = route_decision.practice_generation_capacity
+        if (
+            primary_failure_kind == "output_token_exhausted"
+            and (
+                capacity is None
+                or capacity.escalation_max_output_tokens <= route_decision.max_tokens
+            )
+        ):
+            raise ProviderExecutionError(
+                "Practice generator exhausted its maximum safe output capacity.",
+                failure_kind="output_token_exhausted",
+                attempted_aliases=(primary_alias,),
+            )
+
         # --- Fallback loop ---
         fallback_aliases: list[str] = list(
             getattr(model_resolution.model_config, "fallback_models", None) or []
@@ -563,12 +949,37 @@ class RegistryBackedModelExecutor:
                 ),
             )
 
+            fallback_budget = route_decision.max_tokens
+            if primary_failure_kind == "output_token_exhausted":
+                assert capacity is not None
+                fallback_budget = capacity.escalation_max_output_tokens
+                if (
+                    fallback_resolution.model_config.model_hard_max_output_tokens
+                    < fallback_budget
+                ):
+                    attempted.append(fallback_alias)
+                    _log_practice_generator_attempt(
+                        event_name="generator_fallback_skipped",
+                        route_decision=route_decision,
+                        model_alias=fallback_resolution.model_alias,
+                        provider=fallback_resolution.provider,
+                        attempt_type="fallback",
+                        fallback_index=fallback_index,
+                        duration_ms=int((time.monotonic() - started_at) * 1000),
+                        failure_kind="output_token_exhausted",
+                        error_class="FallbackCapacityInsufficient",
+                        actual_output_budget=fallback_budget,
+                        capacity_escalated=True,
+                        status="failed",
+                    )
+                    continue
+
             fallback_request = ProviderExecutionRequest(
                 route_decision=route_decision,
                 model_resolution=fallback_resolution,
                 messages=messages,  # same messages — reused safely
                 temperature=route_decision.temperature,
-                max_tokens=route_decision.max_tokens,
+                max_tokens=fallback_budget,
                 provider_options={},  # strip thinking/stream options for fallback
             )
 
@@ -587,6 +998,8 @@ class RegistryBackedModelExecutor:
                 fallback_index=fallback_index,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
                 failure_kind=primary_failure_kind,
+                actual_output_budget=fallback_budget,
+                capacity_escalated=(primary_failure_kind == "output_token_exhausted"),
                 status="selected",
             )
             _log_practice_generator_attempt(
@@ -597,6 +1010,8 @@ class RegistryBackedModelExecutor:
                 attempt_type="fallback",
                 fallback_index=fallback_index,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
+                actual_output_budget=fallback_budget,
+                capacity_escalated=(primary_failure_kind == "output_token_exhausted"),
                 status="started",
             )
             if primary_failure_kind == "output_token_exhausted":
@@ -608,19 +1023,24 @@ class RegistryBackedModelExecutor:
 
             try:
                 raw_result = self._provider_executor.execute(fallback_request)
-                if _is_practice_generator_token_exhausted(
+                result_failure_kind = _model_result_failure_kind(
                     route_decision=route_decision,
-                    finish_reason=raw_result.finish_reason,
-                    output_tokens=raw_result.output_tokens,
-                    reasoning_tokens=raw_result.reasoning_tokens,
-                ):
-                    _log_practice_generator_token_exhausted(
-                        route_decision=route_decision,
-                        model_alias=fallback_alias,
-                    )
+                    result=raw_result,
+                )
+                if result_failure_kind is not None:
+                    if result_failure_kind == "output_token_exhausted":
+                        _log_practice_generator_token_exhausted(
+                            route_decision=route_decision,
+                            model_alias=fallback_alias,
+                            content=raw_result.content,
+                            finish_reason=raw_result.finish_reason,
+                            output_tokens=raw_result.output_tokens,
+                            reasoning_tokens=raw_result.reasoning_tokens,
+                            actual_output_budget=fallback_budget,
+                        )
                     raise LlmProviderExecutionError(
-                        "Practice generator output token budget was exhausted.",
-                        failure_kind="output_token_exhausted",
+                        "Provider completion was not acceptable for structured generation.",
+                        failure_kind=result_failure_kind,
                         provider=fallback_resolution.provider,
                         model_alias=fallback_alias,
                     )
@@ -650,6 +1070,7 @@ class RegistryBackedModelExecutor:
                     model=fallback_alias,
                     provider=raw_result.provider,
                     finish_reason=raw_result.finish_reason,
+                    normalized_finish_reason=raw_result.normalized_finish_reason,
                     input_tokens=raw_result.input_tokens,
                     output_tokens=raw_result.output_tokens,
                     total_tokens=raw_result.total_tokens,
@@ -682,6 +1103,14 @@ class RegistryBackedModelExecutor:
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                     fallback_used=True,
                 )
+                _log_practice_generator_completion(
+                    route_decision=route_decision,
+                    resolution=fallback_resolution,
+                    result=result,
+                    actual_output_budget=fallback_budget,
+                    fallback_used=True,
+                    capacity_escalated=(primary_failure_kind == "output_token_exhausted"),
+                )
                 if primary_failure_kind == "output_token_exhausted":
                     _log_practice_model_fallback(
                         event_name="practice_model_fallback_succeeded",
@@ -696,6 +1125,8 @@ class RegistryBackedModelExecutor:
                     attempt_type="fallback",
                     fallback_index=fallback_index,
                     duration_ms=int((time.monotonic() - started_at) * 1000),
+                    actual_output_budget=fallback_budget,
+                    capacity_escalated=(primary_failure_kind == "output_token_exhausted"),
                     status="completed",
                 )
                 return result
@@ -728,6 +1159,10 @@ class RegistryBackedModelExecutor:
                     _log_practice_generator_token_exhausted(
                         route_decision=route_decision,
                         model_alias=fallback_alias,
+                        finish_reason=getattr(exc, "finish_reason", None),
+                        output_tokens=getattr(exc, "output_tokens", None),
+                        reasoning_tokens=getattr(exc, "reasoning_tokens", None),
+                        actual_output_budget=fallback_budget,
                     )
                 logger.warning(
                     "registry_backed_model_executor.execute  fallback_response_failed  "
@@ -1236,6 +1671,7 @@ class ProviderAdapterExecutor:
             provider=resolution.provider,
             model=config.model_id or config.deployment or resolution.model_alias,
             deployment=config.deployment or None,
+            model_alias=resolution.model_alias,
             attempt_type=attempt_type,
             streaming=streaming,
             usage=usage,

@@ -246,10 +246,13 @@ class WaveGenerator:
         self.waves.append(replacement_wave)
         if self.fail_provider:
             raise ProviderExecutionError("provider failed", failure_kind="timeout")
+        question = generated_question(bucket=bucket, slot=slots[0])
+        if replacement_wave == 2:
+            question["question"] = (
+                f"For {slots[0].slot_id}, in a fresh scenario, what is two plus two?"
+            )
         return GeneratedBatch(
-            content=json.dumps(
-                {"questions": [generated_question(bucket=bucket, slot=slots[0])]}
-            ),
+            content=json.dumps({"questions": [question]}),
             route_id=slots[0].generator_route_hint,
             model="test-model",
         )
@@ -372,6 +375,7 @@ def build_orchestrator(*, generator, verifier):
         config=PracticeGenerationConfig(
             enabled=True,
             pattern_context_enabled=False,
+            pattern_reuse_enabled=False,
             assessment_table="assessment",
             question_table="question",
             question_bank_table="bank",
@@ -399,6 +403,7 @@ def test_same_bucket_groups_are_serialized_before_their_exclusions_are_committed
         config=PracticeGenerationConfig(
             enabled=True,
             pattern_context_enabled=False,
+            pattern_reuse_enabled=False,
             assessment_table="assessment",
             question_table="question",
             question_bank_table="bank",

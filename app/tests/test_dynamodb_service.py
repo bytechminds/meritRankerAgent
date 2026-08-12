@@ -311,6 +311,77 @@ class TestBatchGetItems:
 
         assert result == []
 
+    def test_default_does_not_retry_unprocessed_keys(self, monkeypatch):
+        self._setup(monkeypatch)
+        mock_client = _mock_client()
+        mock_client.batch_get_item.return_value = {
+            "Responses": {"t": [{"question_id": {"S": "q-1"}}]},
+            "UnprocessedKeys": {
+                "t": {"Keys": [{"question_id": {"S": "q-2"}}]}
+            },
+        }
+
+        with patch("services.dynamodb_service.get_dynamodb_client", return_value=mock_client):
+            result = batch_get_items("t", [{"question_id": "q-1"}, {"question_id": "q-2"}])
+
+        assert result == [{"question_id": "q-1"}]
+        assert mock_client.batch_get_item.call_count == 1
+
+    def test_opt_in_retries_only_unprocessed_keys(self, monkeypatch):
+        self._setup(monkeypatch)
+        mock_client = _mock_client()
+        first_key = {"question_id": {"S": "q-1"}}
+        second_key = {"question_id": {"S": "q-2"}}
+        mock_client.batch_get_item.side_effect = [
+            {
+                "Responses": {"t": [first_key]},
+                "UnprocessedKeys": {"t": {"Keys": [second_key]}},
+            },
+            {"Responses": {"t": [second_key]}},
+        ]
+
+        with (
+            patch("services.dynamodb_service.get_dynamodb_client", return_value=mock_client),
+            patch("services.dynamodb_service.time.sleep") as mock_sleep,
+        ):
+            result = batch_get_items(
+                "t",
+                [{"question_id": "q-1"}, {"question_id": "q-2"}],
+                max_unprocessed_retries=2,
+            )
+
+        assert result == [{"question_id": "q-1"}, {"question_id": "q-2"}]
+        assert mock_client.batch_get_item.call_count == 2
+        assert mock_client.batch_get_item.call_args_list[1].kwargs["RequestItems"] == {
+            "t": {"Keys": [second_key]}
+        }
+        mock_sleep.assert_called_once_with(0.05)
+
+    def test_unprocessed_key_retries_are_bounded(self, monkeypatch):
+        self._setup(monkeypatch)
+        mock_client = _mock_client()
+        key = {"question_id": {"S": "q-1"}}
+        response = {"Responses": {"t": []}, "UnprocessedKeys": {"t": {"Keys": [key]}}}
+        mock_client.batch_get_item.side_effect = [response, response, response]
+
+        with (
+            patch("services.dynamodb_service.get_dynamodb_client", return_value=mock_client),
+            patch("services.dynamodb_service.time.sleep"),
+        ):
+            result = batch_get_items(
+                "t", [{"question_id": "q-1"}], max_unprocessed_retries=2
+            )
+
+        assert result == []
+        assert mock_client.batch_get_item.call_count == 3
+
+    @pytest.mark.parametrize("retry_count", [-1, 3, True, "1"])
+    def test_rejects_invalid_unprocessed_key_retry_limit(self, monkeypatch, retry_count):
+        self._setup(monkeypatch)
+
+        with pytest.raises(ValueError, match="max_unprocessed_retries"):
+            batch_get_items("t", [{"question_id": "q-1"}], max_unprocessed_retries=retry_count)
+
 
 # ---------------------------------------------------------------------------
 # query_by_partition_key
@@ -420,3 +491,25 @@ class TestQueryByIndex:
         assert call_kwargs["IndexName"] == "my-gsi"
         assert call_kwargs["Limit"] == 3
         assert results[0]["pattern_id"] == "p-1"
+
+    def test_projects_only_requested_attributes(self, monkeypatch):
+        self._setup(monkeypatch)
+        mock_client = _mock_client()
+        mock_client.query.return_value = {"Items": [], "Count": 0}
+
+        with patch("services.dynamodb_service.get_dynamodb_client", return_value=mock_client):
+            query_by_index(
+                "t",
+                "my-gsi",
+                "patternId",
+                "pattern-1",
+                projection_fields=("questionId", "questionText"),
+            )
+
+        call_kwargs = mock_client.query.call_args[1]
+        assert call_kwargs["ProjectionExpression"] == "#projection_0, #projection_1"
+        assert call_kwargs["ExpressionAttributeNames"] == {
+            "#pk": "patternId",
+            "#projection_0": "questionId",
+            "#projection_1": "questionText",
+        }

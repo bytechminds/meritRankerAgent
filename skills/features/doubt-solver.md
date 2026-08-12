@@ -29,7 +29,26 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-08-01
+**Last updated:** 2026-08-10
+
+---
+
+## Latest Changes - Canonical Pattern Intelligence Guidance (2026-08-10)
+
+- The existing S3 doubt selector can use a disabled-by-default canonical Pattern runtime that
+  treats vector hits as candidates, BatchGet-hydrates authoritative Pattern records, rejects weak,
+  stale, inactive, malformed, or incompatible records, and returns to legacy S3 retrieval on any
+  unavailable or `IGNORE` outcome.
+- Typed `DoubtPatternContext` remains internal until the prompt boundary. It exposes only safe
+  structural PatternGraph identities, strictly admitted approved SolveFlow method steps, and at
+  most two answer-redacted linked references read through `questionsByPattern` with a safe
+  projection. ColBERT is restricted to that bounded linked set.
+- Normal, streaming, and legacy-direct answer paths measure Pattern-aware input, remove linked
+  references first, preserve the current student question, and explicitly use the existing
+  non-Pattern path when core guidance cannot fit. Public schemas and answer-verification ownership
+  are unchanged.
+- Live direct S3 Vector/IAM contracts and current post-edit validation remain `[NOT VERIFIED]`;
+  `PATTERN_INTELLIGENCE_ENABLED` therefore remains `false` by default.
 
 ---
 
@@ -644,7 +663,7 @@ Priority: **accuracy > cost > speed > provider reliability**. Classifier routes 
 |---|---|---|
 | `math.generator.basic` | GPT-4.1-mini | o4-mini → native OpenAI |
 | `math.generator.intermediate` | GPT-4.1-mini | o4-mini → o3 |
-| `math.generator.advanced` | DeepSeek v4pro (`DEEPSEEK_V4PRO_MODEL`) | o3 → GPT-5.4 |
+| `math.generator.advanced` | DeepSeek v4pro (`DEEPSEEK_V4PRO_MODEL`) | o3 |
 | `reasoning.generator.basic` | GPT-4.1-mini | o4-mini |
 | `reasoning.generator.intermediate` | o4-mini | GPT-4.1-mini → DeepSeek v4pro |
 | `reasoning.generator.advanced` | o4-mini | o3 → DeepSeek v4pro |
@@ -2985,3 +3004,16 @@ QueryClassification.difficulty
 
 - LLM-based difficulty for nuanced multi-step detection.
 - Per-exam taxonomy (SSC CGL / CAT difficulty profiles).
+# Pattern Intelligence release-blocker closure (2026-08-10)
+
+Doubt Pattern discovery uses S3 Vectors only for candidates, requires authoritative Pattern
+hydration and exact version-hash parity, and falls back to the legacy S3 path on any unavailable,
+weak, stale, malformed, or incompatible result. Optional linked references now come only from the
+verified playable QuestionBank Pattern GSI, never raw PatternQuestion pipeline rows. ColBERT reranks
+at most five already-linked candidates and emits at most two answer-redacted references. Normal,
+streaming, and legacy answer paths remove references before core Pattern/SolveFlow guidance when
+the prompt budget is tight.
+
+Local full validation is green. Live Dev Pattern/ColBERT evidence is not proven and remains held by
+the QuestionBank mutation-authority security blocker; Production and default-off flags are
+unchanged.

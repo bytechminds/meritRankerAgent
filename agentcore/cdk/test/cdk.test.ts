@@ -116,8 +116,7 @@ test('runtime conversation policies are scoped to configured tables and SSM path
     deploymentEnvironment: 'dev',
     runtimeEnvironment: {
       AWS_REGION: 'ap-south-1',
-      APPSYNC_GRAPHQL_ENDPOINT:
-        'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
+      APPSYNC_GRAPHQL_ENDPOINT: 'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
       PRACTICE_GENERATION_ENABLED: 'false',
       ENABLE_ORCHESTRATED_DOUBT_SOLVER: 'true',
       ENABLE_REAL_LLM: 'true',
@@ -140,8 +139,7 @@ test('runtime conversation policies are scoped to configured tables and SSM path
         'Fn::GetAtt': [memoryLogicalId, 'MemoryId'],
       },
       AWS_REGION: 'ap-south-1',
-      APPSYNC_GRAPHQL_ENDPOINT:
-        'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
+      APPSYNC_GRAPHQL_ENDPOINT: 'https://e7rfdkgqczag5bz34ov67locl4.appsync-api.ap-south-1.amazonaws.com/graphql',
       PRACTICE_GENERATION_ENABLED: 'false',
       ENABLE_ORCHESTRATED_DOUBT_SOLVER: 'true',
       ENABLE_REAL_LLM: 'true',
@@ -200,6 +198,10 @@ test('runtime conversation policies are scoped to configured tables and SSM path
   expect(rendered).toContain('/practice/question/test-id-index-name');
   expect(rendered).toContain('/practice/question-bank/category-index-name');
   expect(rendered).toContain('/practice/question-bank/reuse-index-name');
+  expect(rendered).not.toContain('/pattern-intelligence/');
+  expect(rendered).not.toContain('/practice/question-bank/pattern-index-name');
+  expect(rendered).not.toContain('/practice/attempt/');
+  expect(rendered).not.toContain('s3vectors:QueryVectors');
   expect(rendered).not.toContain('sqs:SendMessage');
 });
 
@@ -231,8 +233,7 @@ test('enabled practice grants only its existing AppSync progress mutation', () =
     deploymentEnvironment: 'dev',
     runtimeEnvironment: {
       AWS_REGION: 'ap-south-1',
-      APPSYNC_GRAPHQL_ENDPOINT:
-        'https://t37helcceraznaejlcm27uhmwi.appsync-api.ap-south-1.amazonaws.com/graphql',
+      APPSYNC_GRAPHQL_ENDPOINT: 'https://t37helcceraznaejlcm27uhmwi.appsync-api.ap-south-1.amazonaws.com/graphql',
       PRACTICE_GENERATION_ENABLED: 'true',
     },
   });
@@ -240,9 +241,7 @@ test('enabled practice grants only its existing AppSync progress mutation', () =
   const rendered = JSON.stringify(Template.fromStack(stack).toJSON());
 
   expect(rendered).toContain('appsync:GraphQL');
-  expect(rendered).toContain(
-    'apis/t37helcceraznaejlcm27uhmwi/types/Mutation/fields/updatePracticeGenerationProgress'
-  );
+  expect(rendered).toContain('apis/t37helcceraznaejlcm27uhmwi/types/Mutation/fields/updatePracticeGenerationProgress');
   expect(rendered).toContain('dynamodb:UpdateItem');
   expect(rendered).not.toContain('appsync:*');
   expect(rendered).not.toContain('/types/Mutation/fields/*');

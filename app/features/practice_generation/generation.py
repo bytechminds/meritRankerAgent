@@ -30,14 +30,27 @@ from features.practice_generation.schemas import (
     VerificationPolicy,
     VerificationResult,
 )
-from schemas.llm_routing import RouteRequest
+from schemas.llm_routing import PracticeGenerationWorkload, RouteRequest
+from services.llm.orchestration.config_registry import LlmConfigRegistry
 from services.llm.orchestration.errors import (
     LlmRouteNotFoundError,
     LlmRouteResolutionError,
 )
+from services.llm.orchestration.practice_generation_capacity import (
+    PracticeGenerationCapacityPolicy,
+)
 from services.llm.orchestration.route_resolver import resolve_route
 
-TokenBudgetResolver = Callable[[str, str], int]
+
+@dataclass(frozen=True)
+class RouteOutputCapacity:
+    """Configured completion budget and measured reasoning reserve for one route."""
+
+    configured_output_tokens: int
+    expected_reasoning_tokens: int = 0
+
+
+TokenBudgetResolver = Callable[[str, str], int | RouteOutputCapacity]
 
 
 def _structured_parse_rejection_code(error: ValidationError | TypeError) -> str:
@@ -61,10 +74,10 @@ def _structured_parse_rejection_code(error: ValidationError | TypeError) -> str:
     return "STRUCTURED_PARSE_INVALID"
 
 
-def _route_output_token_budget(subject: str, difficulty: str) -> int:
-    """Read the configured shared generator-route budget without a model call."""
+def _route_output_token_budget(subject: str, difficulty: str) -> RouteOutputCapacity:
+    """Read the configured generator route capacity without a model call."""
     try:
-        return resolve_route(
+        route = resolve_route(
             RouteRequest(
                 request_id="practice-generation-batch-capacity",
                 subject=subject,
@@ -73,10 +86,92 @@ def _route_output_token_budget(subject: str, difficulty: str) -> int:
                 intent="practice",
                 language="english",
             )
-        ).max_tokens
+        )
+        model_config = LlmConfigRegistry().model_map.get(route.model)
+        return RouteOutputCapacity(
+            configured_output_tokens=route.max_tokens,
+            expected_reasoning_tokens=(
+                model_config.structured_output_reasoning_reserve_tokens
+                if model_config is not None
+                else 0
+            ),
+        )
     except (LlmRouteNotFoundError, LlmRouteResolutionError):
         # A route-resolution failure must make batching safer, never larger.
-        return 0
+        return RouteOutputCapacity(configured_output_tokens=0)
+
+
+def _practice_capacity_for_slot(
+    slot: PlannerSlot,
+    *,
+    slot_count: int,
+):
+    """Resolve central Practice capacity from an exact route and model alias."""
+    try:
+        route = resolve_route(
+            RouteRequest(
+                request_id="practice-generation-capacity",
+                subject=slot.subject_id,
+                task_role="generator",
+                difficulty=slot.difficulty.value,
+                intent="practice",
+                language="english",
+            )
+        )
+        model_config = LlmConfigRegistry().model_map.get(route.model)
+        if model_config is None:
+            return None
+        return PracticeGenerationCapacityPolicy.resolve(
+            route_decision=route,
+            model_config=model_config,
+            workload=PracticeGenerationWorkload(
+                complexity=slot.complexity.value,
+                slot_count=slot_count,
+            ),
+        )
+    except (LlmRouteNotFoundError, LlmRouteResolutionError, ValueError):
+        return None
+
+
+def _practice_capacity_for_bucket(
+    bucket: DemandBucket,
+    *,
+    slot_count: int,
+):
+    """Resolve the same central policy for schema-v1 compatibility batches."""
+    try:
+        route = resolve_route(
+            RouteRequest(
+                request_id="practice-generation-capacity",
+                subject=bucket.subject,
+                task_role="generator",
+                difficulty=bucket.difficulty.value,
+                intent="practice",
+                language="english",
+            )
+        )
+        model_config = LlmConfigRegistry().model_map.get(route.model)
+        if model_config is None:
+            return None
+        return PracticeGenerationCapacityPolicy.resolve(
+            route_decision=route,
+            model_config=model_config,
+            workload=PracticeGenerationWorkload(
+                complexity="medium",
+                slot_count=slot_count,
+            ),
+        )
+    except (LlmRouteNotFoundError, LlmRouteResolutionError, ValueError):
+        return None
+
+
+def _normalized_route_output_capacity(
+    capacity: int | RouteOutputCapacity,
+) -> RouteOutputCapacity:
+    """Retain the legacy integer test seam while applying route-local reserves."""
+    if isinstance(capacity, RouteOutputCapacity):
+        return capacity
+    return RouteOutputCapacity(configured_output_tokens=capacity)
 
 
 def _expected_question_output_tokens(
@@ -102,11 +197,17 @@ def _model_safe_batch_capacity(
     token_budget_resolver: TokenBudgetResolver,
 ) -> tuple[int, int]:
     """Return a route-budgeted batch capacity and the source output budget."""
-    output_budget = max(token_budget_resolver(subject, difficulty), 0)
+    route_capacity = _normalized_route_output_capacity(
+        token_budget_resolver(subject, difficulty)
+    )
+    output_budget = max(route_capacity.configured_output_tokens, 0)
     if output_budget <= 0:
         return 1, output_budget
-    # Preserve enough output for the JSON envelope and stop sequence.
-    usable_budget = max(output_budget - 120, 1)
+    # Preserve the measured reasoning reserve, then JSON envelope and stop sequence.
+    usable_budget = max(
+        output_budget - max(route_capacity.expected_reasoning_tokens, 0) - 120,
+        1,
+    )
     expected_per_question = _expected_question_output_tokens(
         subject=subject,
         complexity=complexity,
@@ -120,6 +221,14 @@ def _slot_batch_limit(
     effective_size: int,
     token_budget_resolver: TokenBudgetResolver,
 ) -> tuple[int, int]:
+    if token_budget_resolver is _route_output_token_budget:
+        capacity = _practice_capacity_for_slot(slot, slot_count=1)
+        if capacity is not None:
+            cap = min(effective_size, capacity.max_slots_per_batch)
+            if slot.generation_group_hint is not None:
+                cap = min(cap, slot.generation_group_hint)
+            return cap, capacity.initial_max_output_tokens
+
     difficulty_cap = (
         {"basic": 5, "intermediate": 4, "advanced": 2}[slot.difficulty.value]
         if slot.subject_id in {"math", "reasoning"}
@@ -169,14 +278,39 @@ def bucket_for_slot(
     blueprint: PracticeBlueprint,
     slot: PlannerSlot,
 ) -> DemandBucket:
-    for bucket in blueprint.buckets:
-        if (
-            bucket.subject == slot.subject_id
-            and bucket.topic == slot.topic_id
-            and bucket.difficulty is slot.difficulty
-            and bucket.question_type is slot.question_type
-        ):
+    signatures: dict[tuple[str, ...], int] = {}
+    for candidate in blueprint.slots:
+        signature = (
+            candidate.subject_id,
+            candidate.topic_id,
+            candidate.category_id,
+            candidate.difficulty.value,
+            candidate.question_type.value,
+            candidate.generator_route_hint,
+        )
+        signatures.setdefault(signature, len(signatures))
+        if candidate.slot_id != slot.slot_id:
+            continue
+        bucket_index = signatures[signature]
+        if bucket_index >= len(blueprint.buckets):
+            break
+        bucket = blueprint.buckets[bucket_index]
+        expected_count = sum(
+            1
+            for planned in blueprint.slots
+            if (
+                planned.subject_id,
+                planned.topic_id,
+                planned.category_id,
+                planned.difficulty.value,
+                planned.question_type.value,
+                planned.generator_route_hint,
+            )
+            == signature
+        )
+        if bucket.required_count == expected_count:
             return bucket
+        break
     raise ValueError("PLANNER_SLOT_BUCKET_MISSING")
 
 
@@ -187,8 +321,14 @@ def build_slot_generation_groups(
     group_size: int,
     group_max: int,
     token_budget_resolver: TokenBudgetResolver = _route_output_token_budget,
+    pattern_context_keys: dict[str, str] | None = None,
 ) -> tuple[GenerationGroup, ...]:
-    """Build deterministic homogeneous batches from exact unfilled slots."""
+    """Build deterministic homogeneous batches from exact unfilled slots.
+
+    A selected Pattern identity is an additional batch boundary.  This keeps one
+    compact PatternGraph projection from being repeated for unrelated slots and
+    lets the generator's input budget split otherwise-compatible work safely.
+    """
     effective_size = min(max(group_size, 1), min(max(group_max, 1), 5))
     homogeneous: dict[tuple[str, ...], list[PlannerSlot]] = {}
     batch_limits: dict[tuple[str, ...], tuple[int, int]] = {}
@@ -207,7 +347,14 @@ def build_slot_generation_groups(
             slot.difficulty.value,
             slot.complexity.value,
             slot.question_type.value,
+            ",".join(
+                sorted({exam_id.strip() for exam_id in slot.exam_ids if exam_id.strip()})
+            ),
+            slot.target_skill,
+            slot.reasoning_target or "",
+            slot.pattern_family_id or "",
             slot.generator_route_hint,
+            (pattern_context_keys or {}).get(slot.slot_id, ""),
             str(batch_size),
         )
         homogeneous.setdefault(key, []).append(slot)
@@ -219,13 +366,22 @@ def build_slot_generation_groups(
         bucket = bucket_for_slot(blueprint, slots[0])
         for offset in range(0, len(slots), batch_size):
             batch = slots[offset : offset + batch_size]
+            capacity = (
+                _practice_capacity_for_slot(batch[0], slot_count=len(batch))
+                if token_budget_resolver is _route_output_token_budget
+                else None
+            )
             groups.append(
                 GenerationGroup(
                     group_id=f"slot-group-{sequence:03d}",
                     bucket_id=bucket.bucket_id,
                     required_count=len(batch),
                     slot_ids=[slot.slot_id for slot in batch],
-                    token_budget=output_budget or None,
+                    token_budget=(
+                        capacity.initial_max_output_tokens
+                        if capacity is not None
+                        else output_budget or None
+                    ),
                 )
             )
             sequence += 1
@@ -243,6 +399,10 @@ class ParsedGeneration:
 class FinalValidation:
     ready: bool
     reason_code: str
+    failed_slot_ids: tuple[str, ...] = ()
+    expected_question_count: int = 0
+    actual_question_count: int = 0
+    recoverable: bool = False
 
 
 def build_generation_groups(
@@ -255,11 +415,12 @@ def build_generation_groups(
     effective_size = min(max(group_size, 1), min(max(group_max, 1), 5))
     groups: list[GenerationGroup] = []
     for bucket in blueprint.buckets:
-        difficulty_cap = {
-            "basic": 5,
-            "intermediate": 4,
-            "advanced": 2,
-        }[bucket.difficulty.value]
+        capacity = _practice_capacity_for_bucket(bucket, slot_count=1)
+        difficulty_cap = (
+            capacity.max_slots_per_batch
+            if capacity is not None
+            else {"basic": 5, "intermediate": 4, "advanced": 2}[bucket.difficulty.value]
+        )
         if bucket.generation_group_hint is not None:
             difficulty_cap = min(difficulty_cap, bucket.generation_group_hint)
         bucket_group_size = min(effective_size, difficulty_cap)
@@ -267,11 +428,17 @@ def build_generation_groups(
         sequence = 1
         while remaining:
             count = min(remaining, bucket_group_size)
+            batch_capacity = _practice_capacity_for_bucket(bucket, slot_count=count)
             groups.append(
                 GenerationGroup(
                     group_id=f"{bucket.bucket_id}-g{sequence}",
                     bucket_id=bucket.bucket_id,
                     required_count=count,
+                    token_budget=(
+                        batch_capacity.initial_max_output_tokens
+                        if batch_capacity is not None
+                        else None
+                    ),
                 )
             )
             remaining -= count
@@ -394,16 +561,67 @@ def validate_final_set(
     linked_questions: list[dict[str, object]],
     requested_language: str = "english",
 ) -> FinalValidation:
+    expected_count = blueprint.accepted_count
+    actual_count = len(linked_questions)
+    expected_slots = {slot.slot_id for slot in blueprint.slots}
+    slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+
+    def result(
+        ready: bool,
+        reason_code: str,
+        *,
+        failed_slot_ids: set[str] | tuple[str, ...] = (),
+        recoverable: bool = False,
+    ) -> FinalValidation:
+        return FinalValidation(
+            ready=ready,
+            reason_code=reason_code,
+            failed_slot_ids=tuple(sorted(failed_slot_ids)),
+            expected_question_count=expected_count,
+            actual_question_count=actual_count,
+            recoverable=recoverable,
+        )
+
+    question_slots: list[str] = []
+    for item in linked_questions:
+        meta = item.get("_practiceMeta")
+        question_slots.append(
+            str(meta.get("slotId") or "") if isinstance(meta, dict) else ""
+        )
     if len(linked_questions) != blueprint.accepted_count:
-        return FinalValidation(False, "FINAL_COUNT_MISMATCH")
+        missing_slots = expected_slots - {slot_id for slot_id in question_slots if slot_id}
+        return result(
+            False,
+            "FINAL_COUNT_MISMATCH",
+            failed_slot_ids=missing_slots,
+        )
     ids = [str(item.get("questionId") or "") for item in linked_questions]
     if not all(ids) or len(ids) != len(set(ids)):
-        return FinalValidation(False, "DUPLICATE_OR_MISSING_QUESTION_ID")
+        duplicate_slots = {
+            question_slots[index]
+            for index, question_id in enumerate(ids)
+            if question_slots[index]
+            and (not question_id or question_id in ids[:index])
+        }
+        return result(
+            False,
+            "DUPLICATE_OR_MISSING_QUESTION_ID",
+            failed_slot_ids=duplicate_slots,
+        )
     normalized_texts = [
         normalize_question_text(str(item.get("question") or "")) for item in linked_questions
     ]
     if not all(normalized_texts) or len(normalized_texts) != len(set(normalized_texts)):
-        return FinalValidation(False, "DUPLICATE_OR_EMPTY_QUESTION_TEXT")
+        duplicate_slots = {
+            question_slots[index]
+            for index, text in enumerate(normalized_texts)
+            if question_slots[index] and (not text or text in normalized_texts[:index])
+        }
+        return result(
+            False,
+            "DUPLICATE_OR_EMPTY_QUESTION_TEXT",
+            failed_slot_ids=duplicate_slots,
+        )
     bucket_ids = {bucket.bucket_id for bucket in blueprint.buckets}
     buckets_by_id = {bucket.bucket_id: bucket for bucket in blueprint.buckets}
     counts = {bucket_id: 0 for bucket_id in bucket_ids}
@@ -411,10 +629,15 @@ def validate_final_set(
     for item in linked_questions:
         meta = item.get("_practiceMeta")
         if not isinstance(meta, dict):
-            return FinalValidation(False, "QUESTION_META_INVALID")
+            return result(False, "QUESTION_META_INVALID")
+        slot_id = str(meta.get("slotId") or "")
         bucket_id = str(meta.get("bucketId") or "")
         if bucket_id not in counts or meta.get("verified") is not True:
-            return FinalValidation(False, "QUESTION_NOT_VERIFIED_OR_UNKNOWN_BUCKET")
+            return result(
+                False,
+                "QUESTION_NOT_VERIFIED_OR_UNKNOWN_BUCKET",
+                failed_slot_ids={slot_id} if slot_id in expected_slots else (),
+            )
         bucket = buckets_by_id[bucket_id]
         contract = validate_persisted_playable_question(
             item,
@@ -423,12 +646,16 @@ def validate_final_set(
             solution_required=bucket.solution_required,
         )
         if not contract.valid:
-            return FinalValidation(False, contract.reason_code)
+            return result(
+                False,
+                contract.reason_code,
+                failed_slot_ids={slot_id} if slot_id in expected_slots else (),
+            )
         source_type = str(meta.get("sourceType") or "")
         if source_type == "QUESTION_BANK":
             source_id = str(meta.get("sourceQuestionBankId") or "")
             if not source_id:
-                return FinalValidation(False, "QUESTION_BANK_PROVENANCE_MISSING")
+                return result(False, "QUESTION_BANK_PROVENANCE_MISSING")
             source_question_bank_ids.append(source_id)
         elif source_type == "AI_GENERATED":
             required_method = (
@@ -438,24 +665,46 @@ def validate_final_set(
                 bucket.verification_policy is VerificationPolicy.MANDATORY
                 and meta.get("verificationMethod") != required_method
             ):
-                return FinalValidation(False, "MANDATORY_VERIFICATION_MISSING")
+                return result(
+                    False,
+                    "MANDATORY_VERIFICATION_MISSING",
+                    failed_slot_ids={slot_id} if slot_id in expected_slots else (),
+                )
         else:
-            return FinalValidation(False, "QUESTION_PROVENANCE_INVALID")
+            return result(False, "QUESTION_PROVENANCE_INVALID")
         counts[bucket_id] += 1
     if len(source_question_bank_ids) != len(set(source_question_bank_ids)):
-        return FinalValidation(False, "DUPLICATE_QUESTION_BANK_SOURCE")
+        return result(False, "DUPLICATE_QUESTION_BANK_SOURCE")
     expected = {bucket.bucket_id: bucket.required_count for bucket in blueprint.buckets}
     if counts != expected:
-        return FinalValidation(False, "BLUEPRINT_DISTRIBUTION_MISMATCH")
-    if blueprint.schema_version == "2":
-        expected_slots = {slot.slot_id for slot in blueprint.slots}
-        actual_slots = {
-            str(item.get("_practiceMeta", {}).get("slotId") or "")
-            for item in linked_questions
+        failed_slots = {
+            slot_id
+            for slot_id, item in zip(question_slots, linked_questions, strict=True)
+            if slot_id in slots_by_id
+            and isinstance(item.get("_practiceMeta"), dict)
+            and str(item["_practiceMeta"].get("bucketId") or "")
+            != bucket_for_slot(blueprint, slots_by_id[slot_id]).bucket_id
         }
+        return result(
+            False,
+            "BLUEPRINT_DISTRIBUTION_MISMATCH",
+            failed_slot_ids=failed_slots,
+            recoverable=bool(failed_slots),
+        )
+    if blueprint.schema_version == "2":
+        actual_slots = set(question_slots)
         if actual_slots != expected_slots:
-            return FinalValidation(False, "PLANNER_SLOT_MANIFEST_MISMATCH")
-        slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+            failed_slots = expected_slots - actual_slots
+            failed_slots.update(
+                slot_id
+                for index, slot_id in enumerate(question_slots)
+                if slot_id and slot_id in question_slots[:index]
+            )
+            return result(
+                False,
+                "PLANNER_SLOT_MANIFEST_MISMATCH",
+                failed_slot_ids=failed_slots,
+            )
         for item in linked_questions:
             meta = item["_practiceMeta"]
             slot = slots_by_id[str(meta["slotId"])]
@@ -465,5 +714,9 @@ def validate_final_set(
                 or str(meta.get("questionType") or "").casefold() != slot.question_type.value
                 or meta.get("verified") is not True
             ):
-                return FinalValidation(False, "PLANNER_SLOT_CONTRACT_MISMATCH")
-    return FinalValidation(True, "READY")
+                return result(
+                    False,
+                    "PLANNER_SLOT_CONTRACT_MISMATCH",
+                    failed_slot_ids={slot.slot_id},
+                )
+    return result(True, "READY")

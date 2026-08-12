@@ -23,6 +23,7 @@ from services.llm.orchestration.model_execution import ProviderAdapterExecutor
 from services.llm.providers.errors import (
     FALLBACK_ELIGIBLE_FAILURE_KINDS,
     LlmProviderExecutionError,
+    LlmProviderResponseError,
 )
 from services.llm.providers.gemini_provider import GeminiProviderAdapter
 from services.llm.providers.openai_compatible_adapter import (
@@ -274,6 +275,7 @@ class TestGeminiAdapterExecution:
         assert result.content == "Gemini answer."
         assert result.provider == "gemini"
         assert result.finish_reason == "stop"
+        assert result.normalized_finish_reason == "completed"
         assert result.input_tokens == 10
         assert result.output_tokens == 20
         call_kwargs = fake_client.models.generate_content.call_args.kwargs
@@ -296,6 +298,68 @@ class TestGeminiAdapterExecution:
 
 
 class TestDeepSeekAdapterExecution:
+    def test_length_response_without_final_content_preserves_safe_usage(
+        self,
+    ) -> None:
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        reasoning_content="private reasoning must never be surfaced",
+                    ),
+                    finish_reason="length",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=935,
+                completion_tokens=2600,
+                total_tokens=3535,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=2573),
+            ),
+        )
+        route = RouteDecision(
+            route_id="math.generator.advanced",
+            subject="math",
+            task_role="generator",
+            difficulty="advanced",
+            model="math_advanced_generator",
+            prompt="subjects/math_generator.md",
+            temperature=0.15,
+            max_tokens=3600,
+            provider_options={},
+            fallback=[],
+            fallback_attempts=[],
+            route_source="exact",
+            intent="practice",
+        )
+        request = ProviderExecutionRequest(
+            route_decision=route,
+            model_resolution=ModelConfigResolver(
+                registry=LlmConfigRegistry()
+            ).resolve(route),
+            messages=[LlmMessage(role="user", content="Generate one question.")],
+            temperature=route.temperature,
+            max_tokens=route.max_tokens,
+            provider_options={},
+        )
+        adapter = DeepSeekProviderAdapter(client_factory=lambda _c, _t: fake_client)
+
+        with pytest.raises(LlmProviderResponseError) as raised:
+            adapter.generate(
+                request=request,
+                credentials=ProviderCredentials(provider="deepseek", api_key="test-key"),
+            )
+
+        error = raised.value
+        assert error.finish_reason == "length"
+        assert error.normalized_finish_reason == "output_token_exhausted"
+        assert error.output_tokens == 2600
+        assert error.reasoning_tokens == 2573
+        assert "private reasoning" not in str(error)
+        assert fake_client.chat.completions.create.call_args.kwargs["max_tokens"] == 3600
+
     def test_missing_api_key_raises_provider_not_configured(self, tmp_path: Path) -> None:
         adapter = DeepSeekProviderAdapter(client_factory=lambda _c, _t: MagicMock())
         yaml = textwrap.dedent("""\

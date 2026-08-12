@@ -11,6 +11,7 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from features.practice_generation.matching import ReusableQuestion
+from features.practice_generation.pattern_context import PatternSlotSelection
 from features.practice_generation.planning import resolve_practice_request
 from features.practice_generation.repositories import (
     AssessmentRepository,
@@ -19,7 +20,7 @@ from features.practice_generation.repositories import (
     estimate_dynamodb_item_size,
 )
 from features.practice_generation.resource_validation import IndexProjection
-from features.practice_generation.schemas import GeneratedQuestion
+from features.practice_generation.schemas import GeneratedQuestion, PlannerSlot
 
 _SERIALIZER = TypeSerializer()
 _DESERIALIZER = TypeDeserializer()
@@ -108,7 +109,8 @@ def _request():
 def test_assessment_creation_uses_existing_model_and_conditional_idempotency() -> None:
     client = RecordingClient()
     repository = AssessmentRepository(client, table_name="MockTestQuiz-table")
-    item, duplicate = repository.create_or_get("test-1", _request())
+    request = _request().model_copy(update={"exam_profile_id": "cat_management_pre"})
+    item, duplicate = repository.create_or_get("test-1", request)
 
     assert duplicate is False
     assert (
@@ -119,6 +121,10 @@ def test_assessment_creation_uses_existing_model_and_conditional_idempotency() -
     ) == ("test-1", "GENERATING", "PRIVATE", "AI_CUSTOM")
     assert client.put_calls[0]["ConditionExpression"] == ("attribute_not_exists(testId)")
     assert "querySummary" not in item["meta"]["practiceRequest"]
+    assert "examProfileId" not in item["meta"]
+    assert item["meta"]["practiceRequest"]["examProfileId"] == "cat_management_pre"
+    assert item["assessmentMode"] == "PRACTICE"
+    assert item["examProfileId"] == "cat_management_pre"
 
 
 def test_generated_question_is_assessment_owned_and_conditionally_linked() -> None:
@@ -152,6 +158,13 @@ def test_generated_question_is_assessment_owned_and_conditionally_linked() -> No
         verification_policy="MANDATORY",
         verification_method="MODEL",
         language="english",
+        source_question_bank_id="pattern-v1-linked",
+        pattern_selection=PatternSlotSelection(
+            patternId="pattern-1",
+            patternVersionHash="version-1",
+            tier="GUIDANCE_SAFE",
+            reason="verified_generation",
+        ),
     )
 
     assert created is True
@@ -163,8 +176,64 @@ def test_generated_question_is_assessment_owned_and_conditionally_linked() -> No
     assert stored["meta"]["generationGroupId"] == "bucket-1-g1"
     assert stored["meta"]["questionType"] == "mcq"
     assert stored["meta"]["language"] == "english"
+    assert stored["meta"]["sourceQuestionBankId"] == "pattern-v1-linked"
+    assert stored["patternId"] == "pattern-1"
+    assert stored["patternVersionHash"] == "version-1"
     assert client.transact_calls == []
     assert client.update_calls == []
+
+
+def test_verified_pattern_question_persists_authoritative_link_and_returns_qb_id() -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+    question = GeneratedQuestion(
+        generation_item_id="item-1",
+        bucket_id="bucket-1",
+        question="If x plus 1 is 2, what is x?",
+        question_type="mcq",
+        options=["0", "1", "2", "3"],
+        correct_answer="1",
+        solution="Subtract one from both sides.",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+    )
+    slot = PlannerSlot(
+        slot_id="slot-001",
+        subject_id="math",
+        topic_id="algebra",
+        category_id="algebra",
+        difficulty="intermediate",
+        complexity="medium",
+        exam_ids=["CAT"],
+        question_type="mcq",
+        target_skill="solve_linear_equation",
+        variation_hint="vary_coefficients",
+        generator_route_hint="math.generator.intermediate",
+    )
+
+    qb_id = repository.persist_verified_pattern_question(
+        question=question,
+        slot=slot,
+        pattern_id="pattern-1",
+        pattern_version_hash="version-1",
+        language="english",
+    )
+
+    assert qb_id is not None
+    stored = _plain(client.put_calls[0]["Item"])
+    assert stored["qbId"] == qb_id
+    assert stored["patternId"] == "pattern-1"
+    assert stored["patternVersionHash"] == "version-1"
+    assert stored["patternLinkEvidence"] == "VERIFIED_GENERATION"
+    assert stored["meta"]["qualityStatus"] == "VERIFIED"
 
 
 def test_schema_v2_generated_question_persists_private_versioned_answer_contract() -> None:
@@ -270,7 +339,95 @@ def test_answer_rebalancing_preserves_schema_v2_answer_authority() -> None:
         assert [option["optionId"] for option in answer["options"]] == [0, 1, 2, 3]
 
 
-def test_reused_question_retains_question_bank_provenance() -> None:
+def test_reused_question_retains_question_bank_provenance_without_promoting_pattern_identity(
+) -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+
+    repository.link_reused(
+        test_id="test-1",
+        bucket_id="bucket-1",
+        question=ReusableQuestion(
+            question_id="bank-1",
+            question="What is one plus one?",
+            options=("1", "2", "3", "4"),
+            correct_answer="2",
+            solution="Add the values.",
+            subject="math",
+            topic="arithmetic",
+            difficulty="medium",
+            question_type="mcq",
+            language="english",
+            source="QuestionBank",
+            source_updated_at="2026-07-01T00:00:00Z",
+            pattern_id="forged-question-bank-pattern",
+            pattern_version_hash="forged-version",
+            pattern_link_evidence="VERIFIED_GENERATION",
+        ),
+    )
+
+    stored = _plain(client.put_calls[0]["Item"])
+    assert stored["meta"]["sourceType"] == "QUESTION_BANK"
+    assert stored["meta"]["sourceQuestionBankId"] == "bank-1"
+    assert stored["meta"]["sourceVersion"] == "2026-07-01T00:00:00Z"
+    assert stored["meta"]["questionType"] == "mcq"
+    assert stored["meta"]["language"] == "english"
+    assert "patternId" not in stored
+    assert "patternVersionHash" not in stored
+
+
+def test_runtime_reused_question_persists_only_the_trusted_selection_identity() -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+
+    repository.link_reused(
+        test_id="test-1",
+        bucket_id="bucket-1",
+        question=ReusableQuestion(
+            question_id="bank-1",
+            question="What is one plus one?",
+            options=("1", "2", "3", "4"),
+            correct_answer="2",
+            solution="Add the values.",
+            subject="math",
+            topic="arithmetic",
+            difficulty="medium",
+            question_type="mcq",
+            language="english",
+            source="QuestionBank",
+            source_updated_at="2026-07-01T00:00:00Z",
+            pattern_id="forged-question-bank-pattern",
+            pattern_version_hash="forged-version",
+            pattern_link_evidence="VERIFIED_GENERATION",
+        ),
+        trusted_pattern_selection=PatternSlotSelection(
+            patternId="runtime-selected-pattern",
+            patternVersionHash="runtime-selected-version",
+            tier="REUSE_SAFE",
+            reason="authoritative_playable_question_compatible",
+        ),
+    )
+
+    stored = _plain(client.put_calls[0]["Item"])
+    assert stored["patternId"] == "runtime-selected-pattern"
+    assert stored["patternVersionHash"] == "runtime-selected-version"
+
+
+def test_reused_question_rejects_non_reuse_safe_selection_identity() -> None:
     client = RecordingClient()
     repository = QuestionRepository(
         client,
@@ -298,14 +455,17 @@ def test_reused_question_retains_question_bank_provenance() -> None:
             source="QuestionBank",
             source_updated_at="2026-07-01T00:00:00Z",
         ),
+        trusted_pattern_selection=PatternSlotSelection(
+            patternId="guidance-only-pattern",
+            patternVersionHash="guidance-only-version",
+            tier="GUIDANCE_SAFE",
+            reason="guidance",
+        ),
     )
 
     stored = _plain(client.put_calls[0]["Item"])
-    assert stored["meta"]["sourceType"] == "QUESTION_BANK"
-    assert stored["meta"]["sourceQuestionBankId"] == "bank-1"
-    assert stored["meta"]["sourceVersion"] == "2026-07-01T00:00:00Z"
-    assert stored["meta"]["questionType"] == "mcq"
-    assert stored["meta"]["language"] == "english"
+    assert "patternId" not in stored
+    assert "patternVersionHash" not in stored
 
 
 def test_linked_question_query_does_not_treat_gsi_as_authoritative_counter() -> None:
@@ -446,6 +606,61 @@ def test_keys_only_reuse_projection_hydrates_candidates_by_primary_key() -> None
         == "v1#medium#"
     )
     assert len(client.batch_calls) == 1
+
+
+def test_legacy_reuse_query_logs_safe_aws_diagnostics_and_remains_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeniedClient:
+        def query(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "AccessDeniedException",
+                        "Message": "sensitive provider detail",
+                    }
+                },
+                "Query",
+            )
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "features.practice_generation.repositories.emit_practice_event",
+        lambda name, **kwargs: events.append((name, kwargs)),
+    )
+    repository = QuestionRepository(
+        DeniedClient(),
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="getQuestionsByTestId",
+        question_bank_category_index="getByCategory",
+        question_bank_reuse_index="getByReuseBucket",
+        pattern_context_enabled=False,
+        pattern_reuse_enabled=False,
+    )
+
+    with pytest.raises(PracticeRepositoryError, match="QUESTION_BANK_QUERY_FAILED"):
+        repository.query_topic_reuse_candidates(
+            reuse_bucket_key="math#algebra#mcq#english",
+            limit=5,
+        )
+
+    name, event = events[0]
+    assert name == "PRACTICE_REPOSITORY_FAILURE"
+    assert event["details"] == {
+        "reasonCode": "QUESTION_BANK_QUERY_FAILED",
+        "operation": "Query",
+        "logicalTable": "QuestionBank",
+        "logicalIndex": "QuestionBank.reuse",
+        "awsExceptionType": "ClientError",
+        "awsErrorCode": "AccessDeniedException",
+        "patternContextEnabled": False,
+        "patternReuseEnabled": False,
+        "fallbackDecision": "fatal_legacy_repository_failure",
+    }
+    assert "sensitive provider detail" not in str(event)
 
 
 def test_selected_question_bank_records_are_fetched_by_primary_keys_only() -> None:
@@ -662,6 +877,42 @@ def test_meta_updates_use_document_paths_without_full_meta_replacement() -> None
     expression = client.update_calls[0]["UpdateExpression"]
     assert "#meta.#field0" in expression
     assert "#meta = " not in expression
+
+
+def test_bucket_recovery_is_conditioned_on_test_slot_and_verification() -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="getQuestionsByTestId",
+        question_bank_category_index="getByCategory",
+    )
+
+    repaired = repository.repair_bucket_assignments(
+        "test-1",
+        {"question-1": ("slot-002", "slot-bucket-002")},
+    )
+
+    assert repaired == 1
+    call = client.update_calls[0]
+    assert call["UpdateExpression"] == (
+        "SET #meta.#bucket = :bucket, #updated = :updated"
+    )
+    assert call["ConditionExpression"] == (
+        "#test = :test AND #meta.#slot = :slot AND #meta.#verified = :verified"
+    )
+    values = _plain(call["ExpressionAttributeValues"])
+    assert {
+        key: values[key]
+        for key in (":bucket", ":slot", ":verified", ":test")
+    } == {
+        ":bucket": "slot-bucket-002",
+        ":slot": "slot-002",
+        ":verified": True,
+        ":test": "test-1",
+    }
 
 
 def test_four_group_updates_target_independent_atomic_paths() -> None:

@@ -169,7 +169,7 @@ models:
 
   math_advanced_generator:
     description: >-
-      Advanced math — DeepSeek v4pro primary; o3 and GPT-5.4 fallback.
+      Advanced math — DeepSeek v4pro primary; o3 fallback.
     provider: deepseek
     provider_profile: deepseek_primary
     model_id: deepseek-reasoner
@@ -178,9 +178,9 @@ models:
     supports_reasoning: true
     reasoning_effort: high
     timeout_seconds: 90
+    structured_output_reasoning_reserve_tokens: 2600
     fallback_models:
       - openai_o3
-      - openai_gpt_5_4
 
   math_cat_advanced_generator:
     description: >-

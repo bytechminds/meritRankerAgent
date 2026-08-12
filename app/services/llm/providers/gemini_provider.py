@@ -13,6 +13,7 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from services.llm.providers.usage import (
     clear_stream_usage,
     extract_gemini_usage,
@@ -202,6 +203,8 @@ class GeminiProviderAdapter:
                 model_alias=request.model_resolution.model_alias,
             ) from exc
 
+        usage = extract_gemini_usage(response)
+        finish_reason = _finish_reason(response)
         content = getattr(response, "text", None)
         if not content:
             parsed = getattr(response, "parsed", None)
@@ -212,15 +215,16 @@ class GeminiProviderAdapter:
         if not content:
             raise LlmProviderResponseError(
                 "Gemini response is missing content "
-                f"(model_alias={request.model_resolution.model_alias!r})."
+                f"(model_alias={request.model_resolution.model_alias!r}).",
+                finish_reason=finish_reason,
+                provider_usage=usage,
             )
-        usage = extract_gemini_usage(response)
-        finish_reason = _finish_reason(response)
         return ModelExecutionResult(
             content=content,
             model=request.route_decision.model,
             provider="gemini",
             finish_reason=finish_reason,
+            normalized_finish_reason=normalize_completion_outcome(finish_reason),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,

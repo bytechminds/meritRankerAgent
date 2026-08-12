@@ -37,6 +37,7 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from services.llm.providers.usage import (
     clear_stream_usage,
     extract_openai_usage,
@@ -282,9 +283,17 @@ class OpenAIProviderAdapter:
                 model_alias=request.model_resolution.model_alias,
             ) from exc
 
-        content = self._extract_content(completion, request)
         finish_reason = self._extract_finish_reason(completion)
         usage = extract_openai_usage(completion)
+        try:
+            content = self._extract_content(completion, request)
+        except LlmProviderResponseError as exc:
+            exc.provider_usage = usage
+            exc.finish_reason = finish_reason
+            exc.normalized_finish_reason = normalize_completion_outcome(finish_reason)
+            exc.output_tokens = usage.output_tokens
+            exc.reasoning_tokens = usage.reasoning_tokens
+            raise
 
         logger.info(
             "openai_provider_adapter.generate  model_alias=%s — done  "
@@ -300,6 +309,7 @@ class OpenAIProviderAdapter:
             model=request.route_decision.model,
             provider="openai",
             finish_reason=finish_reason,
+            normalized_finish_reason=normalize_completion_outcome(finish_reason),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,

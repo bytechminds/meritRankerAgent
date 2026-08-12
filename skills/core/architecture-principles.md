@@ -246,3 +246,8 @@ Every integration point should be swappable without touching the graph:
   any practice repair branch. Rationale: fallback selection belongs to the shared ModelExecutor;
   a usable-but-invalid question remains the only input eligible for validation repair, preserving
   accepted questions and preventing unchanged primary-model retries.
+- `2026-08-12` — Centralize shadow AI usage metering at the existing content-free
+  `record_llm_call()` boundary, then aggregate only within request/task-local execution context.
+  Practice transfers that accumulator to its existing durable test lifecycle and copied worker
+  contexts. Rationale: this counts actual provider attempts without graph-node credit logic, a
+  second provider path, financial persistence, new infrastructure, or balance mutation.

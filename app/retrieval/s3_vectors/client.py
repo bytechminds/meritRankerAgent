@@ -50,30 +50,67 @@ class S3VectorClient:
             metadata_filter=pattern_filter(subject),
         )
 
+    def query_pattern_intelligence_candidates(
+        self,
+        *,
+        query_vector: list[float],
+        subject: str | None,
+        top_k: int | None = None,
+    ) -> list[RetrievedCandidate]:
+        """Return bounded canonical Pattern candidates for authoritative hydration.
+
+        This method intentionally applies no legacy runtime approval metadata.
+        The canonical Pattern record remains the only authority for status,
+        quality, and compatibility after DynamoDB hydration.
+        """
+        maximum_candidates = self._settings.pattern_intelligence_max_candidates
+        requested_top_k = maximum_candidates if top_k is None else top_k
+        effective_top_k = min(max(1, requested_top_k), maximum_candidates)
+        normalized_subject = subject.strip() if isinstance(subject, str) else ""
+        metadata_filter = {"subject": normalized_subject} if normalized_subject else None
+        return self._query(
+            index_name=self._settings.s3_vector_pattern_index_name,
+            query_vector=query_vector,
+            top_k=effective_top_k,
+            metadata_filter=metadata_filter,
+        )
+
     def _query(
         self,
         *,
         index_name: str,
         query_vector: list[float],
         top_k: int,
-        metadata_filter: dict[str, object],
+        metadata_filter: dict[str, object] | None,
     ) -> list[RetrievedCandidate]:
         if len(query_vector) != self._settings.s3_vector_dimensions:
             raise S3VectorQueryError("Query vector dimension does not match S3_VECTOR_DIMENSIONS.")
-        if not self._settings.s3_vector_bucket_name or not index_name:
-            raise S3VectorQueryError("S3 Vector bucket and index name must be configured.")
+        index_arn = (
+            self._settings.s3_vector_pattern_index_arn
+            if index_name == self._settings.s3_vector_pattern_index_name
+            else ""
+        )
+        if not index_arn and (not self._settings.s3_vector_bucket_name or not index_name):
+            raise S3VectorQueryError(
+                "S3 Vector index ARN or bucket/index names must be configured."
+            )
 
         client = self._client_factory(self._settings.s3_vector_region or None)
+        request: dict[str, object] = {
+            "queryVector": {"float32": query_vector},
+            "topK": max(1, top_k),
+            "returnDistance": True,
+            "returnMetadata": True,
+        }
+        if index_arn:
+            request["indexArn"] = index_arn
+        else:
+            request["vectorBucketName"] = self._settings.s3_vector_bucket_name
+            request["indexName"] = index_name
+        if metadata_filter:
+            request["filter"] = metadata_filter
         try:
-            response = client.query_vectors(
-                vectorBucketName=self._settings.s3_vector_bucket_name,
-                indexName=index_name,
-                queryVector={"float32": query_vector},
-                topK=max(1, top_k),
-                returnDistance=True,
-                returnMetadata=True,
-                filter=metadata_filter,
-            )
+            response = client.query_vectors(**request)
         except ClientError as exc:
             raise S3VectorQueryError("S3 Vector candidate query failed.") from exc
         return map_query_vectors_response(response if isinstance(response, dict) else {})

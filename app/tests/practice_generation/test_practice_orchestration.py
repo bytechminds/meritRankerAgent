@@ -12,6 +12,10 @@ from features.practice_generation import orchestration as orchestration_module
 from features.practice_generation.config import PracticeGenerationConfig
 from features.practice_generation.generation import deterministic_question_id
 from features.practice_generation.graph import PracticeGraphRunner
+from features.practice_generation.matching import (
+    build_reuse_difficulty_prefix,
+    build_slot_reuse_bucket_key,
+)
 from features.practice_generation.option_distribution import (
     reorder_options,
     target_correct_positions,
@@ -19,13 +23,22 @@ from features.practice_generation.option_distribution import (
 )
 from features.practice_generation.orchestration import PracticeGenerationOrchestrator
 from features.practice_generation.pattern_context import NoOpPatternContextProvider
-from features.practice_generation.planning import BlueprintPlanResult
+from features.practice_generation.planning import (
+    BlueprintManager,
+    BlueprintPlanResult,
+    deterministic_blueprint,
+)
+from features.practice_generation.progress_contract import (
+    PRACTICE_PROGRESS_ALLOWED_META_KEYS,
+    PRACTICE_PROGRESS_INTERNAL_META_KEYS,
+)
 from features.practice_generation.repositories import IndexedQueryResult
 from features.practice_generation.schemas import (
     GeneratedBatch,
     PracticeBlueprint,
     PracticeGenerationRequest,
     PracticeGraphCommand,
+    PracticeType,
     VerificationResult,
 )
 from services.llm.orchestration.errors import ProviderExecutionError
@@ -314,8 +327,10 @@ class FakeQuestions:
         *,
         reuse_bucket_key,
         limit,
+        difficulty_prefix=None,
         exclusive_start_key=None,
     ):
+        del difficulty_prefix
         self.reuse_query_order.append("topic")
         if self.topic_pages is not None:
             page_index = int((exclusive_start_key or {}).get("page") or 0)
@@ -370,7 +385,7 @@ class FakeQuestions:
         meta["bucketReadyCounts"] = counts
         self.assessments.item["meta"] = json.dumps(meta)
 
-    def link_reused(self, *, test_id, bucket_id, question):
+    def link_reused(self, *, test_id, bucket_id, question, **_kwargs):
         question_id = deterministic_question_id(
             test_id,
             source_id=question.question_id,
@@ -410,6 +425,17 @@ class FakeQuestions:
             resolved[0]["testId"] = "other-test"
         return resolved
 
+    def repair_bucket_assignments(self, test_id, assignments):
+        repaired = 0
+        for question_id, (slot_id, bucket_id) in assignments.items():
+            item = self.linked[question_id]
+            assert item["testId"] == test_id
+            assert item["_practiceMeta"]["slotId"] == slot_id
+            assert item["_practiceMeta"]["verified"] is True
+            item["_practiceMeta"]["bucketId"] = bucket_id
+            repaired += 1
+        return repaired
+
     def link_generated(
         self,
         *,
@@ -422,6 +448,7 @@ class FakeQuestions:
         verification_policy,
         verification_method,
         language,
+        **_kwargs,
     ):
         assert verified is True
         question_id = deterministic_question_id(
@@ -661,11 +688,13 @@ def build_orchestrator(
     fail_item_retry_once: bool = False,
     reject_once: bool = False,
     verifier=None,
+    pattern_context=None,
 ):
     return PracticeGenerationOrchestrator(
         config=PracticeGenerationConfig(
             enabled=True,
             pattern_context_enabled=False,
+            pattern_reuse_enabled=False,
             assessment_table="assessment",
             question_table="question",
             question_bank_table="bank",
@@ -687,7 +716,7 @@ def build_orchestrator(
             fail_item_retry_once=fail_item_retry_once,
         ),
         verifier=verifier or Verifier(reject_once=reject_once),
-        pattern_context=NoOpPatternContextProvider(),
+        pattern_context=pattern_context or NoOpPatternContextProvider(),
     )
 
 
@@ -815,6 +844,281 @@ def test_mixed_reuse_and_generation_reaches_exact_ready_count() -> None:
         True,
         10,
     )
+
+
+def test_finalization_repairs_wrong_bucket_metadata_once_and_revalidates() -> None:
+    practice_request = make_request(3)
+    blueprint_data = deterministic_blueprint(practice_request).model_dump(mode="json")
+    blueprint_data["slots"][0]["category_id"] = "basic_fundamentals"
+    blueprint_data["slots"][1]["category_id"] = "tricky_concept"
+    blueprint_data["slots"][2]["category_id"] = "tricky_concept"
+    blueprint = PracticeBlueprint.model_validate(blueprint_data)
+    assessments = FakeAssessments(practice_request)
+    questions = FakeQuestions(assessments)
+    question_ids: list[str] = []
+    for slot in blueprint.slots:
+        question_id = f"question-{slot.slot_id}"
+        question_ids.append(question_id)
+        questions.linked[question_id] = {
+            "questionId": question_id,
+            "testId": "test-1",
+            "question": f"Question for {slot.slot_id}?",
+            "options": ["A", "B", "C", "D"],
+            "answers": json.dumps(
+                {"correctAnswer": "A", "options": ["A", "B", "C", "D"]}
+            ),
+            "correctAnswer": "A",
+            "explanation": "A is correct.",
+            "topic": slot.topic_id,
+            "difficulty": slot.difficulty.value,
+            "_practiceMeta": {
+                "bucketId": "slot-bucket-001",
+                "slotId": slot.slot_id,
+                "verified": True,
+                "sourceType": "AI_GENERATED",
+                "verificationMethod": "INDEPENDENT_MODEL_V2",
+                "questionType": "mcq",
+                "language": "english",
+            },
+        }
+    meta = json.loads(assessments.item["meta"])
+    meta.update(
+        {
+            "blueprint": blueprint.model_dump(mode="json"),
+            "generationGroups": {
+                "g1": {"state": "COMPLETED"},
+                "g2": {"state": "COMPLETED"},
+            },
+            "readyQuestionIds": question_ids,
+            "readyCount": 3,
+            "readyQuestionCount": 3,
+            "generatedCount": 3,
+            "reusedCount": 0,
+            "verifiedCount": 3,
+            "failedCount": 0,
+            "bucketReadyCounts": {"slot-bucket-001": 3},
+        }
+    )
+    assessments.item["meta"] = json.dumps(meta)
+    orchestrator = build_orchestrator(assessments, questions)
+
+    orchestrator._finalize("test-1", practice_request, blueprint, attempt=0)
+
+    recovered_meta = json.loads(assessments.item["meta"])
+    assert recovered_meta["finalizationAttempt"] == 1
+    assert assessments.item["status"] == "GENERATING"
+    assert [
+        questions.linked[question_id]["_practiceMeta"]["bucketId"]
+        for question_id in question_ids
+    ] == ["slot-bucket-001", "slot-bucket-002", "slot-bucket-002"]
+
+    orchestrator._finalize("test-1", practice_request, blueprint, attempt=1)
+
+    assert assessments.item["status"] == "READY"
+
+
+def test_pattern_flags_off_reaches_legacy_five_question_generation_without_pattern_resources(
+) -> None:
+    assessments, questions, _ = run_job(5)
+    meta = json.loads(assessments.item["meta"])
+
+    assert assessments.item["status"] == "READY"
+    assert len(questions.linked) == 5
+    assert meta["generatedCount"] == 5
+    assert "patternRuntime" not in meta
+
+
+def test_pattern_flags_off_never_calls_the_pattern_provider() -> None:
+    class FailIfCalledPatternProvider:
+        def resolve_slots(self, **_kwargs):
+            raise AssertionError("Pattern provider must not run while both flags are off")
+
+    request = make_request(5)
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments)
+    orchestrator = build_orchestrator(
+        assessments,
+        questions,
+        pattern_context=FailIfCalledPatternProvider(),
+    )
+
+    orchestrator.plan_and_fill("test-1")
+
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "GENERATING"
+    assert len(meta["generationGroups"]) == 2
+
+
+def test_schema_v2_reasoning_cat_fallback_reaches_generation_started_with_backend_meta_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failing Dev request must not publish Pattern-only metadata when flags are off."""
+
+    allowed_meta_keys = (
+        PRACTICE_PROGRESS_ALLOWED_META_KEYS | PRACTICE_PROGRESS_INTERNAL_META_KEYS
+    )
+
+    class ContractAssessments(FakeAssessments):
+        def update(self, *args, meta_updates, **kwargs):
+            current = json.loads(self.item["meta"])
+            candidate = {**current, **deepcopy(meta_updates)}
+            assert set(candidate).issubset(allowed_meta_keys)
+            return super().update(*args, meta_updates=meta_updates, **kwargs)
+
+    class InvalidPlanner:
+        def plan(self, *_args, **_kwargs):
+            return '{"slots":[]}'
+
+    request = make_request(5).model_copy(
+        update={
+            "original_query": (
+                "Create a 5-question Quick Practice on seating arrangements in Reasoning "
+                "for CAT Management — Pre."
+            ),
+            "practice_type": PracticeType.QUICK_PRACTICE,
+            "subject": "reasoning",
+            "topic": "seating_arrangements",
+            "exam_stage": "PRE",
+            "exam_profile_id": "cat_management_pre",
+            "assessment_title": "Reasoning Quick Practice",
+        }
+    )
+    assessments = ContractAssessments(request)
+    questions = FakeQuestions(assessments)
+    events: list[str] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda name, **_kwargs: events.append(name),
+    )
+    orchestrator = PracticeGenerationOrchestrator(
+        config=PracticeGenerationConfig(
+            enabled=True,
+            pattern_context_enabled=False,
+            pattern_reuse_enabled=False,
+            assessment_table="assessment",
+            question_table="question",
+            question_bank_table="bank",
+            question_bank_category_index="category-index",
+            question_test_index="test-index",
+            aws_region="ap-south-1",
+        ),
+        assessments=assessments,
+        progress=assessments,
+        questions=questions,
+        blueprint_manager=BlueprintManager(InvalidPlanner(), repair_limit=1),
+        generator=Generator(),
+        verifier=Verifier(),
+        pattern_context=NoOpPatternContextProvider(),
+    )
+
+    orchestrator.plan_and_fill("test-1")
+
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "GENERATING"
+    assert meta["plannerDeterministicFallback"] is True
+    assert meta["blueprint"]["schema_version"] == "2"
+    slots = PracticeBlueprint.model_validate(meta["blueprint"]).slots
+    assert [slot.slot_id for slot in slots] == [
+        "slot-001",
+        "slot-002",
+        "slot-003",
+        "slot-004",
+        "slot-005",
+    ]
+    assert all(
+        slot.subject_id == "reasoning"
+        and slot.topic_id == "seating_arrangements"
+        and slot.category_id == "seating_arrangements"
+        and slot.difficulty.value == "intermediate"
+        and slot.question_type.value == "mcq"
+        and slot.exam_ids == ["CAT"]
+        and slot.pattern_family_id is None
+        and slot.reasoning_target is None
+        and slot.not_same_when == []
+        for slot in slots
+    )
+    assert {
+        build_slot_reuse_bucket_key(slot, language=request.language) for slot in slots
+    } == {"v1#seating_arrangements#seating_arrangements#mcq#english"}
+    assert {build_reuse_difficulty_prefix(slot.difficulty.value) for slot in slots} == {
+        "v1#medium#"
+    }
+    assert len(meta["generationGroups"]) == 2
+    assert "patternRuntime" not in meta
+    assert "QUESTION_BANK_REUSE_QUERY_STARTED" in events
+    assert "QUESTION_BANK_REUSE_QUERY_COMPLETED" in events
+    assert "EXISTING_MATCH_COMPLETED" in events
+    assert "DEFICIT_CALCULATED" in events
+    assert "GENERATION_GROUP_CREATED" in events
+    assert "PATTERN_RETRIEVAL_COMPLETED" not in events
+
+    first_group_id = next(iter(meta["generationGroups"]))
+    orchestrator.generate_group("test-1", first_group_id)
+
+    assert "GENERATION_GROUP_STARTED" in events
+
+
+def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidPlanner:
+        def plan(self, *_args, **_kwargs):
+            return '{"slots": []}'
+
+    request = make_request(5).model_copy(update={"topic": "///"})
+    assessments = FakeAssessments(request)
+    questions = FakeQuestions(assessments)
+    emitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda name, **kwargs: emitted.append((name, kwargs.get("details") or {})),
+    )
+    orchestrator = PracticeGenerationOrchestrator(
+        config=PracticeGenerationConfig(
+            enabled=True,
+            pattern_context_enabled=False,
+            pattern_reuse_enabled=False,
+            assessment_table="assessment",
+            question_table="question",
+            question_bank_table="bank",
+            question_bank_category_index="category-index",
+            question_test_index="test-index",
+            aws_region="ap-south-1",
+        ),
+        assessments=assessments,
+        progress=assessments,
+        questions=questions,
+        blueprint_manager=BlueprintManager(InvalidPlanner(), repair_limit=1),
+        generator=Generator(),
+        verifier=Verifier(),
+        pattern_context=NoOpPatternContextProvider(),
+    )
+
+    orchestrator.plan_and_fill("test-1")
+
+    meta = json.loads(assessments.item["meta"])
+    assert assessments.item["status"] == "FAILED"
+    assert meta["errorCode"] == "PRACTICE_PLANNER_FALLBACK_INVALID"
+    diagnostics = [details for name, details in emitted if name == "planner_validation_failed"]
+    assert diagnostics[-1] == {
+        "expectedSlotCount": 5,
+        "routeId": "quant_reasoning.planner.basic",
+        "plannerTier": "light",
+        "fallbackInvoked": True,
+        "fallbackResult": "invalid",
+        "reasonCode": "PLANNER_SCHEMA_INVALID",
+        "actualSlotCount": None,
+        "plannerAttempt": 2,
+        "plannerPhase": "fallback",
+        "schemaName": "PracticeBlueprint",
+        "validationErrorCount": 1,
+        "fieldPaths": ["$"],
+        "errorTypes": ["ValueError"],
+        "durationMs": 0,
+    }
+    assert "planner_fallback_failed" in [name for name, _details in emitted]
 
 
 def test_duplicate_graph_operation_and_restart_are_idempotent() -> None:

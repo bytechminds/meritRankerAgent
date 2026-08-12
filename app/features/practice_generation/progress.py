@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -12,12 +13,27 @@ from features.practice_generation.appsync_progress_client import (
     AppSyncPracticeProgressClient,
     PracticeProgressError,
 )
+from features.practice_generation.progress_contract import (
+    PracticeProgressContractError,
+    PracticeProgressMeta,
+    PracticeProgressMetaProjection,
+    project_practice_progress_meta,
+)
 from features.practice_generation.repositories import (
     AssessmentRepository,
     PracticeRepositoryError,
     QuestionRepository,
 )
 from features.practice_generation.schemas import InternalPhase, PracticeBlueprint
+
+logger = logging.getLogger(__name__)
+
+_FALLBACKABLE_PROGRESS_FAILURE_CODES = frozenset(
+    {
+        "PRACTICE_PROGRESS_CREDENTIALS_UNAVAILABLE",
+        "PRACTICE_PROGRESS_TRANSPORT_FAILED",
+    }
+)
 
 
 def _meta(item: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +99,17 @@ class AppSyncAssessmentProgressRepository:
                 authoritative_question_ids=authoritative_question_ids,
             )
         self._validate_monotonic(assessment, meta, target_status, target_live)
+        projection = self._project_transport_meta(meta)
+        if projection.unapproved_keys:
+            self._log_transport_projection(meta, projection, logging.ERROR)
+            raise PracticeRepositoryError(
+                "PRACTICE_PROGRESS_UNKNOWN_META_FIELD",
+                operation="appsync.updatePracticeGenerationProgress",
+                logical_table="MockTestQuiz",
+                fallback_decision="fatal_progress_publication_failure",
+            )
+        if projection.unknown_keys:
+            self._log_transport_projection(meta, projection, logging.WARNING)
 
         try:
             result = asyncio.run(
@@ -90,7 +117,7 @@ class AppSyncAssessmentProgressRepository:
                     test_id=test_id,
                     user_id=str(assessment.get("userId") or ""),
                     status=target_status,
-                    meta=meta,
+                    meta=projection.payload,
                     live=target_live,
                     expected_updated_at=str(assessment.get("updatedAt") or ""),
                 )
@@ -102,8 +129,19 @@ class AppSyncAssessmentProgressRepository:
                     self._required_assessment(test_id),
                     meta,
                 )
-                raise PracticeRepositoryError("ASSESSMENT_CONCURRENT_UPDATE") from exc
-            raise PracticeRepositoryError(exc.code) from exc
+                raise PracticeRepositoryError(
+                    "ASSESSMENT_CONCURRENT_UPDATE",
+                    operation="appsync.updatePracticeGenerationProgress",
+                    logical_table="MockTestQuiz",
+                    fallback_decision="fatal_progress_publication_failure",
+                ) from exc
+            raise PracticeRepositoryError(
+                exc.code,
+                operation="appsync.updatePracticeGenerationProgress",
+                logical_table="MockTestQuiz",
+                fallback_decision="fatal_progress_publication_failure",
+                progress_detail=exc.safe_detail,
+            ) from exc
         updated = dict(assessment)
         updated.update(
             {
@@ -169,23 +207,28 @@ class AppSyncAssessmentProgressRepository:
         if str(assessment.get("status") or "") != "GENERATING":
             return
         meta = _meta(assessment)
+        updates = deepcopy(meta_updates or {})
+        updates.update(
+            {
+                "phase": InternalPhase.FAILED.value,
+                "playable": False,
+                "errorCode": error_code,
+                "failedCount": int(meta.get("failedCount") or 0) + 1,
+            }
+        )
         try:
             self.update(
                 test_id,
-                meta_updates={
-                    **deepcopy(meta_updates or {}),
-                    "phase": InternalPhase.FAILED.value,
-                    "playable": False,
-                    "errorCode": error_code,
-                    "failedCount": int(meta.get("failedCount") or 0) + 1,
-                },
+                meta_updates=updates,
                 status="FAILED",
                 live=False,
                 recalculate_manifest=True,
             )
-        except PracticeRepositoryError:
+        except PracticeRepositoryError as exc:
             # AppSync is the primary channel.  If it is unavailable, the existing
             # conditional DynamoDB failure write prevents a permanent stale activity.
+            if exc.code not in _FALLBACKABLE_PROGRESS_FAILURE_CODES:
+                raise
             self._assessments.mark_failed(test_id, error_code)
 
     def claim_group(self, test_id: str, group_id: str) -> dict[str, Any] | None:
@@ -364,7 +407,7 @@ class AppSyncAssessmentProgressRepository:
             return False
         self.update(
             test_id,
-            meta_updates={**meta, **deepcopy(meta_updates)},
+            meta_updates=deepcopy(meta_updates),
             status="READY",
             live=True,
             recalculate_manifest=True,
@@ -376,6 +419,45 @@ class AppSyncAssessmentProgressRepository:
         if assessment is None:
             raise PracticeRepositoryError("ASSESSMENT_NOT_FOUND")
         return assessment
+
+    @staticmethod
+    def _project_transport_meta(meta: dict[str, Any]) -> PracticeProgressMetaProjection:
+        try:
+            return project_practice_progress_meta(meta)
+        except PracticeProgressContractError as exc:
+            projection = PracticeProgressMetaProjection(
+                meta=PracticeProgressMeta(),
+                actual_keys=exc.actual_keys,
+                unknown_keys=exc.unknown_keys,
+            )
+            AppSyncAssessmentProgressRepository._log_transport_projection(
+                meta,
+                projection,
+                logging.ERROR,
+            )
+            raise PracticeRepositoryError(
+                exc.code,
+                operation="appsync.updatePracticeGenerationProgress",
+                logical_table="MockTestQuiz",
+                fallback_decision="fatal_progress_publication_failure",
+            ) from exc
+
+    @staticmethod
+    def _log_transport_projection(
+        meta: dict[str, Any],
+        projection: PracticeProgressMetaProjection,
+        level: int,
+    ) -> None:
+        stage = str(meta.get("lastCompletedStage") or meta.get("phase") or "UNKNOWN")
+        logger.log(
+            level,
+            "practice_progress_transport stage=%s actual_keys=%s unknown_keys=%s "
+            "contract_version=%s",
+            stage,
+            projection.actual_keys,
+            projection.unknown_keys,
+            projection.contract_version,
+        )
 
     def _authoritative_meta(
         self,

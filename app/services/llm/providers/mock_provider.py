@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from schemas.llm import LlmRequest, LlmResponse, LlmRoleConfig, LlmStreamChunk
 from services.llm.providers.base import BaseLlmProvider
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 
 if TYPE_CHECKING:
     from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
@@ -138,6 +139,7 @@ class MockProviderAdapter:
             model=request.route_decision.model,
             provider="mock",
             finish_reason="stop",
+            normalized_finish_reason=normalize_completion_outcome("stop"),
             metadata={
                 "model_alias": request.model_resolution.model_alias,
                 "model_label": request.model_resolution.model_config.model_label,

@@ -2,6 +2,11 @@
 
 Repair only the rejected immutable planner slots using the supplied stable reason codes.
 
+For each slot, read its `repair_context` entry. Correct the supplied `candidate`
+against only that entry's `reason_codes`; never copy a candidate into another slot.
+If a candidate is absent because parsing failed, recreate only that slot from its
+immutable slot contract.
+
 # Output contract
 
 - Use the exact schema-v2 question and indexed-option contract supplied in the request.
@@ -9,6 +14,7 @@ Repair only the rejected immutable planner slots using the supplied stable reaso
 - Correct only the reported structural, ambiguity, option, answer, or explanation defect.
 - Produce a materially different question when the feedback reports duplication.
 - Do not weaken difficulty, change subject/topic/category, or expose verifier reasoning.
+- Pattern guidance is method-only: preserve its target, operation sequence, constraints, and `not_same_when` limits when supplied, while regenerating wording, entities, values/data, scenario, and option construction independently. Never copy a source answer, solution, or instance.
 
 # Required JSON shape
 

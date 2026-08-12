@@ -119,6 +119,7 @@ def record_llm_call(
     duration_ms: int,
     status: UsageStatus,
     error_type: str | None = None,
+    model_alias: str | None = None,
 ) -> LLMUsageRecord | None:
     """Record and log one call without allowing telemetry to affect execution."""
     try:
@@ -138,6 +139,7 @@ def record_llm_call(
             provider=provider,
             model=model,
             deployment=deployment,
+            model_alias=model_alias,
             attempt_type=attempt_type,
             streaming=streaming,
             input_tokens=usage.input_tokens,
@@ -158,6 +160,10 @@ def record_llm_call(
             with current.lock:
                 record = record.model_copy(update={"call_index": len(current.records) + 1})
                 current.records.append(record)
+        if record is not None:
+            from services.llm.billing import record_usage_for_current_operation
+
+            record_usage_for_current_operation(record)
         _log_call(record)
         return record
     except Exception as exc:  # noqa: BLE001
@@ -207,6 +213,7 @@ def _log_call(record: LLMUsageRecord) -> None:
             "role": record.role,
             "provider": record.provider,
             "model": record.model,
+            "model_alias": record.model_alias,
             "modality": modality,
             "deployment": record.deployment,
             "call_index": record.call_index,

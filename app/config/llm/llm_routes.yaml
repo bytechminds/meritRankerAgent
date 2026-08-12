@@ -63,7 +63,7 @@ routes:
         overlays:
           - levels/advanced.md
         temperature: 0.15
-        max_tokens: 2600
+        max_tokens: 3600
         fallback:
           - intermediate
           - default

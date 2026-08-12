@@ -19,6 +19,7 @@ def _config(**updates) -> PracticeGenerationConfig:
     base = PracticeGenerationConfig(
         enabled=True,
         pattern_context_enabled=False,
+        pattern_reuse_enabled=False,
         assessment_table="assessment",
         question_table="question",
         question_bank_table="bank",

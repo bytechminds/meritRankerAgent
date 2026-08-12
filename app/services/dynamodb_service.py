@@ -43,6 +43,10 @@ _MAX_QUERY_LIMIT = 50
 # DynamoDB BatchGetItem allows at most 100 keys per request.
 _MAX_BATCH_SIZE = 100
 
+# Opt-in retries are deliberately small to keep request latency bounded.
+_MAX_UNPROCESSED_KEY_RETRIES = 2
+_UNPROCESSED_KEY_RETRY_BASE_SECONDS = 0.05
+
 # ---------------------------------------------------------------------------
 # Custom exceptions
 # ---------------------------------------------------------------------------
@@ -188,6 +192,8 @@ def get_item(
 def batch_get_items(
     table_name: str,
     keys: list[dict[str, Any]],
+    *,
+    max_unprocessed_retries: int = 0,
 ) -> list[dict[str, Any]]:
     """Fetch multiple items by primary key in a single batch call.
 
@@ -195,6 +201,9 @@ def batch_get_items(
         table_name: DynamoDB table name.
         keys:       List of plain Python key dicts.
                     Capped at _MAX_BATCH_SIZE (100) silently.
+        max_unprocessed_retries: Opt-in bounded retry count for DynamoDB
+                    ``UnprocessedKeys`` responses. Defaults to ``0`` to
+                    preserve the legacy single-call behavior. Maximum ``2``.
 
     Returns:
         List of plain Python dicts.  Missing items are simply absent (not an error).
@@ -202,41 +211,72 @@ def batch_get_items(
     Raises:
         DynamoDbServiceError: On any ClientError from DynamoDB.
 
-    Note:
-        [DEFER] UnprocessedKeys (throttling/partial batch) are not retried in Part 8.
-        Only the first page of processed keys is returned.
+    When retries are enabled, only the unprocessed keys are retried with a
+    short bounded backoff. Items returned before a partial response are kept.
     """
     if not keys:
         return []
+    if (
+        isinstance(max_unprocessed_retries, bool)
+        or not isinstance(max_unprocessed_retries, int)
+        or not 0 <= max_unprocessed_retries <= _MAX_UNPROCESSED_KEY_RETRIES
+    ):
+        raise ValueError(
+            "max_unprocessed_retries must be an integer between 0 and "
+            f"{_MAX_UNPROCESSED_KEY_RETRIES}."
+        )
 
     capped_keys = keys[:_MAX_BATCH_SIZE]
     dynamo_keys = [_key_to_dynamodb(k) for k in capped_keys]
 
     client = _get_client()
     t0 = time.monotonic()
-    try:
-        response = client.batch_get_item(
-            RequestItems={table_name: {"Keys": dynamo_keys}}
-        )
-    except ClientError as exc:
-        error_code = exc.response.get("Error", {}).get("Code", "Unknown")
-        raise DynamoDbServiceError(
-            f"DynamoDB BatchGetItem failed (table={table_name!r}, code={error_code})"
-        ) from exc
+    pending_keys = dynamo_keys
+    raw_items: list[dict[str, Any]] = []
+    retry_count = 0
+    while pending_keys:
+        try:
+            response = client.batch_get_item(
+                RequestItems={table_name: {"Keys": pending_keys}}
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "Unknown")
+            raise DynamoDbServiceError(
+                f"DynamoDB BatchGetItem failed (table={table_name!r}, code={error_code})"
+            ) from exc
+
+        response_items = response.get("Responses", {}).get(table_name, [])
+        if isinstance(response_items, list):
+            raw_items.extend(item for item in response_items if isinstance(item, dict))
+
+        unprocessed = response.get("UnprocessedKeys", {}).get(table_name, {})
+        unprocessed_keys = unprocessed.get("Keys", []) if isinstance(unprocessed, dict) else []
+        if (
+            not isinstance(unprocessed_keys, list)
+            or not unprocessed_keys
+            or retry_count >= max_unprocessed_retries
+        ):
+            break
+
+        retry_count += 1
+        pending_keys = [key for key in unprocessed_keys if isinstance(key, dict)]
+        if not pending_keys:
+            break
+        time.sleep(_UNPROCESSED_KEY_RETRY_BASE_SECONDS * retry_count)
 
     duration_ms = int((time.monotonic() - t0) * 1000)
-    items = response.get("Responses", {}).get(table_name, [])
-    result_count = len(items)
+    result_count = len(raw_items)
     logger.info(
         "DynamoDB batch_get_items",
         extra={
             "table": table_name,
             "requested": len(capped_keys),
             "result_count": result_count,
+            "unprocessed_retry_count": retry_count,
             "duration_ms": duration_ms,
         },
     )
-    return [_from_dynamodb_item(item) for item in items]
+    return [_from_dynamodb_item(item) for item in raw_items]
 
 
 def query_by_partition_key(
@@ -246,6 +286,7 @@ def query_by_partition_key(
     *,
     index_name: str | None = None,
     limit: int = 10,
+    projection_fields: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Query items by a partition key condition.
 
@@ -257,6 +298,8 @@ def query_by_partition_key(
         key_value:   Partition key value.
         index_name:  GSI or LSI name.  None means query the base table.
         limit:       Maximum number of items to return.  Capped at _MAX_QUERY_LIMIT.
+        projection_fields: Optional safe attributes to fetch.  When supplied,
+                    DynamoDB omits all non-projected fields from the response.
 
     Returns:
         List of plain Python dicts, up to *limit* items.
@@ -275,6 +318,21 @@ def query_by_partition_key(
     }
     if index_name:
         kwargs["IndexName"] = index_name
+    if projection_fields:
+        safe_fields = tuple(
+            dict.fromkeys(
+                field.strip()
+                for field in projection_fields
+                if isinstance(field, str) and field.strip()
+            )
+        )
+        if safe_fields:
+            projection_names = {
+                f"#projection_{index}": field
+                for index, field in enumerate(safe_fields)
+            }
+            kwargs["ExpressionAttributeNames"].update(projection_names)
+            kwargs["ProjectionExpression"] = ", ".join(projection_names)
 
     client = _get_client()
     t0 = time.monotonic()
@@ -306,6 +364,7 @@ def query_by_index(
     key_value: str,
     *,
     limit: int = 10,
+    projection_fields: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Query items via a named GSI or LSI.
 
@@ -318,6 +377,7 @@ def query_by_index(
         key_name:    Index partition key attribute name.
         key_value:   Index partition key value.
         limit:       Maximum items to return.  Capped at _MAX_QUERY_LIMIT.
+        projection_fields: Optional safe attributes to fetch.
 
     Returns:
         List of plain Python dicts.
@@ -331,4 +391,5 @@ def query_by_index(
         key_value,
         index_name=index_name,
         limit=limit,
+        projection_fields=projection_fields,
     )

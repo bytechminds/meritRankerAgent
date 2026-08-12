@@ -110,6 +110,9 @@ class ReusableQuestion:
     exam_ids: tuple[str, ...] = ()
     pattern_family_id: str | None = None
     confidence: float | None = None
+    pattern_id: str | None = None
+    pattern_version_hash: str | None = None
+    pattern_link_evidence: str | None = None
 
 
 @dataclass(frozen=True)

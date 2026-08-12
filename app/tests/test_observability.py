@@ -44,6 +44,9 @@ def test_event_contract_contains_required_events() -> None:
         "generation_completed",
         "quality_validation_completed",
         "conversation_persistence_completed",
+        "PRACTICE_RUNTIME_STARTED",
+        "planner_fallback_completed",
+        "planner_fallback_failed",
     } <= EVENT_NAMES
 
 

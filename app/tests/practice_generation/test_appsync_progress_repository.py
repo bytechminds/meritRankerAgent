@@ -11,6 +11,10 @@ from features.practice_generation.appsync_progress_client import (
     PracticeProgressResult,
 )
 from features.practice_generation.progress import AppSyncAssessmentProgressRepository
+from features.practice_generation.progress_contract import (
+    PRACTICE_PROGRESS_ALLOWED_META_KEYS,
+    PRACTICE_PROGRESS_CONTRACT_VERSION,
+)
 from features.practice_generation.repositories import PracticeRepositoryError
 
 
@@ -26,6 +30,7 @@ class Assessments:
             "updatedAt": "before",
             "meta": {
                 "acceptedCount": 2,
+                "examProfileId": "cat_management_pre",
                 "failedCount": 0,
                 "playable": False,
                 "progressPercent": 0,
@@ -36,6 +41,7 @@ class Assessments:
                 "generatedCount": 0,
                 "verifiedCount": 0,
                 "bucketReadyCounts": {},
+                "practiceRequest": {"examProfileId": "cat_management_pre"},
             },
         }
         self.failed_codes: list[str] = []
@@ -134,6 +140,27 @@ def test_progress_recalculates_persisted_questions_before_single_appsync_write()
     assert sent["meta"]["readyQuestionIds"] == ["q-1"]
     assert sent["meta"]["readyCount"] == 1
     assert sent["meta"]["progressPercent"] > 0
+    assert "examProfileId" not in sent["meta"]
+
+
+def test_legacy_exam_profile_is_filtered_without_losing_approved_recovery_metadata(caplog) -> None:
+    progress, assessments, _questions, client = repository()
+    secret = "cat_management_pre"
+
+    progress.update(
+        "test-1",
+        meta_updates={"phase": "GENERATING", "lastCompletedStage": "SLOT_REUSE_MATCHED"},
+        live=False,
+    )
+
+    sent = client.calls[0]["meta"]
+    assert "examProfileId" not in sent
+    assert assessments.item["meta"]["examProfileId"] == secret
+    assert sent["practiceRequest"]["examProfileId"] == secret
+    assert set(sent).issubset(PRACTICE_PROGRESS_ALLOWED_META_KEYS)
+    assert "unknown_keys=('examProfileId',)" in caplog.text
+    assert secret not in caplog.text
+    assert PRACTICE_PROGRESS_CONTRACT_VERSION in caplog.text
 
 
 def test_progress_strips_legacy_raw_query_summary_before_appsync_publish() -> None:
@@ -238,3 +265,143 @@ def test_failed_progress_publication_uses_existing_conditional_failure_write() -
 
     assert len(client.calls) == 1
     assert assessments.failed_codes == ["PRACTICE_GENERATION_FAILED"]
+
+
+def test_invalid_progress_contract_is_fatal_and_never_uses_direct_failure_fallback() -> None:
+    progress, assessments, _questions, client = repository()
+
+    with pytest.raises(PracticeRepositoryError, match="PRACTICE_PROGRESS_UNKNOWN_META_FIELD"):
+        progress.mark_failed(
+            "test-1",
+            "PRACTICE_GENERATION_FAILED",
+            meta_updates={"providerResponse": "must-not-cross-the-contract"},
+        )
+
+    assert client.calls == []
+    assert assessments.failed_codes == []
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "live", "meta_updates"),
+    [
+        (
+            "schema_v1_pattern_off_generating",
+            "GENERATING",
+            False,
+            {"schemaVersion": "1", "phase": "MATCHING_EXISTING"},
+        ),
+        (
+            "schema_v2_pattern_off_generating",
+            "GENERATING",
+            False,
+            {
+                "schemaVersion": "2",
+                "phase": "GENERATING",
+                "blueprint": {"schema_version": "2", "slots": []},
+            },
+        ),
+        (
+            "schema_v2_pattern_on_generating",
+            "GENERATING",
+            False,
+            {
+                "schemaVersion": "2",
+                "phase": "GENERATING",
+                "generationGroups": {
+                    "group-1": {"state": "PENDING", "patternSelection": "guidance"}
+                },
+            },
+        ),
+        (
+            "ready",
+            "READY",
+            True,
+            {
+                "acceptedCount": 2,
+                "phase": "READY",
+                "playable": True,
+                "progressPercent": 100,
+                "questionManifestVersion": 1,
+                "readyCount": 2,
+                "readyQuestionCount": 2,
+                "readyQuestionIds": ["q-1", "q-2"],
+                "verifiedCount": 2,
+            },
+        ),
+        (
+            "failed",
+            "FAILED",
+            False,
+            {
+                "phase": "FAILED",
+                "playable": False,
+                "errorCode": "PRACTICE_GENERATION_FAILED",
+            },
+        ),
+    ],
+)
+def test_every_progress_publish_projects_to_the_backend_allowlist(
+    case: str,
+    status: str,
+    live: bool,
+    meta_updates: dict[str, object],
+) -> None:
+    del case
+    progress, _assessments, _questions, client = repository()
+
+    progress.update(
+        "test-1",
+        meta_updates=meta_updates,
+        status=status,
+        live=live,
+    )
+
+    assert set(client.calls[0]["meta"]).issubset(PRACTICE_PROGRESS_ALLOWED_META_KEYS)
+
+
+def test_python_contract_matches_the_deployed_backend_allowlist_fixture() -> None:
+    expected_backend_keys = {
+        "schemaVersion",
+        "idempotencyKey",
+        "conversationId",
+        "turnId",
+        "practiceType",
+        "requestedCount",
+        "acceptedCount",
+        "examStage",
+        "requestedLanguage",
+        "phase",
+        "playable",
+        "progressPercent",
+        "readyQuestionCount",
+        "questionManifestVersion",
+        "readyQuestionIds",
+        "readyCount",
+        "reusedCount",
+        "generatedCount",
+        "verifiedCount",
+        "failedCount",
+        "practiceRequest",
+        "resourceAliases",
+        "blueprint",
+        "plannerCalls",
+        "plannerTier",
+        "plannerRepaired",
+        "plannerDeterministicFallback",
+        "bucketReadyCounts",
+        "deficits",
+        "generationGroups",
+        "finalizationAttempt",
+        "finalizationReasonCode",
+        "readyAt",
+        "errorCode",
+        "generationVersion",
+        "startedAt",
+        "lastProgressAt",
+        "recoveryAttemptCount",
+        "lastCompletedStage",
+        "replacementWaveCount",
+        "slotReadyCounts",
+    }
+
+    assert PRACTICE_PROGRESS_ALLOWED_META_KEYS == expected_backend_keys

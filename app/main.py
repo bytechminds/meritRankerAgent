@@ -49,6 +49,7 @@ from graphs.image_question_classifier_node import (
 from logging_config import configure_logging
 from observability import (
     begin_request_summary,
+    bind_execution_context,
     bind_request_context,
     configure_runtime_identity,
     current_request_context,
@@ -101,6 +102,14 @@ from services.doubt_solver.streaming_doubt_solver_service import (
     StreamDoubtSolverInput,
     stream_doubt_solver,
 )
+from services.llm.billing import (
+    BillingConfigurationError,
+    OperationUsageAccumulator,
+    begin_operation,
+    current_operation_accumulator,
+    emit_operation_billing_summary,
+    validate_billing_configuration,
+)
 from services.llm.runtime_factory import build_model_executor
 
 # ---------------------------------------------------------------------------
@@ -108,6 +117,10 @@ from services.llm.runtime_factory import build_model_executor
 # ---------------------------------------------------------------------------
 
 settings = get_settings()
+try:
+    validate_billing_configuration()
+except BillingConfigurationError as exc:
+    raise ConfigurationError(str(exc)) from exc
 configure_logging(
     settings.log_level,
     environment=settings.app_env,
@@ -305,8 +318,12 @@ def _stream_replayed_turn(
     *,
     trace_id: str | None = None,
     request_started_logged: bool = False,
+    operation_accumulator: OperationUsageAccumulator | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     started_at = time.monotonic()
+    accumulator = operation_accumulator
+    if accumulator is None:
+        accumulator = begin_operation(operation_id=request_id, feature="doubt")
     with bind_request_context(
         request_id=request_id,
         trace_id=trace_id,
@@ -314,68 +331,78 @@ def _stream_replayed_turn(
         turn_id=turn.turn_id,
         request_type="standalone",
     ):
-        summary_token = begin_request_summary()
-        if not request_started_logged:
-            log_event(
-                "request_started",
-                component="request.lifecycle",
-                stage="started",
-                status="started",
-                details={"request_type": "standalone"},
-            )
-        update_request_summary(
-            request_type="standalone",
-            subject=turn.subject,
-            quality_status=turn.quality_status,
-            history_write_status="idempotent_replay",
-        )
-        terminal_status = "cancelled"
-        terminal_reason = "stream_closed"
-        try:
-            final_answer = FinalAnswerResult(
-                content=turn.final_answer,
-                quality_status=turn.quality_status,
-                was_regenerated=turn.was_regenerated,
-                language_compliant=True,
-            )
-            yield DoubtSolverStreamEvent(
-                type="chunk",
-                request_id=request_id,
-                content=turn.final_answer,
-            )
-            terminal_status = "completed"
-            terminal_reason = "idempotent_replay"
-            yield DoubtSolverStreamEvent(
-                type="complete",
-                request_id=request_id,
-                stage="complete",
-                label="Complete",
-                metadata={"request_id": request_id, "replayed": True},
-                response=DoubtSolverFinalResponse(
-                    request_id=request_id,
-                    content=ResponseContent(value=turn.final_answer),
-                    answer=turn.final_answer,
-                    final_answer=final_answer,
-                    response_type=turn.response_type,
-                    practice_test_id=turn.practice_test_id,
-                ),
-            )
-        finally:
-            duration_ms = int((time.monotonic() - started_at) * 1000)
+        with bind_execution_context(
+            operation_id=request_id,
+            feature="doubt",
+            operation_accumulator=accumulator,
+        ):
+            summary_token = begin_request_summary()
+            if not request_started_logged:
+                log_event(
+                    "request_started",
+                    component="request.lifecycle",
+                    stage="started",
+                    status="started",
+                    details={"request_type": "standalone"},
+                )
             update_request_summary(
-                terminal_status=terminal_status,
-                terminal_reason=terminal_reason,
-                total_duration_ms=duration_ms,
+                request_type="standalone",
+                subject=turn.subject,
+                quality_status=turn.quality_status,
+                history_write_status="idempotent_replay",
             )
-            emit_request_summary()
-            log_event(
-                ("request_completed" if terminal_status == "completed" else "request_cancelled"),
-                component="request.lifecycle",
-                stage="complete" if terminal_status == "completed" else "cancelled",
-                status=terminal_status,
-                duration_ms=duration_ms,
-            )
-            reset_request_summary(summary_token)
+            terminal_status = "cancelled"
+            terminal_reason = "stream_closed"
+            try:
+                final_answer = FinalAnswerResult(
+                    content=turn.final_answer,
+                    quality_status=turn.quality_status,
+                    was_regenerated=turn.was_regenerated,
+                    language_compliant=True,
+                )
+                yield DoubtSolverStreamEvent(
+                    type="chunk",
+                    request_id=request_id,
+                    content=turn.final_answer,
+                )
+                terminal_status = "completed"
+                terminal_reason = "idempotent_replay"
+                yield DoubtSolverStreamEvent(
+                    type="complete",
+                    request_id=request_id,
+                    stage="complete",
+                    label="Complete",
+                    metadata={"request_id": request_id, "replayed": True},
+                    response=DoubtSolverFinalResponse(
+                        request_id=request_id,
+                        content=ResponseContent(value=turn.final_answer),
+                        answer=turn.final_answer,
+                        final_answer=final_answer,
+                        response_type=turn.response_type,
+                        practice_test_id=turn.practice_test_id,
+                    ),
+                )
+            finally:
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                update_request_summary(
+                    terminal_status=terminal_status,
+                    terminal_reason=terminal_reason,
+                    total_duration_ms=duration_ms,
+                )
+                emit_request_summary()
+                emit_operation_billing_summary(operation_status=terminal_status)
+                log_event(
+                    (
+                        "request_completed"
+                        if terminal_status == "completed"
+                        else "request_cancelled"
+                    ),
+                    component="request.lifecycle",
+                    stage="complete" if terminal_status == "completed" else "cancelled",
+                    status=terminal_status,
+                    duration_ms=duration_ms,
+                )
+                reset_request_summary(summary_token)
 
 
 def _persist_completed_result(
@@ -503,6 +530,7 @@ def invoke(payload: dict) -> dict | Response:
                                     else None
                                 ),
                                 request_started_logged=True,
+                                operation_accumulator=current_operation_accumulator(),
                             ),
                             request_id=request_id,
                             cancellation=cancellation,
@@ -687,6 +715,7 @@ def invoke(payload: dict) -> dict | Response:
                         request_started_logged=True,
                         defer_practice_start_until_committed=True,
                         initial_llm_usage_records=snapshot_llm_usage_records(),
+                        operation_accumulator=current_operation_accumulator(),
                     )
                     stream_kwargs = {
                         "adapter": orchestrated_adapter,

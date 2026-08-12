@@ -18,6 +18,7 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from services.llm.providers.openai_provider import _classify_openai_error
 from services.llm.providers.usage import (
     clear_stream_usage,
@@ -134,9 +135,14 @@ class OpenAICompatibleProviderAdapter:
                 model_alias=request.model_resolution.model_alias,
             ) from exc
 
-        content = _extract_content(completion, request)
         finish_reason = _extract_finish_reason(completion)
         usage = extract_openai_usage(completion)
+        content = _extract_content(
+            completion,
+            request,
+            finish_reason=finish_reason,
+            provider_usage=usage,
+        )
 
         logger.info(
             "%s_provider_adapter.generate  model_alias=%s — done  "
@@ -153,6 +159,7 @@ class OpenAICompatibleProviderAdapter:
             model=request.route_decision.model,
             provider=self._provider,
             finish_reason=finish_reason,
+            normalized_finish_reason=normalize_completion_outcome(finish_reason),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
@@ -300,6 +307,7 @@ class OpenAICompatibleProviderAdapter:
             model=request.route_decision.model,
             provider=self._provider,
             finish_reason=finish_reason,
+            normalized_finish_reason=normalize_completion_outcome(finish_reason),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
@@ -313,7 +321,13 @@ class OpenAICompatibleProviderAdapter:
         )
 
 
-def _extract_content(completion: Any, request: ProviderExecutionRequest) -> str:
+def _extract_content(
+    completion: Any,
+    request: ProviderExecutionRequest,
+    *,
+    finish_reason: str | None = None,
+    provider_usage: Any = None,
+) -> str:
     try:
         content = completion.choices[0].message.content
     except (AttributeError, IndexError, TypeError):
@@ -321,7 +335,9 @@ def _extract_content(completion: Any, request: ProviderExecutionRequest) -> str:
     if not content:
         raise LlmProviderResponseError(
             f"Response is missing content "
-            f"(model_alias={request.model_resolution.model_alias!r})."
+            f"(model_alias={request.model_resolution.model_alias!r}).",
+            finish_reason=finish_reason,
+            provider_usage=provider_usage,
         )
     return content
 

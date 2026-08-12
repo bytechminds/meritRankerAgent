@@ -11,6 +11,7 @@ from typing import Any, TypeVar, cast
 
 from observability.context import (
     RequestType,
+    bind_execution_context,
     bind_request_context,
     current_request_context,
     safe_identifier,
@@ -45,98 +46,118 @@ def observe_invocation(function: _F) -> _F:
             turn_id=safe_identifier(payload.get("turn_id")),
             request_type=_request_type(payload),
         ):
-            summary_token = begin_request_summary()
-            try:
-                record_local_preview("mode", payload.get("mode"))
-                record_local_preview("language", payload.get("language"))
-                record_local_preview("exam_id", payload.get("exam_id"))
-                record_local_preview(
-                    "query", payload.get("query") or payload.get("questionText")
-                )
-                with stage_span("doubt_solver.request"):
-                    log_event(
-                        "request_started",
-                        component="request.lifecycle",
-                        stage="started",
-                        status="started",
-                        details={
-                            "request_type": current_request_context().request_type
-                        },
-                    )
-                    result = function(payload, *args, **kwargs)
-                if hasattr(result, "body_iterator"):
-                    return result
-                success = not isinstance(result, dict) or result.get("success", True) is not False
-                duration_ms = int((time.monotonic() - started) * 1000)
-                classification = (
-                    result.get("classification")
-                    if isinstance(result, dict)
-                    and isinstance(result.get("classification"), dict)
-                    else {}
-                )
-                clarification = bool(
-                    not success
-                    and isinstance(result, dict)
-                    and (
-                        result.get("status") == "clarification"
-                        or classification.get("requires_recent_conversation")
-                    )
-                )
-                terminal_status = (
-                    "completed"
-                    if success
-                    else ("clarification" if clarification else "failed")
-                )
-                if isinstance(result, dict):
+            from services.llm.billing import (  # noqa: PLC0415
+                begin_operation,
+                emit_operation_billing_summary,
+            )
+
+            is_doubt_operation = payload.get("mode") == "doubt_solver"
+            with bind_execution_context(
+                operation_id=request_id if is_doubt_operation else None,
+                feature="doubt" if is_doubt_operation else None,
+                operation_accumulator=(
+                    begin_operation(operation_id=request_id, feature="doubt")
+                    if is_doubt_operation
+                    else None
+                ),
+            ):
+                summary_token = begin_request_summary()
+                try:
+                    record_local_preview("mode", payload.get("mode"))
+                    record_local_preview("language", payload.get("language"))
+                    record_local_preview("exam_id", payload.get("exam_id"))
                     record_local_preview(
-                        "response", result.get("answer") or result.get("error")
+                        "query", payload.get("query") or payload.get("questionText")
                     )
-                    record_local_preview(
-                        "response_type",
-                        (
-                            "answer"
-                            if success
-                            else ("clarification" if clarification else "error")
+                    with stage_span("doubt_solver.request"):
+                        log_event(
+                            "request_started",
+                            component="request.lifecycle",
+                            stage="started",
+                            status="started",
+                            details={
+                                "request_type": current_request_context().request_type
+                            },
+                        )
+                        result = function(payload, *args, **kwargs)
+                    if hasattr(result, "body_iterator"):
+                        return result
+                    success = (
+                        not isinstance(result, dict)
+                        or result.get("success", True) is not False
+                    )
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    classification = (
+                        result.get("classification")
+                        if isinstance(result, dict)
+                        and isinstance(result.get("classification"), dict)
+                        else {}
+                    )
+                    clarification = bool(
+                        not success
+                        and isinstance(result, dict)
+                        and (
+                            result.get("status") == "clarification"
+                            or classification.get("requires_recent_conversation")
+                        )
+                    )
+                    terminal_status = (
+                        "completed"
+                        if success
+                        else ("clarification" if clarification else "failed")
+                    )
+                    if isinstance(result, dict):
+                        record_local_preview(
+                            "response", result.get("answer") or result.get("error")
+                        )
+                        record_local_preview(
+                            "response_type",
+                            (
+                                "answer"
+                                if success
+                                else ("clarification" if clarification else "error")
+                            ),
+                        )
+                    update_request_summary(
+                        terminal_status=terminal_status,
+                        terminal_reason=(
+                            "clarification_required" if clarification else terminal_status
                         ),
+                        total_duration_ms=duration_ms,
                     )
-                update_request_summary(
-                    terminal_status=terminal_status,
-                    terminal_reason=(
-                        "clarification_required" if clarification else terminal_status
-                    ),
-                    total_duration_ms=duration_ms,
-                )
-                emit_request_summary()
-                log_event(
-                    "request_completed" if success else "request_failed",
-                    component="request.lifecycle",
-                    stage="complete" if success else "failed",
-                    status=terminal_status,
-                    duration_ms=duration_ms,
-                    error_code=None if success else "REQUEST_FAILED",
-                    level=logging.INFO if success else logging.ERROR,
-                )
-                return result
-            except BaseException as exc:
-                duration_ms = int((time.monotonic() - started) * 1000)
-                update_request_summary(
-                    terminal_status="failed",
-                    terminal_reason="unexpected_exception",
-                    total_duration_ms=duration_ms,
-                )
-                emit_request_summary()
-                log_event(
-                    "request_failed",
-                    component="request.lifecycle",
-                    stage="failed",
-                    status="failed",
-                    duration_ms=duration_ms,
-                    error_code="UNEXPECTED_EXCEPTION",
-                    details={"error_type": type(exc).__name__},
-                    level=logging.ERROR,
-                )
-                raise
-            finally:
-                reset_request_summary(summary_token)
+                    emit_request_summary()
+                    emit_operation_billing_summary(operation_status=terminal_status)
+                    log_event(
+                        "request_completed" if success else "request_failed",
+                        component="request.lifecycle",
+                        stage="complete" if success else "failed",
+                        status=terminal_status,
+                        duration_ms=duration_ms,
+                        error_code=None if success else "REQUEST_FAILED",
+                        level=logging.INFO if success else logging.ERROR,
+                    )
+                    return result
+                except BaseException as exc:
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    update_request_summary(
+                        terminal_status="failed",
+                        terminal_reason="unexpected_exception",
+                        total_duration_ms=duration_ms,
+                    )
+                    emit_request_summary()
+                    emit_operation_billing_summary(operation_status="failed")
+                    log_event(
+                        "request_failed",
+                        component="request.lifecycle",
+                        stage="failed",
+                        status="failed",
+                        duration_ms=duration_ms,
+                        error_code="UNEXPECTED_EXCEPTION",
+                        details={"error_type": type(exc).__name__},
+                        level=logging.ERROR,
+                    )
+                    raise
+                finally:
+                    reset_request_summary(summary_token)
 
     return cast(_F, wrapper)

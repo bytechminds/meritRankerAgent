@@ -727,9 +727,19 @@ Advanced queries with difficulty=`"advanced"` hit the `advanced` sub-route if it
 
 Intent and difficulty are independent. An advanced practice query uses the advanced route AND the practice intent overlay.
 
-#### Token budget update
+#### Practice runtime completion-cap policy
 
-`math.generator.advanced` max_tokens increased from 1000 to **1200** to prevent truncation on advanced practice responses (5 multi-step questions). Other routes unchanged.
+Route `max_tokens` remains the non-Practice route default. Structured Practice generation applies
+`PracticeGenerationCapacityPolicy` after route/model resolution, before provider execution. Its
+typed plan has `initial <= escalation <= product hard <= model hard`, selected only from broad
+subject family, difficulty, complexity, slot count, and model reasoning capability—never topic.
+
+For a basic one-slot non-reasoning item the plan is `900 → 1500 → 2200`; for a high-complexity
+Advanced Math or Reasoning item it is `4000 → 5600 → 5600`, one slot per call. Model catalog
+metadata supplies the model hard cap (currently the configured safe 8,000-token ceiling). On
+`OUTPUT_TOKEN_EXHAUSTED`, the executor retries the same model at the strictly larger escalation
+cap once, then considers only fallbacks whose model cap can send that recovery budget. Provider
+usage—not these ceilings—remains cost authority.
 
 ---
 

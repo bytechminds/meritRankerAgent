@@ -33,6 +33,10 @@ function booleanEnvironment(name: string, defaultValue: boolean): string {
 
 function runtimeEnvironment(target: AwsDeploymentTarget): Record<string, string> {
   const practiceEnabled = booleanEnvironment('PRACTICE_GENERATION_ENABLED', false);
+  const patternIntelligenceEnabled = booleanEnvironment(
+    'PATTERN_INTELLIGENCE_ENABLED',
+    false
+  );
   const endpoint = process.env.APPSYNC_GRAPHQL_ENDPOINT?.trim();
   if (practiceEnabled === 'true' && !endpoint) {
     throw new Error('APPSYNC_GRAPHQL_ENDPOINT is required when practice generation is enabled');
@@ -41,6 +45,11 @@ function runtimeEnvironment(target: AwsDeploymentTarget): Record<string, string>
     AWS_REGION: target.region,
     ...(endpoint ? { APPSYNC_GRAPHQL_ENDPOINT: endpoint } : {}),
     PRACTICE_GENERATION_ENABLED: practiceEnabled,
+    PATTERN_INTELLIGENCE_ENABLED: patternIntelligenceEnabled,
+    PATTERN_INTELLIGENCE_REUSE_ENABLED: booleanEnvironment(
+      'PATTERN_INTELLIGENCE_REUSE_ENABLED',
+      false
+    ),
     ENABLE_ORCHESTRATED_DOUBT_SOLVER: booleanEnvironment(
       'ENABLE_ORCHESTRATED_DOUBT_SOLVER',
       true

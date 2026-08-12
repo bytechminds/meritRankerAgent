@@ -91,6 +91,9 @@ export class AgentCoreStack extends Stack {
     super(scope, id, props);
 
     const { spec, deploymentEnvironment, mcpSpec, credentials, runtimeEnvironment = {} } = props;
+    const practiceEnabled = runtimeEnvironment.PRACTICE_GENERATION_ENABLED === 'true';
+    const patternIntelligenceEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_ENABLED === 'true';
+    const patternReuseEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_REUSE_ENABLED === 'true';
 
     // Create AgentCoreApplication with all agents
     this.application = new AgentCoreApplication(this, 'Application', {
@@ -146,6 +149,42 @@ export class AgentCoreStack extends Stack {
       this,
       '/meritranker/agent-runtime/v1/practice/question-bank/reuse-index-name'
     );
+    const patternTableName = patternIntelligenceEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/pattern-intelligence/pattern/table-name'
+        )
+      : '';
+    const patternTableArn = patternIntelligenceEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/pattern-intelligence/pattern/table-arn'
+        )
+      : '';
+    const patternVectorIndexArn = patternIntelligenceEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/pattern-intelligence/vector/index-arn'
+        )
+      : '';
+    const practiceQuestionBankPatternIndex = patternIntelligenceEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/practice/question-bank/pattern-index-name'
+        )
+      : '';
+    const practiceAttemptTableName = patternReuseEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/practice/attempt/table-name')
+      : '';
+    const practiceAttemptTableArn = patternReuseEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/practice/attempt/table-arn')
+      : '';
+    const practiceAttemptUserActivityIndex = patternReuseEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/practice/attempt/user-activity-index-name'
+        )
+      : '';
     const ssmParameterArns = [
       'conversation-history/table-name',
       'conversation-history/table-arn',
@@ -164,6 +203,17 @@ export class AgentCoreStack extends Stack {
       'practice/question-bank/table-arn',
       'practice/question-bank/category-index-name',
       'practice/question-bank/reuse-index-name',
+      ...(patternIntelligenceEnabled
+        ? [
+            'practice/question-bank/pattern-index-name',
+            'pattern-intelligence/pattern/table-name',
+            'pattern-intelligence/pattern/table-arn',
+            'pattern-intelligence/vector/index-arn',
+          ]
+        : []),
+      ...(patternReuseEnabled
+        ? ['practice/attempt/table-name', 'practice/attempt/table-arn', 'practice/attempt/user-activity-index-name']
+        : []),
     ].map(resourceName =>
       this.formatArn({
         service: 'ssm',
@@ -171,7 +221,6 @@ export class AgentCoreStack extends Stack {
         resourceName: `meritranker/agent-runtime/v1/${resourceName}`,
       })
     );
-    const practiceEnabled = runtimeEnvironment.PRACTICE_GENERATION_ENABLED === 'true';
     const practiceEndpoint = runtimeEnvironment.APPSYNC_GRAPHQL_ENDPOINT;
     if (practiceEnabled && !practiceEndpoint) {
       throw new Error('APPSYNC_GRAPHQL_ENDPOINT is required when practice generation is enabled');
@@ -184,6 +233,32 @@ export class AgentCoreStack extends Stack {
       for (const [name, value] of Object.entries(runtimeEnvironment)) {
         runtimeResource.addPropertyOverride(`EnvironmentVariables.${name}`, value);
       }
+      if (patternIntelligenceEnabled) {
+        runtimeResource.addPropertyOverride('EnvironmentVariables.DYNAMODB_PATTERN_TABLE', patternTableName);
+        runtimeResource.addPropertyOverride('EnvironmentVariables.S3_VECTOR_PATTERN_INDEX_ARN', patternVectorIndexArn);
+        runtimeResource.addPropertyOverride('EnvironmentVariables.S3_VECTOR_PATTERN_INDEX_NAME', 'patterns-v1');
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_QUESTION_BANK_PATTERN_INDEX',
+          practiceQuestionBankPatternIndex
+        );
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_QUESTION_BANK_TABLE',
+          StringParameter.valueForStringParameter(
+            this,
+            '/meritranker/agent-runtime/v1/practice/question-bank/table-name'
+          )
+        );
+      }
+      if (patternReuseEnabled) {
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_PRACTICE_ATTEMPT_TABLE',
+          practiceAttemptTableName
+        );
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_PRACTICE_ATTEMPT_USER_INDEX',
+          practiceAttemptUserActivityIndex
+        );
+      }
       removeDefaultMemoryGrant(environment.runtime.role);
       for (const memory of this.application.memories.values()) {
         environment.runtime.addToPolicy(
@@ -192,6 +267,14 @@ export class AgentCoreStack extends Stack {
             resources: [memory.memoryArn],
           })
         );
+        if (patternReuseEnabled) {
+          environment.runtime.addToPolicy(
+            new iam.PolicyStatement({
+              actions: ['dynamodb:PutItem'],
+              resources: [practiceQuestionBankTableArn],
+            })
+          );
+        }
       }
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
@@ -199,6 +282,39 @@ export class AgentCoreStack extends Stack {
           resources: ssmParameterArns,
         })
       );
+      if (patternIntelligenceEnabled) {
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['s3vectors:QueryVectors'],
+            resources: [patternVectorIndexArn],
+          })
+        );
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['bedrock:InvokeModel'],
+            resources: [
+              this.formatArn({
+                service: 'bedrock',
+                account: '',
+                resource: 'foundation-model',
+                resourceName: 'amazon.titan-embed-text-v2:0',
+              }),
+            ],
+          })
+        );
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['dynamodb:BatchGetItem'],
+            resources: [patternTableArn],
+          })
+        );
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['dynamodb:Query'],
+            resources: [`${practiceQuestionBankTableArn}/index/${practiceQuestionBankPatternIndex}`],
+          })
+        );
+      }
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
           actions: ['dynamodb:Scan'],
@@ -213,7 +329,7 @@ export class AgentCoreStack extends Stack {
       );
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
-          actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
+          actions: ['dynamodb:BatchGetItem', 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
           resources: [sessionTableArn],
         })
       );
@@ -263,6 +379,14 @@ export class AgentCoreStack extends Stack {
             resources: [practiceProgressMutationArn(this, practiceEndpoint)],
           })
         );
+        if (patternReuseEnabled) {
+          environment.runtime.addToPolicy(
+            new iam.PolicyStatement({
+              actions: ['dynamodb:Query'],
+              resources: [`${practiceAttemptTableArn}/index/${practiceAttemptUserActivityIndex}`],
+            })
+          );
+        }
       }
     }
 

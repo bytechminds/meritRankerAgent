@@ -74,7 +74,8 @@ class TestBenchmarkGeneratorMappings:
         cfg = reg.model_map["math_advanced_generator"]
         assert cfg.provider == "deepseek"
         assert cfg.model_id == "deepseek-reasoner"
-        assert cfg.fallback_models == ["openai_o3", "openai_gpt_5_4"]
+        assert cfg.fallback_models == ["openai_o3"]
+        assert cfg.structured_output_reasoning_reserve_tokens == 2600
 
     def test_reasoning_basic_uses_gpt_41_mini(self):
         reg = LlmConfigRegistry()

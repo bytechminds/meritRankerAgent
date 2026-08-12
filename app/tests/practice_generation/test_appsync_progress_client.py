@@ -235,6 +235,36 @@ def test_graphql_authorization_and_conflict_are_not_retried(code: str) -> None:
     assert calls == 1
 
 
+def test_graphql_safe_unknown_field_detail_is_preserved_when_backend_supplies_it() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {
+                        "message": "PRACTICE_PROGRESS_UNKNOWN_META_FIELD",
+                        "extensions": {"unknownField": "examProfileId"},
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(PracticeProgressError) as raised:
+        asyncio.run(
+            client(handler).update_progress(
+                test_id="test-1",
+                user_id="user-1",
+                status="GENERATING",
+                meta={"readyCount": 0},
+                live=False,
+                expected_updated_at="before",
+            )
+        )
+
+    assert raised.value.code == "PRACTICE_PROGRESS_UNKNOWN_META_FIELD"
+    assert raised.value.safe_detail == "examProfileId"
+
+
 def test_missing_credentials_are_controlled_and_not_logged(caplog) -> None:
     secret = "must-not-appear"
     progress_client = client(

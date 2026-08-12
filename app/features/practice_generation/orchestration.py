@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from features.practice_generation.events import emit_practice_event
 from features.practice_generation.generation import (
     QuestionGenerator,
     QuestionVerifier,
+    bucket_for_slot,
     build_generation_groups,
     build_slot_generation_groups,
     deterministic_question_id,
@@ -23,6 +25,7 @@ from features.practice_generation.generation import (
     verification_required,
 )
 from features.practice_generation.matching import (
+    ReusableQuestion,
     build_reuse_bucket_key,
     build_reuse_difficulty_prefix,
     build_slot_reuse_bucket_key,
@@ -32,11 +35,17 @@ from features.practice_generation.matching import (
     reusable_question_from_item,
     shortlist_reuse_candidate_ids,
 )
-from features.practice_generation.pattern_context import PatternContextProvider
+from features.practice_generation.pattern_context import (
+    PatternContextProvider,
+    PatternSlotResolution,
+    PatternSlotSelection,
+)
 from features.practice_generation.planning import (
     BlueprintManager,
     BlueprintPlanningError,
+    PlannerValidationDiagnostic,
     apply_system_bucket_policy,
+    planner_tier,
     select_planner_family,
 )
 from features.practice_generation.progress import AppSyncAssessmentProgressRepository
@@ -57,10 +66,36 @@ from features.practice_generation.schemas import (
     VerificationResult,
 )
 from observability import bind_execution_context
+from retrieval.pattern_intelligence import (
+    CanonicalPlayableQuestion,
+    PatternGenerationContext,
+    PatternMatchTier,
+)
 from services.llm.orchestration.errors import ProviderExecutionError
 from services.llm.providers.errors import FALLBACK_ELIGIBLE_FAILURE_KINDS
 
 logger = logging.getLogger(__name__)
+
+
+def _pattern_reuse_question(value: CanonicalPlayableQuestion) -> ReusableQuestion:
+    return ReusableQuestion(
+        question_id=value.question_id,
+        question=value.question,
+        options=value.options,
+        correct_answer=value.correct_answer,
+        solution=value.explanation,
+        subject=value.subject,
+        topic=value.topic,
+        difficulty=value.difficulty.casefold(),
+        question_type=value.question_type.casefold(),
+        language=value.language.casefold(),
+        source="QuestionBank.Pattern",
+        source_updated_at=value.updated_at or None,
+        category=value.category,
+        exam_ids=value.exam_ids,
+        pattern_family_id=value.pattern_family_id or None,
+        confidence=1.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -72,6 +107,8 @@ class _SlotGenerationContext:
     bucket: DemandBucket
     slots: tuple[PlannerSlot, ...]
     excluded_texts: tuple[str, ...]
+    pattern_guidance_by_slot: dict[str, PatternGenerationContext]
+    pattern_selections_by_slot: dict[str, PatternSlotSelection]
 
 
 @dataclass(frozen=True)
@@ -148,6 +185,26 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
     )
 
 
+def _pattern_selections_for_slots(
+    value: object,
+    slot_ids: list[str],
+) -> dict[str, PatternSlotSelection]:
+    if not isinstance(value, dict):
+        return {}
+    selections: dict[str, PatternSlotSelection] = {}
+    allowed_slot_ids = set(slot_ids)
+    for slot_id, raw_selection in value.items():
+        if not isinstance(slot_id, str) or slot_id not in allowed_slot_ids:
+            continue
+        if not isinstance(raw_selection, dict):
+            continue
+        try:
+            selections[slot_id] = PatternSlotSelection.model_validate(raw_selection)
+        except ValueError:
+            continue
+    return selections
+
+
 class PracticeGenerationOrchestrator:
     def __init__(
         self,
@@ -169,6 +226,35 @@ class PracticeGenerationOrchestrator:
         self._generator = generator
         self._verifier = verifier
         self._pattern_context = pattern_context
+
+    def _resolve_pattern_slots(
+        self,
+        *,
+        request: PracticeGenerationRequest,
+        slots: tuple[PlannerSlot, ...],
+        persisted_selections: dict[str, PatternSlotSelection] | None = None,
+        excluded_question_ids: tuple[str, ...] = (),
+        seen_question_ids: tuple[str, ...] = (),
+        student_history_checked: bool = False,
+    ) -> PatternSlotResolution:
+        if not slots:
+            return PatternSlotResolution()
+        try:
+            return self._pattern_context.resolve_slots(
+                request=request,
+                slots=slots,
+                persisted_selections=persisted_selections,
+                excluded_question_ids=excluded_question_ids,
+                seen_question_ids=seen_question_ids,
+                student_history_checked=student_history_checked,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "pattern guidance unavailable test_id=%s error_type=%s",
+                request.request_id,
+                type(exc).__name__,
+            )
+            return PatternSlotResolution()
 
     def _mark_failed(
         self,
@@ -211,6 +297,74 @@ class PracticeGenerationOrchestrator:
             level=logging.ERROR,
         )
 
+    @staticmethod
+    def _planner_event_base(
+        request: PracticeGenerationRequest,
+        *,
+        fallback_invoked: bool,
+        fallback_result: str,
+    ) -> dict[str, Any]:
+        tier = planner_tier(request)
+        planner_difficulty = {
+            "light": "basic",
+            "standard": "intermediate",
+            "strong": "advanced",
+        }[tier]
+        return {
+            "expectedSlotCount": request.accepted_count,
+            "routeId": f"{select_planner_family(request).value}.planner.{planner_difficulty}",
+            "plannerTier": tier,
+            "fallbackInvoked": fallback_invoked,
+            "fallbackResult": fallback_result,
+        }
+
+    def _emit_planner_validation_diagnostics(
+        self,
+        *,
+        test_id: str,
+        request: PracticeGenerationRequest,
+        diagnostics: tuple[PlannerValidationDiagnostic, ...],
+        fallback_invoked: bool,
+        fallback_result: str,
+    ) -> None:
+        base = self._planner_event_base(
+            request,
+            fallback_invoked=fallback_invoked,
+            fallback_result=fallback_result,
+        )
+        for diagnostic in diagnostics:
+            details = {
+                **base,
+                "reasonCode": diagnostic.reason_code,
+                "actualSlotCount": diagnostic.actual_slot_count,
+                "plannerAttempt": diagnostic.attempt,
+                "plannerPhase": diagnostic.phase,
+                "schemaName": diagnostic.schema_name,
+                "validationErrorCount": diagnostic.error_count,
+                "fieldPaths": list(diagnostic.field_paths),
+                "errorTypes": list(diagnostic.error_types),
+                "durationMs": diagnostic.duration_ms,
+            }
+            emit_practice_event(
+                "planner_validation_failed",
+                test_id=test_id,
+                status="failed",
+                details=details,
+                level=logging.WARNING,
+            )
+            if diagnostic.phase == "initial" and len(diagnostics) > 1:
+                emit_practice_event(
+                    "planner_repair_started",
+                    test_id=test_id,
+                    status="started",
+                    details={
+                        **base,
+                        "reasonCode": diagnostic.reason_code,
+                        "plannerAttempt": diagnostic.attempt + 1,
+                        "plannerPhase": "repair",
+                    },
+                )
+
     def plan_and_fill(self, test_id: str) -> None:
         assessment = self._assessments.get(test_id)
         if assessment is None:
@@ -236,58 +390,67 @@ class PracticeGenerationOrchestrator:
                 status="started",
                 details={"phase": InternalPhase.PLANNING.value},
             )
-            references = self._pattern_context.discover_catalog(request)
-            if references:
-                self._pattern_context.hydrate_context(references)
             try:
                 plan = self._blueprints.build(request)
             except BlueprintPlanningError as exc:
-                self._mark_failed(test_id, str(exc))
+                fallback_result = exc.fallback_result or "not_invoked"
+                self._emit_planner_validation_diagnostics(
+                    test_id=test_id,
+                    request=request,
+                    diagnostics=exc.diagnostics,
+                    fallback_invoked=exc.fallback_invoked,
+                    fallback_result=fallback_result,
+                )
+                if exc.fallback_invoked:
+                    emit_practice_event(
+                        "planner_fallback_failed",
+                        test_id=test_id,
+                        status="failed",
+                        details={
+                            **self._planner_event_base(
+                                request,
+                                fallback_invoked=True,
+                                fallback_result=fallback_result,
+                            ),
+                            "reasonCode": exc.reason_code,
+                        },
+                        level=logging.ERROR,
+                    )
+                self._mark_failed(test_id, exc.reason_code)
                 return
             blueprint = plan.blueprint
-            planner_difficulty = {
-                "light": "basic",
-                "standard": "intermediate",
-                "strong": "advanced",
-            }[plan.tier]
-            planner_event_details = {
-                "reasonCode": plan.validation_reason_code or "PLANNER_SCHEMA_VALID",
-                "expectedSlotCount": request.accepted_count,
-                "actualSlotCount": plan.validation_actual_slot_count,
-                "routeId": f"{select_planner_family(request).value}.planner.{planner_difficulty}",
-                "plannerTier": plan.tier,
-                "repairAttempt": int(plan.planner_calls > 1),
-                "durationMs": plan.validation_duration_ms,
-            }
-            if plan.validation_reason_code is not None:
+            fallback_result = "valid" if plan.deterministic_fallback else "not_invoked"
+            self._emit_planner_validation_diagnostics(
+                test_id=test_id,
+                request=request,
+                diagnostics=plan.validation_diagnostics,
+                fallback_invoked=plan.deterministic_fallback,
+                fallback_result=fallback_result,
+            )
+            planner_event_details = self._planner_event_base(
+                request,
+                fallback_invoked=plan.deterministic_fallback,
+                fallback_result=fallback_result,
+            )
+            if plan.deterministic_fallback:
                 emit_practice_event(
-                    "planner_validation_failed",
+                    "planner_fallback_completed",
                     test_id=test_id,
-                    status="failed",
-                    details=planner_event_details,
-                    level=logging.WARNING,
-                )
-                if plan.planner_calls > 1:
-                    emit_practice_event(
-                        "planner_repair_started",
-                        test_id=test_id,
-                        status="started",
-                        details=planner_event_details,
-                    )
-            if plan.deterministic_fallback and plan.validation_reason_code is not None:
-                emit_practice_event(
-                    "planner_repair_failed",
-                    test_id=test_id,
-                    status="fallback",
-                    details=planner_event_details,
-                    level=logging.WARNING,
+                    status="completed",
+                    details={
+                        **planner_event_details,
+                        "reasonCode": plan.validation_reason_code or "PLANNER_FALLBACK",
+                    },
                 )
             elif plan.repaired:
                 emit_practice_event(
                     "planner_repair_completed",
                     test_id=test_id,
                     status="completed",
-                    details=planner_event_details,
+                    details={
+                        **planner_event_details,
+                        "reasonCode": plan.validation_reason_code or "PLANNER_SCHEMA_VALID",
+                    },
                 )
             plan_meta = {
                 "blueprint": blueprint.model_dump(mode="json"),
@@ -687,6 +850,18 @@ class PracticeGenerationOrchestrator:
                 continue
             lane = (reuse_key, difficulty_prefix)
             if lane not in lane_cache:
+                emit_practice_event(
+                    "QUESTION_BANK_REUSE_QUERY_STARTED",
+                    test_id=test_id,
+                    status="started",
+                    details={
+                        "logicalTable": "QuestionBank",
+                        "logicalIndex": "QuestionBank.reuse",
+                        "operation": "schema_v2_slot_reuse",
+                        "candidateCount": 0,
+                        "selectedCount": 0,
+                    },
+                )
                 lane_items: list[dict[str, Any]] = []
                 continuation: dict[str, Any] | None = None
                 for _page in range(self._config.question_bank_max_pages):
@@ -709,6 +884,18 @@ class PracticeGenerationOrchestrator:
                     if not result.has_more_pages or evaluated == 0:
                         break
                 lane_cache[lane] = lane_items
+                emit_practice_event(
+                    "QUESTION_BANK_REUSE_QUERY_COMPLETED",
+                    test_id=test_id,
+                    status="completed",
+                    details={
+                        "logicalTable": "QuestionBank",
+                        "logicalIndex": "QuestionBank.reuse",
+                        "operation": "schema_v2_slot_reuse",
+                        "candidateCount": len(lane_items),
+                        "selectedCount": 0,
+                    },
+                )
             for item in lane_cache[lane]:
                 question_id = str(item.get("qbId") or "")
                 if question_id and question_id not in already_linked_source_ids:
@@ -764,11 +951,88 @@ class PracticeGenerationOrchestrator:
         deficit_slot_ids = {
             slot.slot_id for slot in blueprint.slots if slot.slot_id not in filled_slot_ids
         }
+        seen_question_ids: set[str] = set()
+        student_history_checked = False
+        if self._config.pattern_reuse_enabled:
+            try:
+                seen_question_ids = self._questions.list_recent_seen_question_bank_ids(
+                    user_id=request.user_id
+                )
+                student_history_checked = True
+            except PracticeRepositoryError:
+                emit_practice_event(
+                    "PATTERN_REUSE_HISTORY_UNAVAILABLE",
+                    test_id=test_id,
+                    status="fallback",
+                    details={"reasonCode": "PRACTICE_HISTORY_READ_FAILED"},
+                    level=logging.WARNING,
+                )
+        pattern_runtime_enabled = (
+            self._config.pattern_context_enabled or self._config.pattern_reuse_enabled
+        )
+        pattern_resolution = PatternSlotResolution()
+        if pattern_runtime_enabled:
+            pattern_resolution = self._resolve_pattern_slots(
+                request=request,
+                slots=tuple(
+                    slot for slot in blueprint.slots if slot.slot_id in deficit_slot_ids
+                ),
+                excluded_question_ids=tuple(sorted(already_linked_source_ids)),
+                seen_question_ids=tuple(sorted(seen_question_ids)),
+                student_history_checked=student_history_checked,
+            )
+        slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+        pattern_reused_count = 0
+        for slot_id, playable in pattern_resolution.reuse_questions_by_slot.items():
+            if slot_id not in deficit_slot_ids:
+                continue
+            slot = slots_by_id[slot_id]
+            bucket = next(
+                value
+                for value in blueprint.buckets
+                if value.subject == slot.subject_id
+                and value.topic == slot.topic_id
+                and value.difficulty is slot.difficulty
+                and value.question_type is slot.question_type
+            )
+            reusable = _pattern_reuse_question(playable)
+            selection = pattern_resolution.selections_by_slot.get(slot_id)
+            trusted_pattern_selection = (
+                selection
+                if selection is not None
+                and selection.tier is PatternMatchTier.REUSE_SAFE
+                else None
+            )
+            if self._questions.link_reused(
+                test_id=test_id,
+                bucket_id=bucket.bucket_id,
+                slot_id=slot_id,
+                question=reusable,
+                trusted_pattern_selection=trusted_pattern_selection,
+            ):
+                filled_slot_ids.add(slot_id)
+                deficit_slot_ids.remove(slot_id)
+                already_linked_source_ids.add(reusable.question_id)
+                pattern_reused_count += 1
+                accepted_ids.append(
+                    deterministic_question_id(
+                        test_id,
+                        source_id=reusable.question_id,
+                        bucket_id=bucket.bucket_id,
+                    )
+                )
+        pattern_context_keys = {
+            slot_id: selection.pattern_id
+            for slot_id, selection in pattern_resolution.selections_by_slot.items()
+            if slot_id in deficit_slot_ids
+            and selection.tier is PatternMatchTier.GUIDANCE_SAFE
+        }
         groups = build_slot_generation_groups(
             blueprint,
             deficit_slot_ids,
             group_size=self._config.generation_group_size,
             group_max=self._config.generation_group_max,
+            pattern_context_keys=pattern_context_keys,
         )
         generation_groups = {
             group.group_id: {
@@ -780,34 +1044,64 @@ class PracticeGenerationOrchestrator:
                 "attempt": 0,
                 "replacementWave": 0,
                 "state": "PENDING",
+                "patternSelections": {
+                    slot_id: pattern_resolution.selections_by_slot[slot_id].model_dump(
+                        by_alias=True
+                    )
+                    for slot_id in group.slot_ids
+                    if slot_id in pattern_resolution.selections_by_slot
+                },
             }
             for group in groups
         }
         slot_ready_counts = {
             slot.slot_id: int(slot.slot_id in filled_slot_ids) for slot in blueprint.slots
         }
+        progress_updates: dict[str, Any] = {
+            **plan_meta,
+            "phase": (
+                InternalPhase.FINALIZING.value
+                if not groups
+                else InternalPhase.GENERATING.value
+            ),
+            "progressPercent": self._progress(
+                len(filled_slot_ids),
+                request.accepted_count,
+            ),
+            "deficits": {slot_id: 1 for slot_id in sorted(deficit_slot_ids)},
+            "slotReadyCounts": slot_ready_counts,
+            "generationGroups": generation_groups,
+            "lastCompletedStage": "SLOT_REUSE_MATCHED",
+        }
         self._progress_updates.update(
             test_id,
-            meta_updates={
-                **plan_meta,
-                "phase": (
-                    InternalPhase.FINALIZING.value
-                    if not groups
-                    else InternalPhase.GENERATING.value
-                ),
-                "progressPercent": self._progress(
-                    len(filled_slot_ids),
-                    request.accepted_count,
-                ),
-                "deficits": {slot_id: 1 for slot_id in sorted(deficit_slot_ids)},
-                "slotReadyCounts": slot_ready_counts,
-                "generationGroups": generation_groups,
-                "lastCompletedStage": "SLOT_REUSE_MATCHED",
-            },
+            meta_updates=progress_updates,
             live=False,
             recalculate_manifest=True,
             authoritative_question_ids=tuple(accepted_ids),
         )
+        emit_practice_event(
+            "EXISTING_MATCH_COMPLETED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "reusedCount": len(filled_slot_ids),
+                "deficitCount": len(deficit_slot_ids),
+            },
+        )
+        if pattern_runtime_enabled:
+            emit_practice_event(
+                "PATTERN_RETRIEVAL_COMPLETED",
+                test_id=test_id,
+                status="completed",
+                details={
+                    "retrievalGroupCount": pattern_resolution.retrieval_group_count,
+                    "vectorQueryCount": pattern_resolution.vector_query_count,
+                    "guidanceSafeCount": len(pattern_resolution.guidance_by_slot),
+                    "ignoredPatternCount": pattern_resolution.ignored_pattern_count,
+                    "reuseSafeCount": pattern_reused_count,
+                },
+            )
         emit_practice_event(
             "DEFICIT_CALCULATED",
             test_id=test_id,
@@ -820,6 +1114,18 @@ class PracticeGenerationOrchestrator:
         )
         if not groups:
             self._finalize(test_id, request, blueprint, attempt=0)
+            return
+        for group in groups:
+            emit_practice_event(
+                "GENERATION_GROUP_CREATED",
+                test_id=test_id,
+                status="created",
+                details={
+                    "groupId": group.group_id,
+                    "bucketId": group.bucket_id,
+                    "requiredCount": group.required_count,
+                },
+            )
 
     def generate_group(self, test_id: str, group_id: str) -> None:
         assessment = self._assessments.get(test_id)
@@ -1039,7 +1345,9 @@ class PracticeGenerationOrchestrator:
                         if replacement and bucket.subject in {"math", "reasoning"}
                         else bucket.verification_policy.value
                     ),
-                    verification_method=("MODEL" if required_verification else "STRUCTURAL"),
+                    verification_method=(
+                        "MODEL" if required_verification else "STRUCTURAL"
+                    ),
                     language=request.language,
                 ):
                     accepted_count += 1
@@ -1314,6 +1622,15 @@ class PracticeGenerationOrchestrator:
                     if item.get("question")
                 )
             )
+            persisted_selections = _pattern_selections_for_slots(
+                persisted.get("patternSelections"),
+                slot_ids,
+            )
+            pattern_resolution = self._resolve_pattern_slots(
+                request=request,
+                slots=slots,
+                persisted_selections=persisted_selections or None,
+            ) if persisted_selections else PatternSlotResolution()
             contexts.append(
                 _SlotGenerationContext(
                     test_id=test_id,
@@ -1328,6 +1645,16 @@ class PracticeGenerationOrchestrator:
                     bucket=bucket,
                     slots=slots,
                     excluded_texts=excluded,
+                    pattern_guidance_by_slot={
+                        slot_id: guidance
+                        for slot_id, guidance in pattern_resolution.guidance_by_slot.items()
+                        if slot_id in slot_ids
+                    },
+                    pattern_selections_by_slot={
+                        slot_id: selection
+                        for slot_id, selection in pattern_resolution.selections_by_slot.items()
+                        if slot_id in slot_ids
+                    },
                 )
             )
             selected_bucket_ids.add(bucket_id)
@@ -1337,7 +1664,11 @@ class PracticeGenerationOrchestrator:
             max_workers=min(2, len(contexts)),
             thread_name_prefix="practice-slot-wave",
         ) as executor:
-            outcomes = list(executor.map(self._execute_slot_group, contexts))
+            futures = [
+                executor.submit(copy_context().run, self._execute_slot_group, context)
+                for context in contexts
+            ]
+            outcomes = [future.result() for future in futures]
         for outcome in outcomes:
             if not self._commit_slot_outcome(outcome):
                 return
@@ -1351,6 +1682,8 @@ class PracticeGenerationOrchestrator:
     ) -> _SlotGenerationOutcome:
         pending = {slot.slot_id: slot for slot in context.slots}
         accepted: dict[str, _VerifiedSlotQuestion] = {}
+        repair_candidates: dict[str, GeneratedQuestion] = {}
+        repair_reasons: dict[str, tuple[str, ...]] = {}
         reasons: list[str] = []
         excluded = set(context.excluded_texts)
         route_id = ""
@@ -1373,6 +1706,28 @@ class PracticeGenerationOrchestrator:
                     "slot_ids": [slot.slot_id for slot in wave_slots],
                 }
             )
+            if replacement_wave == 1:
+                emit_practice_event(
+                    "question_repair_started",
+                    test_id=context.test_id,
+                    status="started",
+                    details={
+                        "groupId": context.group.group_id,
+                        "repairAttempt": 1,
+                        "slotIds": ",".join(slot.slot_id for slot in wave_slots),
+                    },
+                )
+            elif replacement_wave == 2:
+                emit_practice_event(
+                    "question_replacement_started",
+                    test_id=context.test_id,
+                    status="started",
+                    details={
+                        "groupId": context.group.group_id,
+                        "replacementAttempt": 1,
+                        "slotIds": ",".join(slot.slot_id for slot in wave_slots),
+                    },
+                )
             emit_practice_event(
                 "GENERATION_GROUP_STARTED",
                 test_id=context.test_id,
@@ -1401,7 +1756,14 @@ class PracticeGenerationOrchestrator:
                         slots=wave_slots,
                         exclude_normalized_texts=tuple(sorted(excluded)),
                         repair_feedback=tuple(reasons[-8:]),
+                        repair_candidates_by_slot=repair_candidates,
+                        repair_reason_codes_by_slot=repair_reasons,
                         replacement_wave=replacement_wave,
+                        pattern_guidance_by_slot={
+                            slot.slot_id: context.pattern_guidance_by_slot[slot.slot_id]
+                            for slot in wave_slots
+                            if slot.slot_id in context.pattern_guidance_by_slot
+                        },
                     )
                 route_id = batch.route_id
                 model = batch.model
@@ -1481,6 +1843,12 @@ class PracticeGenerationOrchestrator:
                     },
                 )
             reasons.extend(parsed.rejection_reason_codes)
+            if parsed.rejection_reason_codes:
+                for slot in wave_slots:
+                    repair_reasons.setdefault(
+                        slot.slot_id,
+                        tuple(parsed.rejection_reason_codes[:4]),
+                    )
             for question in parsed.accepted:
                 slot = pending.get(str(question.slot_id or ""))
                 if slot is None:
@@ -1571,6 +1939,28 @@ class PracticeGenerationOrchestrator:
                     )
                     excluded.add(normalize_question_text(question.question))
                     pending.pop(slot.slot_id, None)
+                    if replacement_wave == 1:
+                        emit_practice_event(
+                            "question_repair_completed",
+                            test_id=context.test_id,
+                            status="completed",
+                            details={
+                                "groupId": context.group.group_id,
+                                "repairAttempt": 1,
+                                "slotId": slot.slot_id,
+                            },
+                        )
+                    elif replacement_wave == 2:
+                        emit_practice_event(
+                            "question_replacement_completed",
+                            test_id=context.test_id,
+                            status="completed",
+                            details={
+                                "groupId": context.group.group_id,
+                                "replacementAttempt": 1,
+                                "slotId": slot.slot_id,
+                            },
+                        )
                     emit_practice_event(
                         "QUESTION_VERIFICATION_RESULT",
                         test_id=context.test_id,
@@ -1584,6 +1974,11 @@ class PracticeGenerationOrchestrator:
                     )
                     continue
                 reasons.extend(verification.reason_codes)
+                repair_candidates[slot.slot_id] = question
+                repair_reasons[slot.slot_id] = tuple(
+                    verification.reason_codes[:4]
+                    or ["VERIFIER_REJECTED"]
+                )
                 emit_practice_event(
                     "QUESTION_VERIFICATION_RESULT",
                     test_id=context.test_id,
@@ -1607,6 +2002,29 @@ class PracticeGenerationOrchestrator:
             if provider_failure_stage is not None:
                 break
             if pending and not terminal:
+                if force_regeneration:
+                    excluded.update(
+                        normalize_question_text(repair_candidates[slot_id].question)
+                        for slot_id in pending
+                        if slot_id in repair_candidates
+                    )
+                if replacement_wave == 1:
+                    excluded.update(
+                        normalize_question_text(repair_candidates[slot_id].question)
+                        for slot_id in pending
+                        if slot_id in repair_candidates
+                    )
+                    emit_practice_event(
+                        "question_repair_failed",
+                        test_id=context.test_id,
+                        status="failed",
+                        details={
+                            "groupId": context.group.group_id,
+                            "repairAttempt": 1,
+                            "reasonCode": reasons[-1] if reasons else "REPAIR_REJECTED",
+                            "slotIds": ",".join(pending),
+                        },
+                    )
                 replacement_wave = 2 if force_regeneration else replacement_wave + 1
         emit_practice_event(
             "practice_validation_completed",
@@ -1660,6 +2078,32 @@ class PracticeGenerationOrchestrator:
         for verified in outcome.accepted:
             if verified.slot.slot_id in existing_slot_ids:
                 continue
+            source_question_bank_id: str | None = None
+            selection = outcome.context.pattern_selections_by_slot.get(
+                verified.slot.slot_id
+            )
+            if self._config.pattern_reuse_enabled and selection is not None:
+                try:
+                    source_question_bank_id = (
+                        self._questions.persist_verified_pattern_question(
+                            question=verified.question,
+                            slot=verified.slot,
+                            pattern_id=selection.pattern_id,
+                            pattern_version_hash=selection.pattern_version_hash,
+                            language=outcome.context.request.language,
+                        )
+                    )
+                except PracticeRepositoryError:
+                    emit_practice_event(
+                        "PATTERN_QUESTION_BANK_LINK_FAILED",
+                        test_id=test_id,
+                        status="failed",
+                        details={
+                            "slotId": verified.slot.slot_id,
+                            "reasonCode": "QUESTION_BANK_PATTERN_LINK_FAILED",
+                        },
+                        level=logging.WARNING,
+                    )
             linked = self._questions.link_generated(
                 test_id=test_id,
                 question=verified.question,
@@ -1670,6 +2114,8 @@ class PracticeGenerationOrchestrator:
                 verification_policy="MANDATORY",
                 verification_method="INDEPENDENT_MODEL_V2",
                 language=outcome.context.request.language,
+                source_question_bank_id=source_question_bank_id,
+                pattern_selection=selection,
             )
             if linked:
                 existing_slot_ids.add(verified.slot.slot_id)
@@ -1960,8 +2406,99 @@ class PracticeGenerationOrchestrator:
                 "final_manifest_validation_failed",
                 test_id=test_id,
                 status="failed",
-                details={"reasonCode": validation.reason_code},
+                details={
+                    "reasonCode": validation.reason_code,
+                    "failedSlotIds": ",".join(validation.failed_slot_ids),
+                    "expectedQuestionCount": validation.expected_question_count,
+                    "actualQuestionCount": validation.actual_question_count,
+                    "recoverable": validation.recoverable,
+                },
             )
+            if (
+                attempt == 0
+                and validation.recoverable
+                and validation.reason_code == "BLUEPRINT_DISTRIBUTION_MISMATCH"
+                and validation.failed_slot_ids
+            ):
+                slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+                assignments: dict[str, tuple[str, str]] = {}
+                linked_by_slot: dict[str, dict[str, object]] = {}
+                for item in linked:
+                    practice_meta = item.get("_practiceMeta")
+                    if isinstance(practice_meta, dict):
+                        linked_by_slot[str(practice_meta.get("slotId") or "")] = item
+                for slot_id in validation.failed_slot_ids:
+                    slot = slots_by_id.get(slot_id)
+                    item = linked_by_slot.get(slot_id)
+                    question_id = str(item.get("questionId") or "") if item else ""
+                    if slot is None or not question_id:
+                        self._mark_failed(test_id, validation.reason_code)
+                        return
+                    assignments[question_id] = (
+                        slot_id,
+                        bucket_for_slot(blueprint, slot).bucket_id,
+                    )
+                emit_practice_event(
+                    "manifest_recovery_started",
+                    test_id=test_id,
+                    status="started",
+                    details={
+                        "reasonCode": validation.reason_code,
+                        "repairAttempt": 1,
+                        "failedSlotIds": ",".join(validation.failed_slot_ids),
+                    },
+                )
+                try:
+                    repaired_count = self._questions.repair_bucket_assignments(
+                        test_id,
+                        assignments,
+                    )
+                except PracticeRepositoryError as exc:
+                    emit_practice_event(
+                        "manifest_recovery_failed",
+                        test_id=test_id,
+                        status="failed",
+                        details={
+                            "reasonCode": exc.code,
+                            "repairAttempt": 1,
+                            "failedSlotIds": ",".join(validation.failed_slot_ids),
+                        },
+                        level=logging.ERROR,
+                    )
+                    self._mark_failed(test_id, exc.code)
+                    return
+                if repaired_count != len(assignments):
+                    self._mark_failed(test_id, "MANIFEST_RECOVERY_INCOMPLETE")
+                    return
+                retry_recorded = self._progress_updates.record_finalization_retry(
+                    test_id,
+                    next_attempt=1,
+                    reason_code="MANIFEST_BUCKET_ASSIGNMENTS_REPAIRED",
+                )
+                if retry_recorded:
+                    emit_practice_event(
+                        "manifest_recovery_completed",
+                        test_id=test_id,
+                        status="completed",
+                        details={
+                            "reasonCode": "MANIFEST_BUCKET_ASSIGNMENTS_REPAIRED",
+                            "repairAttempt": 1,
+                            "repairedSlotCount": repaired_count,
+                        },
+                    )
+                return
+            if attempt > 0 and validation.recoverable:
+                emit_practice_event(
+                    "manifest_recovery_failed",
+                    test_id=test_id,
+                    status="failed",
+                    details={
+                        "reasonCode": validation.reason_code,
+                        "repairAttempt": 1,
+                        "failedSlotIds": ",".join(validation.failed_slot_ids),
+                    },
+                    level=logging.ERROR,
+                )
             self._mark_failed(test_id, validation.reason_code)
             return
         try:

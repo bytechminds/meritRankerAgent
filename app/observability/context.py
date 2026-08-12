@@ -8,7 +8,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from services.llm.billing import OperationUsageAccumulator
 
 RequestType = Literal["standalone", "follow_up", "image", "pending", "unknown"]
 
@@ -36,6 +39,9 @@ class ExecutionContext:
     activity_id: str | None = None
     batch_id: str | None = None
     slot_ids: tuple[str, ...] = ()
+    operation_id: str | None = None
+    feature: str | None = None
+    operation_accumulator: OperationUsageAccumulator | None = None
 
 
 _execution_context: ContextVar[ExecutionContext | None] = ContextVar(
@@ -157,15 +163,46 @@ def bind_execution_context(
     activity_id: str | None = None,
     batch_id: str | None = None,
     slot_ids: tuple[str, ...] = (),
+    operation_id: str | None = None,
+    feature: str | None = None,
+    operation_accumulator: OperationUsageAccumulator | None = None,
 ) -> Iterator[ExecutionContext]:
     """Bind server-issued operation identifiers without user content."""
+    parent = _execution_context.get() or ExecutionContext()
     context = ExecutionContext(
-        activity_id=safe_identifier(activity_id),
-        batch_id=safe_identifier(batch_id),
-        slot_ids=tuple(
-            safe_slot_id
-            for value in slot_ids[:100]
-            if (safe_slot_id := safe_identifier(value)) is not None
+        activity_id=(
+            safe_identifier(activity_id)
+            if activity_id is not None
+            else parent.activity_id
+        ),
+        batch_id=(
+            safe_identifier(batch_id)
+            if batch_id is not None
+            else parent.batch_id
+        ),
+        slot_ids=(
+            tuple(
+                safe_slot_id
+                for value in slot_ids[:100]
+                if (safe_slot_id := safe_identifier(value)) is not None
+            )
+            if slot_ids
+            else parent.slot_ids
+        ),
+        operation_id=(
+            safe_identifier(operation_id)
+            if operation_id is not None
+            else parent.operation_id
+        ),
+        feature=(
+            safe_identifier(feature)
+            if feature is not None
+            else parent.feature
+        ),
+        operation_accumulator=(
+            operation_accumulator
+            if operation_accumulator is not None
+            else parent.operation_accumulator
         ),
     )
     token = _execution_context.set(context)

@@ -16,10 +16,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from config import get_settings
+from config import Settings, get_settings
 from observability import log_event
 from retrieval.context.data_context_builder import render_retrieval_context
-from retrieval.models import StudentRetrievalContext
+from retrieval.models import RetrievalTrace, StudentRetrievalContext
+from retrieval.pattern_intelligence import (
+    PatternMatchTier,
+    PatternRuntimeRequest,
+    PatternRuntimeService,
+)
 from retrieval.retrieval_service import StudentRetrievalService
 from services.context_retrieval.bedrock_kb_retriever import BedrockKnowledgeBaseRetriever
 from services.context_retrieval.context_models import (
@@ -36,6 +41,7 @@ from services.context_retrieval.web_search_decision import (
     should_attempt_web_fallback,
     should_skip_kb_for_direct_web,
 )
+from services.pattern_intelligence_runtime import build_pattern_intelligence_runtime
 from services.solution_brief.metadata_helpers import (
     humanize_token,
     normalize_metadata_key,
@@ -677,11 +683,15 @@ class ContextRetrievalService:
         web_search_tool: WebSearchTool | None = None,
         brief_builder: SolutionBriefBuilder | None = None,
         student_retrieval_service: StudentRetrievalService | None = None,
+        pattern_runtime: PatternRuntimeService | None = None,
+        pattern_runtime_factory: Callable[[], PatternRuntimeService | None] | None = None,
     ) -> None:
         self._kb_retriever = kb_retriever or BedrockKnowledgeBaseRetriever()
         self._web_search_tool = web_search_tool or WebSearchTool()
         self._brief_builder = brief_builder or SolutionBriefBuilder()
         self._student_retrieval_service = student_retrieval_service or StudentRetrievalService()
+        self._pattern_runtime = pattern_runtime
+        self._pattern_runtime_factory = pattern_runtime_factory
 
     def retrieve_context(
         self,
@@ -753,7 +763,19 @@ class ContextRetrievalService:
         self,
         request: ContextRetrievalRequest,
     ) -> ContextRetrievalResult:
-        """Use S3 Vectors as the only student PatternGraph retrieval provider."""
+        """Use the feature-gated canonical runtime or preserve legacy retrieval."""
+        settings = get_settings()
+        if settings.pattern_intelligence_enabled:
+            return self._retrieve_pattern_intelligence_context(request, settings=settings)
+        return self._retrieve_legacy_s3_vector_context(request)
+
+    def _retrieve_legacy_s3_vector_context(
+        self,
+        request: ContextRetrievalRequest,
+        *,
+        pattern_fallback_reason: str | None = None,
+    ) -> ContextRetrievalResult:
+        """Preserve the existing S3 doubt path when optional guidance is unavailable."""
         retrieval_context = self._student_retrieval_service.retrieve(request)
         context_text = render_retrieval_context(retrieval_context)
         retrieval_used = retrieval_context.mode != "fresh_solve"
@@ -761,8 +783,93 @@ class ContextRetrievalService:
             context_text=context_text,
             item_count=1 if retrieval_used else 0,
             retrieval_used=retrieval_used,
-            reason=retrieval_context.retrieval_trace.fallback_reason or retrieval_context.mode,
+            reason=(
+                pattern_fallback_reason
+                or retrieval_context.retrieval_trace.fallback_reason
+                or retrieval_context.mode
+            ),
             retrieval_context=retrieval_context,
+        )
+
+    def _retrieve_pattern_intelligence_context(
+        self,
+        request: ContextRetrievalRequest,
+        *,
+        settings: Settings,
+    ) -> ContextRetrievalResult:
+        """Resolve compact answer-redacted doubt context with legacy failover."""
+        runtime = self._pattern_runtime
+        if runtime is None:
+            if self._pattern_runtime_factory is not None:
+                runtime = self._pattern_runtime_factory()
+            else:
+                runtime = build_pattern_intelligence_runtime(
+                    settings=settings,
+                    include_linked_question_references=(
+                        settings.pattern_intelligence_max_references > 0
+                    ),
+                )
+        if runtime is None:
+            return self._retrieve_legacy_s3_vector_context(
+                request,
+                pattern_fallback_reason="pattern_intelligence_unavailable",
+            )
+
+        try:
+            result = runtime.resolve_doubt(
+                PatternRuntimeRequest(
+                    requestId=request.request_id,
+                    query=request.query,
+                    subject=request.subject,
+                    topic=request.topic,
+                    difficulty=_pattern_intelligence_difficulty(request.difficulty),
+                    examIds=(request.exam,) if request.exam else (),
+                    patternFamilyId=request.pattern_family_candidate,
+                    candidateLimit=min(settings.pattern_intelligence_max_candidates, 24),
+                    maxLinkedQuestions=max(
+                        0,
+                        min(settings.pattern_intelligence_max_references, 2),
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "pattern_intelligence_retrieval_failed request_id=%s error_type=%s",
+                request.request_id,
+                type(exc).__name__,
+            )
+            return self._retrieve_legacy_s3_vector_context(
+                request,
+                pattern_fallback_reason="pattern_intelligence_unavailable",
+            )
+
+        if result.tier is not PatternMatchTier.GUIDANCE_SAFE or result.doubt_context is None:
+            fallback_reason = result.warnings[0] if result.warnings else "no_compatible_pattern"
+            return self._retrieve_legacy_s3_vector_context(
+                request,
+                pattern_fallback_reason=fallback_reason,
+            )
+
+        retrieval_context = StudentRetrievalContext(
+            mode="pattern_assist",
+            selectedPatternId=result.selected_pattern_id,
+            subject=request.subject,
+            topic=request.topic,
+            pattern_graph_only=True,
+            retrieval_trace=RetrievalTrace(
+                patternCandidatesCount=len(result.decisions),
+                rerankUsed=result.rerank_used,
+                graphGatePassed=True,
+            ),
+            warnings=list(result.warnings),
+        )
+        return ContextRetrievalResult(
+            context_text="",
+            item_count=1,
+            retrieval_used=True,
+            reason="pattern_guidance_selected",
+            retrieval_context=retrieval_context,
+            doubt_pattern_context=result.doubt_context,
         )
 
     def _retrieve_direct_web_context(
@@ -1797,6 +1904,15 @@ class ContextRetrievalService:
             web_items=[],
             max_chars=decision.max_context_chars,
         )
+
+
+def _pattern_intelligence_difficulty(difficulty: str) -> str | None:
+    """Pass only source-native numeric complexity; bands have no verified mapping."""
+    normalized = difficulty.strip()
+    if not normalized.isdecimal():
+        return None
+    numeric = int(normalized)
+    return normalized if 1 <= numeric <= 10 else None
 
 
 def get_context_retrieval_service() -> ContextRetrievalService:

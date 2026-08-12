@@ -95,6 +95,11 @@ class Assessments:
                 "readyCount": 0,
                 "progressPercent": 0,
                 "generationGroups": {},
+                "practiceRequest": {
+                    "requestId": value.request_id,
+                    "conversationId": value.conversation_id,
+                    "turnId": value.turn_id,
+                },
             },
         }
         return self.item, False
@@ -339,6 +344,7 @@ def test_background_failure_emits_safe_exception_class(
     assert failure == {
         "reasonCode": "PRACTICE_GENERATION_FAILED",
         "errorClass": "RuntimeError",
+        "requestId": "request-1",
     }
 
 
@@ -376,8 +382,57 @@ def test_background_repository_failure_preserves_only_its_safe_reason_code(
     assert failure == {
         "reasonCode": "PRACTICE_PROGRESS_GRAPHQL_REJECTED",
         "errorClass": "PracticeRepositoryError",
+        "requestId": "request-1",
     }
     assert assessments.failed_code == "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+
+
+def test_background_repository_failure_emits_safe_operation_and_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    assessments = Assessments(events)
+    tracker = Tracker(events)
+    emitted: list[tuple[str, dict | None]] = []
+    monkeypatch.setattr(
+        agentcore_async,
+        "emit_practice_event",
+        lambda event_name, **kwargs: emitted.append((event_name, kwargs.get("details"))),
+    )
+
+    class RepositoryFailingGraph:
+        def process(self, _command) -> None:
+            try:
+                raise RuntimeError("transport detail must not be emitted")
+            except RuntimeError as exc:
+                raise agentcore_async.PracticeRepositoryError(
+                    "PRACTICE_PROGRESS_UNKNOWN_META_FIELD",
+                    operation="appsync.updatePracticeGenerationProgress",
+                    logical_table="MockTestQuiz",
+                    fallback_decision="fatal_progress_publication_failure",
+                ) from exc
+
+    launcher = AgentCorePracticeAsyncLauncher(
+        task_tracker=tracker,
+        assessments=assessments,
+        progress=assessments,
+        graph_runner=RepositoryFailingGraph(),
+        executor=ImmediateExecutor(),
+    )
+
+    launch = launcher.launch(request("f6804a1f"))
+    launcher.start(launch.test_id)
+
+    failure = next(details for name, details in emitted if name == "practice_async_task_failed")
+    assert failure == {
+        "reasonCode": "PRACTICE_PROGRESS_UNKNOWN_META_FIELD",
+        "errorClass": "PracticeRepositoryError",
+        "requestId": "f6804a1f",
+        "repositoryOperation": "appsync.updatePracticeGenerationProgress",
+        "logicalTable": "MockTestQuiz",
+        "fallbackDecision": "fatal_progress_publication_failure",
+        "causeClass": "RuntimeError",
+    }
 
 
 def test_non_terminal_background_outcome_fails_closed_before_completion() -> None:

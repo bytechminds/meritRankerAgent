@@ -9,6 +9,7 @@ Regenerate fresh questions for the remaining immutable planner-slot deficits aft
 - Do not reuse prior wording, values, distractors, or answer patterns from excluded snippets.
 - Do not weaken difficulty or change the planner design.
 - This is the final bounded replacement wave; return no commentary or partial placeholders.
+- Pattern guidance is method-only: preserve its target, operation sequence, constraints, and `not_same_when` limits when supplied, while using new wording, entities, values/data, scenario, and option construction. Never copy a source answer, solution, or instance.
 
 # Required JSON shape
 

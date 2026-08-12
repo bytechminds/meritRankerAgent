@@ -24,6 +24,7 @@ from features.practice_generation.schemas import (
     QuestionType,
     VerificationPolicy,
 )
+from services.llm.orchestration.errors import ProviderExecutionError
 
 _GENERATION_TARGET = (
     r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|practice\s+(?:set|test)|"
@@ -152,6 +153,20 @@ class PlannerProvider(Protocol):
 class BlueprintPlanningError(RuntimeError):
     """Raised when complex planning cannot be repaired safely."""
 
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        diagnostics: tuple[PlannerValidationDiagnostic, ...] = (),
+        fallback_invoked: bool = False,
+        fallback_result: str | None = None,
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.diagnostics = diagnostics
+        self.fallback_invoked = fallback_invoked
+        self.fallback_result = fallback_result
+
 
 def decide_practice_launch(
     query: str,
@@ -221,6 +236,22 @@ class BlueprintPlanResult:
     validation_reason_code: str | None = None
     validation_actual_slot_count: int | None = None
     validation_duration_ms: int | None = None
+    validation_diagnostics: tuple[PlannerValidationDiagnostic, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlannerValidationDiagnostic:
+    """Safe validation metadata retained across bounded planner recovery."""
+
+    attempt: int
+    phase: str
+    schema_name: str
+    error_count: int
+    field_paths: tuple[str, ...]
+    error_types: tuple[str, ...]
+    reason_code: str
+    actual_slot_count: int | None = None
+    duration_ms: int | None = None
 
 
 def _planner_validation_reason(
@@ -244,6 +275,10 @@ def _planner_validation_reason(
         return "PLANNER_SLOT_COUNT_MISMATCH", actual_slot_count
     if "slot ids must be unique" in message or "slot id" in message and "duplicate" in message:
         return "PLANNER_DUPLICATE_SLOT", actual_slot_count
+    if "topic coverage" in message or "topic_coverage" in message:
+        return "PLANNER_TOPIC_COVERAGE_INVALID", actual_slot_count
+    if "canonical identifiers" in message:
+        return "PLANNER_SLOT_IDENTIFIER_INVALID", actual_slot_count
     if "difficulty" in message:
         return "PLANNER_INVALID_DIFFICULTY", actual_slot_count
     if "category" in message:
@@ -251,6 +286,64 @@ def _planner_validation_reason(
     if "accepted" in message or "required_count" in message:
         return "PLANNER_INVALID_TOTAL", actual_slot_count
     return "PLANNER_SCHEMA_INVALID", actual_slot_count
+
+
+def _planner_validation_diagnostic(
+    error: Exception,
+    *,
+    raw: str,
+    attempt: int,
+    phase: str,
+    duration_ms: int,
+) -> PlannerValidationDiagnostic:
+    """Extract allowlisted validation metadata without retaining model content."""
+    reason_code, actual_slot_count = _planner_validation_reason(error, raw=raw)
+    schema_name = "PracticeBlueprint"
+    field_paths: tuple[str, ...] = ()
+    error_types: tuple[str, ...] = ()
+    error_count = 1
+    if isinstance(error, ValidationError):
+        errors = error.errors(include_url=False)
+        error_count = len(errors)
+        field_paths = tuple(
+            sorted(
+                {
+                    ".".join(str(part) for part in item.get("loc", ())) or "$"
+                    for item in errors
+                }
+            )
+        )
+        error_types = tuple(
+            sorted({str(item.get("type") or "validation_error") for item in errors})
+        )
+    elif isinstance(error, json.JSONDecodeError):
+        schema_name = "PlannerResponse"
+        field_paths = ("$",)
+        error_types = ("json_invalid",)
+    elif isinstance(error, (TypeError, ValueError)):
+        field_paths = ("$",)
+        error_types = (type(error).__name__,)
+    return PlannerValidationDiagnostic(
+        attempt=attempt,
+        phase=phase,
+        schema_name=schema_name,
+        error_count=error_count,
+        field_paths=field_paths,
+        error_types=error_types,
+        reason_code=reason_code,
+        actual_slot_count=actual_slot_count,
+        duration_ms=duration_ms,
+    )
+
+
+def _planner_repair_feedback(diagnostic: PlannerValidationDiagnostic) -> str:
+    """Provide bounded, non-sensitive correction data to the sole repair attempt."""
+    fields = ",".join(diagnostic.field_paths) or "$"
+    error_types = ",".join(diagnostic.error_types) or "validation_error"
+    return (
+        f"reason={diagnostic.reason_code};fields={fields};"
+        f"types={error_types};schema={diagnostic.schema_name}"
+    )
 
 
 def _deterministic_slot_difficulties(
@@ -424,6 +517,35 @@ def _slot_complexity(difficulty: Difficulty) -> Complexity:
     }[difficulty]
 
 
+_FALLBACK_TOPIC_SEPARATOR = re.compile(r"\s*(?:,|;|\||\+|/)\s*")
+_FALLBACK_IDENTIFIER_INVALID = re.compile(r"[^a-z0-9]+")
+
+
+def _canonical_fallback_topic(value: str) -> str:
+    normalized = _FALLBACK_IDENTIFIER_INVALID.sub(
+        "_",
+        value.casefold().replace("&", " and "),
+    ).strip("_")
+    if not normalized:
+        raise ValueError("PRACTICE_FALLBACK_TOPIC_INVALID")
+    return normalized
+
+
+def _requested_topic_ids(request: PracticeGenerationRequest) -> tuple[str, ...]:
+    raw_topic = (request.topic or request.subject).strip()
+    values = _FALLBACK_TOPIC_SEPARATOR.split(raw_topic)
+    topics = tuple(
+        dict.fromkeys(
+            _canonical_fallback_topic(value)
+            for value in values
+            if value.strip()
+        )
+    )
+    if not topics:
+        raise ValueError("PRACTICE_FALLBACK_TOPIC_INVALID")
+    return topics
+
+
 def _verification_policy(
     subject: str,
     difficulty: Difficulty,
@@ -466,6 +588,10 @@ def apply_system_bucket_policy(
             else None
         )
         requested_subject = request.subject.casefold().replace("-", "_").replace(" ", "_")
+        requested_topics = set(_requested_topic_ids(request))
+        planned_topics = {slot.topic_id for slot in blueprint.slots}
+        if not requested_topics.issubset(planned_topics):
+            raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
         for slot in blueprint.slots:
             if slot.question_type is not QuestionType.MCQ:
                 raise ValueError("PLAYER_UNSUPPORTED_QUESTION_TYPE")
@@ -505,7 +631,7 @@ def apply_system_bucket_policy(
 def deterministic_blueprint(
     request: PracticeGenerationRequest,
 ) -> PracticeBlueprint:
-    topic = (request.topic or request.subject).strip().casefold().replace(" ", "_")
+    topics = _requested_topic_ids(request)
     question_type = QuestionType.MCQ
     exam_ids = (
         [request.exam_id.strip().upper().replace("-", "_").replace(" ", "_")]
@@ -522,13 +648,13 @@ def deterministic_blueprint(
             PlannerSlot(
                 slot_id=f"slot-{index:03d}",
                 subject_id=request.subject,
-                topic_id=topic,
-                category_id=topic,
+                topic_id=topics[(index - 1) % len(topics)],
+                category_id=topics[(index - 1) % len(topics)],
                 difficulty=slot_difficulties[index - 1],
                 complexity=_slot_complexity(slot_difficulties[index - 1]),
                 exam_ids=exam_ids,
                 question_type=question_type,
-                target_skill=f"solve_{topic}",
+                target_skill=f"solve_{topics[(index - 1) % len(topics)]}",
                 variation_hint=f"variant_{index:03d}",
                 generator_route_hint=_generator_route_hint(
                     request.subject,
@@ -561,22 +687,67 @@ class BlueprintManager:
         self._planner = planner
         self._repair_limit = min(max(repair_limit, 0), 1)
 
+    @staticmethod
+    def _deterministic_result(
+        request: PracticeGenerationRequest,
+        *,
+        planner_calls: int,
+        repaired: bool,
+        deterministic_fallback: bool,
+        tier: str,
+        diagnostics: tuple[PlannerValidationDiagnostic, ...],
+    ) -> BlueprintPlanResult:
+        try:
+            blueprint = deterministic_blueprint(request)
+        except (TypeError, ValueError, ValidationError) as exc:
+            diagnostic = _planner_validation_diagnostic(
+                exc,
+                raw="",
+                attempt=planner_calls,
+                phase="fallback",
+                duration_ms=0,
+            )
+            raise BlueprintPlanningError(
+                "PRACTICE_PLANNER_FALLBACK_INVALID",
+                diagnostics=(*diagnostics, diagnostic),
+                fallback_invoked=True,
+                fallback_result="invalid",
+            ) from exc
+        first_diagnostic = diagnostics[0] if diagnostics else None
+        return BlueprintPlanResult(
+            blueprint=blueprint,
+            planner_calls=planner_calls,
+            repaired=repaired,
+            deterministic_fallback=deterministic_fallback,
+            tier=tier,
+            validation_reason_code=(
+                first_diagnostic.reason_code if first_diagnostic is not None else None
+            ),
+            validation_actual_slot_count=(
+                first_diagnostic.actual_slot_count if first_diagnostic is not None else None
+            ),
+            validation_duration_ms=(
+                first_diagnostic.duration_ms if first_diagnostic is not None else None
+            ),
+            validation_diagnostics=diagnostics,
+        )
+
     def build(self, request: PracticeGenerationRequest) -> BlueprintPlanResult:
         tier = planner_tier(request)
         if request.accepted_count <= 2:
-            return BlueprintPlanResult(
-                blueprint=deterministic_blueprint(request),
+            result = self._deterministic_result(
+                request,
                 planner_calls=0,
                 repaired=False,
                 deterministic_fallback=False,
                 tier=tier,
+                diagnostics=(),
             )
+            return result
 
         calls = 0
         feedback: str | None = None
-        validation_reason_code: str | None = None
-        validation_actual_slot_count: int | None = None
-        validation_duration_ms: int | None = None
+        diagnostics: list[PlannerValidationDiagnostic] = []
         for attempt in range(self._repair_limit + 1):
             calls += 1
             started_at = time.monotonic()
@@ -593,46 +764,58 @@ class BlueprintManager:
                     repaired=attempt > 0,
                     deterministic_fallback=False,
                     tier=tier,
-                    validation_reason_code=validation_reason_code,
-                    validation_actual_slot_count=validation_actual_slot_count,
-                    validation_duration_ms=validation_duration_ms,
+                    validation_reason_code=(
+                        diagnostics[0].reason_code if diagnostics else None
+                    ),
+                    validation_actual_slot_count=(
+                        diagnostics[0].actual_slot_count if diagnostics else None
+                    ),
+                    validation_duration_ms=(
+                        diagnostics[0].duration_ms if diagnostics else None
+                    ),
+                    validation_diagnostics=tuple(diagnostics),
                 )
             except (ValueError, TypeError, json.JSONDecodeError, ValidationError) as exc:
-                reason_code, actual_slot_count = _planner_validation_reason(exc, raw=raw)
-                if validation_reason_code is None:
-                    validation_reason_code = reason_code
-                    validation_actual_slot_count = actual_slot_count
-                    validation_duration_ms = int((time.monotonic() - started_at) * 1000)
-                feedback = reason_code
-            except Exception as exc:  # provider boundary already owns retries/fallbacks
+                diagnostic = _planner_validation_diagnostic(
+                    exc,
+                    raw=raw,
+                    attempt=calls,
+                    phase="initial" if attempt == 0 else "repair",
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
+                diagnostics.append(diagnostic)
+                feedback = _planner_repair_feedback(diagnostic)
+            except ProviderExecutionError as exc:  # provider boundary owns retries/fallbacks
                 if request.practice_type in {
                     PracticeType.SECTIONAL_TEST,
                     PracticeType.FULL_MOCK,
                 }:
-                    raise BlueprintPlanningError("BLUEPRINT_PROVIDER_UNAVAILABLE") from exc
-                return BlueprintPlanResult(
-                    blueprint=deterministic_blueprint(request),
+                    raise BlueprintPlanningError(
+                        "PRACTICE_PLANNER_PROVIDER_UNAVAILABLE",
+                        diagnostics=tuple(diagnostics),
+                    ) from exc
+                return self._deterministic_result(
+                    request,
                     planner_calls=calls,
                     repaired=False,
                     deterministic_fallback=True,
                     tier=tier,
-                    validation_reason_code=validation_reason_code,
-                    validation_actual_slot_count=validation_actual_slot_count,
-                    validation_duration_ms=validation_duration_ms,
+                    diagnostics=tuple(diagnostics),
                 )
 
         if request.practice_type in {
             PracticeType.SECTIONAL_TEST,
             PracticeType.FULL_MOCK,
         }:
-            raise BlueprintPlanningError("BLUEPRINT_INVALID_AFTER_REPAIR")
-        return BlueprintPlanResult(
-            blueprint=deterministic_blueprint(request),
+            raise BlueprintPlanningError(
+                "PRACTICE_PLANNER_REPAIR_FAILED",
+                diagnostics=tuple(diagnostics),
+            )
+        return self._deterministic_result(
+            request,
             planner_calls=calls,
             repaired=self._repair_limit == 1,
             deterministic_fallback=True,
             tier=tier,
-            validation_reason_code=validation_reason_code,
-            validation_actual_slot_count=validation_actual_slot_count,
-            validation_duration_ms=validation_duration_ms,
+            diagnostics=tuple(diagnostics),
         )

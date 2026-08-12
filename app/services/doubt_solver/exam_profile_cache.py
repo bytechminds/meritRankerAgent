@@ -334,6 +334,7 @@ def _project(profile: ExamProfile, *, subject: str | None, full_mock: bool) -> A
         MappingProxyType(
             {
                 "sectionId": section.section_id,
+                "name": section.name,
                 "subject": section.subject,
                 "level": section.level,
                 "questionStyles": section.question_styles,

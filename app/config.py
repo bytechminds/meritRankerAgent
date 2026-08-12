@@ -71,6 +71,7 @@ class Settings:
     s3_vector_bucket_name: str
     s3_vector_runtime_index_name: str
     s3_vector_pattern_index_name: str
+    s3_vector_pattern_index_arn: str
     s3_vector_region: str
     s3_vector_top_k_runtime: int
     s3_vector_top_k_pattern: int
@@ -81,6 +82,12 @@ class Settings:
     colbert_model_name: str
     retrieval_cache_ttl_seconds: int
     retrieval_max_latency_ms: int
+    # Canonical Pattern Intelligence runtime (disabled until live contracts are verified)
+    pattern_intelligence_enabled: bool
+    pattern_intelligence_reuse_enabled: bool
+    pattern_intelligence_max_candidates: int
+    pattern_intelligence_max_references: int
+    pattern_intelligence_prompt_max_input_tokens: int
     dynamodb_pattern_pk: str
     # Query embedding contract for S3 Vector retrieval
     bedrock_embedding_provider: str
@@ -92,6 +99,12 @@ class Settings:
     enable_dynamodb_fetch: bool
     dynamodb_question_table: str
     dynamodb_pattern_table: str
+    dynamodb_pattern_question_table: str
+    dynamodb_pattern_question_by_pattern_index: str
+    dynamodb_question_bank_table: str
+    dynamodb_question_bank_pattern_index: str
+    dynamodb_practice_attempt_table: str
+    dynamodb_practice_attempt_user_index: str
     dynamodb_default_index: str  # empty string means "no default index"
     dynamodb_region: str  # empty string means "use AWS_REGION or boto3 default"
     # Context builder
@@ -246,6 +259,36 @@ def _parse_domain_list(value: str) -> list[str]:
     return [part.strip() for part in stripped.split(",") if part.strip()]
 
 
+def _pattern_intelligence_limit_from_env(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    enabled: bool,
+) -> int:
+    """Read a bounded Pattern Intelligence limit when the feature is enabled.
+
+    The feature is disabled by default, so inactive deployment configuration must
+    not prevent the existing runtime from starting.  Once enabled, invalid limits
+    fail closed at startup instead of allowing an unbounded retrieval or prompt.
+    """
+    if not enabled:
+        return default
+
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer.") from exc
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(
+            f"{name} must be between {minimum} and {maximum} when "
+            "PATTERN_INTELLIGENCE_ENABLED=true."
+        )
+    return value
+
+
 def _classifier_confidence_threshold_from_env() -> float:
     """Primary classifier threshold for strong-model escalation."""
     primary = os.getenv("DOUBT_SOLVER_CLASSIFIER_CONFIDENCE_THRESHOLD", "").strip()
@@ -291,6 +334,39 @@ def get_settings() -> Settings:
                 )
             if os.getenv("S3_VECTOR_DISTANCE_METRIC", "cosine").strip().lower() != "cosine":
                 raise ConfigurationError("S3_VECTOR_DISTANCE_METRIC must be 'cosine'.")
+
+        pattern_intelligence_enabled = (
+            os.getenv("PATTERN_INTELLIGENCE_ENABLED", "false").strip().lower() == "true"
+        )
+        pattern_intelligence_reuse_enabled = (
+            os.getenv("PATTERN_INTELLIGENCE_REUSE_ENABLED", "false").strip().lower()
+            == "true"
+        )
+        if pattern_intelligence_reuse_enabled and not pattern_intelligence_enabled:
+            raise ConfigurationError(
+                "PATTERN_INTELLIGENCE_REUSE_ENABLED requires PATTERN_INTELLIGENCE_ENABLED."
+            )
+        pattern_intelligence_max_candidates = _pattern_intelligence_limit_from_env(
+            "PATTERN_INTELLIGENCE_MAX_CANDIDATES",
+            default=12,
+            minimum=1,
+            maximum=50,
+            enabled=pattern_intelligence_enabled,
+        )
+        pattern_intelligence_max_references = _pattern_intelligence_limit_from_env(
+            "PATTERN_INTELLIGENCE_MAX_REFERENCES",
+            default=1,
+            minimum=0,
+            maximum=2,
+            enabled=pattern_intelligence_enabled,
+        )
+        pattern_intelligence_prompt_max_input_tokens = _pattern_intelligence_limit_from_env(
+            "PATTERN_INTELLIGENCE_PROMPT_MAX_INPUT_TOKENS",
+            default=3800,
+            minimum=1024,
+            maximum=8192,
+            enabled=pattern_intelligence_enabled,
+        )
         image_classifier_enabled = (
             os.getenv("IMAGE_CLASSIFIER_ENABLED", "false").lower() == "true"
         )
@@ -480,6 +556,9 @@ def get_settings() -> Settings:
             s3_vector_pattern_index_name=os.getenv(
                 "S3_VECTOR_PATTERN_INDEX_NAME", "student-pattern-index"
             ).strip(),
+            s3_vector_pattern_index_arn=os.getenv(
+                "S3_VECTOR_PATTERN_INDEX_ARN", ""
+            ).strip(),
             s3_vector_region=os.getenv("S3_VECTOR_REGION", os.getenv("AWS_REGION", "")).strip(),
             s3_vector_top_k_runtime=int(os.getenv("S3_VECTOR_TOP_K_RUNTIME", "20")),
             s3_vector_top_k_pattern=int(os.getenv("S3_VECTOR_TOP_K_PATTERN", "40")),
@@ -494,6 +573,13 @@ def get_settings() -> Settings:
                 os.getenv("RETRIEVAL_CACHE_TTL_SECONDS", "21600")
             ),
             retrieval_max_latency_ms=int(os.getenv("RETRIEVAL_MAX_LATENCY_MS", "800")),
+            pattern_intelligence_enabled=pattern_intelligence_enabled,
+            pattern_intelligence_reuse_enabled=pattern_intelligence_reuse_enabled,
+            pattern_intelligence_max_candidates=pattern_intelligence_max_candidates,
+            pattern_intelligence_max_references=pattern_intelligence_max_references,
+            pattern_intelligence_prompt_max_input_tokens=(
+                pattern_intelligence_prompt_max_input_tokens
+            ),
             dynamodb_pattern_pk=os.getenv("DYNAMODB_PATTERN_PK", "patternId").strip(),
             bedrock_embedding_provider=embedding_provider,
             bedrock_embedding_model_id=embedding_model_id,
@@ -507,6 +593,24 @@ def get_settings() -> Settings:
             enable_dynamodb_fetch=os.getenv("ENABLE_DYNAMODB_FETCH", "false").lower() == "true",
             dynamodb_question_table=os.getenv("DYNAMODB_QUESTION_TABLE", ""),
             dynamodb_pattern_table=os.getenv("DYNAMODB_PATTERN_TABLE", ""),
+            dynamodb_pattern_question_table=os.getenv(
+                "DYNAMODB_PATTERN_QUESTION_TABLE", ""
+            ).strip(),
+            dynamodb_pattern_question_by_pattern_index=os.getenv(
+                "DYNAMODB_PATTERN_QUESTION_BY_PATTERN_INDEX", ""
+            ).strip(),
+            dynamodb_question_bank_table=os.getenv(
+                "DYNAMODB_QUESTION_BANK_TABLE", ""
+            ).strip(),
+            dynamodb_question_bank_pattern_index=os.getenv(
+                "DYNAMODB_QUESTION_BANK_PATTERN_INDEX", ""
+            ).strip(),
+            dynamodb_practice_attempt_table=os.getenv(
+                "DYNAMODB_PRACTICE_ATTEMPT_TABLE", ""
+            ).strip(),
+            dynamodb_practice_attempt_user_index=os.getenv(
+                "DYNAMODB_PRACTICE_ATTEMPT_USER_INDEX", ""
+            ).strip(),
             dynamodb_default_index=os.getenv("DYNAMODB_DEFAULT_INDEX", ""),
             dynamodb_region=os.getenv(
                 "DYNAMODB_REGION", os.getenv("AWS_REGION", "")

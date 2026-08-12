@@ -117,6 +117,7 @@ class DoubtSolverGraphState(TypedDict):
     context_used: bool  # True if context was passed to answer generator
     service_error: bool  # True if KB or DynamoDB service error occurred
     retrieval_context: dict | None  # internal S3 Vector retrieval contract
+    doubt_pattern_context: dict | None  # answer-redacted Pattern guidance only
     conversation_context: str  # selected recent turn context, when relevant
     conversation_relation: dict | None
 
@@ -218,10 +219,11 @@ def retrieve_kb_context_node(state: DoubtSolverGraphState) -> dict:
 
 
 def _retrieve_s3_vector_context_node(state: DoubtSolverGraphState) -> dict:
-    """Run the approved S3 Vector student retrieval path for the legacy graph."""
-    from retrieval.context.data_context_builder import render_retrieval_context  # noqa: PLC0415
-    from retrieval.retrieval_service import StudentRetrievalService  # noqa: PLC0415
+    """Use the graph-facing context service for both legacy and canonical S3 paths."""
     from services.context_retrieval.context_models import ContextRetrievalRequest  # noqa: PLC0415
+    from services.context_retrieval.context_retrieval_service import (  # noqa: PLC0415
+        get_context_retrieval_service,
+    )
 
     classification_dict = state.get("classification") or {}
     request = ContextRetrievalRequest(
@@ -237,9 +239,14 @@ def _retrieve_s3_vector_context_node(state: DoubtSolverGraphState) -> dict:
         pattern_family_candidate=classification_dict.get("pattern_family_candidate"),
         retrieval_tags=classification_dict.get("retrieval_tags") or [],
     )
-    retrieval_context = StudentRetrievalService().retrieve(request)
-    context_text = render_retrieval_context(retrieval_context)
-    retrieval_used = retrieval_context.mode != "fresh_solve"
+    result = get_context_retrieval_service().retrieve_context(request)
+    context_text = result.context_text or ""
+    retrieval_used = result.retrieval_used
+    doubt_pattern_context = (
+        result.doubt_pattern_context.model_dump(by_alias=True)
+        if result.doubt_pattern_context is not None
+        else None
+    )
     return {
         "kb_results": None,
         "dynamodb_records": None,
@@ -247,7 +254,8 @@ def _retrieve_s3_vector_context_node(state: DoubtSolverGraphState) -> dict:
         "context_source_count": 1 if retrieval_used else 0,
         "used_retrieval": retrieval_used,
         "context_used": bool(context_text),
-        "retrieval_context": retrieval_context.model_dump(by_alias=True),
+        "retrieval_context": result.retrieval_context.model_dump(by_alias=True),
+        "doubt_pattern_context": doubt_pattern_context,
     }
 
 
@@ -260,6 +268,36 @@ def _legacy_intent_for_retrieval(intent: str) -> str:
         "practice_question": "practice",
         "visualize_question": "visualize",
     }.get(intent, "explain")
+
+
+def _doubt_pattern_context_from_state(state: dict) -> object | None:
+    """Validate internal answer-redacted Pattern guidance before prompt handoff."""
+    return _doubt_pattern_context_from_payload(
+        state.get("doubt_pattern_context"),
+        request_id=state.get("request_id", ""),
+    )
+
+
+def _doubt_pattern_context_from_payload(
+    raw_context: object,
+    *,
+    request_id: str,
+) -> object | None:
+    """Validate a server-only serialized Pattern context before prompt handoff."""
+    if not isinstance(raw_context, dict):
+        return None
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from retrieval.pattern_intelligence import DoubtPatternContext  # noqa: PLC0415
+
+    try:
+        return DoubtPatternContext.model_validate(raw_context)
+    except ValidationError:
+        logger.warning(
+            "request_id=%s invalid_doubt_pattern_context=true",
+            request_id,
+        )
+        return None
 
 
 def fetch_dynamodb_records_node(state: DoubtSolverGraphState) -> dict:
@@ -407,15 +445,21 @@ def generate_answer_node(
     context = (
         "\n\n".join(value for value in (conversation_context, retrieval_context) if value) or None
     )
+    generation_kwargs: dict[str, object] = {
+        "context": context,
+        "exam_id": state.get("exam_id"),
+        "exam_stage": state.get("exam_stage"),
+        "exam_profile_id": state.get("exam_profile_id"),
+        "language": state.get("language", "english"),
+        "request_id": state.get("request_id", ""),
+    }
+    doubt_pattern_context = _doubt_pattern_context_from_state(state)
+    if doubt_pattern_context is not None:
+        generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
     output = generate_answer(
         state["query"],
         classification,
-        context=context,
-        exam_id=state.get("exam_id"),
-        exam_stage=state.get("exam_stage"),
-        exam_profile_id=state.get("exam_profile_id"),
-        language=state.get("language", "english"),
-        request_id=state.get("request_id", ""),
+        **generation_kwargs,
     )
     final_answer = build_final_answer_result(
         content=output.content,
@@ -539,6 +583,7 @@ def build_doubt_solver_graph():
             "context_used": False,
             "service_error": False,
             "retrieval_context": None,
+            "doubt_pattern_context": None,
         })
         print(result["response"]["answer"])
         print(result["response"]["used_retrieval"])
@@ -889,6 +934,10 @@ def _orchestrated_collect_context_node(
             result.reason,
         )
         retrieval_payload = result.retrieval_context.model_dump(by_alias=True)
+        if result.doubt_pattern_context is not None:
+            retrieval_payload["doubtPatternContext"] = result.doubt_pattern_context.model_dump(
+                by_alias=True
+            )
         retrieval_mode = str(retrieval_payload.get("mode") or "none")
         retrieval_source = (
             result.web_search_provider or "web"
@@ -1117,6 +1166,11 @@ def build_orchestrated_doubt_solver_graph(
         intent: str = classification_dict.get("intent", "explain")
         difficulty: str = classification_dict.get("difficulty", "default")
         context_text: str = state.get("context_text") or ""
+        retrieval_payload = state.get("retrieval_context") or {}
+        doubt_pattern_context = _doubt_pattern_context_from_payload(
+            retrieval_payload.get("doubtPatternContext"),
+            request_id=state.get("request_id", ""),
+        )
 
         language = cast(CanonicalLanguage, state.get("language", "english"))
         from services.context_retrieval.web_grounding import (  # noqa: PLC0415
@@ -1157,6 +1211,8 @@ def build_orchestrated_doubt_solver_graph(
             }
             if state.get("exam_profile_id"):
                 generation_kwargs["exam_profile_id"] = state["exam_profile_id"]
+            if doubt_pattern_context is not None:
+                generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
             generate_final = getattr(adapter, "generate_final", None)
             if generate_final is not None:
                 final_answer = generate_final(**generation_kwargs)

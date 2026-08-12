@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from features.practice_generation.events import emit_practice_event
 from features.practice_generation.generation import deterministic_question_id
-from features.practice_generation.matching import ReusableQuestion
+from features.practice_generation.matching import (
+    ReusableQuestion,
+    build_reuse_difficulty_prefix,
+    build_slot_reuse_bucket_key,
+)
 from features.practice_generation.option_distribution import (
     reorder_options,
     target_correct_positions,
     validate_answer_position_distribution,
 )
+from features.practice_generation.pattern_context import PatternSlotSelection
 from features.practice_generation.planning import request_idempotency_key
 from features.practice_generation.question_contract import validate_persisted_playable_question
 from features.practice_generation.resource_validation import IndexProjection
@@ -27,6 +34,7 @@ from features.practice_generation.schemas import (
     AssessmentProgress,
     GeneratedQuestion,
     InternalPhase,
+    PlannerSlot,
     PracticeBlueprint,
     PracticeGenerationRequest,
 )
@@ -57,6 +65,7 @@ _ASSESSMENT_SIZE_ENVELOPE: dict[str, Any] = {
     "topic": "x" * 128,
     "type": "mockTest",
     "activityKind": "MINI_MOCK",
+    "assessmentMode": "PRACTICE",
     "status": "GENERATING",
     "visibility": "PRIVATE",
     "origin": "AI_CUSTOM",
@@ -74,9 +83,50 @@ _ASSESSMENT_SIZE_ENVELOPE: dict[str, Any] = {
 class PracticeRepositoryError(RuntimeError):
     """Typed practice persistence failure."""
 
+    def __init__(
+        self,
+        code: str,
+        *,
+        operation: str | None = None,
+        logical_table: str | None = None,
+        logical_index: str | None = None,
+        aws_exception_type: str | None = None,
+        aws_error_code: str | None = None,
+        fallback_decision: str | None = None,
+        progress_detail: str | None = None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.operation = operation
+        self.logical_table = logical_table
+        self.logical_index = logical_index
+        self.aws_exception_type = aws_exception_type
+        self.aws_error_code = aws_error_code
+        self.fallback_decision = fallback_decision
+        self.progress_detail = progress_detail
+
+    def safe_details(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in {
+                "repositoryOperation": self.operation,
+                "logicalTable": self.logical_table,
+                "logicalIndex": self.logical_index,
+                "awsExceptionType": self.aws_exception_type,
+                "awsErrorCode": self.aws_error_code,
+                "fallbackDecision": self.fallback_decision,
+                "progressDetail": self.progress_detail,
+            }.items()
+            if value
+        }
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def normalize_question_for_identity(value: str) -> str:
+    return " ".join(value.casefold().split())
 
 
 def _item(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -211,7 +261,6 @@ class AssessmentRepository:
             "requestedCount": request.requested_count,
             "acceptedCount": request.accepted_count,
             "examStage": request.exam_stage,
-            "examProfileId": request.exam_profile_id,
             "requestedLanguage": request.language,
             "phase": progress.phase.value,
             "playable": False,
@@ -270,6 +319,10 @@ class AssessmentRepository:
             "topic": request.topic or request.subject,
             "type": "mockTest" if is_mock else "quiz",
             "activityKind": "MINI_MOCK" if is_mock else "QUICK_QUIZ",
+            # AI Tutor launch currently supports practice conditions only. This is an
+            # explicit server-owned contract, never a browser-selected inference.
+            "assessmentMode": "PRACTICE",
+            **({"examProfileId": request.exam_profile_id} if request.exam_profile_id else {}),
             "status": "GENERATING",
             "visibility": "PRIVATE",
             "origin": "AI_CUSTOM",
@@ -698,6 +751,10 @@ class QuestionRepository:
         question_bank_table: str,
         question_test_index: str,
         question_bank_category_index: str,
+        pattern_context_enabled: bool = False,
+        pattern_reuse_enabled: bool = False,
+        practice_attempt_table: str = "",
+        practice_attempt_user_index: str = "",
         question_bank_reuse_index: str = "",
         question_bank_reuse_projection: IndexProjection | None = None,
         question_bank_category_projection: IndexProjection | None = None,
@@ -711,6 +768,10 @@ class QuestionRepository:
         self._question_bank_table = question_bank_table
         self._question_test_index = question_test_index
         self._question_bank_category_index = question_bank_category_index
+        self._pattern_context_enabled = pattern_context_enabled
+        self._pattern_reuse_enabled = pattern_reuse_enabled
+        self._practice_attempt_table = practice_attempt_table
+        self._practice_attempt_user_index = practice_attempt_user_index
         self._question_bank_reuse_index = question_bank_reuse_index
         self._question_bank_reuse_projection = question_bank_reuse_projection
         self._question_bank_category_projection = question_bank_category_projection
@@ -799,7 +860,41 @@ class QuestionRepository:
                 if not start_key or not page:
                     break
         except ClientError as exc:
-            raise PracticeRepositoryError("QUESTION_BANK_QUERY_FAILED") from exc
+            error = exc.response.get("Error", {})
+            emit_practice_event(
+                "PRACTICE_REPOSITORY_FAILURE",
+                test_id="runtime",
+                status="failed",
+                details={
+                    "reasonCode": "QUESTION_BANK_QUERY_FAILED",
+                    "operation": "Query",
+                    "logicalTable": "QuestionBank",
+                    "logicalIndex": (
+                        "QuestionBank.reuse"
+                        if index_name == self._question_bank_reuse_index
+                        else "QuestionBank.category"
+                    ),
+                    "awsExceptionType": type(exc).__name__,
+                    "awsErrorCode": str(error.get("Code") or "unknown"),
+                    "patternContextEnabled": self._pattern_context_enabled,
+                    "patternReuseEnabled": self._pattern_reuse_enabled,
+                    "fallbackDecision": "fatal_legacy_repository_failure",
+                },
+                level=logging.ERROR,
+            )
+            raise PracticeRepositoryError(
+                "QUESTION_BANK_QUERY_FAILED",
+                operation="dynamodb.Query",
+                logical_table="QuestionBank",
+                logical_index=(
+                    "QuestionBank.reuse"
+                    if index_name == self._question_bank_reuse_index
+                    else "QuestionBank.category"
+                ),
+                aws_exception_type=type(exc).__name__,
+                aws_error_code=str(error.get("Code") or "unknown"),
+                fallback_decision="fatal_legacy_repository_failure",
+            ) from exc
         duration_ms = int((time.monotonic() - started) * 1000)
         if (
             page_count >= self._query_max_pages and start_key
@@ -882,8 +977,76 @@ class QuestionRepository:
                     break
                 request_items = unprocessed
         except ClientError as exc:
-            raise PracticeRepositoryError("QUESTION_BANK_BATCH_GET_FAILED") from exc
+            error = exc.response.get("Error", {})
+            raise PracticeRepositoryError(
+                "QUESTION_BANK_BATCH_GET_FAILED",
+                operation="dynamodb.BatchGetItem",
+                logical_table="QuestionBank",
+                aws_exception_type=type(exc).__name__,
+                aws_error_code=str(error.get("Code") or "unknown"),
+                fallback_decision="fatal_legacy_repository_failure",
+            ) from exc
         return [_plain(raw) for raw in records]
+
+    def list_recent_seen_question_bank_ids(
+        self,
+        *,
+        user_id: str,
+        limit: int = 50,
+    ) -> set[str]:
+        """Resolve bounded cross-activity QuestionBank history without scans or N+1 reads."""
+        if not self._practice_attempt_table or not self._practice_attempt_user_index:
+            raise PracticeRepositoryError("PRACTICE_HISTORY_INDEX_NOT_CONFIGURED")
+        try:
+            response = self._client.query(
+                TableName=self._practice_attempt_table,
+                IndexName=self._practice_attempt_user_index,
+                KeyConditionExpression="#user = :user",
+                ExpressionAttributeNames={"#user": "userId"},
+                ExpressionAttributeValues=_item({":user": user_id}),
+                ProjectionExpression="activityId",
+                Limit=min(max(limit, 1), 50),
+                ScanIndexForward=False,
+            )
+            activity_ids = list(
+                dict.fromkeys(
+                    str(_plain(item).get("activityId") or "")
+                    for item in response.get("Items", [])
+                    if str(_plain(item).get("activityId") or "")
+                )
+            )[:50]
+            if not activity_ids:
+                return set()
+            assessments = self._client.batch_get_item(
+                RequestItems={
+                    self._assessment_table: {
+                        "Keys": [_item({"testId": value}) for value in activity_ids],
+                        "ConsistentRead": True,
+                    }
+                }
+            )
+            if dict(assessments.get("UnprocessedKeys") or {}):
+                raise PracticeRepositoryError("PRACTICE_HISTORY_BATCH_INCOMPLETE")
+            question_ids: list[str] = []
+            for raw in dict(assessments.get("Responses") or {}).get(
+                self._assessment_table,
+                [],
+            ):
+                meta = _parse_meta(_plain(raw).get("meta"))
+                question_ids.extend(
+                    str(value)
+                    for value in list(meta.get("readyQuestionIds") or [])
+                    if str(value)
+                )
+            questions = self.get_questions_by_ids(list(dict.fromkeys(question_ids))[:100])
+            seen: set[str] = set()
+            for question in questions:
+                source_id = _parse_meta(question.get("meta")).get("sourceQuestionBankId")
+                if source_id:
+                    seen.add(str(source_id))
+            return seen
+        except ClientError as exc:
+            raise PracticeRepositoryError("PRACTICE_HISTORY_READ_FAILED") from exc
 
     def list_linked(
         self,
@@ -925,7 +1088,16 @@ class QuestionRepository:
                 if not start_key or not response.get("Items"):
                     break
         except ClientError as exc:
-            raise PracticeRepositoryError("ASSESSMENT_QUESTIONS_QUERY_FAILED") from exc
+            error = exc.response.get("Error", {})
+            raise PracticeRepositoryError(
+                "ASSESSMENT_QUESTIONS_QUERY_FAILED",
+                operation="dynamodb.Query",
+                logical_table="Question",
+                logical_index="Question.testId",
+                aws_exception_type=type(exc).__name__,
+                aws_error_code=str(error.get("Code") or "unknown"),
+                fallback_decision="fatal_legacy_repository_failure",
+            ) from exc
         duration_ms = int((time.monotonic() - started) * 1000)
         emit_practice_event(
             "ASSESSMENT_QUESTIONS_QUERY_COMPLETED",
@@ -934,6 +1106,7 @@ class QuestionRepository:
             details={
                 "logicalTable": "Question",
                 "logicalIndex": "Question.testId",
+                "operation": "list_linked",
                 "pageCount": page_count,
                 "candidateCount": len(results),
                 "selectedCount": len(results),
@@ -1068,7 +1241,16 @@ class QuestionRepository:
         bucket_id: str,
         question: ReusableQuestion,
         slot_id: str | None = None,
+        trusted_pattern_selection: PatternSlotSelection | None = None,
     ) -> bool:
+        pattern_id = None
+        pattern_version_hash = None
+        if (
+            trusted_pattern_selection is not None
+            and trusted_pattern_selection.tier.value == "REUSE_SAFE"
+        ):
+            pattern_id = trusted_pattern_selection.pattern_id
+            pattern_version_hash = trusted_pattern_selection.pattern_version_hash
         question_id = deterministic_question_id(
             test_id,
             source_id=question.question_id,
@@ -1113,6 +1295,8 @@ class QuestionRepository:
                 "language": question.language,
                 "status": "READY",
             },
+            pattern_id=pattern_id,
+            pattern_version_hash=pattern_version_hash,
         )
 
     def link_generated(
@@ -1127,6 +1311,8 @@ class QuestionRepository:
         verification_policy: str,
         verification_method: str,
         language: str,
+        source_question_bank_id: str | None = None,
+        pattern_selection: PatternSlotSelection | None = None,
     ) -> bool:
         if not verified:
             raise PracticeRepositoryError("UNVERIFIED_QUESTION_REJECTED")
@@ -1186,8 +1372,101 @@ class QuestionRepository:
                 "status": "READY",
                 "reusable": False,
                 "visibility": "PRIVATE",
+                **(
+                    {"sourceQuestionBankId": source_question_bank_id}
+                    if source_question_bank_id
+                    else {}
+                ),
             },
+            pattern_id=(
+                pattern_selection.pattern_id if pattern_selection is not None else None
+            ),
+            pattern_version_hash=(
+                pattern_selection.pattern_version_hash
+                if pattern_selection is not None
+                else None
+            ),
         )
+
+    def persist_verified_pattern_question(
+        self,
+        *,
+        question: GeneratedQuestion,
+        slot: PlannerSlot,
+        pattern_id: str,
+        pattern_version_hash: str,
+        language: str,
+    ) -> str | None:
+        """Create an idempotent reusable QuestionBank row after verifier acceptance."""
+        reuse_bucket_key = build_slot_reuse_bucket_key(slot, language=language)
+        difficulty_prefix = build_reuse_difficulty_prefix(slot.difficulty.value)
+        if not reuse_bucket_key or not difficulty_prefix:
+            return None
+        digest = hashlib.sha256(
+            "|".join(
+                (
+                    pattern_id,
+                    pattern_version_hash,
+                    normalize_question_for_identity(question.question),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        qb_id = f"pattern-v1-{digest}"
+        timestamp = _now()
+        difficulty = {
+            "basic": "EASY",
+            "intermediate": "MEDIUM",
+            "advanced": "HARD",
+        }[slot.difficulty.value]
+        item = {
+            "qbId": qb_id,
+            "question": question.question,
+            "answers": _json({"options": question.options}),
+            "correctAnswer": question.correct_answer,
+            "explanation": question.answer_explanation or question.solution,
+            "category": slot.category_id,
+            "difficulty": difficulty,
+            "source": "PATTERN_VERIFIED_PRACTICE",
+            "meta": {
+                "status": "ACTIVE",
+                "qualityStatus": "VERIFIED",
+                "reusable": True,
+                "visibility": "PLATFORM",
+                "subject": slot.subject_id,
+                "topic": slot.topic_id,
+                "questionType": slot.question_type.value,
+                "language": language,
+                "examIds": list(slot.exam_ids),
+                "patternFamilyId": slot.pattern_family_id,
+                "confidence": 1,
+                "solutionAvailable": True,
+                "answerAvailable": True,
+                "verificationMethod": "INDEPENDENT_MODEL_V2",
+            },
+            "reuseBucketKey": reuse_bucket_key,
+            "reuseSortKey": (
+                f"{difficulty_prefix}"
+                f"{quote(timestamp.casefold(), safe='-_.!~*')}#"
+                f"{quote(qb_id.casefold(), safe='-_.!~*')}"
+            ),
+            "patternId": pattern_id,
+            "patternVersionHash": pattern_version_hash,
+            "patternLinkEvidence": "VERIFIED_GENERATION",
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+            "__typename": "QuestionBank",
+        }
+        try:
+            self._client.put_item(
+                TableName=self._question_bank_table,
+                Item=_item(item),
+                ConditionExpression="attribute_not_exists(qbId)",
+            )
+            return qb_id
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return qb_id
+            raise PracticeRepositoryError("QUESTION_BANK_PATTERN_LINK_FAILED") from exc
 
     def _put_question(
         self,
@@ -1203,6 +1482,8 @@ class QuestionRepository:
         difficulty: str,
         meta: dict[str, Any],
         answer_contract: dict[str, Any] | None = None,
+        pattern_id: str | None = None,
+        pattern_version_hash: str | None = None,
     ) -> bool:
         timestamp = _now()
         item = {
@@ -1227,6 +1508,9 @@ class QuestionRepository:
             "updatedAt": timestamp,
             "__typename": "Question",
         }
+        if pattern_id and pattern_version_hash:
+            item["patternId"] = pattern_id
+            item["patternVersionHash"] = pattern_version_hash
         if solution:
             item["explanation"] = solution
         try:
@@ -1264,6 +1548,50 @@ class QuestionRepository:
                 )
             except ClientError as exc:
                 raise PracticeRepositoryError("QUESTION_ORDERING_FAILED") from exc
+
+    def repair_bucket_assignments(
+        self,
+        test_id: str,
+        assignments: dict[str, tuple[str, str]],
+    ) -> int:
+        """Correct verified schema-v2 bucket metadata under immutable slot ownership."""
+        repaired = 0
+        for question_id, (slot_id, bucket_id) in assignments.items():
+            if not question_id or not slot_id or not bucket_id:
+                raise PracticeRepositoryError("MANIFEST_RECOVERY_INVALID_ASSIGNMENT")
+            try:
+                self._client.update_item(
+                    TableName=self._question_table,
+                    Key=_item({"questionId": question_id}),
+                    UpdateExpression=(
+                        "SET #meta.#bucket = :bucket, #updated = :updated"
+                    ),
+                    ExpressionAttributeNames={
+                        "#meta": "meta",
+                        "#bucket": "bucketId",
+                        "#slot": "slotId",
+                        "#verified": "verified",
+                        "#test": "testId",
+                        "#updated": "updatedAt",
+                    },
+                    ExpressionAttributeValues=_item(
+                        {
+                            ":bucket": bucket_id,
+                            ":slot": slot_id,
+                            ":verified": True,
+                            ":test": test_id,
+                            ":updated": _now(),
+                        }
+                    ),
+                    ConditionExpression=(
+                        "#test = :test AND #meta.#slot = :slot "
+                        "AND #meta.#verified = :verified"
+                    ),
+                )
+            except ClientError as exc:
+                raise PracticeRepositoryError("MANIFEST_RECOVERY_CONFLICT") from exc
+            repaired += 1
+        return repaired
 
     def rebalance_answer_positions(
         self,

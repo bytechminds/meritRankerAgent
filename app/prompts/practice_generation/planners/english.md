@@ -15,6 +15,7 @@ Each slot must contain only:
 # Rules
 
 - Preserve every supplied slot ID exactly once and return exactly `accepted_count` slots.
+- If `planner_phase=repair`, correct `repair_reason`; return complete slots, no commentary.
 - Use canonical lowercase underscore IDs, `subject_id=english`, and only `mcq`.
 - Use the supplied difficulty and exactly the supplied exam ID when present.
 - `generator_route_hint` must be `english.generator.<difficulty>`.

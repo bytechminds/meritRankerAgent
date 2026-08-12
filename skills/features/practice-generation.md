@@ -53,8 +53,9 @@ verification, reuse, question persistence, or finalization rules.
   `generate_wave`, and `finalize` graph commands.
 - `orchestration.py`: blueprint/reuse/deficit/group generation/retry/finalization orchestration.
 - `planning.py`: explicit creation gate, request resolver, subject-aware planner-family selection,
-  schema-v2 slot validation, bounded repair, and deterministic slot fallback for allowed
-  assessment types. Explicit schema-v1 persisted blueprints remain readable.
+  schema-v2 slot validation, bounded repair, request-topic coverage validation, and deterministic
+  slot fallback for allowed assessment types. Explicit schema-v1 persisted blueprints remain
+  readable.
 - `metadata_normalization.py`: centralized fail-closed subject/topic/category/difficulty/exam/
   language/activity/PatternFamily normalization for exact reuse metadata.
 - `matching.py`: backend v1 reuse-key construction, schema-v2 exact slot assignment, eligibility,
@@ -150,13 +151,18 @@ DoubtSolverGraph. Structured calls skip only student-answer completion, continua
 and answer-quality finalization so planner/generator/verifier JSON remains unchanged. Provider
 credentials are resolved lazily only after an active route selects a provider.
 
-The local AgentCore CDK definition grants exact access to the 11 practice SSM parameters, the three
+The local AgentCore CDK definition grants exact access to the 11 legacy practice SSM parameters, the three
 existing table ARNs, and only the named Question/QuestionBank indexes. MockTestQuiz direct access is
 limited to `GetItem`/`PutItem`/conditional `UpdateItem`; Question access uses direct `PutItem`,
 bounded query/batch reads, and position updates. When the existing deployment-time non-secret
 practice flag is enabled, it grants only
 `updatePracticeGenerationProgress` on the configured AppSync API—never an API wildcard. The
-currently deployed Dev runtime remains drifted from this source and was not changed by this task.
+Pattern and PracticeAttempt SSM parameters, environment variables, and IAM grants are synthesized
+only when their matching Pattern flags are enabled. With both flags off, the deployment contract is
+the legacy Practice contract and contains no Pattern resource dependency. The compatible
+Pattern-off AgentCore Dev revision was deployed on 2026-08-10 and its exact legacy index Query
+permissions were verified. Live creation requests were misrouted by the deployed classifier before
+Practice launch, so a READY assessment remains `[NOT VERIFIED]`.
 No secret, queue, credential resolver, or wildcard resource was added.
 
 ## Tests
@@ -166,6 +172,30 @@ routing; planning, reuse, generation, verification, replacement, persistence, ex
 resource contract/validation, shared credentials, duplicate graph operations, restart behavior,
 GSI lag, counter/ownership failures, deterministic option rebalancing, and repeated
 5/50/100-question in-memory runs.
+
+The 2026-08-10 P0 regression suite additionally proves that a Pattern-disabled five-question
+assessment reaches `READY` through the exact legacy path, vector discovery failure returns empty
+optional guidance, a missing Pattern QuestionBank index downgrades `REUSE_SAFE` to
+`GUIDANCE_SAFE`, and a real legacy QuestionBank query failure remains fatal. Legacy repository
+query failures emit content-safe structured diagnostics with operation, logical table/index, AWS
+exception type/code, Pattern flag state, and the explicit fallback decision.
+
+### Schema-v2 checkpoint compatibility repair — 2026-08-10
+
+The Dev failure `practice-d5e83d833e7a09c28b70033890a2f022` was traced to the schema-v2
+post-match checkpoint, not QuestionBank reuse or question persistence. The initial and manifest
+`Question.testId` queries and exact `QuestionBank.getByReuseBucket` read succeeded; the existing
+AppSync progress handler then rejected the unapproved `patternRuntime` metadata key with
+`PRACTICE_PROGRESS_UNKNOWN_META_FIELD`. Pattern-disabled Practice now does not publish
+Pattern-only metadata. Schema-v2 emits explicit reuse-query start/completion events, the generic
+Question event identifies `operation=list_linked`, and the async terminal boundary records only
+safe request correlation, repository operation, cause class, AWS code when present, and fallback
+decision. With both Pattern flags off, schema-v2 does not invoke even the Pattern provider and
+does not emit a Pattern retrieval event. It now publishes `EXISTING_MATCH_COMPLETED` and one
+`GENERATION_GROUP_CREATED` event per persisted group before generation begins. The deterministic
+five-slot CAT PRE Profit and Loss fallback regression asserts the deployed progress metadata
+allowlist, canonical fallback keys, and the generation checkpoint. Dev READY/player evidence
+remains pending the repaired revision deployment and authenticated lifecycle run.
 
 The shared-credential composition test instantiates the routed practice planner, generator, and
 verifier with one centralized runtime model executor. The normal AgentCore runtime uses sanitized
@@ -207,7 +237,10 @@ and the coordinator commits their results sequentially.
 - Logs exclude prompts, questions, solutions, provider bodies, credentials, and raw user IDs.
 - No cache, Redis, Step Functions, new database, or replacement async infrastructure was added.
 - Current-affairs set creation remains unsupported.
-- Pattern context remains disabled and fails closed when force-enabled.
+- Canonical Pattern context is implemented behind both disabled-by-default Pattern flags. It runs
+  only after QuestionBank reuse for deficit slots, requires exact source compatibility, and falls
+  back to ordinary generation when unavailable or unsafe. Live activation remains `[BLOCKED]` by
+  the unverified direct S3 Vector contract and missing Pattern-to-playable-QuestionBank mapping.
 - `[NOT VERIFIED]` Sandbox 1/5/50/100 live generation and start/save/resume/submit/review evidence
   is still required before a complete or production-ready claim.
 - `[BLOCKED]` The deployed runtime has no established safe provider-secret injection channel:
@@ -229,6 +262,33 @@ and the coordinator commits their results sequentially.
   from persisted Questions first.
 
 ## Latest changes
+
+- 2026-08-12: Planner validation recovery now retains content-safe diagnostics for each bounded
+  attempt: attempt/phase, schema name, error count, field paths, error types, reason code, slot
+  count, and validation duration. The sole repair receives those metadata categories; no raw model
+  output, prompt, answers, or student data is persisted or logged. A multi-topic deterministic
+  fallback canonicalizes supported separators and round-robins every requested topic across the
+  accepted slots, then passes the existing schema-v2 and system-bucket validation. If that fallback
+  cannot construct a valid blueprint, it becomes the controlled
+  `PRACTICE_PLANNER_FALLBACK_INVALID` terminal state instead of leaking a generic async
+  `ValidationError`; no generator receives an invalid blueprint. The normal valid-planner path
+  remains one call, malformed output remains initial call plus at most one repair, and fallback
+  makes no LLM call. Repair payloads now identify `planner_phase=repair` and only allowlisted
+  feedback, and all three planner prompts direct the repair action. The central event registry
+  includes `planner_fallback_completed` and `planner_fallback_failed`, so safe fallback telemetry
+  cannot itself terminate the async task. The exact local Dev request for SSC_GD/PRE, Time and
+  Work plus Number System completed on 2026-08-12 as
+  `practice-b06846a73f72427f563a55a1cdbfd6b6`: two invalid planner responses, a valid
+  deterministic fallback, five generated questions, and terminal `READY`. Focused planner and
+  observability coverage passed (175 tests); browser lifecycle, production deployment, and
+  reliability/load evidence remain `[NOT VERIFIED]`.
+
+- 2026-08-10: Added feature-gated canonical PatternGraph guidance for schema-v2 deficit slots.
+  Candidate IDs are authoritatively BatchGet-hydrated, strict metadata/operation/exclusion gates
+  precede `GUIDANCE_SAFE`, prompts enforce method preservation plus anti-copy variation, and input
+  size is measured with adaptive splitting and explicit baseline fallback. Existing QuestionBank
+  reuse and independent verification remain authoritative; `REUSE_SAFE` is intentionally disabled.
+  Current post-edit lint/test execution and live activation are `[NOT VERIFIED]` / `[BLOCKED]`.
 
 - 2026-08-07: Verification-provider execution failures are now separated from
   academic verification decisions. A normalized eligible `ProviderExecutionError` from the
@@ -336,18 +396,15 @@ and the coordinator commits their results sequentially.
   or progress subscriptions. The focused distribution/orchestration/repository suite passes;
   authenticated Dev player verification remains `[NOT VERIFIED]`.
 
-- 2026-08-04: An advanced-practice generator response becomes the typed safe failure
-  `PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED` when `finish_reason=length` consumed the configured
-  completion and reasoning budget. Fallback eligibility is decided by the shared provider failure
-  classification; safety refusals and other non-eligible failures remain terminal. The actual
-  executing model alias is retained for
-  generated-question provenance. Exhausting that chain marks the parent activity `FAILED` without
-  entering validation repair, replacement, or an unchanged primary retry. Advanced Reasoning now
-  requests one question per provider call; other subject group sizes are unchanged. The existing
-  persisted `responseType=practice_generation` and stable `practiceTestId` conversation linkage
-  remain the restoration contract. An authenticated local-browser run reached `READY`, restored its
-  persisted card after reload, and opened the five-question instruction route. External frontend
-  batch-reconciliation request counts remain `[NOT VERIFIED]` in this repository.
+- 2026-08-04: An advanced-practice generator response became the typed safe failure
+  `PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED` when its provider completion limit was reached.
+  The current policy above supersedes the earlier direct-fallback handling with one strictly larger,
+  product-capped same-model recovery and capacity-aware fallback; it never accepts truncated output
+  or repeats an unchanged primary budget. Safety refusals and other non-eligible failures remain
+  terminal. The existing persisted `responseType=practice_generation` and stable `practiceTestId`
+  conversation linkage remain the restoration contract. Historical authenticated local-browser
+  READY evidence did not include the current token policy; current lifecycle evidence remains
+  `[NOT VERIFIED]` in this repository.
 
 - 2026-08-03: The current player contract is now explicitly MCQ-only. Planner and generator prompts
   advertise only `mcq`; generated and persisted Questions must contain exactly four distinct,
@@ -437,3 +494,158 @@ On 2026-08-01 the undeployed separate worker design was removed: its SQS publish
 queue/DLQ contract, Lambda entrypoint, lease semantics, worker-only Secrets Manager resolver,
 Dockerfile, immutable image tooling, and worker deployment documentation. Reusable graph,
 generation, persistence, prompts, shared provider adapters, and tests were retained.
+# Pattern Intelligence release-blocker closure (2026-08-10)
+
+Pattern resolution runs only after the planner and ordinary indexed QuestionBank reuse. Deficit
+slots can now consume `GUIDANCE_SAFE`, and `REUSE_SAFE` exists behind
+`PATTERN_INTELLIGENCE_REUSE_ENABLED=false`. Reuse requires an explicitly Pattern-linked, verified,
+platform-playable QuestionBank row plus checked cross-activity history. Newly Pattern-guided
+questions acquire deterministic QuestionBank linkage only after the existing independent verifier
+accepts them; the resulting QuestionBank ID is recorded on the assessment Question for later seen
+exclusion. No scan or request-path N+1 was added.
+
+Local full validation is green (2850 passed, 1 skipped; Ruff passed). The upstream QuestionBank
+owner-mutation authorization is corrected and tested locally, but its Dev deployment is blocked by
+unrelated dirty-worktree changes. Pattern flags remain false; the deployed Pattern-off runtime has
+the restored legacy Practice IAM contract, but READY/player E2E is still not proven because live
+requests were classified outside the Practice route.
+
+## Performance producer contract (2026-08-12)
+
+New AI Tutor assessments now persist the server-owned top-level
+`assessmentMode: PRACTICE` and, when the trusted request has one, the canonical
+top-level `examProfileId`. The browser does not supply this mode and no Tutor
+request path currently creates `REAL_EXAM`; `FULL_MOCK` and `SECTIONAL_TEST`
+remain practice-condition activities until a separately trusted launch path can
+freeze and enforce the complete exam snapshot.
+
+Verified generated questions persist the trusted runtime selection's canonical
+`patternId` and `patternVersionHash` directly on the playable assessment-owned
+`Question`. Generic QuestionBank reuse retains only provenance; it does not
+promote QuestionBank linkage into direct Pattern identity until that source's
+write boundary is deployed and proven authoritative. Missing or untrusted
+linkage is left unset; no topic-based Pattern inference is performed. Focused
+repository/orchestration tests cover assessment mode/profile and the direct
+generated-versus-reused boundary.
+
+The AppSync progress transport continues to project only the approved `meta`
+contract; top-level performance fields are not copied into that strict mutation.
+Authenticated Dev creation/player and any Real Exam path remain `[NOT VERIFIED]`.
+
+## Strict AppSync progress-meta transport correction (2026-08-10)
+
+The schema-v2 stall after QuestionBank matching was conclusively caused by the durable top-level
+`examProfileId` assessment field being merged into the strict
+`updatePracticeGenerationProgress` payload. It is not in the existing backend resolver allowlist;
+the handler therefore correctly rejected the parent update with
+`PRACTICE_PROGRESS_UNKNOWN_META_FIELD` before group creation or generation.
+
+`PracticeProgressMeta` is now the single typed Python producer contract and projects only the
+backend's exact top-level allowlist. New assessments no longer write the redundant top-level
+`examProfileId`; the approved durable recovery copy is the existing `practiceRequest.examProfileId`.
+The projection filters that top-level field from legacy assessments without removing the recovery
+copy. The client retains its independent key check. Any other unapproved producer field fails
+publication; terminal direct-DynamoDB fallback is limited to unavailable credentials or transport,
+never an invalid progress contract. Key-only diagnostics contain only stage,
+`actual_keys`, `unknown_keys`, and `contractVersion`; no metadata values, query text, answers, or
+provider output are logged.
+
+The strict backend handler remains unchanged in acceptance behavior and now emits the same safe
+key-only diagnostic for a rejected field. Focused regressions cover schema-v1/schema-v2,
+Pattern-off/Pattern-on, READY/FAILED projection parity, the exact five-question Reasoning/CAT
+deterministic fallback through `GENERATION_GROUP_STARTED`, backend-handler rejection diagnostics,
+and the no-direct-fallback invariant. Dev runtime
+`practice-v2-progress-contract-20260810.5` was deployed and its container confirmed that the
+projection removes top-level `examProfileId`; authenticated fresh READY/player evidence remains
+`[NOT VERIFIED]` because the earlier failed activity is terminal and was not recreated under a
+student-owned frontend session.
+
+## Flexible Practice completion-cap and concise-output policy (2026-08-11)
+
+`PracticeGenerationCapacityPolicy` is the single authority for structured Practice output ceilings.
+It runs after route/model resolution and is shared by schema-v1 and schema-v2 grouping, the
+structured orchestrator, and the model executor. It selects `initial <= escalation <= product hard
+<= model hard` only from subject family, difficulty, complexity, slot count, and whether the
+selected model uses reasoning. It contains no topic rules. Model catalog metadata supplies the
+configured safe model cap (8,000 maximum in this runtime); the policy’s product cap is always at
+or below that value.
+
+Basic non-reasoning one-slot work starts at 900 tokens, can recover once at 1,500, and has a 2,200
+product cap. High-complexity Advanced Math/Reasoning uses one slot per call with a 4,000 initial
+cap and one 5,600-token recovery cap. Existing model `reasoning_effort` configuration is unchanged:
+Advanced Math remains `high`, Advanced Reasoning remains its configured `medium`; there is no
+unproven reasoning-effort reduction. The capacity values are ceilings, not expected usage or cost.
+Cost/usage remains provider-reported input/completion/reasoning usage.
+
+`generator_output_policy.md` is applied once as a generator-only shared overlay to initial,
+repair, and regeneration prompts. Its two bullets rank correctness, complete conditions/schema,
+and exam fidelity ahead of conciseness and require the shortest complete, information-dense output;
+it never asks for minimum tokens, fixed word limits, or literal two-line answers. The verifier,
+PatternGraph constraints, independent verification, and playable-question contract are unchanged.
+
+OpenAI/Azure, OpenAI-compatible/DeepSeek, Gemini, and mock adapters now retain the raw provider
+finish reason while mapping it to one internal outcome: `completed`, `output_token_exhausted`,
+`empty_response`, `content_filtered`, `provider_failure`, or `unknown`. A structured Practice
+`OUTPUT_TOKEN_EXHAUSTED` response is never parsed, verified, persisted, or delivered. The executor
+performs at most one same-model recovery at a strictly larger cap; if still exhausted, it selects
+only a fallback that can send the escalation budget, otherwise fails in the existing bounded
+provider path. It does not repeat an identical budget or add an independent retry loop.
+
+Safe per-call telemetry records route/model/provider, subject/difficulty/complexity/slot count,
+configured initial cap, actual cap sent, product cap, provider-reported usage, raw/normalized finish
+reason, fallback and escalation status. It never records prompts, questions, answers, or reasoning
+content. Contract validity and verifier outcome remain generation-stage evidence rather than being
+claimed by provider-call telemetry.
+
+Focused offline validation covers basic versus high-complexity capacity selection, the provider
+parameter sent on primary/escalation/fallback, no identical-cap retry, insufficient-cap fallback
+skipping, finish-reason normalization, prompt priority, Pattern prompt regression, and existing
+academic contracts. Comparative live quality/cost acceptance data and authenticated Dev Practice
+lifecycle evidence remain `[NOT VERIFIED]`; no Production deployment is authorized by this slice.
+
+## Practice generation recovery and final-manifest hardening (2026-08-12)
+
+The failed three-question Reasoning replay was caused after academic acceptance, not by the
+planner or verifier. Its schema-v2 slots shared subject, topic, difficulty, and question type but
+had two different category/route compatibility signatures. The slot-to-bucket lookup ignored the
+category and route fields and consequently persisted every approved question as
+`slot-bucket-001`; the final gate correctly rejected the 1/2 planned distribution as
+`BLUEPRINT_DISTRIBUTION_MISMATCH` after 12 model calls. Slot-to-bucket binding now reconstructs the
+same ordered six-field signature used by `PracticeBlueprint` bucket derivation and verifies the
+derived bucket's required count before generation.
+
+The existing content retry boundary remains exactly three waves per unresolved slot: initial,
+one repair, and one fresh replacement. Accepted sibling slots remain immutable and are never sent
+again. A rejected, schema-valid candidate and up to four stable verifier reason codes are now sent
+only in that slot's `repair_context`; malformed output has no candidate and is recreated from the
+immutable slot contract. Before a fresh replacement, rejected wording is added to the bounded
+exclusion set. Provider failures retain their separate provider-fallback path and never enter
+content repair.
+
+Final validation now returns `ready`, `reason_code`, `failed_slot_ids`, expected and actual counts,
+and `recoverable`. The only final recovery implemented is the proven bookkeeping defect: on the
+first `BLUEPRINT_DISTRIBUTION_MISMATCH`, verified Question metadata is conditionally corrected by
+question ID, assessment ownership, immutable slot ID, and verified status. The coordinator then
+recalculates authoritative parent metadata and runs the complete final validator once more. A
+conflict, incomplete update, second validation failure, missing/duplicate Question, invalid
+answer, verification failure, ownership mismatch, or other authoritative corruption remains a
+typed terminal failure. Recovery performs no LLM call and cannot weaken academic validation.
+
+Safe lifecycle events cover question repair/replacement and manifest recovery start, completion,
+and failure. They contain only IDs, attempt numbers, counts, reason codes, and recoverability; raw
+questions, options, answers, solutions, prompts, and provider payloads remain excluded. No public
+schema, graph operation, route, model, token ceiling, Pattern behavior, billing/credit behavior,
+AppSync acceptance contract, infrastructure, or production deployment changed.
+
+Offline evidence includes the exact two-category distribution regression, conditional repository
+write contract, a first-pass recovery plus second-pass READY integration, slot-scoped real provider
+payload inspection, bounded repair/replacement regressions, and a deterministic 32-case matrix
+across Math/Reasoning, basic/advanced, single/multi-topic, and 3/5/10/20 question manifests.
+The semantically equivalent self-contained local replay created
+`practice-e1f748264ff1d978b02d59b695b6cc0e` and reached `READY`, `live=true`, with three unique
+schema-v2 slots, mandatory independent verification, and exact bucket count. Slot 003 required and
+completed the sole repair wave; accepted siblings were preserved. It used 10 model calls, 8,476
+input tokens, and 10,008 output tokens, compared with 12 calls, 10,113 input tokens, and 21,663
+output tokens in the reported failed run. The literal wording remained blocked by the independent
+context gate when replayed without its historical source turn, so literal-query parity is
+`[NOT VERIFIED]`. No Production deployment was performed or authorized.

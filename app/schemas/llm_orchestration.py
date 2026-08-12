@@ -164,6 +164,14 @@ class ModelExecutionResult(BaseModel):
     model: str = Field(..., min_length=1)
     provider: str | None = None
     finish_reason: str | None = None
+    normalized_finish_reason: Literal[
+        "completed",
+        "output_token_exhausted",
+        "empty_response",
+        "content_filtered",
+        "provider_failure",
+        "unknown",
+    ] = "unknown"
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None

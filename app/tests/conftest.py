@@ -52,6 +52,7 @@ def pytest_configure(config: pytest.Config) -> None:  # noqa: ARG001
     os.environ.setdefault("ENABLE_KB_RETRIEVAL", "false")
     os.environ.setdefault("ENABLE_DYNAMODB_FETCH", "false")
     os.environ.setdefault("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "false")
+    os.environ.setdefault("PATTERN_INTELLIGENCE_ENABLED", "false")
     os.environ.setdefault("PRACTICE_GENERATION_ENABLED", "false")
     os.environ.setdefault("IMAGE_CLASSIFIER_ENABLED", "false")
     os.environ.setdefault("LLM_ROLE_CONFIG_JSON", "{}")
@@ -78,6 +79,7 @@ def _unit_test_env_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENABLE_KB_RETRIEVAL", "false")
     monkeypatch.setenv("ENABLE_DYNAMODB_FETCH", "false")
     monkeypatch.setenv("ENABLE_ORCHESTRATED_DOUBT_SOLVER", "false")
+    monkeypatch.setenv("PATTERN_INTELLIGENCE_ENABLED", "false")
     monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "false")
     monkeypatch.setenv("IMAGE_CLASSIFIER_ENABLED", "false")
     # Empty role map so get_llm_role_config() returns the safe mock default

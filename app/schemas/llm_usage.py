@@ -46,6 +46,7 @@ class LLMUsageRecord(BaseModel):
     provider: str = Field(min_length=1, max_length=64)
     model: str = Field(min_length=1, max_length=128)
     deployment: str | None = Field(default=None, max_length=128)
+    model_alias: str | None = Field(default=None, max_length=128)
     call_index: int = Field(default=0, ge=0)
     attempt_type: str = Field(default="primary", min_length=1, max_length=64)
     streaming: bool = False
@@ -100,8 +101,14 @@ class LLMPricingConfig(BaseModel):
     """Root pricing configuration loaded outside provider adapters."""
 
     pricing_version: str = Field(min_length=1, max_length=64)
+    billing_version: str | None = Field(default=None, min_length=1, max_length=64)
+    metering_enabled: bool | None = None
+    credit_debit_enabled: bool | None = None
     currency: Literal["USD"] = "USD"
     models: tuple[ModelPricing, ...] = ()
+    model_alias_profiles: dict[str, object] = Field(default_factory=dict)
+    infra: dict[str, object] = Field(default_factory=dict)
+    credits: dict[str, object] = Field(default_factory=dict)
 
     model_config = {"frozen": True, "extra": "forbid"}
 

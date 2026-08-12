@@ -26,7 +26,12 @@ Security rules:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+from services.llm.providers.finish_reasons import normalize_completion_outcome
+
+if TYPE_CHECKING:
+    from schemas.llm_usage import ProviderTokenUsage
 
 # ---------------------------------------------------------------------------
 # Provider failure kinds
@@ -150,10 +155,34 @@ class LlmProviderResponseError(LlmProviderAdapterError):
     - message.content is None or blank
     """
 
-    def __init__(self, message: str, *, failure_kind: str = "empty_answer") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: str = "empty_answer",
+        finish_reason: str | None = None,
+        provider_usage: ProviderTokenUsage | None = None,
+    ) -> None:
         super().__init__(message)
-        self.provider_usage: object | None = None
+        self.provider_usage = provider_usage
         self.failure_kind: str = failure_kind
+        self.finish_reason = finish_reason
+        self.normalized_finish_reason = normalize_completion_outcome(finish_reason)
+        self.input_tokens = (
+            provider_usage.input_tokens if provider_usage is not None else None
+        )
+        self.output_tokens = (
+            provider_usage.output_tokens if provider_usage is not None else None
+        )
+        self.total_tokens = (
+            provider_usage.total_tokens if provider_usage is not None else None
+        )
+        self.cached_input_tokens = (
+            provider_usage.cached_input_tokens if provider_usage is not None else None
+        )
+        self.reasoning_tokens = (
+            provider_usage.reasoning_tokens if provider_usage is not None else None
+        )
 
 
 class LlmProviderUnsupportedFeatureError(LlmProviderAdapterError):
