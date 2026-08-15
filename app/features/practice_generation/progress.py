@@ -6,12 +6,17 @@ import asyncio
 import json
 import logging
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from features.practice_generation.appsync_progress_client import (
     AppSyncPracticeProgressClient,
     PracticeProgressError,
+)
+from features.practice_generation.execution_control import (
+    PracticeExecutionStopped,
+    current_practice_execution_id,
+    local_cancellation_requested,
 )
 from features.practice_generation.progress_contract import (
     PracticeProgressContractError,
@@ -34,6 +39,32 @@ _FALLBACKABLE_PROGRESS_FAILURE_CODES = frozenset(
         "PRACTICE_PROGRESS_TRANSPORT_FAILED",
     }
 )
+_RESUMABLE_ERROR_CODES = frozenset(
+    {
+        "USER_CANCELLED",
+        "PRACTICE_GENERATOR_PROVIDER_FAILED",
+        "PRACTICE_GENERATOR_FALLBACK_EXHAUSTED",
+        "PRACTICE_VERIFIER_PROVIDER_FAILED",
+        "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED",
+        "PRACTICE_GENERATION_STALLED",
+        "PRACTICE_RECOVERY_EXHAUSTED",
+        "PRACTICE_MAX_WALL_TIME_EXCEEDED",
+    }
+)
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _is_resumable_error(value: object) -> bool:
+    return value is None or str(value) in _RESUMABLE_ERROR_CODES
 
 
 def _meta(item: dict[str, Any]) -> dict[str, Any]:
@@ -82,6 +113,11 @@ class AppSyncAssessmentProgressRepository:
         authoritative_question_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         assessment = self._required_assessment(test_id)
+        execution_id = current_practice_execution_id()
+        if execution_id is not None and _meta(assessment).get(
+            "activeExecutionId"
+        ) != execution_id:
+            raise PracticeRepositoryError("PRACTICE_EXECUTION_FENCED")
         if expected_updated_at is not None and assessment.get("updatedAt") != expected_updated_at:
             raise PracticeRepositoryError("ASSESSMENT_CONCURRENT_UPDATE")
         current_status = str(assessment.get("status") or "GENERATING")
@@ -152,6 +188,170 @@ class AppSyncAssessmentProgressRepository:
             }
         )
         return updated
+
+    def claim_execution(
+        self,
+        test_id: str,
+        *,
+        user_id: str,
+        execution_id: str,
+        lease_seconds: int,
+        resume_reason: str,
+    ) -> dict[str, Any] | None:
+        """CAS-claim initial/resumed execution and reclaim only unfinished groups."""
+        assessment = self._required_assessment(test_id)
+        if (
+            assessment.get("userId") != user_id
+            or assessment.get("origin") != "AI_CUSTOM"
+            or assessment.get("visibility") != "PRIVATE"
+        ):
+            raise PracticeRepositoryError("PRACTICE_EXECUTION_UNAUTHORIZED")
+        status = str(assessment.get("status") or "")
+        if status == "READY":
+            raise PracticeRepositoryError("PRACTICE_ALREADY_READY")
+        meta = _meta(assessment)
+        active_execution_id = meta.get("activeExecutionId")
+        lease_expires_at = _parse_timestamp(meta.get("executionLeaseExpiresAt"))
+        now = datetime.now(UTC)
+        if (
+            active_execution_id
+            and active_execution_id != execution_id
+            and lease_expires_at is not None
+            and lease_expires_at > now
+        ):
+            return None
+        if status == "FAILED" and not _is_resumable_error(meta.get("errorCode")):
+            raise PracticeRepositoryError("PRACTICE_NOT_RESUMABLE")
+        groups = deepcopy(dict(meta.get("generationGroups") or {}))
+        valid_slot_ids: set[str] = set()
+        invalid_question_ids: tuple[str, ...] = ()
+        if resume_reason != "INITIAL":
+            practice_request = meta.get("practiceRequest")
+            request_data = practice_request if isinstance(practice_request, dict) else {}
+            valid_slot_ids, invalid_question_ids = self._questions.inspect_reusable_slots(
+                test_id,
+                language=str(request_data.get("language") or "english"),
+                solution_required=bool(request_data.get("includeSolutions", True)),
+            )
+        for group in groups.values():
+            group_slot_ids = {
+                str(slot_id) for slot_id in list(group.get("slotIds") or []) if str(slot_id)
+            } if isinstance(group, dict) else set()
+            if isinstance(group, dict) and (
+                group.get("state") in {"RUNNING", "FAILED"}
+                or (resume_reason != "INITIAL" and bool(group_slot_ids - valid_slot_ids))
+            ):
+                group["state"] = "PENDING"
+                group["lastReasonCode"] = "INTERRUPTED_BEFORE_COMMIT"
+        attempt = int(meta.get("executionAttempt") or 0) + 1
+        lease = (now + timedelta(seconds=lease_seconds)).isoformat()
+        try:
+            claimed = self.update(
+                test_id,
+                meta_updates={
+                    "activeExecutionId": execution_id,
+                    "executionLeaseExpiresAt": lease,
+                    "executionStartedAt": now.isoformat(),
+                    "executionAttempt": attempt,
+                    "cancelRequested": False,
+                    "resumeReason": resume_reason,
+                    "generationGroups": groups,
+                    "phase": InternalPhase.GENERATING.value,
+                    "playable": False,
+                    "errorCode": None,
+                    "lastCompletedStage": "EXECUTION_CLAIMED",
+                },
+                status="GENERATING",
+                live=False,
+                expected_updated_at=str(assessment.get("updatedAt") or ""),
+                recalculate_manifest=not invalid_question_ids,
+            )
+        except PracticeRepositoryError as exc:
+            if exc.code == "ASSESSMENT_CONCURRENT_UPDATE":
+                return None
+            raise
+        if not invalid_question_ids:
+            return claimed
+        self._questions.delete_invalid_resume_questions(
+            test_id,
+            execution_id,
+            invalid_question_ids,
+        )
+        return self.update(
+            test_id,
+            meta_updates={"lastCompletedStage": "RESUME_RECONSTRUCTED"},
+            expected_updated_at=str(claimed.get("updatedAt") or ""),
+            live=False,
+            recalculate_manifest=True,
+        )
+
+    def request_cancellation(self, test_id: str, *, user_id: str) -> dict[str, Any]:
+        assessment = self._required_assessment(test_id)
+        if (
+            assessment.get("userId") != user_id
+            or assessment.get("origin") != "AI_CUSTOM"
+            or assessment.get("visibility") != "PRIVATE"
+        ):
+            raise PracticeRepositoryError("PRACTICE_EXECUTION_UNAUTHORIZED")
+        status = str(assessment.get("status") or "")
+        if status == "READY":
+            raise PracticeRepositoryError("PRACTICE_ALREADY_READY")
+        meta = _meta(assessment)
+        if bool(meta.get("cancelRequested")):
+            return assessment
+        if status != "GENERATING":
+            raise PracticeRepositoryError("PRACTICE_NOT_ACTIVE")
+        return self.update(
+            test_id,
+            meta_updates={
+                "cancelRequested": True,
+                "phase": InternalPhase.CANCELLED.value,
+                "playable": False,
+                "errorCode": "USER_CANCELLED",
+                "lastCompletedStage": "CANCEL_REQUESTED",
+            },
+            expected_updated_at=str(assessment.get("updatedAt") or ""),
+            live=False,
+            recalculate_manifest=True,
+        )
+
+    def finish_cancellation(self, test_id: str, execution_id: str) -> None:
+        assessment = self._required_assessment(test_id)
+        meta = _meta(assessment)
+        if meta.get("activeExecutionId") != execution_id:
+            return
+        if bool(meta.get("cancelRequested")) and assessment.get("status") == "GENERATING":
+            self.update(
+                test_id,
+                meta_updates={
+                    "phase": InternalPhase.CANCELLED.value,
+                    "playable": False,
+                    "errorCode": "USER_CANCELLED",
+                    "lastCompletedStage": "CANCEL_COMPLETED",
+                },
+                status="FAILED",
+                live=False,
+                expected_updated_at=str(assessment.get("updatedAt") or ""),
+                recalculate_manifest=True,
+            )
+
+    def require_expensive_work_allowed(
+        self,
+        test_id: str,
+        *,
+        lease_seconds: int = 300,
+    ) -> None:
+        execution_id = current_practice_execution_id()
+        if execution_id is None:
+            return
+        if local_cancellation_requested():
+            raise PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
+        lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+        if not self._assessments.renew_execution_lease(test_id, execution_id, lease):
+            raise PracticeExecutionStopped("PRACTICE_EXECUTION_FENCED")
+
+    def release_execution(self, test_id: str, execution_id: str) -> bool:
+        return self._assessments.release_execution(test_id, execution_id)
 
     def calculate_authoritative_meta(
         self,

@@ -48,6 +48,7 @@ class WebSearchRerankInput:
     attempt_used: str = ""
     official_required: bool = False
     exam_prep_suitable: bool = False
+    max_selected_results: int | None = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,12 @@ class WebSearchReranker:
         tag_tokens = _normalize_tags(rerank_input.retrieval_tags or [])
         topic_tokens = _tokenize(rerank_input.topic or "")
         min_score = settings.web_search_rerank_min_score
-        max_selected = settings.web_search_max_selected_results
+        max_selected = (
+            rerank_input.max_selected_results
+            if rerank_input.max_selected_results is not None
+            else settings.web_search_max_selected_results
+        )
+        max_selected = min(max(max_selected, 1), 20)
         if rerank_input.attempt_used == "exam_prep_fallback":
             max_selected = min(
                 max_selected,

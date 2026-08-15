@@ -24,9 +24,33 @@ _MONTH_YEAR = re.compile(
     r"october|november|december)\s+20\d{2}\b",
     re.IGNORECASE,
 )
+_FRESH_FACT_REQUEST = re.compile(
+    r"\b(?:latest|recent|today|this\s+(?:week|month|year)|current(?:ly)?)\b.*\b(?:"
+    r"affairs?|events?|appointments?|awards?|office\s+holders?|holders?|scheme|policy|"
+    r"president|prime\s+minister|chief\s+justice|governor|minister|"
+    r"sports?\s+result|results?)\b|"
+    r"\bwho\s+is\s+(?:the\s+)?current\b",
+    re.IGNORECASE,
+)
+_DATED_FACT_REQUEST = re.compile(
+    r"\b20\d{2}\b.*\b(?:current\s+affairs?|events?|appointments?|awards?|"
+    r"office\s+holder|scheme|policy|sports?\s+result|results?)\b|"
+    r"\b(?:current\s+affairs?|events?|appointments?|awards?|office\s+holder|"
+    r"scheme|policy|sports?\s+result|results?)\b.*\b20\d{2}\b",
+    re.IGNORECASE,
+)
 _WEB_CONTEXT_ACTIONS = frozenset(
     {"ANSWER_WITH_CONTEXT", "CONTINUE_PREVIOUS", "GENERATE_SIMILAR"}
 )
+
+
+def is_freshness_sensitive_query(query: str) -> bool:
+    """Recognize explicit dynamic-fact language without relying on model memory."""
+    return bool(
+        _CURRENT_AFFAIRS.search(query)
+        or _FRESH_FACT_REQUEST.search(query)
+        or _DATED_FACT_REQUEST.search(query)
+    )
 
 
 def normalize_web_search_demand(
@@ -55,6 +79,8 @@ def normalize_web_search_demand(
     reason: str | None = None
     if _CURRENT_AFFAIRS.search(evidence):
         reason = "current_affairs"
+    elif _FRESH_FACT_REQUEST.search(evidence) or _DATED_FACT_REQUEST.search(evidence):
+        reason = "current_event"
     elif classification.need_web_search:
         return classification
     elif _EXPLICIT_WEB.search(query):

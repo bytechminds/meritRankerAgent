@@ -31,6 +31,7 @@ EVENT_NAMES = frozenset(
         "COST_PROFILE_MISSING",
         "web_search_decision",
         "web_search_execution",
+        "practice_freshness_evidence",
         "grounding_completed",
         "context_gate_completed",
         "conversation_candidates_prepared",
@@ -66,16 +67,26 @@ EVENT_NAMES = frozenset(
         "PRACTICE_DISPATCH_RESULT",
         "PRACTICE_RUNTIME_STARTED",
         "PRACTICE_RUNTIME_VALIDATED",
+        "PRACTICE_REPOSITORY_FAILURE",
         "PRACTICE_RESOURCE_CONTRACT_LOADED",
         "PRACTICE_RESOURCE_VALIDATION_FAILED",
         "practice_request_classified",
         "practice_assessment_initialized",
         "practice_async_task_registered",
+        "practice_execution_claim_started",
+        "practice_execution_claimed",
+        "practice_cancel_requested",
+        "practice_cancel_observed",
+        "practice_resume_requested",
+        "practice_resume_reconstruction_completed",
+        "practice_stale_execution_fenced",
+        "practice_execution_released",
         "practice_graph_started",
         "practice_async_task_failed",
         "practice_reuse_completed",
         "practice_generation_progress",
         "practice_validation_completed",
+        "final_manifest_validation_completed",
         "practice_answer_distribution_validated",
         "practice_answer_distribution_rebalanced",
         "practice_manifest_updated",
@@ -84,6 +95,7 @@ EVENT_NAMES = frozenset(
         "practice_model_execution_failed",
         "practice_model_fallback_started",
         "practice_model_fallback_succeeded",
+        "practice_expensive_attempt_guard",
         "practice_generator_token_exhausted",
         "practice_generator_model_completed",
         "generator_model_attempt_started",
@@ -132,6 +144,9 @@ EVENT_NAMES = frozenset(
         "QUESTION_BANK_REUSE_QUERY_COMPLETED",
         "QUESTION_BANK_CATEGORY_FALLBACK",
         "QUESTION_BANK_REUSE_LIMIT_REACHED",
+        "PATTERN_QUESTION_BANK_LINK_FAILED",
+        "PATTERN_RETRIEVAL_COMPLETED",
+        "PATTERN_REUSE_HISTORY_UNAVAILABLE",
         "QUESTION_MANIFEST_UPDATED",
         "ASSESSMENT_QUESTIONS_QUERY_COMPLETED",
         "ASSESSMENT_CREATED",
@@ -316,7 +331,7 @@ def log_event(
         concise.append(f"request_id={context.request_id[:8]}")
     if duration_ms is not None:
         concise.append(f"duration_ms={max(duration_ms, 0)}")
-    if _detailed_logs:
+    if _detailed_logs or _logger.isEnabledFor(logging.DEBUG):
         concise.extend(f"{key}={value}" for key, value in payload["details"].items())
     collect_event(payload)
     _logger.log(level, " ".join(concise), extra={"observability_event": payload})

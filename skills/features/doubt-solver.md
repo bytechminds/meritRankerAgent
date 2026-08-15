@@ -101,9 +101,9 @@ The four V1 planning documents are complete and implementation is done:
   generation. Verification-limited responses are non-substantive and are skipped by
   History/Session/Memory persistence.
 - Required-web delivery always uses private verified replay. The final answer must cite exact URLs
-  retained in selected bounded web context. Current-affairs practice output is limited to at most
-  one numbered question per selected source card; repeated-source expansions are discarded and
-  unsupported output is replaced before any answer chunk is emitted.
+  retained in selected bounded web context. Freshness-sensitive Practice launches only after its
+  selected evidence bundle contains at least one source card per accepted question; repeated-source
+  expansions, weak retrieval, and unsupported evidence stop before the asynchronous task starts.
 - No classifier, provider, summarizer model, graph node, public schema, persistence field, cache, or
   frontend contract was added.
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 from bedrock_agentcore import BedrockAgentCoreApp
@@ -132,6 +132,56 @@ class RecoveryProgress:
         self.assessments.mark_failed(test_id, code)
 
 
+class DurableExecutionProgress:
+    def __init__(self, assessments: Assessments) -> None:
+        self.assessments = assessments
+        self.lock = threading.Lock()
+        self.claims = 0
+        self.cancel_writes = 0
+
+    def claim_execution(
+        self,
+        _test_id: str,
+        *,
+        user_id: str,
+        execution_id: str,
+        lease_seconds: int,
+        resume_reason: str,
+    ):
+        assert user_id == "user-1"
+        assert lease_seconds >= 300
+        assert resume_reason == "USER_RESUME"
+        with self.lock:
+            meta = self.assessments.item["meta"]
+            if meta.get("activeExecutionId"):
+                return None
+            self.claims += 1
+            self.assessments.item["status"] = "GENERATING"
+            meta.update(
+                {
+                    "activeExecutionId": execution_id,
+                    "cancelRequested": False,
+                    "errorCode": None,
+                    "phase": "GENERATING",
+                }
+            )
+            return copy.deepcopy(self.assessments.item)
+
+    def request_cancellation(self, _test_id: str, *, user_id: str):
+        assert user_id == "user-1"
+        with self.lock:
+            meta = self.assessments.item["meta"]
+            if not meta.get("cancelRequested"):
+                self.cancel_writes += 1
+                meta["cancelRequested"] = True
+                meta["phase"] = "CANCELLED"
+                meta["errorCode"] = "USER_CANCELLED"
+            return copy.deepcopy(self.assessments.item)
+
+    def mark_failed(self, test_id: str, code: str) -> None:
+        self.assessments.mark_failed(test_id, code)
+
+
 class BlockingFailureAssessments(Assessments):
     def __init__(self, events: list[str]) -> None:
         super().__init__(events)
@@ -241,6 +291,97 @@ def test_stale_duplicate_gets_one_recovery_claim_then_second_stale_fails() -> No
     assert exhausted.status == "FAILED"
     assert assessments.failed_code == "PRACTICE_RECOVERY_EXHAUSTED"
     assert second_tracker.added == 0
+
+
+def test_double_resume_claims_one_execution_and_cancel_is_idempotent() -> None:
+    events: list[str] = []
+    assessments = Assessments(events)
+    value = request()
+    test_id = deterministic_test_id(request_idempotency_key(value))
+    assessments.item = {
+        "testId": test_id,
+        "userId": "user-1",
+        "totalQuestions": 5,
+        "status": "FAILED",
+        "meta": {
+            "playable": False,
+            "readyCount": 3,
+            "progressPercent": 60,
+            "activeExecutionId": None,
+            "cancelRequested": True,
+            "errorCode": "USER_CANCELLED",
+            "generationGroups": {
+                "g-1": {"state": "COMPLETED"},
+                "g-2": {"state": "PENDING"},
+            },
+        },
+    }
+    progress = DurableExecutionProgress(assessments)
+    tracker = Tracker(events)
+    executor = QueuedExecutor()
+    launcher = AgentCorePracticeAsyncLauncher(
+        task_tracker=tracker,
+        assessments=assessments,
+        progress=progress,  # type: ignore[arg-type]
+        graph_runner=ReadyGraph(assessments, events),
+        executor=executor,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _value: launcher.resume(test_id, "user-1"), range(2))
+        )
+
+    assert progress.claims == 1
+    assert tracker.added == 1
+    assert len(executor.calls) == 1
+    assert sum(not result.already_active for result in results) == 1
+    assert {result.test_id for result in results} == {test_id}
+
+    launcher.cancel(test_id, "user-1")
+    launcher.cancel(test_id, "user-1")
+
+    assert progress.cancel_writes == 1
+    active_execution_id = assessments.item["meta"]["activeExecutionId"]
+    assert launcher._execution_registry.is_cancelled(active_execution_id) is True
+
+
+def test_resume_reconstructs_from_persistence_with_zero_process_state() -> None:
+    events: list[str] = []
+    assessments = Assessments(events)
+    value = request()
+    test_id = deterministic_test_id(request_idempotency_key(value))
+    assessments.item = {
+        "testId": test_id,
+        "userId": "user-1",
+        "totalQuestions": 1,
+        "status": "FAILED",
+        "meta": {
+            "playable": False,
+            "readyCount": 0,
+            "progressPercent": 0,
+            "activeExecutionId": None,
+            "cancelRequested": False,
+            "errorCode": "PRACTICE_EXECUTION_STALLED",
+            "generationGroups": {"g-1": {"state": "PENDING"}},
+        },
+    }
+    progress = DurableExecutionProgress(assessments)
+    executor = QueuedExecutor()
+
+    restarted_launcher = AgentCorePracticeAsyncLauncher(
+        task_tracker=Tracker(events),
+        assessments=assessments,
+        progress=progress,  # type: ignore[arg-type]
+        graph_runner=ReadyGraph(assessments, events),
+        executor=executor,
+    )
+    result = restarted_launcher.resume(test_id, "user-1")
+
+    assert result.test_id == test_id
+    assert result.status == "GENERATING"
+    assert result.execution_id == assessments.item["meta"]["activeExecutionId"]
+    assert len(executor.calls) == 1
 
 
 def test_success_registers_once_and_persists_ready_before_completion() -> None:

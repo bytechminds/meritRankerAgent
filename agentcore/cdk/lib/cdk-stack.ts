@@ -353,6 +353,12 @@ export class AgentCoreStack extends Stack {
       );
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
+          actions: ['dynamodb:DeleteItem', 'dynamodb:TransactWriteItems'],
+          resources: [practiceAssessmentTableArn, practiceQuestionTableArn],
+        })
+      );
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
           actions: ['dynamodb:Query'],
           resources: [`${practiceQuestionTableArn}/index/${practiceQuestionTestIndex}`],
         })

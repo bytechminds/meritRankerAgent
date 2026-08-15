@@ -125,6 +125,7 @@ class ModelExecutor(Protocol):
         *,
         route_decision: RouteDecision,
         messages: list[LlmMessage],
+        attempt_guard: Callable[[], None] | None = None,
     ) -> ModelExecutionResult:
         """Execute a model call and return the normalised result.
 
@@ -195,6 +196,7 @@ class MockModelExecutor:
         *,
         route_decision: RouteDecision,
         messages: list[LlmMessage],
+        attempt_guard: Callable[[], None] | None = None,
     ) -> ModelExecutionResult:
         """Record the call, optionally raise, or return canned content."""
         self.last_route_decision = route_decision
@@ -559,6 +561,7 @@ class LlmOrchestrator:
         prompt: str,
         overlays: list[str] | None = None,
         practice_generation_workload: PracticeGenerationWorkload | None = None,
+        attempt_guard: Callable[[], None] | None = None,
     ) -> OrchestrationResult:
         """Execute a bounded structured-output call through the shared runtime."""
         if not user_content or not user_content.strip():
@@ -585,13 +588,22 @@ class LlmOrchestrator:
         )
         try:
             with bind_llm_attempt_type(current_llm_attempt_type()):
-                execution_result = self._model_executor.execute(
-                    route_decision=route_decision,
-                    messages=messages,
-                )
+                if attempt_guard is None:
+                    execution_result = self._model_executor.execute(
+                        route_decision=route_decision,
+                        messages=messages,
+                    )
+                else:
+                    execution_result = self._model_executor.execute(
+                        route_decision=route_decision,
+                        messages=messages,
+                        attempt_guard=attempt_guard,
+                    )
         except LlmOrchestrationError:
             raise
         except Exception as exc:
+            if attempt_guard is not None:
+                attempt_guard()
             raise LlmExecutionError(
                 f"Model executor raised an unexpected error for route "
                 f"'{route_decision.route_id}': {type(exc).__name__}"

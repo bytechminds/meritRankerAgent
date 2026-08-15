@@ -30,6 +30,38 @@ Frontend
 → existing AppSync subscription and frontend
 ```
 
+## Freshness-sensitive Practice evidence (2026-08-14)
+
+After the existing classifier and deterministic Practice gate, requests for current affairs,
+recent events, current office-holders, dated awards/appointments, or other freshness-sensitive
+facts run one bounded existing web-search retrieval before the asynchronous assessment is created.
+The request carries `requires_fresh_evidence`, a canonical freshness reason, and a compact selected
+`FreshEvidenceBundle` through `PracticeGenerationRequest` and the existing
+`MockTestQuiz.meta.practiceRequest` recovery payload. Static academic practice never triggers this
+path and stores no web evidence.
+
+The source-policy resolver supplies either the user-explicit date range or the existing current
+window ending on the runtime date. The provider-neutral web tool retains only valid, de-duplicated,
+date-compatible URLs with compact snippets; supplied publication dates outside the window are
+discarded and undated metadata is allowed only when it is otherwise usable. The maximum retained
+evidence set is 20 items. Requests needing more independently grounded facts stop with the typed
+`PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT` result rather than silently reducing the request.
+
+Fresh Practice launches only when the selected evidence count equals or exceeds the accepted
+question count. Provider failures, weak/empty context, malformed recovery metadata, or insufficient
+evidence stop before planner, generator, or verifier model work. No later phase repeats web search.
+The planner receives only freshness metadata; each generator/verifier call receives the exact
+evidence subset for its slot IDs. A verifier-approved fresh-fact question must cite one of those
+selected URLs, otherwise it is deterministically returned for regeneration as `UNSUPPORTED_FACT`.
+Logs retain counts, windows, and status only; raw snippets and URLs are not logged.
+
+Local current-code E2E on 2026-08-14 verified the fail-closed path for both an undated
+current-affairs request and a `2024` historical current-affairs request: live bounded web
+retrieval returned no source that passed the existing quality gate, so no assessment task,
+generator, or verifier call was started and the caller received the controlled startup failure.
+This proves the no-stale-memory guard under unavailable evidence. A successful READY assessment
+with sufficient live evidence remains **[NOT VERIFIED]**; no deployment was performed.
+
 ## Exam Profile Context (2026-08-07)
 
 `PracticeGenerationRequest` carries an optional canonical `exam_profile_id` alongside the existing
@@ -213,6 +245,7 @@ Key files:
 - `app/tests/practice_generation/test_practice_routing.py`
 - `app/tests/practice_generation/test_practice_credentials.py`
 - `app/tests/practice_generation/test_practice_prompts.py`
+- `app/tests/practice_generation/test_practice_freshness.py`
 - `app/tests/practice_generation/test_practice_agentcore_async.py`
 - `app/tests/practice_generation/test_appsync_progress_client.py`
 - `app/tests/practice_generation/test_appsync_progress_repository.py`
@@ -649,3 +682,83 @@ input tokens, and 10,008 output tokens, compared with 12 calls, 10,113 input tok
 output tokens in the reported failed run. The literal wording remained blocked by the independent
 context gate when replayed without its historical source turn, so literal-query parity is
 `[NOT VERIFIED]`. No Production deployment was performed or authorized.
+
+## Cancel, crash recovery, and same-test resume (2026-08-13)
+
+Practice generation now has a durable execution lease on the existing `MockTestQuiz` item. Each
+attempt claims a fresh `activeExecutionId`, lease expiry, start time, attempt number, and resume
+reason by conditional AppSync update. Only that execution may renew the lease, publish progress,
+delete invalid resume rows, or persist a Question. Question persistence uses one DynamoDB
+transaction that checks the parent execution fence before the idempotent put. The runtime role has
+only the additional `TransactWriteItems` and `DeleteItem` actions on the existing assessment and
+Question tables; no table, queue, workflow, checkpoint store, or runtime was added.
+
+Authenticated cancel is cooperative and operation-scoped. The Next.js server derives the Cognito
+owner and invokes `practice_control`; the Python runtime persists `cancelRequested` before signaling
+the matching in-memory execution. Costly planner, generator, repair, replacement, and verifier
+boundaries recheck cancellation and renew the coarse lease. A question already independently
+approved when cancellation arrives is persisted and checkpointed before the worker stops. The
+shared AgentCore session is never terminated because it may also own unrelated conversation work.
+The terminal assessment is `FAILED` with phase `CANCELLED` and `USER_CANCELLED`; repeated cancel is
+idempotent and READY assessments are not cancellable.
+
+Resume always reuses the same assessment/test ID and immutable persisted blueprint. It strongly
+reads existing schema-v2 Questions through the canonical playable-question validator, preserves
+valid verified slots, deletes only exact invalid rows under the new execution fence, reconstructs
+authoritative counts, and resets only incomplete or invalid groups. An active unexpired lease
+blocks concurrent resume; an expired process can be replaced without any in-memory state. The old
+process is fenced from all subsequent Question/progress writes. Resume remains unavailable for
+non-resumable validation and contract failures, and the unchanged final validator is still the only
+path to READY.
+
+Safe events cover claim, cancel request/observation, resume reconstruction, stale fencing, and
+execution release. They include identifiers, counters, states, and reason codes only. Focused
+offline tests cover repeated cancel, cancellation boundaries, paid-approved persistence, active
+lease contention, zero-RAM reconstruction, invalid-slot-only regeneration, stale-executor write
+rejection, sequential registry cleanup, and unchanged final validation behavior. Authenticated
+Sandbox cancel/process-crash/resume with real provider calls, measured latency/cost, and Production
+deployment remain `[NOT VERIFIED]`.
+
+## Strict cancellation cost guard (2026-08-13)
+
+Practice now supplies one optional execution-scoped callback to the existing shared structured
+model executor. The callback reuses `require_expensive_work_allowed`: it checks the process-local
+cancel signal first, then conditionally renews the existing durable execution lease. The shared
+executor has no Practice import, test ID, execution ID, or persistence knowledge. With no callback,
+its invocation and retry/fallback behavior are unchanged.
+
+The callback runs immediately before the one allowed same-model capacity escalation and before
+each configured provider/model fallback. A `PRACTICE_CANCEL_OBSERVED` or
+`PRACTICE_EXECUTION_FENCED` signal propagates as operation control flow and cannot be normalized as
+a provider failure or trigger another fallback. An already-fired synchronous provider request may
+finish and remain billable. No new provider call begins after its result reaches either guarded
+retry boundary.
+
+Existing graph boundaries remain authoritative and were not duplicated: generation waves,
+verifier calls, repair/replacement waves, and subsequent generation groups already invoke the same
+execution-control check. If cancellation arrives during an in-flight verifier, an approved result
+is still authoritatively persisted and checkpointed before stopping; an unverified generator
+result is not persisted merely for cancellation. Resume continues to reuse only verified,
+persisted Questions under the existing fresh execution claim and final validator.
+
+Focused offline regressions prove cancelled and superseded retry blocking, active-guard
+escalation/fallback compatibility, explicit `attempt_guard=None` compatibility, typed signal
+propagation through structured orchestration, no verifier after a generator completes under
+cancellation, and approved in-flight verifier persistence before the next slot is blocked. The
+guard adds no work to a successful primary call. On an active retry path it can add one existing
+conditional lease-renewal write immediately before each new expensive attempt; a local cancel is
+rejected without that write. No new dependency, module, state store, infrastructure, provider
+adapter, route, model, token cap, prompt, Pattern behavior, billing rule, player behavior, or
+public schema was added. Authenticated Dev/local real-provider UI cancellation evidence remains
+`[NOT VERIFIED]`; no Production deployment is authorized by this change.
+
+An authenticated local UI run created
+`practice-d13016fb850913418f4a654a32d14449` at `2026-08-13T17:49:38.661672Z`.
+Cancel was pressed at `17:50:03.679Z`; the UI showed `Stopping generation` on the next sampled
+state and the durable item reached `CANCELLED` / `USER_CANCELLED` / `CANCEL_COMPLETED` at
+`17:50:22.080834Z`. A keyed Question-index query returned zero persisted Questions, and the UI
+offered same-test Resume. The local background worker's provider-attempt event stream was not
+retained in the readable request log, so provider completion time, exact post-cancel attempt
+counts, and token savings could not be independently reconstructed. Therefore the strict
+real-provider event-level acceptance gate remains `[NOT VERIFIED]` and release remains
+`NOT_READY` despite the successful authenticated UI lifecycle check.

@@ -26,6 +26,8 @@ class WebSearchRequest(BaseModel):
     topic: str | None = Field(default=None, max_length=256)
     retrieval_tags: list[str] = Field(default_factory=list, max_length=12)
     web_search_reason: str | None = Field(default=None, max_length=64)
+    requires_fresh_evidence: bool = False
+    required_evidence_count: int = Field(default=0, ge=0, le=20)
     timeout_seconds: float = Field(default=8.0, ge=1.0, le=30.0)
 
     model_config = {"str_strip_whitespace": True}
@@ -65,6 +67,28 @@ class WebSearchItem(BaseModel):
     model_config = {"str_strip_whitespace": True}
 
 
+class FreshnessWindow(BaseModel):
+    """Deterministic date range applied to a freshness-required web search."""
+
+    start_date: str | None = Field(default=None, max_length=16)
+    end_date: str | None = Field(default=None, max_length=16)
+    source: Literal["default", "user_explicit", "none"] = "none"
+    label: str = Field(default="", max_length=64)
+
+    model_config = {"str_strip_whitespace": True, "frozen": True}
+
+
+class FreshEvidenceBundle(BaseModel):
+    """Compact, selected external evidence retained for grounded Practice."""
+
+    requested_window: FreshnessWindow
+    retrieved_at: str = Field(min_length=1, max_length=64)
+    search_query: str = Field(min_length=1, max_length=500)
+    items: list[WebSearchItem] = Field(default_factory=list, max_length=20)
+
+    model_config = {"str_strip_whitespace": True, "frozen": True}
+
+
 class WebSearchProviderResult(BaseModel):
     """Provider adapter output."""
 
@@ -94,5 +118,6 @@ class WebSearchResult(BaseModel):
     official_count: int = Field(default=0, ge=0, le=20)
     reputable_count: int = Field(default=0, ge=0, le=20)
     duration_ms: int = Field(default=0, ge=0)
+    fresh_evidence: FreshEvidenceBundle | None = None
 
     model_config = {"str_strip_whitespace": True}

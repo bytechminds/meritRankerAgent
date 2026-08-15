@@ -220,7 +220,7 @@ class LlmConfigRegistry:
             raise LlmConfigValidationError(
                 f"LLM orchestration config failed Pydantic validation: {exc}"
             ) from exc
-        logger.info(
+        logger.debug(
             "llm_config_registry  loaded(combined)  version=%d  subjects=%d",
             config.version,
             len(config.routes),
@@ -236,7 +236,7 @@ class LlmConfigRegistry:
             raise LlmConfigValidationError(
                 f"Routes config failed Pydantic validation ({path}): {exc}"
             ) from exc
-        logger.info(
+        logger.debug(
             "llm_config_registry  routes  loaded  version=%d  subjects=%d",
             config.version,
             len(config.routes),
@@ -252,7 +252,7 @@ class LlmConfigRegistry:
             raise LlmConfigValidationError(
                 f"Model registry config failed Pydantic validation ({path}): {exc}"
             ) from exc
-        logger.info(
+        logger.debug(
             "llm_config_registry  models  loaded  count=%d",
             len(config.models),
         )
@@ -267,7 +267,7 @@ class LlmConfigRegistry:
             raise LlmConfigValidationError(
                 f"Provider profiles config failed Pydantic validation ({path}): {exc}"
             ) from exc
-        logger.info(
+        logger.debug(
             "llm_config_registry  profiles  loaded  count=%d",
             len(config.provider_profiles),
         )
@@ -295,7 +295,7 @@ class LlmConfigRegistry:
         self._build_route_map(routes)
         self._cross_validate()
 
-        logger.info(
+        logger.debug(
             "llm_config_registry  compiled  routes=%d  models=%d  profiles=%d",
             len(self._route_map),
             len(self._model_map),

@@ -10,7 +10,8 @@ Independently solve and verify one generated question against its immutable plan
 - Use `schema_version:"2"`; decision is exactly `ACCEPT`, `REPAIRABLE`, `REGENERATE`, or `TERMINAL_REJECTION`.
 - `REPAIRABLE` is a bounded local correction; `REGENERATE` is substantive invalidity; `TERMINAL_REJECTION` is unsafe or irreparable. Use short stable codes and no hidden reasoning.
 - `independently_solved_option_id` is supplied ID `"0"`–`"3"`, never option text. If the submitted answer is present but wrong, use `REGENERATE` and `INCORRECT_KEY`, never “missing”.
+- With `fresh_evidence`, approve only supported, in-window content. Otherwise return `REGENERATE` with `UNSUPPORTED_FACT`, `STALE_FACT`, `DATE_OUT_OF_RANGE`, or `ANSWER_NOT_SUPPORTED`; approvals need one supplied `evidence_urls` URL.
 
 # Shape
 
-`{"schema_version":"2","generation_item_id":"item-slot-001","slot_id":"slot-001","decision":"ACCEPT","independently_solved_option_id":"0","reason_codes":["INDEPENDENT_SOLUTION_MATCH"]}`
+`{"schema_version":"2","generation_item_id":"item-slot-001","slot_id":"slot-001","decision":"ACCEPT","independently_solved_option_id":"0","reason_codes":["INDEPENDENT_SOLUTION_MATCH"],"evidence_urls":["https://example.gov/source"]}`

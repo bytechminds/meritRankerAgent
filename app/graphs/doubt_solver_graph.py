@@ -39,8 +39,11 @@ from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     decide_practice_launch,
+    is_fresh_evidence_request_supported,
     practice_async_unavailable_message,
     practice_route_enabled,
+    required_fresh_evidence_count,
+    resolve_practice_freshness_requirement,
     resolve_practice_request,
 )
 from features.practice_generation.schemas import (
@@ -78,6 +81,7 @@ from services.doubt_solver.final_answer import build_final_answer_result
 from services.dynamodb_service import DynamoDbConfigurationError, DynamoDbServiceError
 from services.query_classifier_service import classify_query
 from services.question_record_service import fetch_question_records_by_ids
+from tools.web_search.models import FreshEvidenceBundle
 
 logger = logging.getLogger(__name__)
 
@@ -664,6 +668,7 @@ class OrchestratedDoubtSolverState(TypedDict):
     conversation_preparation: dict | None
     query_classification: dict | None
     source_modality: str
+    fresh_evidence: dict | None
 
 
 # ---------------------------------------------------------------------------
@@ -913,10 +918,44 @@ def _orchestrated_collect_context_node(
             get_context_retrieval_service,
         )
 
+        freshness_requirement = resolve_practice_freshness_requirement(
+            query,
+            classification_dict,
+        )
+        if (
+            freshness_requirement.requires_fresh_evidence
+            and not is_fresh_evidence_request_supported(state.get("original_query") or query)
+        ):
+            log_event(
+                "practice_freshness_evidence",
+                component="practice.freshness",
+                stage="retrieve",
+                status="unavailable",
+                error_code="PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT",
+                details={
+                    "required": True,
+                    "reason": freshness_requirement.freshness_reason,
+                },
+            )
+            return {"context_text": "", "retrieval_context": {}}
+        retrieval_classification = dict(classification_dict)
+        if freshness_requirement.requires_fresh_evidence:
+            retrieval_classification.update(
+                {
+                    "need_web_search": True,
+                    "web_search_reason": freshness_requirement.freshness_reason,
+                }
+            )
         request = ContextRequestBuilder.from_query_and_classification(
             request_id=state.get("request_id", ""),
             query=query,
-            classification=classification_dict,
+            classification=retrieval_classification,
+            requires_fresh_evidence=freshness_requirement.requires_fresh_evidence,
+            required_evidence_count=(
+                required_fresh_evidence_count(state.get("original_query") or query)
+                if freshness_requirement.requires_fresh_evidence
+                else 0
+            ),
         )
         result = get_context_retrieval_service().retrieve_context(
             request,
@@ -957,10 +996,38 @@ def _orchestrated_collect_context_node(
             duration_ms=duration_ms,
             details={"source": retrieval_source, "item_count": result.item_count},
         )
-        return {
+        fresh_evidence = result.fresh_evidence
+        if freshness_requirement.requires_fresh_evidence:
+            log_event(
+                "practice_freshness_evidence",
+                component="practice.freshness",
+                stage="retrieve",
+                status="attached" if fresh_evidence is not None else "unavailable",
+                details={
+                    "required": True,
+                    "reason": freshness_requirement.freshness_reason,
+                    "evidenceItemCount": (
+                        len(fresh_evidence.items) if fresh_evidence is not None else 0
+                    ),
+                    "windowStart": (
+                        fresh_evidence.requested_window.start_date
+                        if fresh_evidence is not None
+                        else ""
+                    ),
+                    "windowEnd": (
+                        fresh_evidence.requested_window.end_date
+                        if fresh_evidence is not None
+                        else ""
+                    ),
+                },
+            )
+        update = {
             "context_text": context_text,
             "retrieval_context": retrieval_payload,
         }
+        if fresh_evidence is not None:
+            update["fresh_evidence"] = fresh_evidence.model_dump(mode="json")
+        return update
 
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1322,6 +1389,27 @@ def build_orchestrated_doubt_solver_graph(
         if practice_launcher is not None:
             classification = state.get("classification") or {}
             try:
+                freshness_requirement = resolve_practice_freshness_requirement(
+                    state.get("original_query") or state["query"],
+                    classification,
+                )
+                if (
+                    freshness_requirement.requires_fresh_evidence
+                    and not is_fresh_evidence_request_supported(
+                        state.get("original_query") or state["query"]
+                    )
+                ):
+                    raise PracticeLaunchError(
+                        "PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT"
+                    )
+                fresh_evidence = (
+                    FreshEvidenceBundle.model_validate(state["fresh_evidence"])
+                    if freshness_requirement.requires_fresh_evidence
+                    and state.get("fresh_evidence")
+                    else None
+                )
+                if freshness_requirement.requires_fresh_evidence and fresh_evidence is None:
+                    raise PracticeLaunchError("PRACTICE_FRESH_EVIDENCE_UNAVAILABLE")
                 request = resolve_practice_request(
                     request_id=state["request_id"],
                     user_id=state["actor_id"],
@@ -1339,6 +1427,8 @@ def build_orchestrated_doubt_solver_graph(
                         (state.get("query_classification") or {}).get("selected_turn_id") or ""
                     )
                     or None,
+                    freshness_requirement=freshness_requirement,
+                    fresh_evidence=fresh_evidence,
                 )
                 launch = practice_launcher(request)
             except PracticeLaunchError:
@@ -1399,8 +1489,19 @@ def build_orchestrated_doubt_solver_graph(
                 },
             )
         if practice_route_enabled() and decision.eligible:
-            return "practice"
+            requirement = resolve_practice_freshness_requirement(
+                state.get("original_query") or state["query"],
+                classification,
+            )
+            return "practice_fresh_context" if requirement.requires_fresh_evidence else "practice"
         return "retrieve"
+
+    def _route_after_context(state: OrchestratedDoubtSolverState) -> str:
+        classification = state.get("classification") or {}
+        decision = decide_practice_launch(state["query"], classification)
+        if practice_route_enabled() and decision.eligible:
+            return "practice"
+        return "generate"
 
     builder: StateGraph = StateGraph(OrchestratedDoubtSolverState)
     builder.add_node("understand_conversation", _understand_conversation_node)
@@ -1420,12 +1521,20 @@ def build_orchestrated_doubt_solver_graph(
         {
             "complete": END,
             "practice": "practice_launch" if practice_route_enabled() else "collect_context",
+            "practice_fresh_context": "collect_context",
             "retrieve": "collect_context",
         },
     )
     if practice_route_enabled():
         builder.add_edge("practice_launch", END)
-    builder.add_edge("collect_context", "generate")
+    builder.add_conditional_edges(
+        "collect_context",
+        _route_after_context,
+        {
+            "practice": "practice_launch" if practice_route_enabled() else "generate",
+            "generate": "generate",
+        },
+    )
     builder.add_edge("generate", END)
 
     return builder.compile()

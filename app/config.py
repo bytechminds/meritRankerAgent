@@ -219,6 +219,21 @@ class Settings:
 
 # Module-level singleton — built once on first call to get_settings().
 _settings: Settings | None = None
+_VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+
+
+def _resolve_log_level(app_env: str) -> str:
+    """Return the validated application log level with a production INFO floor."""
+    configured = (
+        os.getenv("AGENT_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "INFO"
+    ).strip().upper()
+    if configured not in _VALID_LOG_LEVELS:
+        raise ConfigurationError(
+            "AGENT_LOG_LEVEL or LOG_LEVEL must be one of CRITICAL, ERROR, WARNING, INFO, DEBUG."
+        )
+    if app_env == "production" and configured == "DEBUG":
+        return "INFO"
+    return configured
 
 
 def _parse_optional_float(value: str) -> float | None:
@@ -510,7 +525,7 @@ def get_settings() -> Settings:
 
         _settings = Settings(
             app_env=os.getenv("APP_ENV", "local"),
-            log_level=os.getenv("AGENT_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")),
+            log_level=_resolve_log_level(current_app_env),
             agent_log_format=os.getenv("AGENT_LOG_FORMAT", "").strip(),
             agent_log_file_enabled=(
                 os.getenv(

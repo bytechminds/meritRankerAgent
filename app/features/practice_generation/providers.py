@@ -7,6 +7,9 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from features.practice_generation.execution_control import (
+    current_expensive_attempt_guard,
+)
 from features.practice_generation.planning import select_planner_family
 from features.practice_generation.schemas import (
     DemandBucket,
@@ -15,6 +18,7 @@ from features.practice_generation.schemas import (
     GenerationGroup,
     PlannerSlot,
     PracticeGenerationRequest,
+    VerificationDecision,
     VerificationResult,
 )
 from retrieval.pattern_intelligence import PatternGenerationContext
@@ -62,6 +66,7 @@ def _execute(
         prompt=f"{prompt_name}.md",
         overlays=overlays,
         practice_generation_workload=practice_generation_workload,
+        attempt_guard=current_expensive_attempt_guard(),
     )
     return GeneratedBatch(
         content=result.content,
@@ -97,6 +102,75 @@ def _pattern_guidance_payload(
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _freshness_metadata_payload(request: PracticeGenerationRequest) -> dict[str, object] | None:
+    if not request.requires_fresh_evidence or request.fresh_evidence is None:
+        return None
+    return {
+        "required": True,
+        "reason": request.freshness_reason,
+        "requested_window": request.fresh_evidence.requested_window.model_dump(mode="json"),
+        "evidence_item_count": len(request.fresh_evidence.items),
+    }
+
+
+def _fresh_evidence_payload(
+    request: PracticeGenerationRequest,
+    *,
+    slot_ids: tuple[str, ...] = (),
+) -> dict[str, object] | None:
+    if not request.requires_fresh_evidence or request.fresh_evidence is None:
+        return None
+    items = request.fresh_evidence.items
+    if slot_ids:
+        selected = []
+        for slot_id in slot_ids:
+            try:
+                index = int(slot_id.rsplit("-", 1)[-1]) - 1
+            except ValueError:
+                continue
+            if 0 <= index < len(items):
+                selected.append(items[index])
+        items = selected
+    return {
+        "requested_window": request.fresh_evidence.requested_window.model_dump(mode="json"),
+        "items": [item.model_dump(mode="json") for item in items],
+    }
+
+
+def _enforce_evidence_citations(
+    request: PracticeGenerationRequest,
+    result: VerificationResult,
+    *,
+    evidence: dict[str, object] | None,
+) -> VerificationResult:
+    if not request.requires_fresh_evidence or not result.is_approved:
+        return result
+    raw_items = evidence.get("items") if isinstance(evidence, dict) else None
+    allowed_urls = {
+        str(item.get("url") or "").strip()
+        for item in raw_items
+        if isinstance(item, dict) and str(item.get("url") or "").strip()
+    }
+    cited_urls = {url.strip() for url in result.evidence_urls if url.strip()}
+    if cited_urls and cited_urls.issubset(allowed_urls):
+        return result
+    if result.schema_version == "2":
+        return result.model_copy(
+            update={
+                "decision": VerificationDecision.REGENERATE,
+                "reason_codes": ["UNSUPPORTED_FACT"],
+                "evidence_urls": [],
+            }
+        )
+    return result.model_copy(
+        update={
+            "approved": False,
+            "reason_code": "UNSUPPORTED_FACT",
+            "evidence_urls": [],
+        }
+    )
 
 
 def _combine_prompt_budgets(budgets: list[PromptInputBudget]) -> PromptInputBudget | None:
@@ -156,6 +230,9 @@ class RoutedPlannerProvider:
                 f"slot-{index:03d}" for index in range(1, request.accepted_count + 1)
             ],
         }
+        freshness = _freshness_metadata_payload(request)
+        if freshness is not None:
+            payload["freshness_requirement"] = freshness
         if profile_resolution.context is not None:
             payload["exam_profile"] = profile_resolution.context.as_planner_payload()
         return _execute(
@@ -188,6 +265,26 @@ class RoutedQuestionGenerator:
         group: GenerationGroup,
         exclude_normalized_texts: tuple[str, ...],
     ) -> GeneratedBatch:
+        payload: dict[str, Any] = {
+            "bucket": bucket.model_dump(mode="json"),
+            "group_id": group.group_id,
+            "count": group.required_count,
+            "language": request.language,
+            "exam_id": request.exam_id,
+            "exam_stage": request.exam_stage,
+            "include_solutions": request.include_solutions,
+            "excluded_question_snippets": [
+                value[:180] for value in exclude_normalized_texts[-20:]
+            ],
+        }
+        evidence = _fresh_evidence_payload(request)
+        if evidence is not None:
+            payload["fresh_evidence"] = evidence
+            logger.info(
+                "practice_fresh_evidence_generator request_id=%s evidence_count=%d",
+                request.request_id,
+                len(evidence["items"]),
+            )
         return _execute(
             self._orchestrator,
             request_id=request.request_id,
@@ -196,18 +293,7 @@ class RoutedQuestionGenerator:
             difficulty=bucket.difficulty.value,
             language=request.language,
             prompt_name="practice_generation/question_generator",
-            payload={
-                "bucket": bucket.model_dump(mode="json"),
-                "group_id": group.group_id,
-                "count": group.required_count,
-                "language": request.language,
-                "exam_id": request.exam_id,
-                "exam_stage": request.exam_stage,
-                "include_solutions": request.include_solutions,
-                "excluded_question_snippets": [
-                    value[:180] for value in exclude_normalized_texts[-20:]
-                ],
-            },
+            payload=payload,
             practice_generation_workload=PracticeGenerationWorkload(
                 complexity="medium",
                 slot_count=group.required_count,
@@ -374,6 +460,12 @@ class RoutedQuestionGenerator:
         pattern_guidance = _pattern_guidance_payload(guidance_by_slot)
         if pattern_guidance:
             payload["pattern_guidance"] = pattern_guidance
+        evidence = _fresh_evidence_payload(
+            request,
+            slot_ids=tuple(slot.slot_id for slot in slots),
+        )
+        if evidence is not None:
+            payload["fresh_evidence"] = evidence
         return payload
 
     def _measure_slot_budget(
@@ -632,6 +724,19 @@ class RoutedQuestionVerifier:
         bucket: DemandBucket,
         question: GeneratedQuestion,
     ) -> VerificationResult:
+        evidence = _fresh_evidence_payload(request)
+        payload: dict[str, Any] = {
+            "bucket": bucket.model_dump(mode="json"),
+            "question": question.model_dump(mode="json"),
+            "language": request.language,
+        }
+        if evidence is not None:
+            payload["fresh_evidence"] = evidence
+            logger.info(
+                "practice_fresh_evidence_verifier request_id=%s evidence_count=%d",
+                request.request_id,
+                len(evidence["items"]),
+            )
         raw = _execute(
             self._orchestrator,
             request_id=request.request_id,
@@ -640,13 +745,13 @@ class RoutedQuestionVerifier:
             difficulty="default",
             language=request.language,
             prompt_name="practice_generation/question_verifier",
-            payload={
-                "bucket": bucket.model_dump(mode="json"),
-                "question": question.model_dump(mode="json"),
-                "language": request.language,
-            },
+            payload=payload,
         )
-        return VerificationResult.model_validate(json.loads(raw.content))
+        return _enforce_evidence_citations(
+            request,
+            VerificationResult.model_validate(json.loads(raw.content)),
+            evidence=evidence,
+        )
 
     def verify_slot(
         self,
@@ -656,6 +761,35 @@ class RoutedQuestionVerifier:
         slot: PlannerSlot,
         question: GeneratedQuestion,
     ) -> VerificationResult:
+        evidence = _fresh_evidence_payload(request, slot_ids=(slot.slot_id,))
+        payload: dict[str, Any] = {
+            "schema_version": "2",
+            "slot": slot.model_dump(mode="json"),
+            "question": {
+                "schema_version": question.schema_version,
+                "generation_item_id": question.generation_item_id,
+                "slot_id": question.slot_id,
+                "question": question.question,
+                "question_type": question.question_type.value,
+                "options": [
+                    option.model_dump(mode="json") for option in question.canonical_options
+                ],
+                "submitted_answer": {
+                    "correct_option_id": question.correct_option_id,
+                    "correct_answer": question.correct_answer,
+                },
+                "answer_explanation": question.answer_explanation,
+            },
+            "language": request.language,
+            "instruction": "Solve independently before comparing the submitted option ID.",
+        }
+        if evidence is not None:
+            payload["fresh_evidence"] = evidence
+            logger.info(
+                "practice_fresh_evidence_verifier request_id=%s evidence_count=%d",
+                request.request_id,
+                len(evidence["items"]),
+            )
         raw = _execute(
             self._orchestrator,
             request_id=request.request_id,
@@ -664,26 +798,10 @@ class RoutedQuestionVerifier:
             difficulty="default",
             language=request.language,
             prompt_name="practice_generation/question_verifier_v2",
-            payload={
-                "schema_version": "2",
-                "slot": slot.model_dump(mode="json"),
-                "question": {
-                    "schema_version": question.schema_version,
-                    "generation_item_id": question.generation_item_id,
-                    "slot_id": question.slot_id,
-                    "question": question.question,
-                    "question_type": question.question_type.value,
-                    "options": [
-                        option.model_dump(mode="json") for option in question.canonical_options
-                    ],
-                    "submitted_answer": {
-                        "correct_option_id": question.correct_option_id,
-                        "correct_answer": question.correct_answer,
-                    },
-                    "answer_explanation": question.answer_explanation,
-                },
-                "language": request.language,
-                "instruction": "Solve independently before comparing the submitted option ID.",
-            },
+            payload=payload,
         )
-        return VerificationResult.model_validate(json.loads(raw.content))
+        return _enforce_evidence_citations(
+            request,
+            VerificationResult.model_validate(json.loads(raw.content)),
+            evidence=evidence,
+        )

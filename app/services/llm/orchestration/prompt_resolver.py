@@ -171,7 +171,7 @@ class PromptResolver:
         context_chars = len(context) if context else 0
         context_truncated = context_chars > MAX_CONTEXT_CHARS
 
-        logger.info(
+        logger.debug(
             "prompt_resolver  resolve  route_id=%s  overlay_count=%d  "
             "context_chars=%d  context_truncated=%s",
             route_decision.route_id,
@@ -211,7 +211,7 @@ class PromptResolver:
         user_content: str,
     ) -> list[LlmMessage]:
         """Compose messages for structured-output calls without answer policies."""
-        logger.info(
+        logger.debug(
             "prompt_resolver  resolve_structured  route_id=%s  overlay_count=%d",
             route_decision.route_id,
             len(route_decision.overlays),

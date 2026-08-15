@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from urllib.parse import urlsplit, urlunsplit
 
 from config import Settings, get_settings
 from tools.web_search.formatter import WebContextFormatter
 from tools.web_search.models import (
+    FreshEvidenceBundle,
+    FreshnessWindow,
     SearchAttemptKind,
+    WebSearchItem,
     WebSearchRequest,
     WebSearchResult,
 )
@@ -189,6 +194,12 @@ class WebSearchTool:
                     official_required=official_only
                     and settings.web_search_require_official_for_exam_updates,
                     exam_prep_suitable=exam_prep_suitable,
+                    max_selected_results=(
+                        request.required_evidence_count
+                        if request.requires_fresh_evidence
+                        and request.required_evidence_count > 0
+                        else None
+                    ),
                 ),
                 policy=policy,
                 settings=settings,
@@ -215,6 +226,16 @@ class WebSearchTool:
             )
 
         weak_context = best_rerank.weak_context or not best_items
+        fresh_evidence: FreshEvidenceBundle | None = None
+        if request.requires_fresh_evidence:
+            fresh_evidence = _build_fresh_evidence_bundle(
+                policy=policy,
+                search_query=search_query,
+                items=best_items,
+            )
+            best_items = list(fresh_evidence.items)
+            if len(best_items) < request.required_evidence_count:
+                weak_context = True
         context_strength = best_rerank.context_strength
         evidence_context_chars = 0
         if weak_context:
@@ -290,6 +311,7 @@ class WebSearchTool:
             official_count=official_count,
             reputable_count=reputable_count,
             duration_ms=int((time.monotonic() - started_at) * 1000),
+            fresh_evidence=(fresh_evidence if not weak_context else None),
         )
 
     def _run_attempt(
@@ -305,7 +327,7 @@ class WebSearchTool:
             search_query=search_query,
             policy=policy,
             attempt=attempt,
-            max_results=self._max_results_for_attempt(attempt, settings),
+            max_results=self._max_results_for_attempt(attempt, request, settings),
             search_depth=settings.web_search_search_depth,
             timeout_seconds=request.timeout_seconds,
         )
@@ -313,11 +335,20 @@ class WebSearchTool:
         return provider.search(provider_request)
 
     @staticmethod
-    def _max_results_for_attempt(attempt: SearchAttemptPlan, settings: Settings) -> int:
+    def _max_results_for_attempt(
+        attempt: SearchAttemptPlan,
+        request: WebSearchRequest,
+        settings: Settings,
+    ) -> int:
         if attempt.kind == "exam_prep_fallback":
             return min(
                 settings.web_search_max_results,
                 settings.web_search_exam_prep_max_selected_results,
+            )
+        if request.requires_fresh_evidence:
+            return min(
+                max(settings.web_search_max_results, request.required_evidence_count),
+                20,
             )
         return settings.web_search_max_results
 
@@ -356,3 +387,74 @@ def build_fake_web_search_tool(items=None) -> WebSearchTool:
             ),
         ]
     return WebSearchTool(provider=FakeWebSearchProvider(default_items))
+
+
+def _build_fresh_evidence_bundle(
+    *,
+    policy,
+    search_query: str,
+    items: list[WebSearchItem],
+) -> FreshEvidenceBundle:
+    """Keep only compact, usable, in-window evidence for Practice grounding."""
+    selected: list[WebSearchItem] = []
+    seen_urls: set[str] = set()
+    for item in items:
+        url = _normalized_url(item.url)
+        if not url or len(item.snippet.strip()) < 20:
+            continue
+        published_date = _published_date(item.published_at)
+        if published_date is not None:
+            if policy.start_date and published_date < policy.start_date:
+                continue
+            if policy.end_date and published_date > policy.end_date:
+                continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        selected.append(
+            item.model_copy(
+                update={
+                    "title": item.title[:256],
+                    "url": url,
+                    "snippet": item.snippet[:600],
+                    "source": item.source[:128],
+                }
+            )
+        )
+
+    return FreshEvidenceBundle(
+        requested_window=FreshnessWindow(
+            start_date=policy.start_date,
+            end_date=policy.end_date,
+            source=policy.freshness_source,
+            label=policy.freshness_label,
+        ),
+        retrieved_at=datetime.now(UTC).isoformat(),
+        search_query=search_query,
+        items=selected,
+    )
+
+
+def _normalized_url(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/"),
+            parsed.query,
+            "",
+        )
+    )
+
+
+def _published_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = value.strip()[:10]
+    try:
+        return datetime.fromisoformat(match).date().isoformat()
+    except ValueError:
+        return None

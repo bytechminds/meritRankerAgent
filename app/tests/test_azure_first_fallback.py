@@ -20,6 +20,7 @@ No real provider calls. No AWS calls. No network access.
 from __future__ import annotations
 
 import json
+import logging
 import textwrap
 import types
 from collections.abc import Iterator
@@ -29,6 +30,7 @@ from typing import Any
 import pytest
 
 import services.llm.orchestration.model_execution as model_execution_module
+from features.practice_generation.execution_control import PracticeExecutionStopped
 from observability import bind_execution_context, bind_request_context
 from schemas.llm import LlmMessage
 from schemas.llm_orchestration import ModelExecutionResult, ProviderExecutionRequest
@@ -496,6 +498,204 @@ class TestRegistryCrossValidation:
 
 
 class TestModelExecutionFallback:
+    def test_attempt_guard_blocks_escalation_after_primary_finishes_cancelled(
+        self, tmp_path: Path
+    ) -> None:
+        exhausted = ModelExecutionResult(
+            content="partial",
+            model="azure_fast",
+            provider="azure_openai",
+            finish_reason="length",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            return_for={
+                "azure_fast": exhausted,
+                "openai_native_fallback": "Fallback answer.",
+            }
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        with pytest.raises(PracticeExecutionStopped, match="PRACTICE_CANCEL_OBSERVED"):
+            executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+                attempt_guard=lambda: (_ for _ in ()).throw(
+                    PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
+                ),
+            )
+
+        assert fake_executor.call_log == ["azure_fast"]
+
+    def test_attempt_guard_blocks_fallback_after_inflight_escalation_finishes(
+        self, tmp_path: Path
+    ) -> None:
+        class _CancelDuringEscalation:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.cancelled = False
+
+            def execute(self, request: ProviderExecutionRequest) -> ModelExecutionResult:
+                alias = request.model_resolution.model_alias
+                self.calls.append(alias)
+                if len(self.calls) == 1:
+                    return ModelExecutionResult(
+                        content="partial",
+                        model=alias,
+                        provider=request.model_resolution.provider,
+                        finish_reason="length",
+                    )
+                self.cancelled = True
+                raise LlmProviderExecutionError(
+                    "escalation unavailable",
+                    failure_kind="provider_unavailable",
+                )
+
+            def execute_stream(self, request: ProviderExecutionRequest) -> Iterator[str]:
+                raise AssertionError("Streaming is not used for structured Practice generation.")
+
+        provider = _CancelDuringEscalation()
+        executor = RegistryBackedModelExecutor(
+            provider_executor=provider,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        def guard() -> None:
+            if provider.cancelled:
+                raise PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
+
+        with pytest.raises(PracticeExecutionStopped, match="PRACTICE_CANCEL_OBSERVED"):
+            executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+                attempt_guard=guard,
+            )
+
+        assert provider.calls == ["azure_fast", "azure_fast"]
+
+    def test_superseded_attempt_guard_blocks_capacity_escalation(
+        self, tmp_path: Path
+    ) -> None:
+        exhausted = ModelExecutionResult(
+            content="partial",
+            model="azure_fast",
+            provider="azure_openai",
+            finish_reason="length",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            return_for={
+                "azure_fast": exhausted,
+                "openai_native_fallback": "Fallback answer.",
+            }
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        with pytest.raises(PracticeExecutionStopped, match="PRACTICE_EXECUTION_FENCED"):
+            executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+                attempt_guard=lambda: (_ for _ in ()).throw(
+                    PracticeExecutionStopped("PRACTICE_EXECUTION_FENCED")
+                ),
+            )
+
+        assert fake_executor.call_log == ["azure_fast"]
+
+    def test_active_attempt_guard_preserves_escalation_and_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        exhausted = LlmProviderResponseError("response unavailable")
+        exhausted.finish_reason = "length"
+        exhausted.output_tokens = 800
+        exhausted.reasoning_tokens = 800
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": exhausted},
+            return_for={"openai_native_fallback": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+        guard_calls = 0
+
+        def guard() -> None:
+            nonlocal guard_calls
+            guard_calls += 1
+
+        result = executor.execute(
+            route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+            messages=_messages(),
+            attempt_guard=guard,
+        )
+
+        assert fake_executor.call_log == [
+            "azure_fast",
+            "azure_fast",
+            "openai_native_fallback",
+        ]
+        assert guard_calls == 2
+        assert result.model == "openai_native_fallback"
+
+    def test_none_attempt_guard_preserves_existing_model_execution(
+        self, tmp_path: Path
+    ) -> None:
+        empty_response = LlmProviderResponseError(
+            "response unavailable",
+            failure_kind="empty_answer",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            raise_for={"azure_fast": empty_response},
+            return_for={"openai_native_fallback": "Fallback answer."},
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        result = executor.execute(
+            route_decision=_route_decision(),
+            messages=_messages(),
+            attempt_guard=None,
+        )
+
+        assert fake_executor.call_log == ["azure_fast", "openai_native_fallback"]
+        assert result.model == "openai_native_fallback"
+
+    def test_attempt_guard_does_not_log_unstructured_exception_text(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=model_execution_module.logger.name)
+        exhausted = ModelExecutionResult(
+            content="partial",
+            model="azure_fast",
+            provider="azure_openai",
+            finish_reason="length",
+        )
+        fake_executor = _AliasedFakeProviderExecutor(
+            return_for={"azure_fast": exhausted}
+        )
+        executor = RegistryBackedModelExecutor(
+            provider_executor=fake_executor,
+            model_config_resolver=_resolver(tmp_path),
+        )
+
+        with pytest.raises(RuntimeError, match="private-provider-detail"):
+            executor.execute(
+                route_decision=_route_decision().model_copy(update={"intent": "practice"}),
+                messages=_messages(),
+                attempt_guard=lambda: (_ for _ in ()).throw(
+                    RuntimeError("private-provider-detail")
+                ),
+            )
+
+        assert "private-provider-detail" not in caplog.text
+        assert "RuntimeError" in caplog.text
+
     def test_real_math_advanced_empty_response_uses_o3_fallback(self) -> None:
         empty_response = LlmProviderResponseError(
             "response unavailable",

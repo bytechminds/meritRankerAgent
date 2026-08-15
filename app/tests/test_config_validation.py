@@ -54,6 +54,23 @@ def test_production_forces_local_log_content_off(
     _reset_settings()
 
 
+def test_log_level_is_validated_and_production_never_uses_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.delenv("AGENT_LOG_LEVEL", raising=False)
+    _reset_settings()
+
+    assert cfg_module.get_settings().log_level == "INFO"
+
+    monkeypatch.setenv("LOG_LEVEL", "verbose")
+    _reset_settings()
+    with pytest.raises(cfg_module.ConfigurationError, match="LOG_LEVEL"):
+        cfg_module.get_settings()
+    _reset_settings()
+
+
 # ---------------------------------------------------------------------------
 # LLM configuration errors
 # ---------------------------------------------------------------------------

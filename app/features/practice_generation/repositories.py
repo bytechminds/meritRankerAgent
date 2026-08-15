@@ -15,6 +15,7 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
 from features.practice_generation.events import emit_practice_event
+from features.practice_generation.execution_control import current_practice_execution_id
 from features.practice_generation.generation import deterministic_question_id
 from features.practice_generation.matching import (
     ReusableQuestion,
@@ -280,6 +281,12 @@ class AssessmentRepository:
             "lastCompletedStage": "INITIALIZED",
             "replacementWaveCount": 0,
             "slotReadyCounts": {},
+            "activeExecutionId": None,
+            "executionLeaseExpiresAt": None,
+            "executionStartedAt": None,
+            "executionAttempt": 0,
+            "cancelRequested": False,
+            "resumeReason": None,
             "practiceRequest": {
                 "requestId": request.request_id,
                 "conversationId": request.conversation_id,
@@ -297,6 +304,13 @@ class AssessmentRepository:
                 "examStage": request.exam_stage,
                 "examProfileId": request.exam_profile_id,
                 "sourceQuestionReference": request.source_question_reference,
+                "requiresFreshEvidence": request.requires_fresh_evidence,
+                "freshnessReason": request.freshness_reason,
+                "freshEvidence": (
+                    request.fresh_evidence.model_dump(mode="json")
+                    if request.fresh_evidence is not None
+                    else None
+                ),
                 "includeSolutions": request.include_solutions,
                 "assessmentTitle": request.assessment_title,
             },
@@ -401,6 +415,77 @@ class AssessmentRepository:
                 raise PracticeRepositoryError("ASSESSMENT_CONCURRENT_UPDATE") from exc
             raise PracticeRepositoryError("ASSESSMENT_UPDATE_FAILED") from exc
 
+    def renew_execution_lease(
+        self,
+        test_id: str,
+        execution_id: str,
+        lease_expires_at: str,
+    ) -> bool:
+        """Renew one coarse lease only while this execution still owns the assessment."""
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=(
+                    "SET #meta.#lease = :lease, #meta.#last = :now, #updated = :now"
+                ),
+                ConditionExpression=(
+                    "#status = :generating AND #meta.#execution = :execution "
+                    "AND #meta.#cancel = :false"
+                ),
+                ExpressionAttributeNames={
+                    "#meta": "meta",
+                    "#lease": "executionLeaseExpiresAt",
+                    "#last": "lastProgressAt",
+                    "#execution": "activeExecutionId",
+                    "#cancel": "cancelRequested",
+                    "#status": "status",
+                    "#updated": "updatedAt",
+                },
+                ExpressionAttributeValues=_item(
+                    {
+                        ":lease": lease_expires_at,
+                        ":now": _now(),
+                        ":execution": execution_id,
+                        ":false": False,
+                        ":generating": "GENERATING",
+                    }
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("PRACTICE_EXECUTION_LEASE_UPDATE_FAILED") from exc
+
+    def release_execution(self, test_id: str, execution_id: str) -> bool:
+        """Release only the matching execution; a stale executor cannot release its successor."""
+        try:
+            self._client.update_item(
+                TableName=self._table,
+                Key=_item({"testId": test_id}),
+                UpdateExpression=(
+                    "SET #meta.#execution = :empty, #meta.#lease = :empty, "
+                    "#meta.#last = :now, #updated = :now"
+                ),
+                ConditionExpression="#meta.#execution = :execution",
+                ExpressionAttributeNames={
+                    "#meta": "meta",
+                    "#execution": "activeExecutionId",
+                    "#lease": "executionLeaseExpiresAt",
+                    "#last": "lastProgressAt",
+                    "#updated": "updatedAt",
+                },
+                ExpressionAttributeValues=_item(
+                    {":execution": execution_id, ":empty": None, ":now": _now()}
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise PracticeRepositoryError("PRACTICE_EXECUTION_RELEASE_FAILED") from exc
+
     def set_blueprint(
         self,
         test_id: str,
@@ -427,6 +512,32 @@ class AssessmentRepository:
 
     def mark_failed(self, test_id: str, error_code: str) -> None:
         timestamp = _now()
+        execution_id = current_practice_execution_id()
+        condition = "attribute_exists(testId) AND #status = :generating_status"
+        names = {
+            "#meta": "meta",
+            "#phase": "phase",
+            "#playable": "playable",
+            "#error": "errorCode",
+            "#failed": "failedCount",
+            "#status": "status",
+            "#live": "live",
+            "#updated": "updatedAt",
+        }
+        values: dict[str, Any] = {
+            ":phase": InternalPhase.FAILED.value,
+            ":false": False,
+            ":error": error_code,
+            ":zero": 0,
+            ":one": 1,
+            ":failed_status": "FAILED",
+            ":generating_status": "GENERATING",
+            ":updated": timestamp,
+        }
+        if execution_id is not None:
+            condition += " AND #meta.#execution = :execution"
+            names["#execution"] = "activeExecutionId"
+            values[":execution"] = execution_id
         try:
             self._client.update_item(
                 TableName=self._table,
@@ -437,29 +548,9 @@ class AssessmentRepository:
                     "#meta.#failed = if_not_exists(#meta.#failed, :zero) + :one, "
                     "#status = :failed_status, #live = :false, #updated = :updated"
                 ),
-                ConditionExpression=("attribute_exists(testId) AND #status = :generating_status"),
-                ExpressionAttributeNames={
-                    "#meta": "meta",
-                    "#phase": "phase",
-                    "#playable": "playable",
-                    "#error": "errorCode",
-                    "#failed": "failedCount",
-                    "#status": "status",
-                    "#live": "live",
-                    "#updated": "updatedAt",
-                },
-                ExpressionAttributeValues=_item(
-                    {
-                        ":phase": InternalPhase.FAILED.value,
-                        ":false": False,
-                        ":error": error_code,
-                        ":zero": 0,
-                        ":one": 1,
-                        ":failed_status": "FAILED",
-                        ":generating_status": "GENERATING",
-                        ":updated": timestamp,
-                    }
-                ),
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=_item(values),
             )
         except ClientError as exc:
             if not _is_conditional_failure(exc):
@@ -1199,6 +1290,83 @@ class QuestionRepository:
             key=lambda item: int(item.get("position") or 0),
         )
 
+    def inspect_reusable_slots(
+        self,
+        test_id: str,
+        *,
+        language: str,
+        solution_required: bool,
+    ) -> tuple[set[str], tuple[str, ...]]:
+        """Reuse the canonical playable validator for durable resume reconstruction."""
+        valid_slot_ids: set[str] = set()
+        invalid_question_ids: list[str] = []
+        for item in self.list_linked(test_id):
+            practice_meta = item.get("_practiceMeta")
+            if not isinstance(practice_meta, dict):
+                practice_meta = _parse_meta(item.get("meta"))
+            slot_id = str(practice_meta.get("slotId") or "")
+            if not slot_id:
+                continue
+            item["_practiceMeta"] = practice_meta
+            contract = validate_persisted_playable_question(
+                item,
+                expected_question_type=str(practice_meta.get("questionType") or "mcq"),
+                expected_language=language,
+                solution_required=solution_required,
+            )
+            if (
+                contract.valid
+                and practice_meta.get("verified") is True
+                and practice_meta.get("status") == "READY"
+            ):
+                valid_slot_ids.add(slot_id)
+            else:
+                question_id = str(item.get("questionId") or "")
+                if question_id:
+                    invalid_question_ids.append(question_id)
+        return valid_slot_ids, tuple(dict.fromkeys(invalid_question_ids))
+
+    def delete_invalid_resume_questions(
+        self,
+        test_id: str,
+        execution_id: str,
+        question_ids: tuple[str, ...],
+    ) -> None:
+        """Delete only invalid assessment-owned rows under the new execution fence."""
+        for question_id in question_ids:
+            try:
+                self._client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "ConditionCheck": {
+                                "TableName": self._assessment_table,
+                                "Key": _item({"testId": test_id}),
+                                "ConditionExpression": "#meta.#execution = :execution",
+                                "ExpressionAttributeNames": {
+                                    "#meta": "meta",
+                                    "#execution": "activeExecutionId",
+                                },
+                                "ExpressionAttributeValues": _item(
+                                    {":execution": execution_id}
+                                ),
+                            }
+                        },
+                        {
+                            "Delete": {
+                                "TableName": self._question_table,
+                                "Key": _item({"questionId": question_id}),
+                                "ConditionExpression": "#test = :test",
+                                "ExpressionAttributeNames": {"#test": "testId"},
+                                "ExpressionAttributeValues": _item({":test": test_id}),
+                            }
+                        },
+                    ]
+                )
+            except ClientError as exc:
+                raise PracticeRepositoryError(
+                    "PRACTICE_RESUME_INVALID_QUESTION_CLEANUP_FAILED"
+                ) from exc
+
     def get_questions_by_ids(
         self,
         question_ids: list[str],
@@ -1514,16 +1682,105 @@ class QuestionRepository:
         if solution:
             item["explanation"] = solution
         try:
-            self._client.put_item(
-                TableName=self._question_table,
-                Item=_item(item),
-                ConditionExpression="attribute_not_exists(questionId)",
-            )
+            execution_id = current_practice_execution_id()
+            if execution_id is None:
+                self._client.put_item(
+                    TableName=self._question_table,
+                    Item=_item(item),
+                    ConditionExpression="attribute_not_exists(questionId)",
+                )
+            else:
+                self._client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "ConditionCheck": {
+                                "TableName": self._assessment_table,
+                                "Key": _item({"testId": test_id}),
+                                "ConditionExpression": "#meta.#execution = :execution",
+                                "ExpressionAttributeNames": {
+                                    "#meta": "meta",
+                                    "#execution": "activeExecutionId",
+                                },
+                                "ExpressionAttributeValues": _item(
+                                    {":execution": execution_id}
+                                ),
+                            }
+                        },
+                        {
+                            "Put": {
+                                "TableName": self._question_table,
+                                "Item": _item(item),
+                                "ConditionExpression": "attribute_not_exists(questionId)",
+                            }
+                        },
+                    ]
+                )
             return True
         except ClientError as exc:
-            if _is_conditional_failure(exc):
+            code = exc.response.get("Error", {}).get("Code")
+            if _is_conditional_failure(exc) or code == "TransactionCanceledException":
+                cancellation_reasons = exc.response.get("CancellationReasons")
+                if isinstance(cancellation_reasons, list) and any(
+                    isinstance(reason, dict)
+                    and reason.get("Code") not in {None, "None", "ConditionalCheckFailed"}
+                    for reason in cancellation_reasons
+                ):
+                    raise PracticeRepositoryError("QUESTION_LINK_FAILED") from exc
+                if execution_id is not None:
+                    current = self._client.get_item(
+                        TableName=self._assessment_table,
+                        Key=_item({"testId": test_id}),
+                        ConsistentRead=True,
+                    ).get("Item")
+                    assessment = _plain(current) if current else {}
+                    if _parse_meta(assessment.get("meta")).get(
+                        "activeExecutionId"
+                    ) != execution_id:
+                        raise PracticeRepositoryError("PRACTICE_EXECUTION_FENCED") from exc
                 return False
             raise PracticeRepositoryError("QUESTION_LINK_FAILED") from exc
+
+    def _update_question_with_execution_fence(
+        self,
+        *,
+        test_id: str,
+        question_id: str,
+        update_expression: str,
+        condition_expression: str,
+        names: dict[str, str],
+        values: dict[str, Any],
+    ) -> None:
+        execution_id = current_practice_execution_id()
+        update = {
+            "TableName": self._question_table,
+            "Key": _item({"questionId": question_id}),
+            "UpdateExpression": update_expression,
+            "ConditionExpression": condition_expression,
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": _item(values),
+        }
+        if execution_id is None:
+            self._client.update_item(**update)
+            return
+        self._client.transact_write_items(
+            TransactItems=[
+                {
+                    "ConditionCheck": {
+                        "TableName": self._assessment_table,
+                        "Key": _item({"testId": test_id}),
+                        "ConditionExpression": "#meta.#execution = :execution",
+                        "ExpressionAttributeNames": {
+                            "#meta": "meta",
+                            "#execution": "activeExecutionId",
+                        },
+                        "ExpressionAttributeValues": _item(
+                            {":execution": execution_id}
+                        ),
+                    }
+                },
+                {"Update": update},
+            ]
+        )
 
     def assign_positions(self, questions: list[dict[str, Any]]) -> None:
         ordered = sorted(
@@ -1535,16 +1792,16 @@ class QuestionRepository:
         )
         for position, question in enumerate(ordered, start=1):
             try:
-                self._client.update_item(
-                    TableName=self._question_table,
-                    Key=_item({"questionId": str(question["questionId"])}),
-                    UpdateExpression="SET #position = :position, #updated = :updated",
-                    ExpressionAttributeNames={
+                self._update_question_with_execution_fence(
+                    test_id=str(question.get("testId") or ""),
+                    question_id=str(question["questionId"]),
+                    update_expression="SET #position = :position, #updated = :updated",
+                    names={
                         "#position": "position",
                         "#updated": "updatedAt",
                     },
-                    ExpressionAttributeValues=_item({":position": position, ":updated": _now()}),
-                    ConditionExpression="attribute_exists(questionId)",
+                    values={":position": position, ":updated": _now()},
+                    condition_expression="attribute_exists(questionId)",
                 )
             except ClientError as exc:
                 raise PracticeRepositoryError("QUESTION_ORDERING_FAILED") from exc
@@ -1560,13 +1817,13 @@ class QuestionRepository:
             if not question_id or not slot_id or not bucket_id:
                 raise PracticeRepositoryError("MANIFEST_RECOVERY_INVALID_ASSIGNMENT")
             try:
-                self._client.update_item(
-                    TableName=self._question_table,
-                    Key=_item({"questionId": question_id}),
-                    UpdateExpression=(
+                self._update_question_with_execution_fence(
+                    test_id=test_id,
+                    question_id=question_id,
+                    update_expression=(
                         "SET #meta.#bucket = :bucket, #updated = :updated"
                     ),
-                    ExpressionAttributeNames={
+                    names={
                         "#meta": "meta",
                         "#bucket": "bucketId",
                         "#slot": "slotId",
@@ -1574,16 +1831,14 @@ class QuestionRepository:
                         "#test": "testId",
                         "#updated": "updatedAt",
                     },
-                    ExpressionAttributeValues=_item(
-                        {
-                            ":bucket": bucket_id,
-                            ":slot": slot_id,
-                            ":verified": True,
-                            ":test": test_id,
-                            ":updated": _now(),
-                        }
-                    ),
-                    ConditionExpression=(
+                    values={
+                        ":bucket": bucket_id,
+                        ":slot": slot_id,
+                        ":verified": True,
+                        ":test": test_id,
+                        ":updated": _now(),
+                    },
+                    condition_expression=(
                         "#test = :test AND #meta.#slot = :slot "
                         "AND #meta.#verified = :verified"
                     ),
@@ -1665,25 +1920,23 @@ class QuestionRepository:
                         "options": reordered,
                     }
                 try:
-                    self._client.update_item(
-                        TableName=self._question_table,
-                        Key=_item({"questionId": str(item["questionId"])}),
-                        UpdateExpression=(
+                    self._update_question_with_execution_fence(
+                        test_id=test_id,
+                        question_id=str(item["questionId"]),
+                        update_expression=(
                             "SET #options = :options, #answers = :answers, #updated = :updated"
                         ),
-                        ExpressionAttributeNames={
+                        names={
                             "#options": "options",
                             "#answers": "answers",
                             "#updated": "updatedAt",
                         },
-                        ExpressionAttributeValues=_item(
-                            {
-                                ":options": reordered,
-                                ":answers": _json(answer_contract),
-                                ":updated": _now(),
-                            }
-                        ),
-                        ConditionExpression="attribute_exists(questionId)",
+                        values={
+                            ":options": reordered,
+                            ":answers": _json(answer_contract),
+                            ":updated": _now(),
+                        },
+                        condition_expression="attribute_exists(questionId)",
                     )
                 except ClientError as exc:
                     raise PracticeRepositoryError(

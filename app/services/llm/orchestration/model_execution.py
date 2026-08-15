@@ -50,6 +50,49 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+AttemptGuard = Callable[[], None]
+
+
+def _require_expensive_attempt_allowed(
+    attempt_guard: AttemptGuard | None,
+    *,
+    route_decision: RouteDecision,
+    attempt_kind: str,
+) -> None:
+    if attempt_guard is None:
+        return
+    try:
+        attempt_guard()
+    except Exception as exc:
+        reason_code = str(exc)
+        if (
+            not reason_code
+            or len(reason_code) > 64
+            or reason_code != reason_code.upper()
+            or not reason_code.replace("_", "").isalnum()
+        ):
+            reason_code = type(exc).__name__
+        logger.info(
+            "practice_expensive_attempt_guard  route_id=%s  attempt_kind=%s  "
+            "allowed=false  reason=%s",
+            route_decision.route_id,
+            attempt_kind,
+            reason_code,
+        )
+        log_event(
+            "practice_expensive_attempt_guard",
+            component="llm.model_execution",
+            stage=route_decision.task_role,
+            status="blocked",
+            details={
+                "route": route_decision.route_id,
+                "attemptKind": attempt_kind,
+                "allowed": False,
+                "reasonCode": reason_code,
+            },
+        )
+        raise
+
 
 def _configured_model_name(resolution: ResolvedModelConfig) -> str:
     config = resolution.model_config
@@ -543,6 +586,7 @@ class RegistryBackedModelExecutor:
         messages: list[LlmMessage],
         resolution: ResolvedModelConfig,
         started_at: float,
+        attempt_guard: AttemptGuard | None,
     ) -> tuple[ModelExecutionResult | None, str]:
         """Retry one exact Practice work unit once at a strictly larger safe cap."""
         capacity = route_decision.practice_generation_capacity
@@ -560,6 +604,11 @@ class RegistryBackedModelExecutor:
             temperature=route_decision.temperature,
             max_tokens=escalation_budget,
             provider_options=dict(route_decision.provider_options),
+        )
+        _require_expensive_attempt_allowed(
+            attempt_guard,
+            route_decision=route_decision,
+            attempt_kind="capacity_escalation",
         )
         _log_practice_generator_attempt(
             event_name="generator_capacity_escalation_started",
@@ -659,6 +708,7 @@ class RegistryBackedModelExecutor:
         *,
         route_decision: RouteDecision,
         messages: list[LlmMessage],
+        attempt_guard: AttemptGuard | None = None,
     ) -> ModelExecutionResult:
         started_at = time.monotonic()
         primary_alias = route_decision.model
@@ -879,6 +929,7 @@ class RegistryBackedModelExecutor:
                     messages=messages,
                     resolution=model_resolution,
                     started_at=started_at,
+                    attempt_guard=attempt_guard,
                 )
             )
             if escalated_result is not None:
@@ -981,6 +1032,12 @@ class RegistryBackedModelExecutor:
                 temperature=route_decision.temperature,
                 max_tokens=fallback_budget,
                 provider_options={},  # strip thinking/stream options for fallback
+            )
+
+            _require_expensive_attempt_allowed(
+                attempt_guard,
+                route_decision=route_decision,
+                attempt_kind="provider_fallback",
             )
 
             logger.debug(

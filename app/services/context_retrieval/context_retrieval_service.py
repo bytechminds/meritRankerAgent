@@ -626,6 +626,8 @@ class ContextRequestBuilder:
         query: str,
         classification: dict[str, Any],
         confidence: float | None = None,
+        requires_fresh_evidence: bool = False,
+        required_evidence_count: int = 0,
     ) -> ContextRetrievalRequest:
         settings = get_settings()
         exam = ContextRequestBuilder._detect_exam(query)
@@ -662,6 +664,8 @@ class ContextRequestBuilder:
             need_web_search=need_web_search,
             web_search_reason=str(web_search_reason) if web_search_reason else None,
             web_search_query=str(web_search_query) if web_search_query else None,
+            requires_fresh_evidence=requires_fresh_evidence,
+            required_evidence_count=required_evidence_count,
         )
 
     @staticmethod
@@ -1039,6 +1043,8 @@ class ContextRetrievalService:
                     topic=request.topic,
                     retrieval_tags=request.retrieval_tags,
                     web_search_reason=request.web_search_reason,
+                    requires_fresh_evidence=request.requires_fresh_evidence,
+                    required_evidence_count=request.required_evidence_count,
                     timeout_seconds=settings.web_search_timeout_seconds,
                 ),
                 on_retry_sources=on_web_search_retry,
@@ -1101,6 +1107,7 @@ class ContextRetrievalService:
                 web_context_chars=0,
                 web_result_count=0,
                 web_citation_count=0,
+                fresh_evidence=None,
             )
 
         brief_result = self._brief_builder.build(
@@ -1127,6 +1134,7 @@ class ContextRetrievalService:
             web_context_chars=len(web_result.context_text),
             web_result_count=len(web_result.items),
             web_citation_count=sum(bool(item.url) for item in web_result.items),
+            fresh_evidence=web_result.fresh_evidence,
         )
 
     def _compose_generator_context(

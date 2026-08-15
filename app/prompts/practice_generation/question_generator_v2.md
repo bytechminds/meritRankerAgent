@@ -11,7 +11,8 @@ Generate one independently playable MCQ for each assigned immutable planner slot
 - Emit four ordered options with IDs `"0"`–`"3"`; the identified option is the only correct one and `correct_answer` is its exact value.
 - Treat the key as `PENDING_VERIFICATION`; only the independent verifier accepts it.
 - Keep explanation and solution consistent. Meet slot constraints/exclusions; never copy excluded text.
-- Pattern guidance is method-only. Preserve target, operation sequence, constraints, and `not_same_when`; vary wording, entities, data, scenario, and options. Never copy a source instance, answer, or solution.
+- Pattern guidance controls method only; never copy source facts, answers, or solutions.
+- With `fresh_evidence`, use only each slot’s evidence: every current claim, answer, option, and explanation must be supported and in-window. Never add model-memory facts; omit unsupported slots.
 
 # Shape
 

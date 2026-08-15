@@ -114,6 +114,18 @@ Environment variables:
 - `AGENT_DETAILED_LOGS`
 - `AGENT_OBSERVABILITY_ENABLED`
 
+`AGENT_LOG_LEVEL` takes precedence over `LOG_LEVEL`; accepted values are `CRITICAL`, `ERROR`,
+`WARNING`, `INFO`, and `DEBUG`. Invalid values fail configuration at startup. Production applies an
+INFO floor, so an accidental `DEBUG` value resolves to `INFO`; local and test use the explicitly
+configured level.
+
+Practice-generation events use this same level control. DEBUG exposes safe slot, group, matching,
+verification, recovery, and manifest metadata directly in the existing CLI output. Successful
+production requests retain only Practice lifecycle milestones (initialization, graph start,
+blueprint, matching, final manifest validation, and READY); recovery remains WARNING and failures
+retain their existing ERROR severity. No new logger, context mechanism, storage, network call, or
+background worker was introduced.
+
 The local file path is fixed at `.logs/agent-runtime.log` and is not environment-configurable. A
 request-local collector stores at most 64
 approved operational events and writes the complete request block once at terminal state while
@@ -368,6 +380,24 @@ once per process; it causes no per-request Git, SSM, or provider calls.
   active reload child, commit, environment, Region, and independent persistence readiness.
 - Deployed CloudWatch delivery, Transaction Search, and custom span export remain
   **[NOT VERIFIED]** until runtime deployment and AWS console verification.
+
+## Latest Changes
+
+- 2026-08-13: Added the allowlisted `practice_expensive_attempt_guard` blocked-attempt event at
+  shared capacity-escalation and provider-fallback boundaries. It records only the route,
+  attempt kind, boolean decision, and typed reason code; prompts, questions, answers, reasoning,
+  credentials, and provider payloads remain excluded. Dev/CloudWatch delivery is **[NOT VERIFIED]**.
+- 2026-08-12: Hardened Practice logging policy through the existing structured event boundary.
+  Internal successful-path events default to DEBUG, bounded recovery events default to WARNING,
+  and terminal production milestones stay INFO. DEBUG messages render sanitized metadata in the
+  existing CLI without requiring `AGENT_DETAILED_LOGS`; prompt, answer, credential, payload, and
+  private-content keys remain removed. The successful final-manifest milestone now records only
+  counts and recovery state. Added configuration and observability tests for level validation,
+  production DEBUG suppression, safe DEBUG context, INFO suppression, and recovery retention.
+  The repetitive LLM registry-load, route-resolution, and prompt-resolution diagnostics now also
+  use DEBUG. Schema-v2 verifier events now identify their in-memory `slotId`; no question or
+  answer content is added. Full practice/runtime dry-run and deployed CloudWatch volume remain
+  **[NOT VERIFIED]**.
 
 ## 2026-07-28 readable LLM and retrieval evidence
 

@@ -54,9 +54,11 @@ definitions. Explicit month searches use a compact canonical current-affairs que
 cache.
 
 Required-web generation is now fail-closed at the evidence boundary: selected context must retain
-at least one URL, and the final answer must cite only selected URLs. Current-affairs practice cannot
-produce more numbered questions than selected source cards. Graph and SSE paths use the same checks;
-required current facts cannot use live token delivery even under an `always_live` local policy.
+at least one URL, and the final answer must cite only selected URLs. Freshness-sensitive Practice
+requires a compact, selected evidence bundle with at least one distinct usable source per accepted
+question; absent, weak, or insufficient evidence prevents the asynchronous task launch. Graph and
+SSE paths use the same checks; required current facts cannot use live token delivery even under an
+`always_live` local policy.
 
 The text-classifier prompt explicitly treats English, Hindi, Hinglish, mixed-script,
 transliterated, informal, and misspelled student messages as input to understand. Response language

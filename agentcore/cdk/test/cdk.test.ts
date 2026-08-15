@@ -184,9 +184,9 @@ test('runtime conversation policies are scoped to configured tables and SSM path
   expect(rendered).not.toContain('secretsmanager:GetSecretValue');
   expect(rendered).toContain('dynamodb:BatchGetItem');
   expect(rendered).not.toContain('appsync:*');
-  expect(rendered).not.toContain('dynamodb:TransactWriteItems');
+  expect(rendered).toContain('dynamodb:TransactWriteItems');
   expect(rendered).toContain('dynamodb:DescribeTable');
-  expect(rendered).not.toContain('dynamodb:DeleteItem');
+  expect(rendered).toContain('dynamodb:DeleteItem');
   expect(rendered).not.toContain('sqs:ReceiveMessage');
   expect(rendered).not.toContain('sqs:DeleteMessage');
   expect(rendered).not.toContain('sqs:ChangeMessageVisibility');

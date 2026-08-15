@@ -48,6 +48,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from features.practice_generation.execution_control import PracticeExecutionStopped
 from schemas.llm_orchestration import ModelExecutionResult, OrchestrationResult
 from schemas.llm_routing import RouteDecision, RouteRequest
 from services.llm_orchestration.errors import (
@@ -170,6 +171,30 @@ def test_generate_structured_returns_json_without_answer_finalization(tmp_path: 
     assert executor.last_messages is not None
     assert "Return JSON only." in executor.last_messages[0].content
     assert executor.last_messages[1].content == '{"count":1}'
+
+
+def test_generate_structured_propagates_expensive_attempt_stop_signal(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "structured.md", "Return JSON only.")
+    decision = _make_route_decision(prompt="unused.md")
+    executor = MockModelExecutor(raise_on_execute=RuntimeError("retry blocked"))
+    orchestrator = LlmOrchestrator(
+        model_executor=executor,
+        prompt_resolver=PromptResolver(prompt_root=tmp_path),
+        route_resolver_fn=_fixed_route_resolver(decision),
+    )
+
+    def guard() -> None:
+        raise PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
+
+    with pytest.raises(PracticeExecutionStopped, match="PRACTICE_CANCEL_OBSERVED"):
+        orchestrator.generate_structured(
+            route_request=_make_route_request(),
+            user_content='{"count":1}',
+            prompt="structured.md",
+            attempt_guard=guard,
+        )
 
 
 # ---------------------------------------------------------------------------

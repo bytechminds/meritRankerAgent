@@ -13,7 +13,9 @@ from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     decide_practice_launch,
+    is_fresh_evidence_request_supported,
     practice_route_enabled,
+    resolve_practice_freshness_requirement,
     resolve_practice_request,
 )
 from features.practice_generation.schemas import (
@@ -91,6 +93,7 @@ from services.llm.billing import (
     begin_operation,
     emit_operation_billing_summary,
 )
+from tools.web_search.models import FreshEvidenceBundle
 
 logger = logging.getLogger(__name__)
 __all__ = ["orchestrated_classify_query_with_delivery_signals"]
@@ -406,6 +409,10 @@ def _iter_stream_doubt_solver(
         logger.debug("follow_up_request_count count=1")
 
     practice_decision = decide_practice_launch(query, classification_dict)
+    freshness_requirement = resolve_practice_freshness_requirement(
+        input.original_query or query,
+        classification_dict,
+    )
     if practice_route_enabled() and classification_dict.get("intent") == "practice":
         log_event(
             "PRACTICE_LAUNCH_DECISION",
@@ -432,10 +439,10 @@ def _iter_stream_doubt_solver(
         if practice_launcher is None:
             if conversation_persistence is not None:
                 conversation_persistence.record_skip(
-                    request_id=request_id,
-                    conversation_id=input.conversation_id,
-                    turn_id=input.turn_id,
-                    skip_reason="practice_agentcore_async_not_configured",
+                        request_id=request_id,
+                        conversation_id=input.conversation_id,
+                        turn_id=input.turn_id,
+                        skip_reason="failed_quality_gate",
                 )
             log_event(
                 "PRACTICE_LAUNCH_DECISION",
@@ -450,6 +457,62 @@ def _iter_stream_doubt_solver(
                 retryable=False,
             )
             return
+        fresh_evidence = None
+        if freshness_requirement.requires_fresh_evidence:
+            if not is_fresh_evidence_request_supported(input.original_query or input.query):
+                if conversation_persistence is not None:
+                    conversation_persistence.record_skip(
+                        request_id=request_id,
+                        conversation_id=input.conversation_id,
+                        turn_id=input.turn_id,
+                        skip_reason="failed_quality_gate",
+                    )
+                yield _error_event(
+                    request_id,
+                    code="PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT",
+                    retryable=False,
+                )
+                return
+            context_update = _orchestrated_collect_context_node(
+                state,
+                on_before_web_search=status_tracker.hook(
+                    stage="thinking",
+                    label=LABEL_WEB_SEARCH,
+                    reason_code="web_search_started",
+                ),
+                on_web_search_retry=status_tracker.hook(
+                    stage="thinking",
+                    label=LABEL_WEB_SEARCH_RETRY,
+                    reason_code="web_search_retry_sources",
+                ),
+                on_web_search_weak_context=status_tracker.hook(
+                    stage="thinking",
+                    label=LABEL_WEB_SEARCH_WEAK,
+                    reason_code="web_search_weak_context",
+                ),
+            )
+            state.update(context_update)
+            yield from emit_pending_statuses()
+            raw_fresh_evidence = state.get("fresh_evidence")
+            if isinstance(raw_fresh_evidence, dict):
+                try:
+                    fresh_evidence = FreshEvidenceBundle.model_validate(raw_fresh_evidence)
+                except ValueError:
+                    fresh_evidence = None
+            if fresh_evidence is None:
+                if conversation_persistence is not None:
+                    conversation_persistence.record_skip(
+                        request_id=request_id,
+                        conversation_id=input.conversation_id,
+                        turn_id=input.turn_id,
+                        skip_reason="failed_quality_gate",
+                    )
+                yield _error_event(
+                    request_id,
+                    code="PRACTICE_FRESH_EVIDENCE_UNAVAILABLE",
+                    retryable=False,
+                )
+                return
         try:
             practice_request = resolve_practice_request(
                 request_id=request_id,
@@ -469,6 +532,8 @@ def _iter_stream_doubt_solver(
                 source_question_reference=(
                     raw_classification.selected_turn_id if raw_classification is not None else None
                 ),
+                freshness_requirement=freshness_requirement,
+                fresh_evidence=fresh_evidence,
             )
             launch = practice_launcher.launch(practice_request)
         except PracticeLaunchError as exc:
@@ -477,7 +542,7 @@ def _iter_stream_doubt_solver(
                     request_id=request_id,
                     conversation_id=input.conversation_id,
                     turn_id=input.turn_id,
-                    skip_reason=exc.code.casefold(),
+                    skip_reason="failed_quality_gate",
                 )
             yield _error_event(request_id, code=exc.code, retryable=False)
             return

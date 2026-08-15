@@ -13,6 +13,10 @@ from typing import Any
 
 from features.practice_generation.config import PracticeGenerationConfig
 from features.practice_generation.events import emit_practice_event
+from features.practice_generation.execution_control import (
+    PracticeExecutionStopped,
+    current_practice_execution_id,
+)
 from features.practice_generation.generation import (
     QuestionGenerator,
     QuestionVerifier,
@@ -130,6 +134,7 @@ class _SlotGenerationOutcome:
     terminal_rejection: bool = False
     provider_failure_recoverable: bool = False
     provider_failure_stage: str | None = None
+    cancelled: bool = False
 
 
 def _meta(assessment: dict[str, Any]) -> dict[str, Any]:
@@ -179,6 +184,9 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "exam_stage": value.get("examStage"),
             "exam_profile_id": value.get("examProfileId"),
             "source_question_reference": value.get("sourceQuestionReference"),
+            "requires_fresh_evidence": bool(value.get("requiresFreshEvidence")),
+            "freshness_reason": value.get("freshnessReason"),
+            "fresh_evidence": value.get("freshEvidence"),
             "include_solutions": value.get("includeSolutions", True),
             "assessment_title": value.get("assessmentTitle") or assessment.get("name"),
         }
@@ -226,6 +234,11 @@ class PracticeGenerationOrchestrator:
         self._generator = generator
         self._verifier = verifier
         self._pattern_context = pattern_context
+
+    def _require_expensive_work_allowed(self, test_id: str) -> None:
+        if current_practice_execution_id() is None:
+            return
+        self._progress_updates.require_expensive_work_allowed(test_id)
 
     def _resolve_pattern_slots(
         self,
@@ -391,7 +404,10 @@ class PracticeGenerationOrchestrator:
                 details={"phase": InternalPhase.PLANNING.value},
             )
             try:
+                self._require_expensive_work_allowed(test_id)
                 plan = self._blueprints.build(request)
+            except PracticeExecutionStopped:
+                raise
             except BlueprintPlanningError as exc:
                 fallback_result = exc.fallback_result or "not_invoked"
                 self._emit_planner_validation_diagnostics(
@@ -1196,6 +1212,7 @@ class PracticeGenerationOrchestrator:
             attempt=attempt,
         )
         try:
+            self._require_expensive_work_allowed(test_id)
             batch = self._generator.generate(
                 request=request,
                 bucket=bucket,
@@ -1208,6 +1225,8 @@ class PracticeGenerationOrchestrator:
                 bucket=bucket,
                 existing_normalized_texts=existing_texts,
             )
+        except PracticeExecutionStopped:
+            raise
         except ProviderExecutionError as exc:
             reason_code = (
                 "PRACTICE_GENERATOR_OUTPUT_TOKEN_EXHAUSTED"
@@ -1304,11 +1323,14 @@ class PracticeGenerationOrchestrator:
                 )
                 if required_verification:
                     try:
+                        self._require_expensive_work_allowed(test_id)
                         result = self._verifier.verify(
                             request=request,
                             bucket=bucket,
                             question=question,
                         )
+                    except PracticeExecutionStopped:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         result = VerificationResult(
                             generation_item_id=question.generation_item_id,
@@ -1693,8 +1715,14 @@ class PracticeGenerationOrchestrator:
         provider_failure_stage: str | None = None
         completed_wave = 0
         replacement_wave = 0
+        cancelled = False
         while replacement_wave <= 2:
             if not pending or terminal:
+                break
+            try:
+                self._require_expensive_work_allowed(context.test_id)
+            except PracticeExecutionStopped:
+                cancelled = True
                 break
             completed_wave = replacement_wave
             force_regeneration = False
@@ -1775,6 +1803,9 @@ class PracticeGenerationOrchestrator:
                     existing_normalized_texts=wave_excluded,
                     slots=wave_slots,
                 )
+            except PracticeExecutionStopped:
+                cancelled = True
+                break
             except ProviderExecutionError as exc:
                 provider_failure_recoverable = (
                     exc.failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
@@ -1855,12 +1886,20 @@ class PracticeGenerationOrchestrator:
                     reasons.append("VERIFIER_SLOT_BINDING_MISMATCH")
                     continue
                 try:
+                    self._require_expensive_work_allowed(context.test_id)
+                except PracticeExecutionStopped:
+                    cancelled = True
+                    break
+                try:
                     verification = self._verifier.verify_slot(
                         request=context.request,
                         bucket=context.bucket,
                         slot=slot,
                         question=question,
                     )
+                except PracticeExecutionStopped:
+                    cancelled = True
+                    break
                 except ProviderExecutionError as exc:
                     provider_failure_recoverable = (
                         exc.failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
@@ -1913,6 +1952,7 @@ class PracticeGenerationOrchestrator:
                         details={
                             "groupId": context.group.group_id,
                             "bucketId": context.bucket.bucket_id,
+                            "slotId": slot.slot_id,
                             "replacementWave": replacement_wave,
                             "reasonCode": "VERIFIER_UNAVAILABLE",
                         },
@@ -1968,6 +2008,7 @@ class PracticeGenerationOrchestrator:
                         details={
                             "groupId": context.group.group_id,
                             "bucketId": context.bucket.bucket_id,
+                            "slotId": slot.slot_id,
                             "replacementWave": replacement_wave,
                             "reasonCode": "VERIFIER_APPROVED",
                         },
@@ -1986,6 +2027,7 @@ class PracticeGenerationOrchestrator:
                     details={
                         "groupId": context.group.group_id,
                         "bucketId": context.bucket.bucket_id,
+                        "slotId": slot.slot_id,
                         "replacementWave": replacement_wave,
                         "reasonCode": (
                             verification.reason_codes[0]
@@ -2000,6 +2042,8 @@ class PracticeGenerationOrchestrator:
                 if verification.decision is VerificationDecision.REGENERATE:
                     force_regeneration = True
             if provider_failure_stage is not None:
+                break
+            if cancelled:
                 break
             if pending and not terminal:
                 if force_regeneration:
@@ -2048,6 +2092,7 @@ class PracticeGenerationOrchestrator:
             terminal_rejection=terminal,
             provider_failure_recoverable=provider_failure_recoverable,
             provider_failure_stage=provider_failure_stage,
+            cancelled=cancelled,
         )
 
     def _commit_slot_outcome(self, outcome: _SlotGenerationOutcome) -> bool:
@@ -2126,6 +2171,15 @@ class PracticeGenerationOrchestrator:
                         bucket_id=verified.question.bucket_id,
                     )
                 )
+        if outcome.cancelled:
+            if accepted_question_ids:
+                self._update_progress(
+                    test_id,
+                    outcome.context.request,
+                    authoritative_question_ids=tuple(accepted_question_ids),
+                    meta_updates={"lastCompletedStage": "CANCEL_CHECKPOINTED"},
+                )
+            raise PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
         unresolved = [
             slot_id
             for slot_id in outcome.unresolved_slot_ids
@@ -2554,10 +2608,19 @@ class PracticeGenerationOrchestrator:
         if not ready_updated:
             return
         emit_practice_event(
-            "final_manifest_playable",
+            "final_manifest_validation_completed",
             test_id=test_id,
-            status="ready",
-            details={"acceptedCount": request.accepted_count},
+            status="valid",
+            details={
+                "expectedQuestionCount": request.accepted_count,
+                "actualQuestionCount": len(linked),
+                "uniqueQuestionCount": len({str(item.get("questionId") or "") for item in linked}),
+                "expectedSlotCount": len(blueprint.slots),
+                "resolvedSlotCount": len(blueprint.slots),
+                "failedSlotCount": 0,
+                "recoverable": False,
+                "recoveryAttempt": attempt,
+            },
         )
         emit_practice_event(
             "practice_ready",

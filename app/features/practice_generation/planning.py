@@ -18,13 +18,16 @@ from features.practice_generation.schemas import (
     PlannerFamily,
     PlannerSlot,
     PracticeBlueprint,
+    PracticeFreshnessRequirement,
     PracticeGenerationRequest,
     PracticeLaunchDecision,
     PracticeType,
     QuestionType,
     VerificationPolicy,
 )
+from services.classification.web_search_demand import is_freshness_sensitive_query
 from services.llm.orchestration.errors import ProviderExecutionError
+from tools.web_search.models import FreshEvidenceBundle
 
 _GENERATION_TARGET = (
     r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|practice\s+(?:set|test)|"
@@ -75,6 +78,7 @@ _EXPLICIT_DIFFICULTY_SIGNAL = re.compile(
     r"difficult|expert)\b",
     re.IGNORECASE,
 )
+_MAX_FRESH_EVIDENCE_ITEMS = 20
 _WORD_COUNTS = {
     "one": 1,
     "two": 2,
@@ -223,6 +227,22 @@ def decide_practice_launch(
         eligible=False,
         reason_code="PRACTICE_CREATION_SIGNAL_MISSING",
         requested_artifact=None,
+    )
+
+
+def resolve_practice_freshness_requirement(
+    query: str,
+    classification: dict[str, object],
+) -> PracticeFreshnessRequirement:
+    """Require evidence only for explicit dynamic-fact Practice requests."""
+    if str(classification.get("intent") or "") != "practice":
+        return PracticeFreshnessRequirement()
+    if not is_freshness_sensitive_query(query):
+        return PracticeFreshnessRequirement()
+    reason = str(classification.get("web_search_reason") or "current_event").strip()
+    return PracticeFreshnessRequirement(
+        requires_fresh_evidence=True,
+        freshness_reason=reason or "current_event",
     )
 
 
@@ -401,6 +421,18 @@ def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
     return _DEFAULT_COUNTS[practice_type]
 
 
+def required_fresh_evidence_count(query: str) -> int:
+    """Return the bounded number of independent facts needed for a fresh Practice set."""
+    practice_type = resolve_practice_type(query)
+    return min(resolve_requested_count(query, practice_type), _MAX_FRESH_EVIDENCE_ITEMS)
+
+
+def is_fresh_evidence_request_supported(query: str) -> bool:
+    """Fresh Practice cannot safely ground more facts than the evidence contract permits."""
+    practice_type = resolve_practice_type(query)
+    return resolve_requested_count(query, practice_type) <= _MAX_FRESH_EVIDENCE_ITEMS
+
+
 def resolve_practice_request(
     *,
     request_id: str,
@@ -416,6 +448,8 @@ def resolve_practice_request(
     exam_stage: str | None,
     exam_profile_id: str | None = None,
     source_question_reference: str | None = None,
+    freshness_requirement: PracticeFreshnessRequirement | None = None,
+    fresh_evidence: FreshEvidenceBundle | None = None,
 ) -> PracticeGenerationRequest:
     practice_type = resolve_practice_type(query)
     requested_count = resolve_requested_count(query, practice_type)
@@ -427,6 +461,7 @@ def resolve_practice_request(
     }.get(difficulty, Difficulty.INTERMEDIATE)
     display_topic = topic or subject.replace("_", " ").title()
     title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
+    freshness_requirement = freshness_requirement or PracticeFreshnessRequirement()
     return PracticeGenerationRequest(
         request_id=request_id,
         user_id=user_id,
@@ -448,6 +483,9 @@ def resolve_practice_request(
         exam_stage=exam_stage,
         exam_profile_id=exam_profile_id,
         source_question_reference=source_question_reference,
+        requires_fresh_evidence=freshness_requirement.requires_fresh_evidence,
+        freshness_reason=freshness_requirement.freshness_reason,
+        fresh_evidence=fresh_evidence,
         assessment_title=title,
     )
 

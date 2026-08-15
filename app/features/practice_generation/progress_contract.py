@@ -77,6 +77,15 @@ class PracticeProgressMeta(BaseModel):
         alias="replacementWaveCount",
     )
     slot_ready_counts: dict[str, int] | None = Field(default=None, alias="slotReadyCounts")
+    active_execution_id: str | None = Field(default=None, alias="activeExecutionId")
+    execution_lease_expires_at: str | None = Field(
+        default=None,
+        alias="executionLeaseExpiresAt",
+    )
+    execution_started_at: str | None = Field(default=None, alias="executionStartedAt")
+    execution_attempt: int | None = Field(default=None, alias="executionAttempt")
+    cancel_requested: bool | None = Field(default=None, alias="cancelRequested")
+    resume_reason: str | None = Field(default=None, alias="resumeReason")
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
 

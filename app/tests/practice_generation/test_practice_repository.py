@@ -10,6 +10,10 @@ import pytest
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
+from features.practice_generation.execution_control import (
+    ActivePracticeExecutionRegistry,
+    bind_practice_execution,
+)
 from features.practice_generation.matching import ReusableQuestion
 from features.practice_generation.pattern_context import PatternSlotSelection
 from features.practice_generation.planning import resolve_practice_request
@@ -87,6 +91,31 @@ class RecordingClient:
                 )
                 for index in range(count)
             ]
+        }
+
+
+class FencedQuestionClient(RecordingClient):
+    def transact_write_items(self, **kwargs):
+        self.transact_calls.append(kwargs)
+        raise ClientError(
+            {
+                "Error": {"Code": "TransactionCanceledException", "Message": "cancelled"},
+                "CancellationReasons": [
+                    {"Code": "ConditionalCheckFailed"},
+                    {"Code": "None"},
+                ],
+            },
+            "TransactWriteItems",
+        )
+
+    def get_item(self, **_kwargs):
+        return {
+            "Item": _item(
+                {
+                    "testId": "test-1",
+                    "meta": {"activeExecutionId": "new-execution"},
+                }
+            )
         }
 
 
@@ -180,7 +209,103 @@ def test_generated_question_is_assessment_owned_and_conditionally_linked() -> No
     assert stored["patternId"] == "pattern-1"
     assert stored["patternVersionHash"] == "version-1"
     assert client.transact_calls == []
+
+
+def test_generated_question_write_is_transaction_fenced_during_an_execution() -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+    registry = ActivePracticeExecutionRegistry()
+    registry.register("execution-1", "test-1")
+
+    with bind_practice_execution("execution-1", registry):
+        created = repository._put_question(
+            question_id="question-1",
+            test_id="test-1",
+            question="Question?",
+            options=["A", "B", "C", "D"],
+            correct_answer="A",
+            solution="Solution",
+            subject="math",
+            topic="algebra",
+            difficulty="basic",
+            meta={"verified": True},
+        )
+
+    assert created is True
+    assert client.put_calls == []
+    transaction = client.transact_calls[0]["TransactItems"]
+    assert transaction[0]["ConditionCheck"]["ExpressionAttributeValues"] == _item(
+        {":execution": "execution-1"}
+    )
+
+
+def test_old_executor_cannot_persist_after_a_new_execution_claims() -> None:
+    client = FencedQuestionClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+    registry = ActivePracticeExecutionRegistry()
+    registry.register("old-execution", "test-1")
+
+    with bind_practice_execution("old-execution", registry):
+        with pytest.raises(PracticeRepositoryError, match="PRACTICE_EXECUTION_FENCED"):
+            repository._put_question(
+                question_id="question-1",
+                test_id="test-1",
+                question="Question?",
+                options=["A", "B", "C", "D"],
+                correct_answer="A",
+                solution="Solution",
+                subject="math",
+                topic="algebra",
+                difficulty="basic",
+                meta={"verified": True},
+            )
     assert client.update_calls == []
+
+
+def test_final_question_updates_retain_the_execution_fence() -> None:
+    client = RecordingClient()
+    repository = QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+    registry = ActivePracticeExecutionRegistry()
+    registry.register("execution-1", "test-1")
+
+    with bind_practice_execution("execution-1", registry):
+        repository.assign_positions(
+            [
+                {
+                    "questionId": "question-1",
+                    "testId": "test-1",
+                    "_practiceMeta": {"bucketId": "bucket-1"},
+                }
+            ]
+        )
+
+    assert client.update_calls == []
+    transaction = client.transact_calls[0]["TransactItems"]
+    assert transaction[0]["ConditionCheck"]["ExpressionAttributeValues"] == _item(
+        {":execution": "execution-1"}
+    )
+    assert transaction[1]["Update"]["Key"] == _item({"questionId": "question-1"})
 
 
 def test_verified_pattern_question_persists_authoritative_link_and_returns_qb_id() -> None:

@@ -284,7 +284,7 @@ def _build_decision(
         route_source=route_source,  # type: ignore[arg-type]
     )
 
-    logger.info(
+    logger.debug(
         "route_resolver.resolved  request_id=%s  route_id=%s  model=%s  "
         "route_source=%s  fallback_count=%d",
         request.request_id,

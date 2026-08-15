@@ -13,3 +13,4 @@ Generate only the assigned questions for one demand bucket.
 - Include a complete solution only when `solution_required` is true.
 - Return exactly four non-empty, normalized-unique options and make `correct_answer` exactly one option.
 - Do not repeat supplied excluded fingerprints or excluded variants.
+- When `fresh_evidence` is supplied, generate factual current content only from that evidence and its requested window. Do not add facts from model memory; omit any unsupported item.

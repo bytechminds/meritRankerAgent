@@ -6,7 +6,14 @@ import json
 import threading
 from copy import deepcopy
 
+import pytest
+
 from features.practice_generation.config import PracticeGenerationConfig
+from features.practice_generation.execution_control import (
+    ActivePracticeExecutionRegistry,
+    PracticeExecutionStopped,
+    bind_practice_execution,
+)
 from features.practice_generation.orchestration import PracticeGenerationOrchestrator
 from features.practice_generation.pattern_context import NoOpPatternContextProvider
 from features.practice_generation.planning import deterministic_blueprint
@@ -95,6 +102,7 @@ class Progress:
     def __init__(self, assessments: Assessments, questions: Questions) -> None:
         self.assessments = assessments
         self.questions = questions
+        self.stop_event: threading.Event | None = None
 
     def claim_group(self, _test_id: str, group_id: str):
         group = self.assessments.item["meta"]["generationGroups"][group_id]
@@ -123,6 +131,10 @@ class Progress:
     def mark_failed(self, _test_id: str, error_code: str, **_kwargs):
         self.assessments.item["status"] = "FAILED"
         self.assessments.item["meta"]["errorCode"] = error_code
+
+    def require_expensive_work_allowed(self, _test_id: str) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise PracticeExecutionStopped("PRACTICE_CANCEL_OBSERVED")
 
 
 class Questions:
@@ -213,6 +225,18 @@ class Verifier:
         )
 
 
+class CountingVerifier(Verifier):
+    def __init__(self, *, stop_event: threading.Event | None = None) -> None:
+        self.calls: list[str] = []
+        self.stop_event = stop_event
+
+    def verify_slot(self, *, slot, question, **kwargs):
+        self.calls.append(slot.slot_id)
+        if self.stop_event is not None:
+            self.stop_event.set()
+        return super().verify_slot(slot=slot, question=question, **kwargs)
+
+
 def generated_question(*, bucket, slot) -> dict:
     return {
         "schema_version": "2",
@@ -256,6 +280,17 @@ class WaveGenerator:
             route_id=slots[0].generator_route_hint,
             model="test-model",
         )
+
+
+class CancelAfterGenerationGenerator(WaveGenerator):
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__()
+        self.stop_event = stop_event
+
+    def generate_slots(self, **kwargs):
+        result = super().generate_slots(**kwargs)
+        self.stop_event.set()
+        return result
 
 
 class SelectiveProviderFailureGenerator:
@@ -433,6 +468,53 @@ def test_same_bucket_groups_are_serialized_before_their_exclusions_are_committed
     assert set(assessments.item["meta"]["readyQuestionIds"]) == {
         "question-slot-001",
     }
+
+
+def test_generator_success_after_cancel_does_not_start_verifier_or_next_slot() -> None:
+    stop_event = threading.Event()
+    verifier = CountingVerifier()
+    orchestrator, assessments = build_orchestrator(
+        generator=CancelAfterGenerationGenerator(stop_event),
+        verifier=verifier,
+    )
+    orchestrator._progress_updates.stop_event = stop_event
+    registry = ActivePracticeExecutionRegistry()
+
+    with bind_practice_execution("execution-1", registry):
+        with pytest.raises(PracticeExecutionStopped, match="PRACTICE_CANCEL_OBSERVED"):
+            orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert verifier.calls == []
+    assert orchestrator._questions.linked == {}
+    assert assessments.item["meta"]["generationGroups"]["g2"]["state"] == "PENDING"
+
+
+def test_approved_inflight_verifier_persists_then_stops_before_next_slot() -> None:
+    stop_event = threading.Event()
+    verifier = CountingVerifier(stop_event=stop_event)
+    generator = SelectiveProviderFailureGenerator(failing_slot_id="not-a-slot")
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=verifier,
+    )
+    orchestrator._progress_updates.stop_event = stop_event
+    groups = assessments.item["meta"]["generationGroups"]
+    groups["g1"].update(
+        {
+            "slotIds": ["slot-001", "slot-002"],
+            "requiredCount": 2,
+        }
+    )
+    del groups["g2"]
+    registry = ActivePracticeExecutionRegistry()
+
+    with bind_practice_execution("execution-1", registry):
+        with pytest.raises(PracticeExecutionStopped, match="PRACTICE_CANCEL_OBSERVED"):
+            orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.calls == [("slot-001", "slot-002")]
+    assert verifier.calls == ["slot-001"]
+    assert set(orchestrator._questions.linked) == {"question-slot-001"}
 
 
 def test_repairable_question_uses_one_repair_wave_then_accepts() -> None:

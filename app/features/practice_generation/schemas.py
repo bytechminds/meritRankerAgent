@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from services.llm.orchestration.prompt_budget import PromptInputBudget
+from tools.web_search.models import FreshEvidenceBundle
 
 
 class PracticeType(StrEnum):
@@ -92,6 +93,9 @@ class PracticeGenerationRequest(BaseModel):
     exam_stage: str | None = Field(default=None, max_length=64)
     exam_profile_id: str | None = Field(default=None, max_length=160)
     source_question_reference: str | None = Field(default=None, max_length=128)
+    requires_fresh_evidence: bool = False
+    freshness_reason: str | None = Field(default=None, max_length=64)
+    fresh_evidence: FreshEvidenceBundle | None = None
     include_solutions: bool = True
     assessment_title: str = Field(min_length=1, max_length=180)
 
@@ -99,6 +103,15 @@ class PracticeGenerationRequest(BaseModel):
     def _accepted_count_is_clamped(self) -> PracticeGenerationRequest:
         if self.accepted_count != min(self.requested_count, 100):
             raise ValueError("accepted_count must equal min(requested_count, 100)")
+        if self.requires_fresh_evidence:
+            if not self.freshness_reason:
+                raise ValueError("freshness-required practice needs a reason")
+            if self.fresh_evidence is None:
+                raise ValueError("freshness-required practice needs fresh evidence")
+            if len(self.fresh_evidence.items) < self.accepted_count:
+                raise ValueError("fresh evidence is insufficient for the accepted count")
+        elif self.fresh_evidence is not None:
+            raise ValueError("static practice must not retain fresh evidence")
         return self
 
 
@@ -457,6 +470,29 @@ class PracticeLaunchResult(BaseModel):
     playable: bool
     duplicate_request: bool = False
     message: str = Field(min_length=1, max_length=500)
+    execution_id: str | None = Field(default=None, max_length=128)
+
+
+class PracticeControlRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
+
+    mode: Literal["practice_control"]
+    action: Literal["cancel", "resume"]
+    test_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
+    conversation_id: str = Field(min_length=1, max_length=100)
+
+
+class PracticeControlResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    success: bool
+    test_id: str = Field(min_length=1, max_length=128)
+    status: Literal["GENERATING", "CANCEL_REQUESTED", "CANCELLED", "READY", "FAILED"]
+    execution_id: str | None = Field(default=None, max_length=128)
+    already_active: bool = False
+    ready_count: int = Field(default=0, ge=0, le=100)
+    requested_count: int = Field(default=0, ge=0, le=100)
 
 
 class PracticeLaunchDecision(BaseModel):
@@ -465,6 +501,15 @@ class PracticeLaunchDecision(BaseModel):
     eligible: bool
     reason_code: str = Field(min_length=1, max_length=96)
     requested_artifact: str | None = Field(default=None, max_length=32)
+
+
+class PracticeFreshnessRequirement(BaseModel):
+    """Deterministic pre-launch freshness decision for one Practice request."""
+
+    model_config = ConfigDict(frozen=True)
+
+    requires_fresh_evidence: bool = False
+    freshness_reason: str | None = Field(default=None, max_length=64)
 
 
 class GeneratedBatch(BaseModel):
@@ -493,6 +538,7 @@ class VerificationResult(BaseModel):
     decision: VerificationDecision | None = None
     independently_solved_option_id: Literal["0", "1", "2", "3"] | None = None
     reason_codes: list[str] = Field(default_factory=list, max_length=8)
+    evidence_urls: list[str] = Field(default_factory=list, max_length=4)
     approved: bool | None = None
     reason_code: str | None = Field(default=None, max_length=96)
 

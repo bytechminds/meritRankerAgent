@@ -251,3 +251,8 @@ Every integration point should be swappable without touching the graph:
   Practice transfers that accumulator to its existing durable test lifecycle and copied worker
   contexts. Rationale: this counts actual provider attempts without graph-node credit logic, a
   second provider path, financial persistence, new infrastructure, or balance mutation.
+- `2026-08-14` — Treat freshness-sensitive Practice as an evidence-required variant of the existing
+  context-retrieval boundary. Persist only the compact selected evidence needed to resume the
+  existing background task, and pass slot-specific subsets to the existing generators/verifiers.
+  Rationale: current facts fail closed before model work without a second search provider, graph,
+  task type, persistence store, or frontend contract.

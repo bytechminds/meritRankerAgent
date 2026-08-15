@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -24,6 +25,8 @@ class Assessments:
         self.item = {
             "testId": "test-1",
             "userId": "user-1",
+            "origin": "AI_CUSTOM",
+            "visibility": "PRIVATE",
             "status": "GENERATING",
             "live": False,
             "totalQuestions": 2,
@@ -68,6 +71,9 @@ class Questions:
         }
         self.list_calls = 0
         self.batch_calls = 0
+        self.valid_slot_ids: set[str] = set()
+        self.invalid_question_ids: tuple[str, ...] = ()
+        self.deleted_question_ids: list[str] = []
 
     def list_linked(self, _test_id: str):
         self.list_calls += 1
@@ -76,6 +82,21 @@ class Questions:
     def get_questions_by_ids(self, ids):
         self.batch_calls += 1
         return deepcopy([self.items[value] for value in ids if value in self.items])
+
+    def inspect_reusable_slots(self, _test_id, *, language, solution_required):
+        assert language == "english"
+        assert solution_required is True
+        return set(self.valid_slot_ids), self.invalid_question_ids
+
+    def delete_invalid_resume_questions(
+        self,
+        _test_id,
+        _execution_id,
+        question_ids,
+    ):
+        self.deleted_question_ids.extend(question_ids)
+        for question_id in question_ids:
+            self.items.pop(question_id, None)
 
 
 class Client:
@@ -102,6 +123,24 @@ class Client:
                 "updatedAt": "after",
             }
         )
+
+
+class StatefulClient(Client):
+    def __init__(self, assessments: Assessments) -> None:
+        super().__init__()
+        self.assessments = assessments
+
+    async def update_progress(self, **kwargs):
+        result = await super().update_progress(**kwargs)
+        self.assessments.item.update(
+            {
+                "status": kwargs["status"],
+                "live": kwargs["live"],
+                "meta": deepcopy(kwargs["meta"]),
+                "updatedAt": result.updated_at,
+            }
+        )
+        return result
 
 
 def repository(*, error: str | None = None):
@@ -212,6 +251,153 @@ def test_recovery_claim_loser_does_not_execute_after_cas_conflict() -> None:
 
     assert progress.claim_recovery("test-1") is False
     assert len(client.calls) == 1
+
+
+def test_execution_claim_reclaims_only_unfinished_groups_and_preserves_questions() -> None:
+    progress, assessments, questions, client = repository()
+    assessments.item["meta"].update(
+        {
+            "activeExecutionId": "old-execution",
+            "executionLeaseExpiresAt": (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat(),
+            "executionAttempt": 1,
+            "cancelRequested": False,
+            "generationGroups": {
+                "complete": {"state": "COMPLETED"},
+                "running": {"state": "RUNNING"},
+                "failed": {"state": "FAILED"},
+            },
+        }
+    )
+
+    claimed = progress.claim_execution(
+        "test-1",
+        user_id="user-1",
+        execution_id="new-execution",
+        lease_seconds=300,
+        resume_reason="USER_RESUME",
+    )
+
+    assert claimed is not None
+    sent = client.calls[0]["meta"]
+    assert sent["activeExecutionId"] == "new-execution"
+    assert sent["executionAttempt"] == 2
+    assert sent["generationGroups"]["complete"]["state"] == "COMPLETED"
+    assert sent["generationGroups"]["running"]["state"] == "PENDING"
+    assert sent["generationGroups"]["failed"]["state"] == "PENDING"
+    assert sent["readyQuestionIds"] == ["q-1"]
+    assert questions.list_calls == 1
+
+
+def test_active_execution_lease_blocks_double_resume_without_publication() -> None:
+    progress, assessments, _questions, client = repository()
+    assessments.item["meta"].update(
+        {
+            "activeExecutionId": "active-execution",
+            "executionLeaseExpiresAt": (
+                datetime.now(UTC) + timedelta(minutes=5)
+            ).isoformat(),
+        }
+    )
+
+    claimed = progress.claim_execution(
+        "test-1",
+        user_id="user-1",
+        execution_id="competing-execution",
+        lease_seconds=300,
+        resume_reason="USER_RESUME",
+    )
+
+    assert claimed is None
+    assert client.calls == []
+
+
+def test_resume_removes_only_invalid_slot_and_reopens_its_completed_group() -> None:
+    assessments = Assessments()
+    questions = Questions()
+    questions.items["q-1"]["_practiceMeta"]["slotId"] = "slot-001"
+    questions.items["q-2"] = {
+        "questionId": "q-2",
+        "testId": "test-1",
+        "_practiceMeta": {
+            "bucketId": "bucket-1",
+            "slotId": "slot-002",
+            "source": "GENERATED",
+        },
+    }
+    questions.valid_slot_ids = {"slot-001"}
+    questions.invalid_question_ids = ("q-2",)
+    assessments.item["meta"].update(
+        {
+            "activeExecutionId": "old-execution",
+            "executionLeaseExpiresAt": (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat(),
+            "generationGroups": {
+                "g-1": {"state": "COMPLETED", "slotIds": ["slot-001"]},
+                "g-2": {"state": "COMPLETED", "slotIds": ["slot-002"]},
+            },
+        }
+    )
+    client = StatefulClient(assessments)
+    progress = AppSyncAssessmentProgressRepository(
+        assessments=assessments,
+        questions=questions,
+        client=client,
+    )
+
+    claimed = progress.claim_execution(
+        "test-1",
+        user_id="user-1",
+        execution_id="new-execution",
+        lease_seconds=300,
+        resume_reason="USER_RESUME",
+    )
+
+    assert claimed is not None
+    assert questions.deleted_question_ids == ["q-2"]
+    assert client.calls[0]["meta"]["generationGroups"]["g-1"]["state"] == "COMPLETED"
+    assert client.calls[0]["meta"]["generationGroups"]["g-2"]["state"] == "PENDING"
+    assert client.calls[1]["meta"]["readyQuestionIds"] == ["q-1"]
+
+
+def test_cancel_request_is_owner_checked_and_preserves_partial_manifest() -> None:
+    progress, assessments, _questions, client = repository()
+    assessments.item["meta"].update(
+        {
+            "activeExecutionId": "execution-1",
+            "cancelRequested": False,
+        }
+    )
+
+    cancelled = progress.request_cancellation("test-1", user_id="user-1")
+
+    assert cancelled["status"] == "GENERATING"
+    sent = client.calls[0]["meta"]
+    assert sent["cancelRequested"] is True
+    assert sent["phase"] == "CANCELLED"
+    assert sent["readyQuestionIds"] == ["q-1"]
+
+
+def test_cancel_request_rejects_non_owner_before_write() -> None:
+    progress, _assessments, _questions, client = repository()
+
+    with pytest.raises(PracticeRepositoryError, match="PRACTICE_EXECUTION_UNAUTHORIZED"):
+        progress.request_cancellation("test-1", user_id="user-2")
+
+    assert client.calls == []
+
+
+def test_cancel_request_cannot_replace_an_unrelated_terminal_failure() -> None:
+    progress, assessments, _questions, client = repository()
+    assessments.item["status"] = "FAILED"
+    assessments.item["meta"]["errorCode"] = "VERIFIER_TERMINAL_REJECTION"
+
+    with pytest.raises(PracticeRepositoryError, match="PRACTICE_NOT_ACTIVE"):
+        progress.request_cancellation("test-1", user_id="user-1")
+
+    assert client.calls == []
 
 
 def test_generating_progress_cannot_decrease_or_become_playable() -> None:
@@ -402,6 +588,12 @@ def test_python_contract_matches_the_deployed_backend_allowlist_fixture() -> Non
         "lastCompletedStage",
         "replacementWaveCount",
         "slotReadyCounts",
+        "activeExecutionId",
+        "executionLeaseExpiresAt",
+        "executionStartedAt",
+        "executionAttempt",
+        "cancelRequested",
+        "resumeReason",
     }
 
     assert PRACTICE_PROGRESS_ALLOWED_META_KEYS == expected_backend_keys

@@ -36,6 +36,7 @@ from starlette.responses import Response, StreamingResponse
 from config import ConfigurationError, get_settings
 from features.practice_generation.agentcore_async import build_practice_async_launcher
 from features.practice_generation.planning import decide_practice_launch
+from features.practice_generation.schemas import PracticeControlRequest
 from graphs.demo_graph import build_demo_graph
 from graphs.doubt_solver_graph import (
     build_doubt_solver_graph,
@@ -426,7 +427,7 @@ def _persist_completed_result(
                 request_id=request_id,
                 conversation_id=request.conversation_id,
                 turn_id=request.turn_id,
-                skip_reason="practice_agentcore_async_not_configured",
+                skip_reason="failed_quality_gate",
             )
         return
     if conversation_persistence is None:
@@ -493,6 +494,22 @@ def invoke(payload: dict) -> dict | Response:
 
     try:
         mode = payload.get("mode", "demo")
+
+        if mode == "practice_control":
+            control = PracticeControlRequest.model_validate(payload)
+            if practice_async_launcher is None:
+                return {
+                    "success": False,
+                    "code": "PRACTICE_GENERATION_UNAVAILABLE",
+                    "test_id": control.test_id,
+                    "status": "FAILED",
+                }
+            result = (
+                practice_async_launcher.cancel(control.test_id, control.user_id)
+                if control.action == "cancel"
+                else practice_async_launcher.resume(control.test_id, control.user_id)
+            )
+            return result.model_dump(mode="json")
 
         # --- Doubt Solver path --------------------------------------------
         if mode == "doubt_solver":

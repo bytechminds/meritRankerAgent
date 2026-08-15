@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from features.practice_generation.events import emit_practice_event
 from observability.context import (
     bind_request_context,
     current_request_context,
@@ -39,6 +40,7 @@ def test_event_contract_contains_required_events() -> None:
         "request_failed",
         "request_cancelled",
         "classification_completed",
+        "practice_freshness_evidence",
         "follow_up_context_loaded",
         "retrieval_completed",
         "generation_completed",
@@ -47,6 +49,7 @@ def test_event_contract_contains_required_events() -> None:
         "PRACTICE_RUNTIME_STARTED",
         "planner_fallback_completed",
         "planner_fallback_failed",
+        "final_manifest_validation_completed",
     } <= EVENT_NAMES
 
 
@@ -303,6 +306,98 @@ def test_log_event_attaches_sanitized_payload(caplog: pytest.LogCaptureFixture) 
     assert "PRIVATE QUERY" not in json.dumps(payload)
     assert "request_id=request-" in caplog.records[-1].message
     assert "request_id=request-1" not in caplog.records[-1].message
+
+
+def test_practice_debug_events_include_safe_trace_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="agent.observability"):
+        with bind_request_context(request_id="request-practice"):
+            emit_practice_event(
+                "QUESTION_VERIFICATION_RESULT",
+                test_id="test-1",
+                status="rejected",
+                details={
+                    "slotId": "slot-001",
+                    "reasonCode": "LOGIC_INVALID",
+                    "prompt": "PRIVATE PROMPT",
+                    "correctAnswer": "PRIVATE ANSWER",
+                },
+            )
+
+    record = caplog.records[-1]
+    payload = record.observability_event
+    assert record.levelno == logging.DEBUG
+    assert payload["details"] == {
+        "slotid": "slot-001",
+        "reasoncode": "LOGIC_INVALID",
+        "testid": "test-1",
+        "activityid": "test-1",
+    }
+    assert "slotid=slot-001" in record.message
+    assert "PRIVATE" not in json.dumps(payload)
+    assert "PRIVATE" not in record.message
+
+
+def test_practice_debug_mode_includes_recovery_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="agent.observability"):
+        emit_practice_event(
+            "question_repair_started",
+            test_id="test-1",
+            status="started",
+            details={"slotId": "slot-001", "repairAttempt": 1},
+        )
+
+    assert caplog.records[-1].levelno == logging.WARNING
+    assert "slotid=slot-001" in caplog.records[-1].message
+    assert "repairattempt=1" in caplog.records[-1].message
+
+
+def test_practice_internal_events_are_suppressed_at_info_but_recovery_is_retained(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="agent.observability"):
+        emit_practice_event(
+            "QUESTION_BANK_REUSE_QUERY_STARTED",
+            test_id="test-1",
+            status="started",
+        )
+        emit_practice_event(
+            "question_repair_started",
+            test_id="test-1",
+            status="started",
+            details={"slotId": "slot-001", "repairAttempt": 1},
+        )
+        emit_practice_event(
+            "final_manifest_validation_completed",
+            test_id="test-1",
+            status="valid",
+            details={
+                "expectedQuestionCount": 3,
+                "actualQuestionCount": 3,
+                "uniqueQuestionCount": 3,
+                "failedSlotCount": 0,
+            },
+        )
+        emit_practice_event(
+            "practice_ready",
+            test_id="test-1",
+            status="ready",
+            details={"acceptedCount": 3},
+        )
+
+    events = [record.observability_event["event"] for record in caplog.records]
+    assert events == [
+        "question_repair_started",
+        "final_manifest_validation_completed",
+        "practice_ready",
+    ]
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "slotid=slot-001" not in caplog.records[0].message
+    assert caplog.records[1].levelno == logging.INFO
+    assert caplog.records[2].levelno == logging.INFO
 
 
 def test_tracing_is_safe_noop_when_sdk_unavailable(

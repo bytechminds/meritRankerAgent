@@ -52,6 +52,7 @@ class WebSourcePolicy:
     time_range: str | None
     source_strictness: str
     freshness_label: str
+    freshness_source: str
 
 
 class WebSourcePolicyResolver:
@@ -119,7 +120,7 @@ class WebSourcePolicyResolver:
             topic_value = india_pack.topic
         else:
             topic_value = world_pack.topic
-        start_date, end_date, time_range, freshness_label = _parse_freshness(
+        start_date, end_date, time_range, freshness_label, freshness_source = _parse_freshness(
             combined,
             default_recent_days=default_recent_days,
         )
@@ -150,6 +151,7 @@ class WebSourcePolicyResolver:
             time_range=time_range,
             source_strictness=source_strictness,
             freshness_label=freshness_label,
+            freshness_source=freshness_source,
         )
 
 
@@ -211,22 +213,28 @@ def _parse_freshness(
     text: str,
     *,
     default_recent_days: int,
-) -> tuple[str | None, str | None, str | None, str]:
+) -> tuple[str | None, str | None, str | None, str, str]:
     today = date.today()
     lower = text.lower()
 
     if "today" in lower:
         iso = today.isoformat()
-        return iso, iso, None, today.strftime("%B %Y")
+        return iso, iso, None, today.strftime("%B %Y"), "user_explicit"
 
     if "yesterday" in lower:
         day = today - timedelta(days=1)
         iso = day.isoformat()
-        return iso, iso, None, day.strftime("%B %Y")
+        return iso, iso, None, day.strftime("%B %Y"), "user_explicit"
 
     if "last week" in lower or "past week" in lower:
         start = today - timedelta(days=7)
-        return start.isoformat(), today.isoformat(), None, today.strftime("%B %Y")
+        return (
+            start.isoformat(),
+            today.isoformat(),
+            None,
+            today.strftime("%B %Y"),
+            "user_explicit",
+        )
 
     month_match = re.search(
         r"\b(january|february|march|april|may|june|july|august|september|october|november|december)"
@@ -241,18 +249,42 @@ def _parse_freshness(
             end = date(int(year_str), 12, 31)
         else:
             end = date(int(year_str), month_num + 1, 1) - timedelta(days=1)
-        return start.isoformat(), end.isoformat(), None, start.strftime("%B %Y")
+        return (
+            start.isoformat(),
+            end.isoformat(),
+            None,
+            start.strftime("%B %Y"),
+            "user_explicit",
+        )
 
     year_match = re.search(r"\b(20\d{2})\b", lower)
-    if year_match and any(token in lower for token in ("year", "annual", "yearly")):
+    if year_match and (
+        any(token in lower for token in ("year", "annual", "yearly"))
+        or any(
+            token in lower
+            for token in ("current affairs", "awards", "appointments", "events")
+        )
+    ):
         year = int(year_match.group(1))
-        return f"{year}-01-01", f"{year}-12-31", None, str(year)
+        return (
+            f"{year}-01-01",
+            f"{year}-12-31",
+            None,
+            str(year),
+            "user_explicit",
+        )
 
     if any(token in lower for token in ("recent", "latest", "current", "this month", "this year")):
         start = today - timedelta(days=default_recent_days)
-        return start.isoformat(), today.isoformat(), None, today.strftime("%B %Y")
+        return (
+            start.isoformat(),
+            today.isoformat(),
+            None,
+            today.strftime("%B %Y"),
+            "default",
+        )
 
-    return None, None, None, today.strftime("%B %Y")
+    return None, None, None, today.strftime("%B %Y"), "none"
 
 
 def _month_number(name: str) -> int:
