@@ -22,6 +22,7 @@ class PatternVectorCandidateFinder(Protocol):
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate | Mapping[str, Any]]:
         """Return Pattern identifiers discovered from a vector index."""
         ...

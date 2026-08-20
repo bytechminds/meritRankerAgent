@@ -18,6 +18,7 @@ Each slot must contain only:
 - If `planner_phase=repair`, correct `repair_reason`; return complete slots, no commentary.
 - Use canonical lowercase underscore IDs and only `mcq`.
 - Use the supplied subject and difficulty. Use exactly the supplied exam ID when present.
+- Each supplied `topic` must be some slot's `topic_id`.
 - `generator_route_hint` must be `general.generator.<difficulty>`.
 - Provide syllabus breadth and distinct facts/forms appropriate to the target exam.
 - Do not create current-affairs or time-sensitive slots without an explicit supported source/date

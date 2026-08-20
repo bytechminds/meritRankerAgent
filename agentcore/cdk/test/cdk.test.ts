@@ -428,13 +428,16 @@ test.each(['shadow', 'on'])(
   (mode) => {
     const statements = questionVectorStatements(semanticStack(mode));
     expect(statements).toHaveLength(1);
-    expect(statements[0].Action).toEqual('s3vectors:QueryVectors');
+    // GetVectors is the documented dependent permission for filtered queries with
+    // returnMetadata; nothing else may appear.
+    expect(statements[0].Action).toEqual(['s3vectors:QueryVectors', 's3vectors:GetVectors']);
     const rendered = JSON.stringify(Template.fromStack(semanticStack(mode)).toJSON());
     expect(rendered).toContain('S3_VECTOR_QUESTION_INDEX_ARN');
     expect(rendered).toContain('question-bank/vector/index-arn');
     for (const forbidden of [
       's3vectors:PutVectors',
       's3vectors:DeleteVectors',
+      's3vectors:ListVectors',
       's3vectors:*',
       'pattern-intelligence/vector/index-arn',
     ]) {

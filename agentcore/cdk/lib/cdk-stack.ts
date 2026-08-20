@@ -295,9 +295,12 @@ export class AgentCoreStack extends Stack {
           questionVectorIndexArn
         );
         // Discovery only, questions-v1 only. Nothing on patterns-v1, no write actions.
+        // GetVectors accompanies QueryVectors because S3 Vectors requires it as a
+        // dependent permission when a query uses metadata filters and returnMetadata;
+        // application code never calls get_vectors, DynamoDB remains authoritative.
         environment.runtime.addToPolicy(
           new iam.PolicyStatement({
-            actions: ['s3vectors:QueryVectors'],
+            actions: ['s3vectors:QueryVectors', 's3vectors:GetVectors'],
             resources: [questionVectorIndexArn],
           })
         );

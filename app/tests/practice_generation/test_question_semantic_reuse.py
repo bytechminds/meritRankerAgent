@@ -76,18 +76,31 @@ def bank_row(qb_id_topic: str = "profit_and_loss", **overrides: Any) -> dict[str
 
 
 class _Finder:
-    def __init__(self, results: list[tuple[str, float, str]], *, fail: bool = False) -> None:
+    """Single-page finder: the whole pool arrives in one API call."""
+
+    def __init__(
+        self,
+        results: list[tuple[str, float, str]],
+        *,
+        fail: bool = False,
+        api_call_count: int = 1,
+    ) -> None:
         self.results = results
         self.fail = fail
+        self.api_call_count = api_call_count
         self.calls: list[dict[str, Any]] = []
 
     def find_candidates(self, *, demand_text, metadata_filter, top_k):
+        from features.practice_generation.question_semantic_reuse import CandidateDiscovery
+
         self.calls.append(
             {"demand_text": demand_text, "filter": metadata_filter, "top_k": top_k}
         )
         if self.fail:
             raise RuntimeError("questions-v1 unavailable")
-        return self.results
+        return CandidateDiscovery(
+            candidates=tuple(self.results), api_call_count=self.api_call_count
+        )
 
 
 def resolver(rows: list[dict[str, Any]], finder: _Finder, *, threshold: float = 0.30):
@@ -466,18 +479,17 @@ def test_on_mode_serves_and_reduces_the_deficit() -> None:
 
 # --- headroom, API-call accounting, and near-duplicate diversity ---------------
 
-def test_query_vectors_is_not_a_paginated_api() -> None:
-    """Pinned as a contract: QueryVectors has no nextToken, so one logical semantic
-    search is always exactly one API call. Headroom, not pagination, absorbs
-    rejected candidates."""
+def test_installed_sdk_supports_query_vectors_pagination() -> None:
+    """Capability, not a frozen SDK shape: the runtime must be able to send and
+    receive a continuation token, otherwise deep candidate pools are unreachable."""
     import boto3
 
     model = boto3.client(
         "s3vectors", region_name="ap-south-1",
         aws_access_key_id="x", aws_secret_access_key="y",
     ).meta.service_model.operation_model("QueryVectors")
-    assert "nextToken" not in model.input_shape.members
-    assert "nextToken" not in model.output_shape.members
+    assert "nextToken" in model.input_shape.members
+    assert "nextToken" in model.output_shape.members
 
 
 def test_top_k_carries_bounded_headroom_over_demand() -> None:
@@ -538,5 +550,142 @@ def test_hundred_slots_with_a_large_rejecting_pool_still_fill_exactly() -> None:
     assert outcome.vector_api_call_count == 1
     assert finder.calls[0]["top_k"] == 200, "headroom must exceed demand"
     assert outcome.version_parity_rejected_count == 40
+    assert outcome.would_reuse_count == 100
+    assert len(set(c.question_id for c in outcome.selected_by_slot.values())) == 100
+
+
+# --- service paging: real finder over a fake paging vector client -------------
+
+class _PagingVectorClient:
+    """Serves candidates across pages, exactly as questions-v1 does."""
+
+    def __init__(self, pages: list[list[tuple[str, float, str]]]) -> None:
+        self.pages = pages
+        self.requests: list[str | None] = []
+
+    def query_question_page(self, *, query_vector, metadata_filter, top_k, next_token=None):
+        from retrieval.models import RetrievedCandidate
+
+        self.requests.append(next_token)
+        index = 0 if next_token is None else int(next_token)
+        page = self.pages[index]
+        following = str(index + 1) if index + 1 < len(self.pages) else None
+        return (
+            [
+                RetrievedCandidate(pattern_id=key, score=score, version_hash=vhash)
+                for key, score, vhash in page
+            ],
+            following,
+        )
+
+
+class _StubEmbedder:
+    def embed_query(self, text: str) -> list[float]:
+        return [0.01] * 1024
+
+
+def _paging_finder(pages):
+    from features.practice_generation.question_semantic_reuse import S3QuestionCandidateFinder
+
+    client = _PagingVectorClient(pages)
+    finder = S3QuestionCandidateFinder(embedder=_StubEmbedder(), vector_client=client)
+    return finder, client
+
+
+def test_a_single_sufficient_page_makes_no_further_request() -> None:
+    page_one = [(f"qb-v2-{i}", 0.9, "h") for i in range(12)]
+    finder, client = _paging_finder([page_one, [("qb-v2-later", 0.5, "h")]])
+
+    discovery = finder.find_candidates(demand_text="d", metadata_filter={}, top_k=12)
+
+    assert discovery.api_call_count == 1
+    assert client.requests == [None], "must not fetch a page it does not need"
+
+
+def test_pagination_continues_until_the_demand_can_be_met() -> None:
+    pages = [
+        [(f"qb-v2-p1-{i}", 0.9, "h") for i in range(5)],
+        [(f"qb-v2-p2-{i}", 0.8, "h") for i in range(5)],
+        [(f"qb-v2-p3-{i}", 0.7, "h") for i in range(5)],
+    ]
+    finder, client = _paging_finder(pages)
+
+    discovery = finder.find_candidates(demand_text="d", metadata_filter={}, top_k=12)
+
+    assert discovery.api_call_count == 3
+    assert len(discovery.candidates) == 15
+    assert client.requests == [None, "1", "2"]
+
+
+def test_pagination_stops_when_the_service_is_exhausted() -> None:
+    finder, client = _paging_finder([[("qb-v2-only", 0.9, "h")]])
+
+    discovery = finder.find_candidates(demand_text="d", metadata_filter={}, top_k=50)
+
+    assert discovery.api_call_count == 1
+    assert len(discovery.candidates) == 1
+
+
+def test_pagination_is_bounded_even_with_an_endless_service() -> None:
+    from features.practice_generation.question_semantic_reuse import _MAX_DISCOVERY_PAGES
+
+    class _Endless(_PagingVectorClient):
+        def query_question_page(self, *, query_vector, metadata_filter, top_k, next_token=None):
+            from retrieval.models import RetrievedCandidate
+
+            self.requests.append(next_token)
+            token = str(len(self.requests))
+            return (
+                [RetrievedCandidate(pattern_id=f"qb-{token}", score=0.9, version_hash="h")],
+                token,
+            )
+
+    from features.practice_generation.question_semantic_reuse import S3QuestionCandidateFinder
+
+    client = _Endless([])
+    finder = S3QuestionCandidateFinder(embedder=_StubEmbedder(), vector_client=client)
+
+    discovery = finder.find_candidates(demand_text="d", metadata_filter={}, top_k=10_000)
+
+    assert discovery.api_call_count == _MAX_DISCOVERY_PAGES
+
+
+def test_hundred_slots_filled_from_candidates_spanning_multiple_pages() -> None:
+    """First page is all stale; the valid candidates only arrive on later pages."""
+    valid = [
+        bank_row("profit_and_loss", question=f"Discount scenario {i} find the selling price.")
+        for i in range(100)
+    ]
+    stale = [
+        bank_row("profit_and_loss", question=f"Stale scenario {i} find the selling price.")
+        for i in range(60)
+    ]
+    pages = [
+        [(r["qbId"], 0.99, "stale-hash") for r in stale],
+        [(r["qbId"], 0.80, r["versionHash"]) for r in valid[:50]],
+        [(r["qbId"], 0.70, r["versionHash"]) for r in valid[50:]],
+    ]
+    finder, client = _paging_finder(pages)
+    by_id = {row["qbId"]: row for row in valid + stale}
+    from features.practice_generation.question_semantic_reuse import (
+        QuestionSemanticReuseResolver,
+    )
+
+    outcome = QuestionSemanticReuseResolver(
+        finder=finder,
+        hydrate=lambda ids: [by_id[i] for i in ids if i in by_id],
+        threshold=0.30,
+        top_k=12,
+    ).resolve(
+        test_id="test-1",
+        groups=group_semantic_demands([slot(i) for i in range(1, 101)], language="english"),
+        language="english",
+        excluded_question_ids=set(),
+    )
+
+    assert outcome.embedding_call_count == 1
+    assert outcome.semantic_search_count == 1
+    assert outcome.vector_api_call_count > 1, "deep pool must require paging"
+    assert outcome.version_parity_rejected_count == 60
     assert outcome.would_reuse_count == 100
     assert len(set(c.question_id for c in outcome.selected_by_slot.values())) == 100

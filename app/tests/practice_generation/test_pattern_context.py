@@ -31,6 +31,7 @@ class _Finder:
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate]:
         self.calls.append((query, subject, limit))
         return self._candidates
@@ -43,6 +44,7 @@ class _UnavailableFinder(_Finder):
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate]:
         del query, subject, limit
         raise RuntimeError("vector unavailable")

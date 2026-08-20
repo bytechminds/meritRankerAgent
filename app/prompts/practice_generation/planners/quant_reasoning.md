@@ -18,6 +18,7 @@ Each slot must contain only:
 - If `planner_phase=repair`, correct `repair_reason`; return complete slots, no commentary.
 - Use canonical lowercase underscore IDs, zero ownership/security fields, and only `mcq`.
 - Use the supplied subject and difficulty. Use exactly the supplied exam ID when present.
+- Each supplied `topic` must be some slot's `topic_id`.
 - `generator_route_hint` must be `<subject_id>.generator.<difficulty>`.
 - Vary target skill, numerical/logical structure, reasoning depth, and exam-appropriate form.
 - Give repeated topic/category slots distinct `variation_hint` values and meaningful

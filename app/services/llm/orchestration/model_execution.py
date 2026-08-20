@@ -948,23 +948,31 @@ class RegistryBackedModelExecutor:
             primary_failure_kind = escalation_failure_kind
 
         capacity = route_decision.practice_generation_capacity
-        if (
-            primary_failure_kind == "output_token_exhausted"
-            and (
-                capacity is None
-                or capacity.escalation_max_output_tokens <= route_decision.max_tokens
-            )
-        ):
-            raise ProviderExecutionError(
-                "Practice generator exhausted its maximum safe output capacity.",
-                failure_kind="output_token_exhausted",
-                attempted_aliases=(primary_alias,),
-            )
+        no_additional_capacity = primary_failure_kind == "output_token_exhausted" and (
+            capacity is None
+            or capacity.escalation_max_output_tokens <= route_decision.max_tokens
+        )
 
         # --- Fallback loop ---
         fallback_aliases: list[str] = list(
             getattr(model_resolution.model_config, "fallback_models", None) or []
         )
+        if no_additional_capacity:
+            # An escalation that cannot raise the cap is a known-failing model call.
+            # Skip it, but keep the existing fallback policy: only a route with no
+            # fallback left is genuinely terminal.
+            logger.info(
+                "practice generator capacity exhausted route_id=%s reason=%s fallbacks=%d",
+                route_decision.route_id,
+                "NO_ADDITIONAL_CAPACITY",
+                len(fallback_aliases),
+            )
+            if not fallback_aliases:
+                raise ProviderExecutionError(
+                    "Practice generator exhausted its maximum safe output capacity.",
+                    failure_kind="output_token_exhausted",
+                    attempted_aliases=(primary_alias,),
+                )
         attempted: list[str] = [primary_alias]
 
         for fallback_index, fallback_alias in enumerate(fallback_aliases, start=1):

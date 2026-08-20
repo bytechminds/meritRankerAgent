@@ -440,6 +440,9 @@ class PatternRuntimeMemo:
     raw_candidate_stats: dict[tuple[str, str, int], tuple[int, float | None]] = field(
         default_factory=dict
     )
+    # Request-local only. Initial and expanded searches embed identical text;
+    # they differ solely in candidate_limit, so the vector is reusable.
+    query_embeddings: dict[str, list[float]] = field(default_factory=dict)
     patterns: dict[str, CanonicalPatternRecord | None] = field(default_factory=dict)
     playable_questions: dict[str, tuple[CanonicalPlayableQuestion, ...]] = field(
         default_factory=dict

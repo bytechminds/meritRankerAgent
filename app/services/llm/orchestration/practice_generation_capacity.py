@@ -55,6 +55,10 @@ class PracticeGenerationCapacityPolicy:
             difficulty = "basic"
         is_reasoning_model = model_config.supports_reasoning
         band = cls._BANDS[(difficulty, is_reasoning_model)]
+        band = cls._stabilized_band(
+            band, subject=route_decision.subject, difficulty=difficulty,
+            is_reasoning_model=is_reasoning_model,
+        )
         visible_output_floor = cls._visible_output_floor(
             subject=route_decision.subject,
             complexity=workload.complexity,
@@ -100,6 +104,35 @@ class PracticeGenerationCapacityPolicy:
             ),
             complexity=workload.complexity,
             slot_count=workload.slot_count,
+        )
+
+    @staticmethod
+    def _stabilized_band(
+        band: _CapacityBand,
+        *,
+        subject: str,
+        difficulty: str,
+        is_reasoning_model: bool,
+    ) -> _CapacityBand:
+        """Start advanced reasoning at the cap that actually completes.
+
+        Every observed advanced-reasoning attempt at the 4000 initial floor
+        exhausted output tokens and was immediately retried at 5600, which then
+        succeeded. Starting at 5600 removes that known-failing call. It buys no
+        extra capacity: the escalation floor and the product hard cap are already
+        5600, so the executor's existing "escalation adds nothing" guard now skips
+        the second attempt and proceeds straight to the unchanged fallback.
+
+        Scoped to reasoning: math advanced shares this band but uses a different
+        provider with a measured reasoning reserve and is deliberately untouched.
+        """
+        if subject != "reasoning" or difficulty != "advanced" or not is_reasoning_model:
+            return band
+        return _CapacityBand(
+            initial_floor=band.escalation_floor,
+            escalation_floor=band.escalation_floor,
+            product_hard_cap=band.product_hard_cap,
+            max_slots_per_batch=band.max_slots_per_batch,
         )
 
     @staticmethod

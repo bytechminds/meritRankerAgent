@@ -838,8 +838,9 @@ class TestModelExecutionFallback:
         result = executor.execute(route_decision=decision, messages=_messages())
 
         assert decision.model == "reasoning_advanced_generator"
+        # Advanced reasoning now starts at 5600, so the escalation call that could
+        # not add capacity is skipped: one fewer known-failing model call.
         assert fake_executor.call_log == [
-            "reasoning_advanced_generator",
             "reasoning_advanced_generator",
             "openai_o3",
             "deepseek_v4pro",
@@ -2094,3 +2095,100 @@ def _executor_pair_simple(
         ),
         fake,
     )
+
+
+class TestAdvancedReasoningCapacityStabilization:
+    """Model-call accounting for the advanced reasoning path.
+
+    Latency is not asserted; the eliminated known-failing model call is.
+    """
+
+    @staticmethod
+    def _manifest(count: int = 1) -> str:
+        return json.dumps(
+            {
+                "questions": [
+                    {
+                        "generation_item_id": f"reasoning-{index}",
+                        "bucket_id": "reasoning-advanced",
+                        "question": f"Reasoning question {index}?",
+                        "question_type": "mcq",
+                        "options": ["A", "B", "C", "D"],
+                        "correct_answer": "A",
+                        "solution": "Concise solution.",
+                        "subject": "reasoning",
+                        "topic": "logical_reasoning",
+                        "difficulty": "advanced",
+                    }
+                    for index in range(1, count + 1)
+                ]
+            }
+        )
+
+    @staticmethod
+    def _advanced_route():
+        return resolve_route(
+            RouteRequest(
+                request_id="practice-reasoning-capacity",
+                subject="reasoning",
+                task_role="generator",
+                difficulty="advanced",
+                intent="practice",
+                language="english",
+            )
+        )
+
+    @staticmethod
+    def _exhausted() -> LlmProviderResponseError:
+        error = LlmProviderResponseError("response unavailable")
+        error.finish_reason = "length"
+        error.output_tokens = 5600
+        error.reasoning_tokens = 5600
+        return error
+
+    def test_success_at_the_initial_capacity_costs_exactly_one_model_call(self) -> None:
+        fake = _AliasedFakeProviderExecutor(
+            raise_for={},
+            return_for={"reasoning_advanced_generator": self._manifest()},
+        )
+        executor = RegistryBackedModelExecutor(provider_executor=fake)
+
+        result = executor.execute(route_decision=self._advanced_route(), messages=_messages())
+
+        assert fake.call_log == ["reasoning_advanced_generator"]
+        assert result.fallback_used is False
+
+    def test_exhaustion_skips_the_noop_escalation_and_falls_back(self) -> None:
+        fake = _AliasedFakeProviderExecutor(
+            raise_for={"reasoning_advanced_generator": self._exhausted()},
+            return_for={"openai_o3": self._manifest()},
+        )
+        executor = RegistryBackedModelExecutor(provider_executor=fake)
+
+        result = executor.execute(route_decision=self._advanced_route(), messages=_messages())
+
+        # Two calls, not three: the escalation that could not add capacity is gone.
+        assert fake.call_log == ["reasoning_advanced_generator", "openai_o3"]
+        assert fake.call_log.count("reasoning_advanced_generator") == 1
+        assert result.fallback_used is True
+
+    def test_fallback_failure_preserves_terminal_semantics(self) -> None:
+        fake = _AliasedFakeProviderExecutor(
+            raise_for={
+                "reasoning_advanced_generator": self._exhausted(),
+                "openai_o3": LlmProviderExecutionError(
+                    "fallback unavailable", failure_kind="provider_unavailable"
+                ),
+                "deepseek_v4pro": LlmProviderExecutionError(
+                    "fallback unavailable", failure_kind="provider_unavailable"
+                ),
+            },
+            return_for={},
+        )
+        executor = RegistryBackedModelExecutor(provider_executor=fake)
+
+        with pytest.raises(ProviderExecutionError):
+            executor.execute(route_decision=self._advanced_route(), messages=_messages())
+
+        # No retries were added; each alias is attempted once.
+        assert fake.call_log.count("reasoning_advanced_generator") == 1

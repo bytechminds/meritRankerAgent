@@ -30,6 +30,7 @@ class _Finder:
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate | Mapping[str, Any]]:
         self.calls.append((query, subject, limit))
         return self._candidates
@@ -620,6 +621,7 @@ class _WindowedFinder:
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate]:
         del query, subject
         self.calls.append(limit)
@@ -1060,3 +1062,65 @@ def test_exhausted_candidate_budget_skips_the_expansion_query_entirely() -> None
     assert len(store.calls) == 24
     assert result.candidate_expansion_used is False
     assert len(result.decisions) == 24
+
+
+def test_expanded_search_reuses_the_request_local_query_embedding() -> None:
+    """Initial and expanded candidate searches embed identical text and differ only
+    in candidate_limit, so the vector is computed once per request."""
+    from services.pattern_intelligence_runtime import S3PatternIntelligenceCandidateFinder
+
+    class _CountingEmbedder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def embed_query(self, text: str) -> list[float]:
+            self.calls += 1
+            return [0.01] * 1024
+
+    class _StubVectorClient:
+        def __init__(self) -> None:
+            self.searches = 0
+
+        def query_pattern_intelligence_candidates(self, *, query_vector, subject, top_k):
+            self.searches += 1
+            return []
+
+    embedder = _CountingEmbedder()
+    vector_client = _StubVectorClient()
+    finder = S3PatternIntelligenceCandidateFinder(
+        embedder=embedder, vector_client=vector_client
+    )
+    cache: dict[str, list[float]] = {}
+
+    finder.find_candidates(query="same demand", subject="math", limit=8, embedding_cache=cache)
+    finder.find_candidates(query="same demand", subject="math", limit=16, embedding_cache=cache)
+
+    assert embedder.calls == 1, "identical demand text must be embedded once"
+    assert vector_client.searches == 2, "both searches must still run"
+
+
+def test_a_different_demand_is_embedded_separately() -> None:
+    from services.pattern_intelligence_runtime import S3PatternIntelligenceCandidateFinder
+
+    class _CountingEmbedder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def embed_query(self, text: str) -> list[float]:
+            self.calls += 1
+            return [0.01] * 1024
+
+    class _StubVectorClient:
+        def query_pattern_intelligence_candidates(self, *, query_vector, subject, top_k):
+            return []
+
+    embedder = _CountingEmbedder()
+    finder = S3PatternIntelligenceCandidateFinder(
+        embedder=embedder, vector_client=_StubVectorClient()
+    )
+    cache: dict[str, list[float]] = {}
+
+    finder.find_candidates(query="demand one", subject="math", limit=8, embedding_cache=cache)
+    finder.find_candidates(query="demand two", subject="math", limit=8, embedding_cache=cache)
+
+    assert embedder.calls == 2

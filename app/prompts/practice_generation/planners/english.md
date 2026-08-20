@@ -14,6 +14,7 @@ Each slot must contain only:
 
 # Rules
 
+- Each supplied `topic` must be some slot's `topic_id`.
 - Preserve every supplied slot ID exactly once and return exactly `accepted_count` slots.
 - If `planner_phase=repair`, correct `repair_reason`; return complete slots, no commentary.
 - Use canonical lowercase underscore IDs, `subject_id=english`, and only `mcq`.

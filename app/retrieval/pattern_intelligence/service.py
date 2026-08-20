@@ -417,6 +417,7 @@ class PatternRuntimeService:
                 query=request.query,
                 subject=request.subject,
                 limit=plan.candidate_limit,
+                embedding_cache=memo.query_embeddings,
             )
         except Exception:
             warnings.append("vector_discovery_unavailable")

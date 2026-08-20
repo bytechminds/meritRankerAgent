@@ -72,12 +72,16 @@ class S3PatternIntelligenceCandidateFinder:
         query: str,
         subject: str | None,
         limit: int,
+        embedding_cache: dict[str, list[float]] | None = None,
     ) -> Sequence[VectorPatternCandidate]:
         """Return bounded candidate identifiers plus an advisory relevance score."""
         normalized_query = " ".join(query.split())
         if not normalized_query or limit < 1:
             return ()
-        query_vector = self._embedder.embed_query(normalized_query)
+        cached_vector = None if embedding_cache is None else embedding_cache.get(normalized_query)
+        query_vector = cached_vector or self._embedder.embed_query(normalized_query)
+        if embedding_cache is not None and cached_vector is None:
+            embedding_cache[normalized_query] = query_vector
         if len(query_vector) != self._settings.s3_vector_dimensions:
             raise ValueError("Pattern Intelligence embedding dimension does not match S3 Vectors.")
         candidates = self._vector_client.query_pattern_intelligence_candidates(

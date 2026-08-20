@@ -35,10 +35,11 @@ from features.practice_generation.metadata_normalization import (
 from features.practice_generation.schemas import PlannerSlot
 
 _QB_DIFFICULTY = {"basic": "EASY", "intermediate": "MEDIUM", "advanced": "HARD"}
-# QueryVectors is not a paginated API: it has no nextToken in either its input or
-# output shape, so one logical semantic search is always exactly one API call and the
-# only way to survive rejections is to ask for headroom up front.
+# One logical semantic search may span several QueryVectors requests: the service
+# returns a nextToken when more candidates remain. Headroom absorbs rejected
+# candidates; paging is bounded so discovery can never run away.
 _CANDIDATE_HEADROOM_MULTIPLIER = 2
+_MAX_DISCOVERY_PAGES = 5
 _MAX_CANDIDATE_TOP_K = 200
 # Deliberately high: "same template, different numbers" is the reuse we want, so only
 # near-verbatim repeats are suppressed.
@@ -74,6 +75,14 @@ def is_near_duplicate(candidate_stem: str, selected_stems: Sequence[frozenset[st
     return False
 
 
+@dataclass(frozen=True)
+class CandidateDiscovery:
+    """Candidates plus the number of API requests it actually took to collect them."""
+
+    candidates: tuple[tuple[str, float, str], ...]
+    api_call_count: int
+
+
 class QuestionCandidateFinder(Protocol):
     """Bounded questions-v1 discovery."""
 
@@ -83,8 +92,8 @@ class QuestionCandidateFinder(Protocol):
         demand_text: str,
         metadata_filter: dict[str, object],
         top_k: int,
-    ) -> Sequence[tuple[str, float, str]]:
-        """Return (qbId, similarity, vector versionHash) triples."""
+    ) -> CandidateDiscovery:
+        """Return (qbId, similarity, vector versionHash) triples and the call count."""
 
 
 @dataclass(frozen=True)
@@ -257,14 +266,14 @@ class QuestionSemanticReuseResolver:
             try:
                 outcome.embedding_call_count += 1
                 outcome.semantic_search_count += 1
-                # One logical search == one API call, because QueryVectors does not
-                # paginate. Counted separately so the invariant stays observable.
-                outcome.vector_api_call_count += 1
-                candidates = self._finder.find_candidates(
+                discovery = self._finder.find_candidates(
                     demand_text=build_demand_text(group),
                     metadata_filter=metadata_filter,
                     top_k=resolve_candidate_top_k(self._top_k, group.required_count),
                 )
+                # One logical search, however many pages the service needed.
+                outcome.vector_api_call_count += discovery.api_call_count
+                candidates = discovery.candidates
             except Exception:  # noqa: BLE001 - discovery is an optimization
                 emit_practice_event(
                     "QUESTION_SEMANTIC_RETRIEVAL_FAILED",
@@ -389,18 +398,28 @@ class S3QuestionCandidateFinder:
         demand_text: str,
         metadata_filter: dict[str, object],
         top_k: int,
-    ) -> Sequence[tuple[str, float, str]]:
+    ) -> CandidateDiscovery:
         query_vector = self._embedder.embed_query(demand_text)
-        candidates = self._vector_client.query_question_candidates(
-            query_vector=query_vector,
-            metadata_filter=metadata_filter,
-            top_k=top_k,
-        )
-        return tuple(
-            (candidate.pattern_id, float(candidate.score), str(candidate.version_hash or ""))
-            for candidate in candidates
-            if candidate.pattern_id
-        )
+        collected: list[tuple[str, float, str]] = []
+        next_token: str | None = None
+        api_calls = 0
+        for _page in range(_MAX_DISCOVERY_PAGES):
+            page, next_token = self._vector_client.query_question_page(
+                query_vector=query_vector,
+                metadata_filter=metadata_filter,
+                top_k=top_k,
+                next_token=next_token,
+            )
+            api_calls += 1
+            collected.extend(
+                (candidate.pattern_id, float(candidate.score), str(candidate.version_hash or ""))
+                for candidate in page
+                if candidate.pattern_id
+            )
+            # Stop as soon as the demand can be satisfied, or the service is done.
+            if not next_token or len(collected) >= top_k:
+                break
+        return CandidateDiscovery(candidates=tuple(collected), api_call_count=api_calls)
 
 
 def build_question_semantic_resolver(

@@ -75,17 +75,19 @@ class S3VectorClient:
             metadata_filter=metadata_filter,
         )
 
-    def query_question_candidates(
+    def query_question_page(
         self,
         *,
         query_vector: list[float],
         metadata_filter: dict[str, object] | None,
         top_k: int,
-    ) -> list[RetrievedCandidate]:
-        """Discover reusable Question candidates in questions-v1.
+        next_token: str | None = None,
+    ) -> tuple[list[RetrievedCandidate], str | None]:
+        """Fetch one page of questions-v1 candidates plus its continuation token.
 
         Discovery only: every candidate is re-validated against the authoritative
-        QuestionBank row before it may be served.
+        QuestionBank row before it may be served.  Paging policy lives with the
+        caller so the bound stays a product decision, not a transport detail.
         """
         index_arn = self._settings.s3_vector_question_index_arn
         if not index_arn:
@@ -101,12 +103,19 @@ class S3VectorClient:
         }
         if metadata_filter:
             request["filter"] = metadata_filter
+        if next_token:
+            request["nextToken"] = next_token
         client = self._client_factory(self._settings.s3_vector_region or None)
         try:
             response = client.query_vectors(**request)
         except ClientError as exc:
             raise S3VectorQueryError("questions-v1 candidate query failed.") from exc
-        return map_query_vectors_response(response if isinstance(response, dict) else {})
+        payload = response if isinstance(response, dict) else {}
+        token = payload.get("nextToken")
+        return (
+            map_query_vectors_response(payload),
+            str(token) if isinstance(token, str) and token else None,
+        )
 
     def _query(
         self,
