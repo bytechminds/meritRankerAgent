@@ -8,6 +8,8 @@ Regenerate fresh questions for the remaining immutable planner-slot deficits aft
 - Return one fresh question for every supplied slot, preserving its `slot_id` and constraints.
 - Do not reuse prior wording, values, distractors, or answer patterns from excluded snippets.
 - Do not weaken difficulty or change the planner design.
+- Preserve the supplied `language` for the question, options, explanation, and solution; this is a hard delivery constraint.
+- With `fresh_evidence`, use only this slot's in-window `evidence_by_slot` facts; never use another slot or model memory. Omit unsupported slots.
 - This is the final bounded replacement wave; return no commentary or partial placeholders.
 - Pattern guidance is method-only: preserve its target, operation sequence, constraints, and `not_same_when` limits when supplied, while using new wording, entities, values/data, scenario, and option construction. Never copy a source answer, solution, or instance.
 

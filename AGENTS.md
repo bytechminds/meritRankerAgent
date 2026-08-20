@@ -127,7 +127,8 @@ Every feature must pass through the role sequence below.
 | Review | 7 | Security Reviewer | `skills/roles/security-reviewer.md` |
 | Review | 8 | Performance-Cost Reviewer | `skills/roles/performance-cost-reviewer.md` |
 | Review | 9 | Documentation Maintainer | `skills/roles/documentation-maintainer.md` |
-| Release | 10 | Release Gatekeeper | `skills/roles/release-gatekeeper.md` |
+| Guard | 10 | Scope Guard | `skills/roles/scope-guard.md` |
+| Release | 11 | Release Gatekeeper | `skills/roles/release-gatekeeper.md` |
 
 ### Workflow Rules
 
@@ -136,6 +137,13 @@ Every feature must pass through the role sequence below.
 
 2. **Python Agent Engineer implements only the approved plan.** Scope changes during
    implementation must be escalated back to the relevant planning role.
+
+2a. **Scope Guard reviews both the plan (before implementation) and the actual diff
+   (after implementation).** Any file touched, abstraction added, or behavior changed
+   that does not trace back to the literal request must be flagged and requires the
+   user's explicit permission before proceeding — it is never implemented first and
+   disclosed afterward. This applies regardless of how small or "obviously correct"
+   the extra change is.
 
 3. **After implementation, Solution Architect and AI Solution Architect review code
    boundaries and AI workflow** before QA, Security, and Performance proceed.
@@ -155,6 +163,15 @@ Every feature must pass through the role sequence below.
 See `skills/roles/README.md` for the full role boundary and permission table.
 
 ---
+
+## Claude Code Project Skills
+
+`.claude/skills/*/SKILL.md` wires this `skills/` knowledge base into Claude Code's
+skill auto-loading. Each project skill is a thin pointer (owning files,
+invariants, tests, reviewers) into the real `skills/` docs below — it does not
+duplicate them. When adding a new `skills/features/<name>.md`, add a matching
+`.claude/skills/meritranker-<name>/SKILL.md` once the feature is real enough to
+need routing. Keep both in sync; the `skills/` docs remain the source of truth.
 
 ## Skills Index
 

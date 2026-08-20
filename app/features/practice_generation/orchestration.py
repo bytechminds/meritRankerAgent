@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +54,10 @@ from features.practice_generation.planning import (
     select_planner_family,
 )
 from features.practice_generation.progress import AppSyncAssessmentProgressRepository
+from features.practice_generation.question_semantic_reuse import (
+    QuestionSemanticReuseResolver,
+    group_semantic_demands,
+)
 from features.practice_generation.repositories import (
     AssessmentRepository,
     PracticeRepositoryError,
@@ -180,6 +185,7 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "mixed_difficulty_requested": mixed_difficulty_requested,
             "explicit_difficulty_requested": explicit_difficulty_requested,
             "language": value.get("language"),
+            "language_source": value.get("languageSource", "REQUEST"),
             "exam_id": value.get("examId"),
             "exam_stage": value.get("examStage"),
             "exam_profile_id": value.get("examProfileId"),
@@ -225,6 +231,7 @@ class PracticeGenerationOrchestrator:
         generator: QuestionGenerator,
         verifier: QuestionVerifier,
         pattern_context: PatternContextProvider,
+        semantic_resolver: QuestionSemanticReuseResolver | None = None,
     ) -> None:
         self._config = config
         self._assessments = assessments
@@ -234,6 +241,8 @@ class PracticeGenerationOrchestrator:
         self._generator = generator
         self._verifier = verifier
         self._pattern_context = pattern_context
+        # Absent unless Phase D is configured; "off" never constructs one.
+        self._semantic_resolver = semantic_resolver
 
     def _require_expensive_work_allowed(self, test_id: str) -> None:
         if current_practice_execution_id() is None:
@@ -354,8 +363,12 @@ class PracticeGenerationOrchestrator:
                 "plannerPhase": diagnostic.phase,
                 "schemaName": diagnostic.schema_name,
                 "validationErrorCount": diagnostic.error_count,
-                "fieldPaths": list(diagnostic.field_paths),
-                "errorTypes": list(diagnostic.error_types),
+                # Joined, not lists: the observability sanitizer replaces any
+                # non-scalar with its type name, so emitting these as lists logged
+                # the literal string "list" and destroyed the only detail that
+                # identifies which planner field failed.
+                "fieldPaths": ",".join(diagnostic.field_paths)[:512],
+                "errorTypes": ",".join(diagnostic.error_types)[:256],
                 "durationMs": diagnostic.duration_ms,
             }
             emit_practice_event(
@@ -900,6 +913,21 @@ class PracticeGenerationOrchestrator:
                     if not result.has_more_pages or evaluated == 0:
                         break
                 lane_cache[lane] = lane_items
+                # DEBUG only: the completed event reports candidateCount without the
+                # educational bucket it queried, so a zero result cannot be told apart
+                # from "inventory exists under a different topic label".
+                emit_practice_event(
+                    "QUESTION_BANK_REUSE_QUERY_DEBUG",
+                    test_id=test_id,
+                    status="completed",
+                    details={
+                        "slotId": slot.slot_id,
+                        "reuseBucketKey": reuse_key,
+                        "difficultyPrefix": difficulty_prefix,
+                        "returnedCount": len(lane_items),
+                    },
+                    level=logging.DEBUG,
+                )
                 emit_practice_event(
                     "QUESTION_BANK_REUSE_QUERY_COMPLETED",
                     test_id=test_id,
@@ -983,6 +1011,16 @@ class PracticeGenerationOrchestrator:
                     details={"reasonCode": "PRACTICE_HISTORY_READ_FAILED"},
                     level=logging.WARNING,
                 )
+        # Phase D: between exact reuse and Pattern, over remaining deficits only.
+        deficit_slot_ids = self._apply_question_semantic_reuse(
+            test_id=test_id,
+            request=request,
+            blueprint=blueprint,
+            deficit_slot_ids=deficit_slot_ids,
+            filled_slot_ids=filled_slot_ids,
+            already_linked_source_ids=already_linked_source_ids,
+            accepted_ids=accepted_ids,
+        )
         pattern_runtime_enabled = (
             self._config.pattern_context_enabled or self._config.pattern_reuse_enabled
         )
@@ -1113,6 +1151,7 @@ class PracticeGenerationOrchestrator:
                 details={
                     "retrievalGroupCount": pattern_resolution.retrieval_group_count,
                     "vectorQueryCount": pattern_resolution.vector_query_count,
+                    "expansionQueryCount": pattern_resolution.expansion_query_count,
                     "guidanceSafeCount": len(pattern_resolution.guidance_by_slot),
                     "ignoredPatternCount": pattern_resolution.ignored_pattern_count,
                     "reuseSafeCount": pattern_reused_count,
@@ -1224,6 +1263,7 @@ class PracticeGenerationOrchestrator:
                 group=group,
                 bucket=bucket,
                 existing_normalized_texts=existing_texts,
+                requested_language=request.language,
             )
         except PracticeExecutionStopped:
             raise
@@ -1698,6 +1738,73 @@ class PracticeGenerationOrchestrator:
         if current is not None and current.get("status") == "GENERATING":
             self._maybe_finalize(test_id, request, blueprint)
 
+    def _verify_one_slot(
+        self,
+        *,
+        context: _SlotGenerationContext,
+        slot: PlannerSlot,
+        question: GeneratedQuestion,
+    ) -> VerificationResult | BaseException:
+        """Run one unchanged verifier call, returning its failure instead of raising.
+
+        Returning the exception keeps every worker terminally resolved, so no task
+        is ever abandoned and the caller applies the existing failure policy in a
+        single deterministic place.
+        """
+        try:
+            self._require_expensive_work_allowed(context.test_id)
+            return self._verifier.verify_slot(
+                request=context.request,
+                bucket=context.bucket,
+                slot=slot,
+                question=question,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            return exc
+
+    def _verify_slots_bounded(
+        self,
+        *,
+        context: _SlotGenerationContext,
+        units: list[tuple[PlannerSlot, GeneratedQuestion]],
+    ) -> dict[str, VerificationResult | BaseException]:
+        """Fan the existing per-question verifier calls out under a bounded pool."""
+        if not units:
+            return {}
+        limit = max(1, min(self._config.verification_max_concurrency, len(units)))
+        if limit == 1:
+            return {
+                slot.slot_id: self._verify_one_slot(
+                    context=context, slot=slot, question=question
+                )
+                for slot, question in units
+            }
+        outcomes: dict[str, VerificationResult | BaseException] = {}
+        # Bounded and fully joined: the pool never exceeds `limit` in-flight calls and
+        # the context manager waits for every worker before returning.
+        with ThreadPoolExecutor(
+            max_workers=limit,
+            thread_name_prefix="practice-verify",
+        ) as executor:
+            futures = {
+                slot.slot_id: executor.submit(
+                    copy_context().run,
+                    functools.partial(
+                        self._verify_one_slot,
+                        context=context,
+                        slot=slot,
+                        question=question,
+                    ),
+                )
+                for slot, question in units
+            }
+            for slot_id, future in futures.items():
+                try:
+                    outcomes[slot_id] = future.result()
+                except BaseException as exc:  # noqa: BLE001
+                    outcomes[slot_id] = exc
+        return outcomes
+
     def _execute_slot_group(
         self,
         context: _SlotGenerationContext,
@@ -1802,6 +1909,7 @@ class PracticeGenerationOrchestrator:
                     bucket=context.bucket,
                     existing_normalized_texts=wave_excluded,
                     slots=wave_slots,
+                    requested_language=context.request.language,
                 )
             except PracticeExecutionStopped:
                 cancelled = True
@@ -1880,27 +1988,28 @@ class PracticeGenerationOrchestrator:
                         slot.slot_id,
                         tuple(parsed.rejection_reason_codes[:4]),
                     )
+            verification_units: list[tuple[PlannerSlot, GeneratedQuestion]] = []
             for question in parsed.accepted:
                 slot = pending.get(str(question.slot_id or ""))
                 if slot is None:
                     reasons.append("VERIFIER_SLOT_BINDING_MISMATCH")
                     continue
-                try:
-                    self._require_expensive_work_allowed(context.test_id)
-                except PracticeExecutionStopped:
+                verification_units.append((slot, question))
+            # Transport-only fan-out: each question still gets its own verifier call
+            # with the same route, model, and prompt. Outcomes are keyed by slot_id and
+            # merged below in the original deterministic order, so completion order can
+            # never determine identity or event ordering.
+            verification_outcomes = self._verify_slots_bounded(
+                context=context,
+                units=verification_units,
+            )
+            for slot, question in verification_units:
+                outcome = verification_outcomes.get(slot.slot_id)
+                if isinstance(outcome, PracticeExecutionStopped):
                     cancelled = True
                     break
-                try:
-                    verification = self._verifier.verify_slot(
-                        request=context.request,
-                        bucket=context.bucket,
-                        slot=slot,
-                        question=question,
-                    )
-                except PracticeExecutionStopped:
-                    cancelled = True
-                    break
-                except ProviderExecutionError as exc:
+                if isinstance(outcome, ProviderExecutionError):
+                    exc = outcome
                     provider_failure_recoverable = (
                         exc.failure_kind in FALLBACK_ELIGIBLE_FAILURE_KINDS
                     )
@@ -1937,12 +2046,12 @@ class PracticeGenerationOrchestrator:
                         level=logging.WARNING,
                     )
                     break
-                except Exception as exc:  # noqa: BLE001
+                if isinstance(outcome, BaseException) or outcome is None:
                     logger.warning(
                         "slot verifier unavailable test_id=%s group_id=%s error_type=%s",
                         context.test_id,
                         context.group.group_id,
-                        type(exc).__name__,
+                        type(outcome).__name__,
                     )
                     reasons.append("VERIFIER_UNAVAILABLE")
                     emit_practice_event(
@@ -1958,6 +2067,7 @@ class PracticeGenerationOrchestrator:
                         },
                     )
                     continue
+                verification = outcome
                 binding_valid = (
                     verification.schema_version == "2"
                     and verification.generation_item_id == question.generation_item_id
@@ -2095,6 +2205,89 @@ class PracticeGenerationOrchestrator:
             cancelled=cancelled,
         )
 
+    def _apply_question_semantic_reuse(
+        self,
+        *,
+        test_id: str,
+        request: PracticeGenerationRequest,
+        blueprint: PracticeBlueprint,
+        deficit_slot_ids: set[str],
+        filled_slot_ids: set[str],
+        already_linked_source_ids: set[str],
+        accepted_ids: list[str],
+    ) -> set[str]:
+        """Fill remaining deficits from questions-v1, or leave them for Pattern.
+
+        In "shadow" mode the full retrieval and authoritative validation run and are
+        reported, but nothing is served and no deficit is reduced.
+        """
+        mode = self._config.question_semantic_reuse_mode
+        if mode == "off" or not deficit_slot_ids or self._semantic_resolver is None:
+            return deficit_slot_ids
+        slots_by_id = {slot.slot_id: slot for slot in blueprint.slots}
+        pending = tuple(
+            slots_by_id[slot_id] for slot_id in sorted(deficit_slot_ids) if slot_id in slots_by_id
+        )
+        if not pending:
+            return deficit_slot_ids
+        groups = group_semantic_demands(pending, language=request.language)
+        outcome = self._semantic_resolver.resolve(
+            test_id=test_id,
+            groups=groups,
+            language=request.language,
+            excluded_question_ids=set(already_linked_source_ids),
+        )
+        served = 0
+        if mode == "on":
+            for slot_id, candidate in outcome.selected_by_slot.items():
+                if slot_id not in deficit_slot_ids:
+                    continue
+                slot = slots_by_id[slot_id]
+                bucket = bucket_for_slot(blueprint, slot)
+                if not self._questions.link_reused(
+                    test_id=test_id,
+                    bucket_id=bucket.bucket_id,
+                    slot_id=slot_id,
+                    question=candidate,
+                ):
+                    continue
+                filled_slot_ids.add(slot_id)
+                deficit_slot_ids.discard(slot_id)
+                already_linked_source_ids.add(candidate.question_id)
+                accepted_ids.append(
+                    deterministic_question_id(
+                        test_id,
+                        source_id=candidate.question_id,
+                        bucket_id=bucket.bucket_id,
+                    )
+                )
+                served += 1
+        emit_practice_event(
+            "QUESTION_SEMANTIC_REUSE_COMPLETED",
+            test_id=test_id,
+            status="completed",
+            details={
+                "semanticMode": mode,
+                "semanticDemandGroupCount": outcome.group_count,
+                "embeddingCallCount": outcome.embedding_call_count,
+                "semanticSearchCount": outcome.semantic_search_count,
+                "vectorApiCallCount": outcome.vector_api_call_count,
+                "nearDuplicateRejectedCount": outcome.near_duplicate_rejected_count,
+                "candidateCount": outcome.candidate_count,
+                "hydratedCount": outcome.hydrated_count,
+                "versionParityRejectedCount": outcome.version_parity_rejected_count,
+                "identityRejectedCount": outcome.identity_rejected_count,
+                "trustRejectedCount": outcome.trust_rejected_count,
+                "compatibilityRejectedCount": outcome.compatibility_rejected_count,
+                "duplicateRejectedCount": outcome.duplicate_rejected_count,
+                "thresholdRejectedCount": outcome.threshold_rejected_count,
+                "wouldReuseCount": outcome.would_reuse_count,
+                "selectedCount": served,
+                "remainingDeficitCount": len(deficit_slot_ids),
+            },
+        )
+        return deficit_slot_ids
+
     def _commit_slot_outcome(self, outcome: _SlotGenerationOutcome) -> bool:
         test_id = outcome.context.test_id
         current = self._assessments.get(test_id)
@@ -2127,15 +2320,22 @@ class PracticeGenerationOrchestrator:
             selection = outcome.context.pattern_selections_by_slot.get(
                 verified.slot.slot_id
             )
-            if self._config.pattern_reuse_enabled and selection is not None:
+            if self._config.question_bank_promotion_enabled:
                 try:
                     source_question_bank_id = (
-                        self._questions.persist_verified_pattern_question(
+                        self._questions.persist_verified_question(
+                            test_id=test_id,
                             question=verified.question,
                             slot=verified.slot,
-                            pattern_id=selection.pattern_id,
-                            pattern_version_hash=selection.pattern_version_hash,
                             language=outcome.context.request.language,
+                            pattern_id=(
+                                selection.pattern_id if selection is not None else None
+                            ),
+                            pattern_version_hash=(
+                                selection.pattern_version_hash
+                                if selection is not None
+                                else None
+                            ),
                         )
                     )
                 except PracticeRepositoryError:

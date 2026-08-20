@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 from config import Settings, get_settings
 from tools.web_search.formatter import WebContextFormatter
 from tools.web_search.models import (
+    MAX_FRESH_EVIDENCE_ITEMS,
     FreshEvidenceBundle,
     FreshnessWindow,
     SearchAttemptKind,
@@ -119,6 +120,9 @@ class WebSearchTool:
             request.query,
             request.web_search_query,
             scope_policy,
+            start_date=policy.start_date,
+            end_date=policy.end_date,
+            temporal_mode=policy.temporal_mode,
         )
 
         allow_generic = settings.web_search_allow_generic_fallback
@@ -157,6 +161,7 @@ class WebSearchTool:
         retry_status_sent = False
         attempt_count = 0
         candidate_count = 0
+        stale_results_rejected = 0
 
         for attempt_idx, attempt in enumerate(attempts):
             if (
@@ -180,8 +185,14 @@ class WebSearchTool:
                 policy=policy,
                 attempt_kind=attempt.kind,
             )
-            rerank_result = self._reranker.rerank(
+            eligible, rejected = _filter_temporally_eligible_items(
                 tagged,
+                policy=policy,
+                required=request.requires_fresh_evidence,
+            )
+            stale_results_rejected += rejected
+            rerank_result = self._reranker.rerank(
+                eligible,
                 WebSearchRerankInput(
                     request_id=request.request_id,
                     query=request.query,
@@ -200,6 +211,7 @@ class WebSearchTool:
                         and request.required_evidence_count > 0
                         else None
                     ),
+                    requires_fresh_evidence=request.requires_fresh_evidence,
                 ),
                 policy=policy,
                 settings=settings,
@@ -227,6 +239,8 @@ class WebSearchTool:
 
         weak_context = best_rerank.weak_context or not best_items
         fresh_evidence: FreshEvidenceBundle | None = None
+        evidence_date_min: str | None = None
+        evidence_date_max: str | None = None
         if request.requires_fresh_evidence:
             fresh_evidence = _build_fresh_evidence_bundle(
                 policy=policy,
@@ -234,6 +248,14 @@ class WebSearchTool:
                 items=best_items,
             )
             best_items = list(fresh_evidence.items)
+            evidence_dates = sorted(
+                date_value
+                for item in best_items
+                if (date_value := _published_date(item.published_at)) is not None
+            )
+            if evidence_dates:
+                evidence_date_min = evidence_dates[0]
+                evidence_date_max = evidence_dates[-1]
             if len(best_items) < request.required_evidence_count:
                 weak_context = True
         context_strength = best_rerank.context_strength
@@ -270,7 +292,9 @@ class WebSearchTool:
             "candidate_count=%d  used=%s  result_count=%d  "
             "context_chars=%d  evidence_context_chars=%d  safe_note_chars=%d  "
             "source_pack=%s  scope=%s  source_need=%s  attempt=%s  weak_context=%s  "
-            "duration_ms=%d",
+            "duration_ms=%d  freshness_required=%s  temporal_mode=%s  "
+            "start_date=%s  end_date=%s  stale_results_rejected=%d  "
+            "eligible_evidence_count=%d  evidence_date_min=%s  evidence_date_max=%s",
             request.request_id,
             provider_name,
             attempt_count,
@@ -286,6 +310,14 @@ class WebSearchTool:
             best_attempt or "",
             weak_context,
             int((time.monotonic() - started_at) * 1000),
+            request.requires_fresh_evidence,
+            policy.temporal_mode if request.requires_fresh_evidence else "",
+            policy.start_date if request.requires_fresh_evidence else "",
+            policy.end_date if request.requires_fresh_evidence else "",
+            stale_results_rejected,
+            len(best_items),
+            evidence_date_min or "",
+            evidence_date_max or "",
         )
 
         official_count = sum(
@@ -311,6 +343,14 @@ class WebSearchTool:
             official_count=official_count,
             reputable_count=reputable_count,
             duration_ms=int((time.monotonic() - started_at) * 1000),
+            freshness_required=request.requires_fresh_evidence,
+            freshness_start_date=(policy.start_date if request.requires_fresh_evidence else None),
+            freshness_end_date=(policy.end_date if request.requires_fresh_evidence else None),
+            temporal_mode=(policy.temporal_mode if request.requires_fresh_evidence else None),
+            stale_results_rejected=stale_results_rejected,
+            eligible_evidence_count=len(best_items),
+            evidence_date_min=evidence_date_min,
+            evidence_date_max=evidence_date_max,
             fresh_evidence=(fresh_evidence if not weak_context else None),
         )
 
@@ -396,18 +436,17 @@ def _build_fresh_evidence_bundle(
     items: list[WebSearchItem],
 ) -> FreshEvidenceBundle:
     """Keep only compact, usable, in-window evidence for Practice grounding."""
+    eligible, _rejected = _filter_temporally_eligible_items(
+        items,
+        policy=policy,
+        required=True,
+    )
     selected: list[WebSearchItem] = []
     seen_urls: set[str] = set()
-    for item in items:
+    for item in eligible:
         url = _normalized_url(item.url)
         if not url or len(item.snippet.strip()) < 20:
             continue
-        published_date = _published_date(item.published_at)
-        if published_date is not None:
-            if policy.start_date and published_date < policy.start_date:
-                continue
-            if policy.end_date and published_date > policy.end_date:
-                continue
         if url in seen_urls:
             continue
         seen_urls.add(url)
@@ -427,12 +466,39 @@ def _build_fresh_evidence_bundle(
             start_date=policy.start_date,
             end_date=policy.end_date,
             source=policy.freshness_source,
+            temporal_mode=policy.temporal_mode,
             label=policy.freshness_label,
         ),
         retrieved_at=datetime.now(UTC).isoformat(),
         search_query=search_query,
-        items=selected,
+        items=selected[:MAX_FRESH_EVIDENCE_ITEMS],
     )
+
+
+def _filter_temporally_eligible_items(
+    items: list[WebSearchItem],
+    *,
+    policy,
+    required: bool,
+) -> tuple[list[WebSearchItem], int]:
+    """Filter dated evidence before ranking; freshness claims never trust unknown dates."""
+    if not required:
+        return items, 0
+    selected: list[WebSearchItem] = []
+    rejected = 0
+    for item in items:
+        published_date = _published_date(item.published_at)
+        if published_date is None:
+            rejected += 1
+            continue
+        if policy.start_date and published_date < policy.start_date:
+            rejected += 1
+            continue
+        if policy.end_date and published_date > policy.end_date:
+            rejected += 1
+            continue
+        selected.append(item)
+    return selected, rejected
 
 
 def _normalized_url(value: str) -> str:

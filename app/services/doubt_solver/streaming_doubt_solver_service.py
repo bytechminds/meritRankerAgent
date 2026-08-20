@@ -6,17 +6,20 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
+from traceback import extract_tb
 from typing import Literal, Protocol
 
 from config import get_settings
 from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
+    PracticeRequestCountError,
     decide_practice_launch,
-    is_fresh_evidence_request_supported,
     practice_route_enabled,
     resolve_practice_freshness_requirement,
     resolve_practice_request,
+    validate_practice_requested_count,
 )
 from features.practice_generation.schemas import (
     PracticeGenerationRequest,
@@ -51,6 +54,7 @@ from schemas.doubt_solver import (
     DoubtSolverStreamEvent,
     PracticeGenerationStartedData,
     ResponseContent,
+    TerminalConversationIdentity,
 )
 from schemas.llm_usage import LLMUsageRecord
 from services.context_retrieval.web_grounding import (
@@ -154,6 +158,55 @@ class StreamDoubtSolverInput:
     operation_accumulator: OperationUsageAccumulator | None = None
 
 
+@dataclass
+class _PostAnswerFinalizationProgress:
+    """Request-local diagnostic state for the narrow post-answer boundary."""
+
+    lifecycle_stage: str = "before_answer"
+    answer_emitted: bool = False
+    persistence_payload_build_started: bool = False
+    persistence_network_call_started: bool = False
+
+
+def _sanitized_exception_origin(exc: Exception) -> tuple[str, str, int, str]:
+    """Return frame coordinates only; never include exception text or source lines."""
+    frames = extract_tb(exc.__traceback__)
+    if not frames:
+        return "unknown", "unknown", 0, "unknown"
+    origin = frames[-1]
+    module = "/".join(Path(origin.filename).parts[-3:]) or "unknown"
+    trace = " <- ".join(
+        f"{'/'.join(Path(frame.filename).parts[-3:])}:{frame.name}:{frame.lineno}"
+        for frame in frames[-8:]
+    )
+    return module, origin.name, origin.lineno, trace
+
+
+def _post_answer_finalization_failure_details(
+    exc: Exception,
+    progress: _PostAnswerFinalizationProgress,
+    *,
+    operation_id: str,
+) -> tuple[dict[str, object], str]:
+    """Build bounded diagnostic metadata without serializing user-controlled exception text."""
+    origin_module, origin_function, origin_line, trace = _sanitized_exception_origin(exc)
+    return (
+        {
+            "operation_id": operation_id,
+            "lifecycle_stage": progress.lifecycle_stage,
+            "exception_type": type(exc).__name__,
+            "exception_message_short": "exception message redacted",
+            "origin_module": origin_module,
+            "origin_function": origin_function,
+            "origin_line": origin_line,
+            "answer_emitted": progress.answer_emitted,
+            "persistence_payload_build_started": progress.persistence_payload_build_started,
+            "persistence_network_call_started": progress.persistence_network_call_started,
+        },
+        trace,
+    )
+
+
 def _cancelled(input: StreamDoubtSolverInput) -> bool:
     return input.should_cancel is not None and input.should_cancel()
 
@@ -173,6 +226,31 @@ def _error_event(
     )
 
 
+def _terminal_metadata(
+    input: StreamDoubtSolverInput,
+    *,
+    persisted: bool,
+    terminal_reason: str | None = None,
+) -> dict[str, object]:
+    metadata = TerminalConversationIdentity(
+        request_id=input.request_id,
+        conversation_id=input.conversation_id,
+        turn_id=input.turn_id,
+        persisted=persisted,
+    ).model_dump(mode="json")
+    if terminal_reason is not None:
+        metadata["terminal_reason"] = terminal_reason
+    return metadata
+
+
+def _history_persisted(result: object | None) -> bool:
+    return bool(
+        result is not None
+        and getattr(result, "history_write_status", None)
+        in {"succeeded", "idempotent_replay"}
+    )
+
+
 def _iter_stream_doubt_solver(
     input: StreamDoubtSolverInput,
     *,
@@ -181,6 +259,7 @@ def _iter_stream_doubt_solver(
     follow_up_resolver=None,
     conversation_understanding=None,
     practice_launcher: PracticeLauncher | None = None,
+    post_answer_progress: _PostAnswerFinalizationProgress | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Yield live chunks only for low risk requests, otherwise replay approval."""
     request_id = input.request_id
@@ -303,10 +382,11 @@ def _iter_stream_doubt_solver(
                 request_id=request_id,
                 stage="complete",
                 label=get_stream_label("complete"),
-                metadata={
-                    "request_id": request_id,
-                    "terminal_reason": "clarification_required",
-                },
+                metadata=_terminal_metadata(
+                    input,
+                    persisted=False,
+                    terminal_reason="clarification_required",
+                ),
                 response=DoubtSolverFinalResponse(
                     request_id=request_id,
                     content=ResponseContent(value=clarification),
@@ -458,21 +538,19 @@ def _iter_stream_doubt_solver(
             )
             return
         fresh_evidence = None
-        if freshness_requirement.requires_fresh_evidence:
-            if not is_fresh_evidence_request_supported(input.original_query or input.query):
-                if conversation_persistence is not None:
-                    conversation_persistence.record_skip(
-                        request_id=request_id,
-                        conversation_id=input.conversation_id,
-                        turn_id=input.turn_id,
-                        skip_reason="failed_quality_gate",
-                    )
-                yield _error_event(
-                    request_id,
-                    code="PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT",
-                    retryable=False,
+        try:
+            validate_practice_requested_count(input.original_query or input.query)
+        except PracticeRequestCountError as exc:
+            if conversation_persistence is not None:
+                conversation_persistence.record_skip(
+                    request_id=request_id,
+                    conversation_id=input.conversation_id,
+                    turn_id=input.turn_id,
+                    skip_reason="failed_quality_gate",
                 )
-                return
+            yield _error_event(request_id, code=exc.reason_code, retryable=False)
+            return
+        if freshness_requirement.requires_fresh_evidence:
             context_update = _orchestrated_collect_context_node(
                 state,
                 on_before_web_search=status_tracker.hook(
@@ -535,6 +613,16 @@ def _iter_stream_doubt_solver(
                 freshness_requirement=freshness_requirement,
                 fresh_evidence=fresh_evidence,
             )
+            log_event(
+                "practice_language_resolved",
+                component="practice.routing",
+                stage="language",
+                status="resolved",
+                details={
+                    "language": practice_request.language,
+                    "source": practice_request.language_source,
+                },
+            )
             launch = practice_launcher.launch(practice_request)
         except PracticeLaunchError as exc:
             if conversation_persistence is not None:
@@ -545,6 +633,9 @@ def _iter_stream_doubt_solver(
                     skip_reason="failed_quality_gate",
                 )
             yield _error_event(request_id, code=exc.code, retryable=False)
+            return
+        except PracticeRequestCountError as exc:
+            yield _error_event(request_id, code=exc.reason_code, retryable=False)
             return
         except (TypeError, ValueError):
             yield _error_event(
@@ -613,7 +704,7 @@ def _iter_stream_doubt_solver(
             request_id=request_id,
             stage="practice_generation_started",
             label=launch.message,
-            metadata={"request_id": request_id},
+            metadata=_terminal_metadata(input, persisted=history_linked),
             data=PracticeGenerationStartedData(
                 practice_test_id=launch.test_id,
                 message=launch.message,
@@ -1122,15 +1213,23 @@ def _iter_stream_doubt_solver(
     event = emit_status(stage="finalizing", reason_code="finalizing")
     if event is not None:
         yield event
+    if post_answer_progress is not None:
+        post_answer_progress.lifecycle_stage = "final_response_contract"
     final_response = DoubtSolverFinalResponse(
         request_id=request_id,
         content=ResponseContent(value=answer),
         answer=answer,
         final_answer=final_answer,
     )
+    if post_answer_progress is not None:
+        post_answer_progress.lifecycle_stage = "response_preview"
     record_local_preview("response_type", "answer")
     record_local_preview("response", answer)
+    persistence_result = None
     if conversation_persistence is not None:
+        if post_answer_progress is not None:
+            post_answer_progress.lifecycle_stage = "persistence_payload_build"
+            post_answer_progress.persistence_payload_build_started = True
         turn = CompletedConversationTurn.now(
             actor_id=input.actor_id,
             conversation_id=input.conversation_id,
@@ -1147,11 +1246,15 @@ def _iter_stream_doubt_solver(
             quality_status=final_answer.quality_status,
             was_regenerated=final_answer.was_regenerated,
         )
-        conversation_persistence.persist_completed_turn(
+        if post_answer_progress is not None:
+            post_answer_progress.lifecycle_stage = "persistence_coordinator_entry"
+        persistence_result = conversation_persistence.persist_completed_turn(
             turn,
             final_answer,
             request_id=request_id,
         )
+    if post_answer_progress is not None:
+        post_answer_progress.lifecycle_stage = "terminal_event_build"
     logger.debug(
         "answer_delivery request_id=%s stream_completed=true strategy=%s latency_ms=%d "
         "quality_status=%s was_regenerated=%s language_compliant=%s",
@@ -1167,7 +1270,10 @@ def _iter_stream_doubt_solver(
         request_id=request_id,
         stage="complete",
         label=get_stream_label("complete"),
-        metadata={"request_id": request_id},
+        metadata=_terminal_metadata(
+            input,
+            persisted=_history_persisted(persistence_result),
+        ),
         response=final_response,
     )
 
@@ -1215,6 +1321,7 @@ def stream_doubt_solver(
             terminal = False
             terminal_reason = "unexpected_internal_error"
             terminal_error_type: str | None = None
+            post_answer_progress = _PostAnswerFinalizationProgress()
             try:
                 with stage_span("doubt_solver.request"):
                     if not input.request_started_logged:
@@ -1232,6 +1339,7 @@ def stream_doubt_solver(
                         follow_up_resolver=follow_up_resolver,
                         conversation_understanding=conversation_understanding,
                         practice_launcher=practice_launcher,
+                        post_answer_progress=post_answer_progress,
                     ):
                         if _cancelled(input):
                             terminal_reason = (
@@ -1256,7 +1364,10 @@ def stream_doubt_solver(
                             return
                         if event.type == "chunk":
                             visible = True
-                        elif event.type in {
+                            post_answer_progress.answer_emitted = True
+                        if event.stage:
+                            post_answer_progress.lifecycle_stage = event.stage
+                        if event.type in {
                             "complete",
                             "error",
                             "practice_generation_started",
@@ -1276,6 +1387,30 @@ def stream_doubt_solver(
                 terminal = True
                 terminal_reason = "unexpected_internal_error"
                 terminal_error_type = type(exc).__name__
+                if post_answer_progress.answer_emitted:
+                    details, trace = _post_answer_finalization_failure_details(
+                        exc,
+                        post_answer_progress,
+                        operation_id=input.request_id,
+                    )
+                    log_event(
+                        "post_answer_finalization_failed",
+                        component="doubt_solver.finalization",
+                        stage=post_answer_progress.lifecycle_stage,
+                        status="failed",
+                        error_code="POST_ANSWER_FINALIZATION_FAILED",
+                        details=details,
+                        level=logging.ERROR,
+                    )
+                    if (
+                        get_settings().app_env == "local"
+                        and logger.isEnabledFor(logging.DEBUG)
+                    ):
+                        logger.debug(
+                            "post_answer_finalization_trace request_id=%s trace=%s",
+                            input.request_id,
+                            trace,
+                        )
                 yield _error_event(
                     input.request_id,
                     code=("ANSWER_PARTIAL_STREAM_FAILED" if visible else "ANSWER_STREAM_FAILED"),

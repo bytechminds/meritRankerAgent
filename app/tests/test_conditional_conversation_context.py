@@ -272,3 +272,70 @@ def test_ambiguous_candidate_clarification_is_context_aware() -> None:
     assert "explain" in clarification
     assert "highlight its steps" in clarification
     assert "similar question" in clarification
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # The reported incident: an anaphoric word with its source in the same turn.
+        "A right triangle has legs of length 6 cm and 8 cm. Find the hypotenuse."
+        " Create 2 similar questions.",
+        # The literal word "practice" must not be what decides this.
+        "A right triangle has legs of length 6 cm and 8 cm. Find the hypotenuse."
+        " Create 2 similar practice questions.",
+        "A triangle has angles 25 and 45 degrees. Find the third angle."
+        " Create 3 similar questions.",
+        "Solve 2x + 5 = 15. Give me 5 more questions like this.",
+        "Solve x squared - 5x + 6 = 0 and give me 5 more questions like this.",
+        "Create 10 questions similar to this: If 5 workers complete a job in 12 days,"
+        " how long would 10 workers take?",
+        "Here is a grammar sentence: The boy run fast every morning."
+        " Create 4 similar questions.",
+        "A right triangle has legs of 6 and 8. Find the hypotenuse."
+        " Create 100 similar questions.",
+    ],
+)
+def test_local_source_resolves_similar_without_history(query: str) -> None:
+    assessment = ContextNeedGate().evaluate(query)
+
+    assert assessment.decision == "CONTEXT_NOT_NEEDED", assessment.reason_codes
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Create 2 similar questions.",
+        "Give me 5 more like the previous one.",
+        "Give me 5 more like that.",
+        "Make questions similar to what we just did.",
+        "Create 3 questions similar to the previous question.",
+    ],
+)
+def test_similar_without_a_local_source_still_requires_history(query: str) -> None:
+    assessment = ContextNeedGate().evaluate(query)
+
+    assert assessment.decision == "CONTEXT_REQUIRED", assessment.reason_codes
+
+
+def test_local_antecedent_is_reported_as_its_own_reason_code() -> None:
+    assessment = ContextNeedGate().evaluate(
+        "A triangle has angles 25 and 45 degrees. Find the third angle."
+        " Create 3 similar questions."
+    )
+
+    assert assessment.reason_codes == ("local_antecedent_resolved",)
+    assert assessment.matched_signals == ("similar_reference",)
+
+
+def test_local_precedence_never_overrides_an_ordinal_history_reference() -> None:
+    # Self-contained wording plus an explicitly prior pointer: history still wins.
+    assessment = ContextNeedGate().evaluate(
+        "Solve 2x + 5 = 15. Now give me 5 more like the previous one."
+    )
+
+    assert assessment.decision == "CONTEXT_REQUIRED"
+
+
+def test_a_bare_local_source_introducer_is_not_treated_as_an_anchor() -> None:
+    # The introducer must actually introduce something substantial.
+    assert ContextNeedGate().evaluate("Here is a question.").decision != "CONTEXT_NOT_NEEDED"

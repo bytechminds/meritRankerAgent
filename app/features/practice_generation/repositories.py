@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
@@ -19,8 +18,10 @@ from features.practice_generation.execution_control import current_practice_exec
 from features.practice_generation.generation import deterministic_question_id
 from features.practice_generation.matching import (
     ReusableQuestion,
+    build_question_bank_id,
     build_reuse_difficulty_prefix,
     build_slot_reuse_bucket_key,
+    question_bank_version_hash_from_item,
 )
 from features.practice_generation.option_distribution import (
     reorder_options,
@@ -58,6 +59,13 @@ _SUBJECTS = {
     "general": "GENERAL",
 }
 logger = logging.getLogger(__name__)
+
+
+def _storage_language(language: str) -> str:
+    return {"english": "en", "hindi": "hi", "hinglish": "hinglish"}.get(
+        language.casefold(),
+        "",
+    )
 _ASSESSMENT_SIZE_ENVELOPE: dict[str, Any] = {
     "testId": "x" * 128,
     "userId": "x" * 128,
@@ -124,10 +132,6 @@ class PracticeRepositoryError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
-def normalize_question_for_identity(value: str) -> str:
-    return " ".join(value.casefold().split())
 
 
 def _item(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -300,6 +304,7 @@ class AssessmentRepository:
                 "mixedDifficultyRequested": request.mixed_difficulty_requested,
                 "explicitDifficultyRequested": request.explicit_difficulty_requested,
                 "language": request.language,
+                "languageSource": request.language_source,
                 "examId": request.exam_id,
                 "examStage": request.exam_stage,
                 "examProfileId": request.exam_profile_id,
@@ -340,7 +345,7 @@ class AssessmentRepository:
             "status": "GENERATING",
             "visibility": "PRIVATE",
             "origin": "AI_CUSTOM",
-            "language": "hi" if request.language == "hindi" else "en",
+            "language": _storage_language(request.language),
             "durationMinutes": max(1, min(request.accepted_count * 2, 180)),
             "totalQuestions": request.accepted_count,
             "exams": [request.exam_id] if request.exam_id else ["General"],
@@ -1271,6 +1276,13 @@ class QuestionRepository:
         )
         if not requested_language:
             raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
+        requires_storage_language = isinstance(practice_request, dict) and (
+            "languageSource" in practice_request
+        )
+        if requires_storage_language and assessment.get("language") != _storage_language(
+            requested_language
+        ):
+            raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
         solution_required = bool(practice_request.get("includeSolutions", True))
         playable: list[dict[str, Any]] = []
         for question_id in manifest_ids:
@@ -1281,6 +1293,11 @@ class QuestionRepository:
                 expected_question_type="mcq",
                 expected_language=requested_language,
                 solution_required=solution_required,
+                expected_storage_language=(
+                    _storage_language(requested_language)
+                    if requires_storage_language
+                    else None
+                ),
             )
             if not contract.valid:
                 raise PracticeRepositoryError("TEST_CONTENT_NOT_YET_CONSISTENT")
@@ -1465,6 +1482,7 @@ class QuestionRepository:
             },
             pattern_id=pattern_id,
             pattern_version_hash=pattern_version_hash,
+            language=question.language,
         )
 
     def link_generated(
@@ -1554,32 +1572,42 @@ class QuestionRepository:
                 if pattern_selection is not None
                 else None
             ),
+            language=language,
         )
 
-    def persist_verified_pattern_question(
+    def persist_verified_question(
         self,
         *,
+        test_id: str,
         question: GeneratedQuestion,
         slot: PlannerSlot,
-        pattern_id: str,
-        pattern_version_hash: str,
         language: str,
+        pattern_id: str | None = None,
+        pattern_version_hash: str | None = None,
     ) -> str | None:
-        """Create an idempotent reusable QuestionBank row after verifier acceptance."""
+        """Create an idempotent reusable QuestionBank row after verifier acceptance.
+
+        Trust comes from independent verifier acceptance of system-generated content,
+        so Pattern linkage is optional and only decorates the row when the server
+        itself selected a Pattern for the slot.
+        """
         reuse_bucket_key = build_slot_reuse_bucket_key(slot, language=language)
         difficulty_prefix = build_reuse_difficulty_prefix(slot.difficulty.value)
         if not reuse_bucket_key or not difficulty_prefix:
             return None
-        digest = hashlib.sha256(
-            "|".join(
-                (
-                    pattern_id,
-                    pattern_version_hash,
-                    normalize_question_for_identity(question.question),
-                )
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-        qb_id = f"pattern-v1-{digest}"
+        qb_id = build_question_bank_id(
+            subject=slot.subject_id,
+            difficulty=slot.difficulty.value,
+            exam_ids=slot.exam_ids,
+            language=language,
+            question_type=question.question_type.value,
+            question=question.question,
+            options=tuple(question.options),
+            correct_answer=question.correct_answer,
+        )
+        if qb_id is None:
+            return None
+        pattern_linked = bool(pattern_id and pattern_version_hash)
         timestamp = _now()
         difficulty = {
             "basic": "EASY",
@@ -1594,7 +1622,9 @@ class QuestionRepository:
             "explanation": question.answer_explanation or question.solution,
             "category": slot.category_id,
             "difficulty": difficulty,
-            "source": "PATTERN_VERIFIED_PRACTICE",
+            "source": (
+                "PATTERN_VERIFIED_PRACTICE" if pattern_linked else "SYSTEM_VERIFIED_PRACTICE"
+            ),
             "meta": {
                 "status": "ACTIVE",
                 "qualityStatus": "VERIFIED",
@@ -1617,13 +1647,25 @@ class QuestionRepository:
                 f"{quote(timestamp.casefold(), safe='-_.!~*')}#"
                 f"{quote(qb_id.casefold(), safe='-_.!~*')}"
             ),
-            "patternId": pattern_id,
-            "patternVersionHash": pattern_version_hash,
-            "patternLinkEvidence": "VERIFIED_GENERATION",
+            **(
+                {
+                    "patternId": pattern_id,
+                    "patternVersionHash": pattern_version_hash,
+                    "patternLinkEvidence": "VERIFIED_GENERATION",
+                }
+                if pattern_linked
+                else {}
+            ),
             "createdAt": timestamp,
             "updatedAt": timestamp,
             "__typename": "QuestionBank",
         }
+        # Derived from the constructed row through the same function every reader
+        # uses, so the writer cannot drift from recomputation.
+        version_hash = question_bank_version_hash_from_item(item)
+        if version_hash is None:
+            return None
+        item["versionHash"] = version_hash
         try:
             self._client.put_item(
                 TableName=self._question_bank_table,
@@ -1633,7 +1675,65 @@ class QuestionRepository:
             return qb_id
         except ClientError as exc:
             if _is_conditional_failure(exc):
+                if pattern_linked:
+                    self.attach_verified_pattern_link_if_absent(
+                        test_id=test_id,
+                        qb_id=qb_id,
+                        pattern_id=str(pattern_id),
+                        pattern_version_hash=str(pattern_version_hash),
+                    )
                 return qb_id
+            raise PracticeRepositoryError("QUESTION_BANK_PATTERN_LINK_FAILED") from exc
+
+    def attach_verified_pattern_link_if_absent(
+        self,
+        *,
+        test_id: str,
+        qb_id: str,
+        pattern_id: str,
+        pattern_version_hash: str,
+    ) -> bool:
+        """Attach authoritative Pattern evidence to an existing reusable Question.
+
+        Enrichment only.  The condition keeps the write idempotent for the same
+        Pattern, never replaces a different Pattern already recorded, and never
+        creates a row.  Playable content, classification, and trust fields are
+        outside the update expression by construction.
+        """
+        if not qb_id or not pattern_id or not pattern_version_hash:
+            return False
+        try:
+            self._client.update_item(
+                TableName=self._question_bank_table,
+                Key=_item({"qbId": qb_id}),
+                UpdateExpression=(
+                    "SET patternId = :pattern, patternVersionHash = :version, "
+                    "patternLinkEvidence = :evidence, updatedAt = :now"
+                ),
+                ConditionExpression=(
+                    "attribute_exists(qbId) AND "
+                    "(attribute_not_exists(patternId) OR patternId = :pattern)"
+                ),
+                ExpressionAttributeValues=_item(
+                    {
+                        ":pattern": pattern_id,
+                        ":version": pattern_version_hash,
+                        ":evidence": "VERIFIED_GENERATION",
+                        ":now": _now(),
+                    }
+                ),
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                emit_practice_event(
+                    "PATTERN_QUESTION_BANK_LINK_CONFLICT",
+                    test_id=test_id,
+                    status="skipped",
+                    details={"reasonCode": "QUESTION_BANK_PATTERN_LINK_NOT_ABSENT"},
+                    level=logging.WARNING,
+                )
+                return False
             raise PracticeRepositoryError("QUESTION_BANK_PATTERN_LINK_FAILED") from exc
 
     def _put_question(
@@ -1649,6 +1749,7 @@ class QuestionRepository:
         topic: str,
         difficulty: str,
         meta: dict[str, Any],
+        language: str = "",
         answer_contract: dict[str, Any] | None = None,
         pattern_id: str | None = None,
         pattern_version_hash: str | None = None,
@@ -1670,6 +1771,11 @@ class QuestionRepository:
             "difficulty": difficulty.upper(),
             "topic": topic,
             "subject": _SUBJECTS.get(subject.casefold(), "OTHER"),
+            **(
+                {"language": _storage_language(language)}
+                if _storage_language(language)
+                else {}
+            ),
             "format": "standard",
             "meta": meta,
             "createdAt": timestamp,

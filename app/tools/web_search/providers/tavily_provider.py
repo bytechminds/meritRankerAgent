@@ -38,7 +38,6 @@ class TavilyWebSearchProvider(WebSearchProvider):
             attempt_kind = "authoritative"
 
         payload: dict[str, Any] = {
-            "api_key": self._api_key,
             "query": request.query,
             "max_results": request.max_results,
             "search_depth": request.search_depth,
@@ -63,7 +62,10 @@ class TavilyWebSearchProvider(WebSearchProvider):
         http_request = urllib.request.Request(
             _TAVILY_SEARCH_URL,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            },
             method="POST",
         )
         try:

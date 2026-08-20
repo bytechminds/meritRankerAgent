@@ -45,6 +45,7 @@ def test_event_contract_contains_required_events() -> None:
         "retrieval_completed",
         "generation_completed",
         "quality_validation_completed",
+        "conversation_persistence_started",
         "conversation_persistence_completed",
         "PRACTICE_RUNTIME_STARTED",
         "planner_fallback_completed",
@@ -634,3 +635,32 @@ def test_inspector_supports_required_block_filters(
         ["--path", str(log_path), "--conversation-id", "conversation-full", "--json"]
     ) == 0
     assert '"request_id": "request1"' in capsys.readouterr().out
+
+
+def test_planner_validation_diagnostics_survive_sanitization() -> None:
+    """Regression: these were emitted as lists, and the sanitizer replaces any
+    non-scalar with its type name, so the log recorded the literal string "list"
+    and destroyed the only field identifying which planner field failed."""
+    details = sanitize_details(
+        {
+            "reasonCode": "PLANNER_SCHEMA_INVALID",
+            "fieldPaths": "blueprint.slots.0.category,blueprint.slots.1.category",
+            "errorTypes": "missing,string_type",
+            "validationErrorCount": 2,
+            "actualSlotCount": 3,
+            "plannerAttempt": 1,
+            "plannerPhase": "initial",
+        }
+    )
+
+    assert details["fieldpaths"] == "blueprint.slots.0.category,blueprint.slots.1.category"
+    assert details["errortypes"] == "missing,string_type"
+    assert details["validationerrorcount"] == 2
+    assert details["actualslotcount"] == 3
+
+
+def test_sanitizer_still_collapses_non_scalar_detail_values() -> None:
+    # The underlying behaviour is unchanged; callers must serialize instead.
+    details = sanitize_details({"fieldPaths": ["a.b", "c.d"]})
+
+    assert details["fieldpaths"] == "list"

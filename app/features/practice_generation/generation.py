@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from features.practice_generation.matching import normalize_question_text
 from features.practice_generation.metadata_normalization import (
+    normalize_difficulty,
     normalize_subject,
     normalize_topic,
 )
@@ -453,6 +454,7 @@ def parse_partial_generation(
     bucket: DemandBucket,
     existing_normalized_texts: set[str],
     slots: tuple[PlannerSlot, ...] = (),
+    requested_language: str | None = None,
 ) -> ParsedGeneration:
     try:
         payload = json.loads(raw)
@@ -494,6 +496,14 @@ def parse_partial_generation(
             rejected += 1
             rejection_reason_codes.append(contract.reason_code)
             continue
+        if requested_language and not _is_delivery_language_compliant(
+            question,
+            requested_language=requested_language,
+            subject=bucket.subject,
+        ):
+            rejected += 1
+            rejection_reason_codes.append("QUESTION_LANGUAGE_MISMATCH")
+            continue
         normalized = normalize_question_text(question.question)
         slot = slots_by_id.get(str(question.slot_id or "")) if slots else None
         canonical_subject = normalize_subject(question.subject)
@@ -533,6 +543,31 @@ def parse_partial_generation(
         rejected_count=rejected,
         rejection_reason_codes=tuple(rejection_reason_codes),
     )
+
+
+def _is_delivery_language_compliant(
+    question: GeneratedQuestion,
+    *,
+    requested_language: str,
+    subject: str,
+) -> bool:
+    """Use a bounded script signal before the independent language-aware verifier."""
+    text = " ".join(
+        (
+            question.question,
+            *question.options,
+            question.answer_explanation,
+            question.solution,
+        )
+    )
+    devanagari_count = sum("\u0900" <= character <= "\u097f" for character in text)
+    if requested_language == "english":
+        return devanagari_count < 8
+    if requested_language == "hinglish":
+        return devanagari_count < 4
+    if requested_language == "hindi" and subject.casefold() != "english":
+        return devanagari_count >= 4
+    return True
 
 
 def verification_required(
@@ -708,9 +743,16 @@ def validate_final_set(
         for item in linked_questions:
             meta = item["_practiceMeta"]
             slot = slots_by_id[str(meta["slotId"])]
+            # Compared through the same canonical normalizers the admission-time
+            # matcher uses.  QuestionBank stores backend difficulty vocabulary
+            # (EASY/MEDIUM/HARD) while planner slots use basic/intermediate/advanced,
+            # so a raw casefold comparison rejected every reused Question even though
+            # it had already satisfied strict slot compatibility.  Topic carries the
+            # same alias risk.  This is a vocabulary fix, not a relaxation: the
+            # normalizers are exact alias maps and still reject genuine mismatches.
             if (
-                str(item.get("topic") or "").casefold() != slot.topic_id
-                or str(item.get("difficulty") or "").casefold() != slot.difficulty.value
+                normalize_topic(item.get("topic")) != slot.topic_id
+                or normalize_difficulty(item.get("difficulty")) != slot.difficulty.value
                 or str(meta.get("questionType") or "").casefold() != slot.question_type.value
                 or meta.get("verified") is not True
             ):

@@ -72,6 +72,7 @@ class Settings:
     s3_vector_runtime_index_name: str
     s3_vector_pattern_index_name: str
     s3_vector_pattern_index_arn: str
+    s3_vector_question_index_arn: str
     s3_vector_region: str
     s3_vector_top_k_runtime: int
     s3_vector_top_k_pattern: int
@@ -573,6 +574,9 @@ def get_settings() -> Settings:
             ).strip(),
             s3_vector_pattern_index_arn=os.getenv(
                 "S3_VECTOR_PATTERN_INDEX_ARN", ""
+            ).strip(),
+            s3_vector_question_index_arn=os.getenv(
+                "S3_VECTOR_QUESTION_INDEX_ARN", ""
             ).strip(),
             s3_vector_region=os.getenv("S3_VECTOR_REGION", os.getenv("AWS_REGION", "")).strip(),
             s3_vector_top_k_runtime=int(os.getenv("S3_VECTOR_TOP_K_RUNTIME", "20")),

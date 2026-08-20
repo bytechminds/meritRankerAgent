@@ -118,6 +118,67 @@ def select_blocks(
     return selected[-limit:]
 
 
+@dataclass(frozen=True)
+class OperationLine:
+    """One incremental operation event or its terminal aggregate summary."""
+
+    operation_id: str
+    test_id: str
+    execution_id: str
+    request_id: str
+    summary: bool
+    text: str
+
+
+_OPERATION_PREFIXES = ("[operation] ", "[operation-summary] ")
+
+
+def _operation_field(text: str, key: str) -> str:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", text)
+    return match.group(1) if match else ""
+
+
+def load_operation_lines(path: Path) -> list[OperationLine]:
+    """Read the operation timeline written by the long-running operation scope."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []
+    lines: list[OperationLine] = []
+    for raw in content.splitlines():
+        text = raw.strip()
+        if not text.startswith(_OPERATION_PREFIXES):
+            continue
+        lines.append(
+            OperationLine(
+                operation_id=_operation_field(text, "op"),
+                test_id=_operation_field(text, "test"),
+                execution_id=_operation_field(text, "exec"),
+                request_id=_operation_field(text, "req"),
+                summary=text.startswith("[operation-summary] "),
+                text=text,
+            )
+        )
+    return lines
+
+
+def select_operation_lines(
+    lines: Iterable[OperationLine],
+    *,
+    operation_id: str | None = None,
+    test_id: str | None = None,
+    execution_id: str | None = None,
+) -> list[OperationLine]:
+    """Reconstruct exactly one operation timeline; identifiers combine with AND."""
+    return [
+        line
+        for line in lines
+        if (operation_id is None or line.operation_id == operation_id)
+        and (test_id is None or line.test_id == test_id)
+        and (execution_id is None or line.execution_id == execution_id)
+    ]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", type=Path, default=DEFAULT_LOG_PATH)
@@ -143,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     filters.add_argument("--failures", action="store_true")
     filters.add_argument("--persistence-failures", action="store_true")
     filters.add_argument("--follow-up-failures", action="store_true")
+    operations = parser.add_argument_group("operation timeline")
+    operations.add_argument("--operation-id")
+    operations.add_argument("--test-id")
+    operations.add_argument("--execution-id")
     return parser
 
 
@@ -151,6 +216,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit < 1:
         print("--limit must be greater than zero.", file=sys.stderr)
         return 2
+    if args.operation_id or args.test_id or args.execution_id:
+        timeline = select_operation_lines(
+            load_operation_lines(args.path),
+            operation_id=args.operation_id,
+            test_id=args.test_id,
+            execution_id=args.execution_id,
+        )[-args.limit :]
+        if args.as_json:
+            print(json.dumps([asdict(line) for line in timeline], indent=2, sort_keys=True))
+        else:
+            for line in timeline:
+                print(line.text)
+        return 0
     command = args.command
     value = args.value
     if args.latest:

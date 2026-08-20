@@ -69,6 +69,12 @@ class TestDoubtSolverRequest:
         )
         assert req.language == "hindi"
 
+    def test_language_devanagari_alias_is_accepted(self):
+        req = DoubtSolverRequest(
+            mode="doubt_solver", query="hello", language="हिंदी", **_REQUEST_IDS
+        )
+        assert req.language == "hindi"
+
     def test_invalid_language_rejected(self):
         with pytest.raises(ValidationError):
             DoubtSolverRequest(mode="doubt_solver", query="hello", language="fr")  # type: ignore[arg-type]

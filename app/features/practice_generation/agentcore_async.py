@@ -8,10 +8,11 @@ import re
 import threading
 import uuid
 from concurrent.futures import Executor, ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from config import get_settings
+from config import Settings, get_settings
 from features.practice_generation.appsync_progress_client import AppSyncPracticeProgressClient
 from features.practice_generation.config import (
     PRACTICE_RUNTIME_REVISION,
@@ -27,6 +28,9 @@ from features.practice_generation.execution_control import (
 from features.practice_generation.graph import PracticeGraphRunner
 from features.practice_generation.orchestration import PracticeGenerationOrchestrator
 from features.practice_generation.pattern_context import build_pattern_context_provider
+from features.practice_generation.pattern_resource_contract import (
+    load_pattern_resource_contract,
+)
 from features.practice_generation.planning import (
     BlueprintManager,
     deterministic_test_id,
@@ -37,6 +41,9 @@ from features.practice_generation.providers import (
     RoutedPlannerProvider,
     RoutedQuestionGenerator,
     RoutedQuestionVerifier,
+)
+from features.practice_generation.question_semantic_reuse import (
+    build_question_semantic_resolver,
 )
 from features.practice_generation.repositories import (
     AssessmentRepository,
@@ -51,9 +58,12 @@ from features.practice_generation.schemas import (
     PracticeLaunchResult,
 )
 from observability import (
+    begin_operation_log,
     bind_execution_context,
     bind_request_context,
     current_request_context,
+    finalize_operation_log,
+    reset_operation_log,
 )
 from services.aws_client_factory import get_dynamodb_client
 from services.llm.billing import (
@@ -600,7 +610,18 @@ class AgentCorePracticeAsyncLauncher:
                         test_id
                     ),
                 ):
-                    self._run_tracked_with_context(task_id, test_id, execution_id)
+                    # The operation scope is opened here, not in the request that
+                    # launched it, so request_completed can never finalize it.
+                    operation_token = begin_operation_log(
+                        operation_id=test_id,
+                        test_id=test_id,
+                        request_id=request_id,
+                        execution_id=execution_id,
+                    )
+                    try:
+                        self._run_tracked_with_context(task_id, test_id, execution_id)
+                    finally:
+                        reset_operation_log(operation_token)
 
     def _run_tracked_with_context(
         self,
@@ -609,6 +630,7 @@ class AgentCorePracticeAsyncLauncher:
         execution_id: str,
     ) -> None:
         business_status = "FAILED"
+        terminal_reason: str | None = None
         try:
             emit_practice_event(
                 "practice_graph_started",
@@ -617,10 +639,12 @@ class AgentCorePracticeAsyncLauncher:
             )
             business_status = self._run_to_terminal(test_id)
             if business_status not in {"READY", "FAILED"}:
-                self._mark_failed(test_id, "PRACTICE_GENERATION_STALLED")
+                terminal_reason = "PRACTICE_GENERATION_STALLED"
+                self._mark_failed(test_id, terminal_reason)
                 business_status = "FAILED"
         except PracticeExecutionStopped as exc:
             stopped_code = str(exc)
+            terminal_reason = stopped_code
             emit_practice_event(
                 (
                     "practice_cancel_observed"
@@ -639,6 +663,7 @@ class AgentCorePracticeAsyncLauncher:
         except BaseException as exc:  # the task boundary must consume background failures
             failure_class = type(exc).__name__
             failure_reason_code = _failure_reason_code(exc)
+            terminal_reason = failure_reason_code
             failure_details = _safe_failure_details(exc)
             logger.error(
                 "practice background task failed test_id=%s error_type=%s operation=%s "
@@ -678,6 +703,8 @@ class AgentCorePracticeAsyncLauncher:
                 status="completed",
                 details=self._terminal_task_details(test_id, business_status),
             )
+            # Exactly one aggregate summary, at the operation's own terminal state.
+            finalize_operation_log(status=business_status, error_code=terminal_reason)
 
     def _finish_execution(self, test_id: str, execution_id: str) -> None:
         try:
@@ -853,6 +880,26 @@ class AgentCorePracticeAsyncLauncher:
             self._billing_operations.pop(test_id, None)
 
 
+def _with_pattern_resources(settings: Settings) -> Settings:
+    """Overlay the resolved Pattern resource contract onto the settings snapshot."""
+    contract = load_pattern_resource_contract()
+    return replace(
+        settings,
+        s3_vector_pattern_index_arn=contract.pattern_vector_index_arn,
+        s3_vector_pattern_index_name=contract.pattern_vector_index_name,
+        dynamodb_pattern_table=contract.pattern_table_name,
+        dynamodb_question_bank_table=contract.question_bank_table_name,
+        dynamodb_question_bank_pattern_index=contract.question_bank_pattern_index_name,
+        dynamodb_practice_attempt_table=(
+            contract.practice_attempt_table_name or settings.dynamodb_practice_attempt_table
+        ),
+        dynamodb_practice_attempt_user_index=(
+            contract.practice_attempt_user_index_name
+            or settings.dynamodb_practice_attempt_user_index
+        ),
+    )
+
+
 def build_practice_async_launcher(
     *,
     task_tracker: AgentCoreTaskTracker,
@@ -863,6 +910,11 @@ def build_practice_async_launcher(
     if not config.enabled:
         return None
     runtime_settings = get_settings()
+    if runtime_settings.pattern_intelligence_enabled:
+        # Resolve the SSM-backed Pattern identifiers before the reuse gate below, so
+        # the gate validates the same values the runtime will actually use. Explicit
+        # environment values still win; only genuinely missing ones are read.
+        runtime_settings = _with_pattern_resources(runtime_settings)
     if config.pattern_reuse_enabled and not all(
         (
             runtime_settings.pattern_intelligence_enabled,
@@ -943,6 +995,12 @@ def build_practice_async_launcher(
             enabled=(
                 config.pattern_context_enabled or config.pattern_reuse_enabled
             )
+        ),
+        semantic_resolver=build_question_semantic_resolver(
+            mode=config.question_semantic_reuse_mode,
+            threshold=config.question_semantic_threshold,
+            top_k=config.question_semantic_top_k,
+            hydrate=questions.get_reuse_candidates,
         ),
     )
     return AgentCorePracticeAsyncLauncher(

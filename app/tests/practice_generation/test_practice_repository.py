@@ -14,7 +14,17 @@ from features.practice_generation.execution_control import (
     ActivePracticeExecutionRegistry,
     bind_practice_execution,
 )
-from features.practice_generation.matching import ReusableQuestion
+from features.practice_generation.matching import (
+    ReusableQuestion,
+    _candidate_matches_slot,
+    build_question_bank_id,
+    build_question_bank_version_hash,
+    build_reuse_difficulty_prefix,
+    build_slot_reuse_bucket_key,
+    question_bank_identity_is_intact,
+    question_bank_version_hash_from_item,
+    reusable_question_from_item,
+)
 from features.practice_generation.pattern_context import PatternSlotSelection
 from features.practice_generation.planning import resolve_practice_request
 from features.practice_generation.repositories import (
@@ -24,7 +34,7 @@ from features.practice_generation.repositories import (
     estimate_dynamodb_item_size,
 )
 from features.practice_generation.resource_validation import IndexProjection
-from features.practice_generation.schemas import GeneratedQuestion, PlannerSlot
+from features.practice_generation.schemas import Difficulty, GeneratedQuestion, PlannerSlot
 
 _SERIALIZER = TypeSerializer()
 _DESERIALIZER = TypeDeserializer()
@@ -344,12 +354,13 @@ def test_verified_pattern_question_persists_authoritative_link_and_returns_qb_id
         generator_route_hint="math.generator.intermediate",
     )
 
-    qb_id = repository.persist_verified_pattern_question(
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
         question=question,
         slot=slot,
+        language="english",
         pattern_id="pattern-1",
         pattern_version_hash="version-1",
-        language="english",
     )
 
     assert qb_id is not None
@@ -1141,3 +1152,924 @@ def test_group_transition_updates_existing_group() -> None:
 
     condition = client.update_calls[0]["ConditionExpression"]
     assert condition == "attribute_exists(#meta.#groups.#group)"
+
+
+def _promotion_question(**overrides: Any) -> GeneratedQuestion:
+    payload: dict[str, Any] = {
+        "generation_item_id": "item-1",
+        "bucket_id": "bucket-1",
+        "question": "If x plus 1 is 2, what is x?",
+        "question_type": "mcq",
+        "options": ["0", "1", "2", "3"],
+        "correct_answer": "1",
+        "solution": "Subtract one from both sides.",
+        "subject": "math",
+        "topic": "algebra",
+        "difficulty": "intermediate",
+    }
+    payload.update(overrides)
+    return GeneratedQuestion.model_validate(payload)
+
+
+def _promotion_slot() -> PlannerSlot:
+    return PlannerSlot(
+        slot_id="slot-001",
+        subject_id="math",
+        topic_id="algebra",
+        category_id="algebra",
+        difficulty="intermediate",
+        complexity="medium",
+        exam_ids=["CAT"],
+        question_type="mcq",
+        target_skill="solve_linear_equation",
+        variation_hint="vary_coefficients",
+        generator_route_hint="math.generator.intermediate",
+    )
+
+
+def _promotion_repository(client: Any) -> QuestionRepository:
+    return QuestionRepository(
+        client,
+        assessment_table="MockTestQuiz-table",
+        question_table="Question-table",
+        question_bank_table="QuestionBank-table",
+        question_test_index="questionsByTestIdAndCreatedAt",
+        question_bank_category_index="questionBanksByCategory",
+    )
+
+
+def test_verified_question_promotes_without_any_pattern_linkage() -> None:
+    client = RecordingClient()
+    repository = _promotion_repository(client)
+
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+
+    assert qb_id is not None
+    assert qb_id.startswith("qb-v2-")
+    stored = _plain(client.put_calls[0]["Item"])
+    assert "patternId" not in stored
+    assert "patternVersionHash" not in stored
+    assert "patternLinkEvidence" not in stored
+    assert stored["source"] == "SYSTEM_VERIFIED_PRACTICE"
+    # Reuse eligibility is meta-based, so a Pattern-less row must still be readable
+    # by the unchanged exact-reuse path.
+    assert stored["meta"]["status"] == "ACTIVE"
+    assert stored["meta"]["qualityStatus"] == "VERIFIED"
+    assert stored["meta"]["reusable"] is True
+    assert stored["meta"]["visibility"] == "PLATFORM"
+    assert stored["reuseBucketKey"]
+    assert stored["reuseSortKey"].startswith("v1#medium#")
+
+
+def test_pattern_less_promoted_row_is_accepted_by_existing_reuse_gates() -> None:
+    client = RecordingClient()
+    repository = _promotion_repository(client)
+    repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    stored = _plain(client.put_calls[0]["Item"])
+
+    candidate = reusable_question_from_item(stored, requested_language="english")
+
+    assert candidate is not None
+    assert candidate.question_id == stored["qbId"]
+    assert candidate.pattern_family_id is None
+
+
+def test_question_identity_is_stable_across_retry_and_pattern_attachment() -> None:
+    first_client = RecordingClient()
+    retry_client = RecordingClient()
+    pattern_client = RecordingClient()
+
+    unlinked = _promotion_repository(first_client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    retried = _promotion_repository(retry_client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    linked = _promotion_repository(pattern_client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+        pattern_id="pattern-1",
+        pattern_version_hash="version-1",
+    )
+
+    assert unlinked == retried == linked
+    assert _plain(pattern_client.put_calls[0]["Item"])["patternId"] == "pattern-1"
+
+
+def test_question_identity_separates_materially_different_playable_content() -> None:
+    slot = _promotion_slot()
+    repository = _promotion_repository(RecordingClient())
+
+    baseline = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(), slot=slot, language="english"
+    )
+    other_options = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(options=["0", "1", "5", "9"]),
+        slot=slot,
+        language="english",
+    )
+    other_answer = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(correct_answer="2"),
+        slot=slot,
+        language="english",
+    )
+    other_values = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(question="If x plus 7 is 2, what is x?"),
+        slot=slot,
+        language="english",
+    )
+
+    assert len({baseline, other_options, other_answer, other_values}) == 4
+
+
+def test_question_identity_ignores_explanation_and_classification_only_changes() -> None:
+    repository = _promotion_repository(RecordingClient())
+    baseline = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(), slot=_promotion_slot(), language="english"
+    )
+    reworded_solution = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(solution="Take one away from each side."),
+        slot=_promotion_slot(),
+        language="english",
+    )
+
+    assert baseline == reworded_solution
+
+
+class _ConditionalPutClient(RecordingClient):
+    """Second writer of the same logical Question loses the conditional put."""
+
+    def put_item(self, **kwargs):
+        self.put_calls.append(kwargs)
+        raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
+
+
+def test_duplicate_promotion_returns_one_identity_without_overwrite() -> None:
+    client = _ConditionalPutClient()
+    repository = _promotion_repository(client)
+
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+
+    assert qb_id is not None
+    assert client.put_calls[0]["ConditionExpression"] == "attribute_not_exists(qbId)"
+
+
+class _ConditionalDynamoClient(RecordingClient):
+    """Enforces attribute_not_exists(qbId) the way DynamoDB does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    def put_item(self, **kwargs):
+        self.put_calls.append(kwargs)
+        key = kwargs["Item"]["qbId"]["S"]
+        if kwargs.get("ConditionExpression") == "attribute_not_exists(qbId)" and key in self.rows:
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
+        self.rows[key] = kwargs["Item"]
+        return {}
+
+
+def test_phase_a_round_trip_preserves_the_full_playable_question() -> None:
+    client = _ConditionalDynamoClient()
+    slot = _promotion_slot()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(), slot=slot, language="english"
+    )
+    stored = _plain(client.rows[qb_id])
+
+    candidate = reusable_question_from_item(stored, requested_language="english")
+
+    assert candidate is not None
+    assert candidate.question_id == qb_id
+    assert candidate.question == "If x plus 1 is 2, what is x?"
+    assert candidate.options == ("0", "1", "2", "3")
+    assert candidate.correct_answer == "1"
+    assert candidate.solution == "Subtract one from both sides."
+    assert candidate.language == "english"
+    assert candidate.difficulty == "medium"
+    assert candidate.exam_ids == ("CAT",)
+    assert candidate.question_type == "mcq"
+    # Reuse keys must let getByReuseBucket find it again for the same demand.
+    assert stored["reuseBucketKey"] == build_slot_reuse_bucket_key(slot, language="english")
+    assert stored["reuseSortKey"].startswith(
+        build_reuse_difficulty_prefix(slot.difficulty.value)
+    )
+
+
+def test_second_promotion_never_attaches_pattern_linkage_to_an_existing_row() -> None:
+    """Characterises the create-only contract: the conditional put is a no-op."""
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    first = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(), slot=_promotion_slot(), language="english"
+    )
+    second = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+        pattern_id="pattern-1",
+        pattern_version_hash="version-1",
+    )
+
+    assert first == second
+    stored = _plain(client.rows[first])
+    assert "patternId" not in stored
+    assert stored["source"] == "SYSTEM_VERIFIED_PRACTICE"
+
+
+def test_second_promotion_never_rewrites_classification_or_solution() -> None:
+    """Create-only rows keep the first classification and first explanation."""
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    first = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(solution="First explanation."),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(solution="Corrected explanation."),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    stored = _plain(client.rows[first])
+
+    assert stored["explanation"] == "First explanation."
+    assert stored["difficulty"] == "MEDIUM"
+
+
+def test_option_order_is_part_of_playable_identity() -> None:
+    baseline = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(options=["0", "1", "2", "3"]),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    reordered = _promotion_repository(RecordingClient()).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(options=["3", "2", "1", "0"]),
+        slot=_promotion_slot(),
+        language="english",
+    )
+
+    assert baseline != reordered
+
+
+def test_identity_segments_resist_delimiter_injection() -> None:
+    shifted = build_question_bank_id(
+        subject="math",
+        difficulty="intermediate",
+        exam_ids=["CAT"],
+        question_type="mcq",
+        question="What is 12|34 plus one?",
+        options=("1", "2", "3", "4"),
+        correct_answer="1",
+        language="english",
+    )
+    split = build_question_bank_id(
+        subject="math",
+        difficulty="intermediate",
+        exam_ids=["CAT"],
+        question_type="mcq",
+        question="What is 12",
+        options=("34 plus one?", "2", "3", "4"),
+        correct_answer="1",
+        language="english",
+    )
+
+    assert shifted != split
+
+
+def test_identity_uses_canonical_language_normalization() -> None:
+    ids = {
+        build_question_bank_id(
+            subject="math",
+            difficulty="intermediate",
+            exam_ids=["CAT"],
+            question_type="mcq",
+            question="What is 12 plus one?",
+            options=("1", "2", "3", "4"),
+            correct_answer="1",
+            language=language,
+        )
+        for language in ("english", "English", "EN", "en")
+    }
+
+    assert len(ids) == 1
+
+
+def _identity(**overrides: Any) -> str | None:
+    payload: dict[str, Any] = {
+        "subject": "math",
+        "difficulty": "basic",
+        "exam_ids": ["CAT"],
+        "language": "english",
+        "question_type": "mcq",
+        "question": "Two angles of a triangle are 55 and 75 degrees. Find the third.",
+        "options": ("40", "50", "60", "70"),
+        "correct_answer": "50",
+    }
+    payload.update(overrides)
+    return build_question_bank_id(**payload)
+
+
+def test_strict_compatibility_dimensions_separate_identity() -> None:
+    baseline = _identity()
+
+    assert baseline is not None
+    assert _identity(subject="physics") != baseline
+    assert _identity(difficulty="advanced") != baseline
+    assert _identity(exam_ids=["GMAT"]) != baseline
+    assert _identity(language="hindi") != baseline
+    assert _identity(question_type="msq") != baseline
+
+
+def test_exact_playable_content_separates_identity() -> None:
+    baseline = _identity()
+
+    assert _identity(options=("40", "50", "60", "99")) != baseline
+    assert _identity(correct_answer="60") != baseline
+    assert (
+        _identity(question="Two angles of a triangle are 35 and 75 degrees. Find the third.")
+        != baseline
+    )
+
+
+def test_exam_scope_identity_is_order_and_duplicate_insensitive() -> None:
+    assert _identity(exam_ids=["CAT", "XAT"]) == _identity(exam_ids=["XAT", "CAT"])
+    assert _identity(exam_ids=["CAT", "CAT"]) == _identity(exam_ids=["CAT"])
+    assert _identity(exam_ids=["CAT", "XAT"]) != _identity(exam_ids=["CAT"])
+
+
+def test_difficulty_aliases_resolve_to_one_identity() -> None:
+    assert _identity(difficulty="basic") == _identity(difficulty="easy")
+    assert _identity(difficulty="intermediate") == _identity(difficulty="medium")
+    assert _identity(difficulty="advanced") == _identity(difficulty="hard")
+
+
+def test_identity_is_none_when_a_strict_dimension_cannot_canonicalize() -> None:
+    assert _identity(subject="not a real subject") is None
+    assert _identity(difficulty="somewhat tricky") is None
+    assert _identity(language="klingon") is None
+    assert _identity(exam_ids=["not an exam id"]) is None
+
+
+def test_classification_scopes_produce_two_distinct_rows() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    basic = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    harder = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot().model_copy(
+            update={"difficulty": Difficulty.ADVANCED, "exam_ids": ["GMAT"]}
+        ),
+        language="english",
+    )
+
+    assert basic != harder
+    assert len(client.rows) == 2
+    first = _plain(client.rows[basic])
+    second = _plain(client.rows[harder])
+    assert first["difficulty"] == "MEDIUM"
+    assert second["difficulty"] == "HARD"
+    assert first["meta"]["examIds"] == ["CAT"]
+    assert second["meta"]["examIds"] == ["GMAT"]
+
+
+def test_pattern_link_attaches_then_stays_idempotent_and_never_overwrites() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    assert "patternId" not in _plain(client.rows[qb_id])
+
+    assert repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id=qb_id, pattern_id="P1", pattern_version_hash="V1"
+    )
+    update = client.update_calls[-1]
+    assert update["ConditionExpression"] == (
+        "attribute_exists(qbId) AND "
+        "(attribute_not_exists(patternId) OR patternId = :pattern)"
+    )
+    # Only Pattern-linkage fields and updatedAt may appear in the update expression.
+    for protected in (
+        "question",
+        "answers",
+        "correctAnswer",
+        "explanation",
+        "difficulty",
+        "category",
+        "meta",
+        "source",
+        "reuseBucketKey",
+        "reuseSortKey",
+    ):
+        assert protected not in update["UpdateExpression"]
+
+
+def test_pattern_link_attach_refuses_missing_identifiers() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+
+    assert not repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id="", pattern_id="P1", pattern_version_hash="V1"
+    )
+    assert not repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id="qb-v2-x", pattern_id="", pattern_version_hash="V1"
+    )
+    assert client.update_calls == []
+
+
+def test_pattern_link_conflict_is_reported_without_failing_practice() -> None:
+    class _ConflictingClient(_ConditionalDynamoClient):
+        def update_item(self, **kwargs):
+            self.update_calls.append(kwargs)
+            raise ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem"
+            )
+
+    client = _ConflictingClient()
+    repository = _promotion_repository(client)
+
+    assert not repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id="qb-v2-x", pattern_id="P2", pattern_version_hash="V2"
+    )
+
+
+def test_duplicate_promotion_with_pattern_enriches_the_existing_row() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    first = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    again = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+        pattern_id="P1",
+        pattern_version_hash="V1",
+    )
+
+    assert first == again
+    assert len(client.update_calls) == 1
+
+
+def test_duplicate_promotion_without_pattern_performs_no_update() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    for _ in range(2):
+        repository.persist_verified_question(
+            test_id="test-1",
+            question=_promotion_question(),
+            slot=_promotion_slot(),
+            language="english",
+        )
+
+    assert client.update_calls == []
+
+
+def _promoted_row(client: _ConditionalDynamoClient | None = None) -> dict[str, Any]:
+    client = client or _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    return _plain(client.rows[qb_id])
+
+
+def test_versioned_row_passes_identity_integrity() -> None:
+    assert question_bank_identity_is_intact(_promoted_row())
+    assert reusable_question_from_item(_promoted_row(), requested_language="english") is not None
+
+
+def test_in_place_mutation_of_identity_fields_is_rejected_from_reuse() -> None:
+    for field, value in (
+        ("question", "A completely different question stem entirely?"),
+        ("correctAnswer", "2"),
+        ("answers", json.dumps({"options": ["0", "1", "2", "9"]})),
+        ("difficulty", "HARD"),
+    ):
+        row = _promoted_row()
+        row[field] = value
+        assert not question_bank_identity_is_intact(row), field
+        assert reusable_question_from_item(row, requested_language="english") is None, field
+
+
+def test_in_place_mutation_of_identity_metadata_is_rejected_from_reuse() -> None:
+    for key, value in (("subject", "physics"), ("examIds", ["GMAT"]), ("language", "hindi")):
+        row = _promoted_row()
+        row["meta"] = {**row["meta"], key: value}
+        assert not question_bank_identity_is_intact(row), key
+
+
+def test_solution_only_correction_keeps_identity_valid() -> None:
+    row = _promoted_row()
+    row["explanation"] = "A corrected and much clearer explanation."
+
+    assert question_bank_identity_is_intact(row)
+    candidate = reusable_question_from_item(row, requested_language="english")
+    assert candidate is not None
+    assert candidate.solution == "A corrected and much clearer explanation."
+
+
+def test_legacy_pattern_v1_rows_keep_existing_eligibility() -> None:
+    row = _promoted_row()
+    row["qbId"] = "pattern-v1-" + "a" * 32
+
+    # Legacy ids predate this formula and must not be recomputed or rejected.
+    assert question_bank_identity_is_intact(row)
+    candidate = reusable_question_from_item(row, requested_language="english")
+    assert candidate is not None
+    assert candidate.question_id == row["qbId"]
+
+
+def test_path_a_cannot_cross_classification_scopes() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    basic_slot = _promotion_slot()
+    hard_slot = _promotion_slot().model_copy(
+        update={"difficulty": Difficulty.ADVANCED, "exam_ids": ["GMAT"]}
+    )
+    basic_id = repository.persist_verified_question(
+        test_id="test-1", question=_promotion_question(), slot=basic_slot, language="english"
+    )
+    hard_id = repository.persist_verified_question(
+        test_id="test-1", question=_promotion_question(), slot=hard_slot, language="english"
+    )
+    basic_row = _plain(client.rows[basic_id])
+    hard_row = _plain(client.rows[hard_id])
+
+    basic_candidate = reusable_question_from_item(basic_row, requested_language="english")
+    hard_candidate = reusable_question_from_item(hard_row, requested_language="english")
+    assert basic_candidate is not None and hard_candidate is not None
+    # Each row is only compatible with its own strict scope.
+    assert _candidate_matches_slot(basic_candidate, basic_slot, requested_language="english")
+    assert not _candidate_matches_slot(hard_candidate, basic_slot, requested_language="english")
+    assert _candidate_matches_slot(hard_candidate, hard_slot, requested_language="english")
+    assert not _candidate_matches_slot(basic_candidate, hard_slot, requested_language="english")
+
+
+def test_round_trip_with_pattern_present_from_first_write() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+        pattern_id="P1",
+        pattern_version_hash="V1",
+    )
+    row = _plain(client.rows[qb_id])
+
+    assert row["patternId"] == "P1"
+    assert row["source"] == "PATTERN_VERIFIED_PRACTICE"
+    assert question_bank_identity_is_intact(row)
+    candidate = reusable_question_from_item(row, requested_language="english")
+    assert candidate is not None
+    assert candidate.options == ("0", "1", "2", "3")
+
+
+def test_round_trip_survives_later_pattern_enrichment() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    before = reusable_question_from_item(_plain(client.rows[qb_id]), requested_language="english")
+    assert before is not None
+
+    repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id=qb_id, pattern_id="P1", pattern_version_hash="V1"
+    )
+    # Simulate the persisted effect of the scoped update expression.
+    row = _plain(client.rows[qb_id])
+    row.update(
+        {
+            "patternId": "P1",
+            "patternVersionHash": "V1",
+            "patternLinkEvidence": "VERIFIED_GENERATION",
+        }
+    )
+
+    after = reusable_question_from_item(row, requested_language="english")
+    assert after is not None
+    # Enrichment must not disturb identity or any playable field.
+    assert question_bank_identity_is_intact(row)
+    assert after.question_id == before.question_id
+    assert after.question == before.question
+    assert after.options == before.options
+    assert after.correct_answer == before.correct_answer
+    assert after.solution == before.solution
+
+
+def _version(**overrides: Any) -> str | None:
+    payload: dict[str, Any] = {
+        "subject": "math",
+        "difficulty": "basic",
+        "exam_ids": ["CAT"],
+        "language": "english",
+        "question_type": "mcq",
+        "topic": "geometry",
+        "category": "geometry",
+        "question": "Two angles of a triangle are 55 and 75 degrees. Find the third.",
+        "options": ("40", "50", "60", "70"),
+        "correct_answer": "50",
+        "solution": "Interior angles sum to 180 degrees.",
+    }
+    payload.update(overrides)
+    return build_question_bank_version_hash(**payload)
+
+
+def test_identical_question_produces_one_version_hash() -> None:
+    assert _version() is not None
+    assert _version() == _version()
+
+
+def test_authoritative_content_changes_change_the_version_hash() -> None:
+    baseline = _version()
+
+    assert _version(question="Two angles are 35 and 75 degrees. Find the third.") != baseline
+    assert _version(options=("40", "50", "60", "99")) != baseline
+    assert _version(options=("70", "60", "50", "40")) != baseline
+    assert _version(correct_answer="60") != baseline
+    assert _version(solution="A different explanation entirely.") != baseline
+
+
+def test_strict_compatibility_changes_change_the_version_hash() -> None:
+    baseline = _version()
+
+    assert _version(subject="physics") != baseline
+    assert _version(difficulty="advanced") != baseline
+    assert _version(exam_ids=["GMAT"]) != baseline
+    assert _version(language="hindi") != baseline
+    assert _version(question_type="msq") != baseline
+
+
+def test_semantic_representation_changes_change_the_version_hash() -> None:
+    baseline = _version()
+
+    # topic and category stay out of qbId but are embedded/strict, so a change
+    # must invalidate an indexed vector.
+    assert _version(topic="algebra") != baseline
+    assert _version(category="algebra") != baseline
+
+
+def test_exam_ordering_alone_keeps_the_version_hash_stable() -> None:
+    assert _version(exam_ids=["CAT", "XAT"]) == _version(exam_ids=["XAT", "CAT"])
+    assert _version(exam_ids=["CAT", "CAT"]) == _version(exam_ids=["CAT"])
+
+
+def test_version_hash_fails_closed_on_uncanonicalizable_metadata() -> None:
+    assert _version(subject="not a subject") is None
+    assert _version(difficulty="sort of hard") is None
+    assert _version(language="klingon") is None
+    assert _version(exam_ids=["not an exam"]) is None
+
+
+def test_promoted_row_stores_a_recomputable_version_hash() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+
+    assert row["versionHash"]
+    assert question_bank_version_hash_from_item(row) == row["versionHash"]
+
+
+def test_transient_and_pattern_fields_never_move_the_version_hash() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+    baseline = question_bank_version_hash_from_item(row)
+
+    for mutation in (
+        {"updatedAt": "2030-01-01T00:00:00Z"},
+        {"createdAt": "2030-01-01T00:00:00Z"},
+        {"patternId": "P1", "patternVersionHash": "V1"},
+        {"patternVersionHash": "V2"},
+        {"patternLinkEvidence": "VERIFIED_GENERATION"},
+        {"qbId": "qb-v2-" + "b" * 32},
+        {"source": "PATTERN_VERIFIED_PRACTICE"},
+    ):
+        assert question_bank_version_hash_from_item({**row, **mutation}) == baseline, mutation
+
+
+def test_pattern_family_change_does_not_move_the_version_hash() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+    enriched = {**row, "meta": {**row["meta"], "patternFamilyId": "some_family"}}
+
+    # Not embedded, not vector metadata, not student-facing: re-checked live instead.
+    assert question_bank_version_hash_from_item(enriched) == (
+        question_bank_version_hash_from_item(row)
+    )
+
+
+def test_pattern_attachment_keeps_identity_and_version_hash_stable() -> None:
+    client = _ConditionalDynamoClient()
+    repository = _promotion_repository(client)
+    qb_id = repository.persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+    before = question_bank_version_hash_from_item(row)
+
+    repository.attach_verified_pattern_link_if_absent(
+        test_id="test-1", qb_id=qb_id, pattern_id="P1", pattern_version_hash="V1"
+    )
+    enriched = {
+        **row,
+        "patternId": "P1",
+        "patternVersionHash": "V1",
+        "patternLinkEvidence": "VERIFIED_GENERATION",
+        "updatedAt": "2030-01-01T00:00:00Z",
+    }
+
+    assert question_bank_identity_is_intact(enriched)
+    assert question_bank_version_hash_from_item(enriched) == before
+    assert enriched["qbId"] == qb_id
+
+
+def test_solution_correction_keeps_identity_but_moves_the_version_hash() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+    corrected = {**row, "explanation": "A corrected and clearer explanation."}
+
+    # Same durable Question, newer authoritative content: an old vector must
+    # fail parity until it is reindexed.
+    assert question_bank_identity_is_intact(corrected)
+    assert corrected["qbId"] == qb_id
+    assert question_bank_version_hash_from_item(corrected) != row["versionHash"]
+
+
+def test_stored_version_hash_is_advisory_not_authoritative() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    row = _plain(client.rows[qb_id])
+    # An administrative edit that forgets to refresh the stored hash.
+    tampered = {**row, "explanation": "Silently rewritten explanation."}
+
+    assert tampered["versionHash"] == row["versionHash"]
+    assert question_bank_version_hash_from_item(tampered) != tampered["versionHash"]
+
+
+def test_legacy_rows_have_no_version_hash_and_stay_reusable() -> None:
+    client = _ConditionalDynamoClient()
+    qb_id = _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    legacy = _plain(client.rows[qb_id])
+    legacy["qbId"] = "pattern-v1-" + "a" * 32
+    legacy.pop("versionHash")
+
+    assert question_bank_identity_is_intact(legacy)
+    assert reusable_question_from_item(legacy, requested_language="english") is not None
+    # Recomputation still works, so Phase C/D can index legacy rows deliberately.
+    assert question_bank_version_hash_from_item(legacy) is not None
+
+
+def _bucket(topic: str, *, category: str | None = None) -> str | None:
+    # Constructed, not model_copy: PlannerSlot's field validator canonicalizes the
+    # taxonomy identifiers, and that is what the real planner path exercises.
+    slot = PlannerSlot(
+        slot_id="slot-001",
+        subject_id="math",
+        topic_id=topic,
+        category_id=category or topic,
+        difficulty="basic",
+        complexity="low",
+        exam_ids=[],
+        question_type="mcq",
+        target_skill="selling_price_from_discount",
+        variation_hint="vary_values",
+        generator_route_hint="math.generator.basic",
+    )
+    return build_slot_reuse_bucket_key(slot, language="english")
+
+
+def test_reuse_bucket_partitions_on_the_planner_topic_label() -> None:
+    """Characterises the incident: the same concept under two planner labels lands
+    in two different GSI partitions, so the second request queries an empty bucket."""
+    first_run = _bucket("profit_and_loss")
+    second_run = _bucket("percentage_discount")
+
+    assert first_run != second_run
+    assert first_run == "v1#profit_and_loss#profit_and_loss#mcq#english"
+    assert second_run == "v1#percentage_discount#percentage_discount#mcq#english"
+
+
+def test_identical_topic_labels_share_one_reuse_bucket() -> None:
+    # Reuse works whenever the planner reproduces the same label, independent of
+    # the numbers in the question.
+    assert _bucket("percentage_discount") == _bucket("percentage_discount")
+
+
+def test_reuse_bucket_is_stable_across_label_casing_and_spacing() -> None:
+    # The canonical normalizer already absorbs presentation differences; only a
+    # genuinely different label produces a different bucket.
+    assert _bucket("Percentage Discount") == _bucket("percentage_discount")
+    assert _bucket("percentage-discount") == _bucket("percentage_discount")
+
+
+def test_distinct_concepts_never_share_a_reuse_bucket() -> None:
+    buckets = {
+        _bucket(topic)
+        for topic in (
+            "linear_equations",
+            "quadratic_equations",
+            "triangle_angle_sum",
+            "pythagorean_theorem",
+            "simple_interest",
+            "compound_interest",
+            "probability",
+            "geometry",
+        )
+    }
+
+    # False-positive protection: distinct educational concepts stay separated.
+    assert len(buckets) == 8

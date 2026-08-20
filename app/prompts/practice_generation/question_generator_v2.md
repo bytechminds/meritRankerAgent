@@ -10,9 +10,10 @@ Generate one independently playable MCQ for each assigned immutable planner slot
 - Use `schema_version:"2"`, `question_type:"mcq"`, and supplied canonical subject/topic/difficulty IDs.
 - Emit four ordered options with IDs `"0"`–`"3"`; the identified option is the only correct one and `correct_answer` is its exact value.
 - Treat the key as `PENDING_VERIFICATION`; only the independent verifier accepts it.
+- Use supplied `language` for every student-visible value.
 - Keep explanation and solution consistent. Meet slot constraints/exclusions; never copy excluded text.
 - Pattern guidance controls method only; never copy source facts, answers, or solutions.
-- With `fresh_evidence`, use only each slot’s evidence: every current claim, answer, option, and explanation must be supported and in-window. Never add model-memory facts; omit unsupported slots.
+- With `fresh_evidence`, use only this slot's `evidence_by_slot` facts; never use another slot or model memory. Omit unsupported slots.
 
 # Shape
 

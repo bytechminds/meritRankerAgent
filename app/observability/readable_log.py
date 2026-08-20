@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -75,6 +76,25 @@ class RequestLogBuffer:
     flushed: bool = False
 
 
+@dataclass
+class OperationLogBuffer:
+    """A long-running operation scope that deliberately outlives its HTTP request.
+
+    Only counters and already-sanitized aggregate scalars are retained, so a
+    multi-minute operation cannot grow this buffer with per-event payloads.
+    """
+
+    operation_id: str
+    test_id: str
+    request_id: str | None = None
+    execution_id: str | None = None
+    started_at: float = field(default_factory=time.monotonic)
+    event_count: int = 0
+    aggregates: dict[str, object] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    finalized: bool = False
+
+
 class SafeRequestBlockHandler(RotatingFileHandler):
     """Write one complete request block while holding the handler lock."""
 
@@ -95,6 +115,46 @@ class SafeRequestBlockHandler(RotatingFileHandler):
 
 _buffer: ContextVar[RequestLogBuffer | None] = ContextVar(
     "agent_readable_request_log", default=None
+)
+# Deliberately a separate ContextVar: an operation scope must survive the request
+# scope being reset, and request_completed must never finalize an operation.
+_operation_buffer: ContextVar[OperationLogBuffer | None] = ContextVar(
+    "agent_readable_operation_log", default=None
+)
+_operation_detail_enabled = False
+_MAX_OPERATION_LINE = 320
+# Exact-key content restriction for the operation path. The shared sanitizer
+# matches on substrings, so `question` cannot go there without also destroying
+# questionId/questionCount telemetry; these keys are therefore matched exactly.
+_OPERATION_CONTENT_KEYS = frozenset(
+    {
+        "answer",
+        "answers",
+        "credentials",
+        "explanation",
+        "option",
+        "options",
+        "prompt",
+        "prompts",
+        "provider_response",
+        "query",
+        "question",
+        "questions",
+        "raw_provider_payload",
+        "solution",
+        "solutions",
+    }
+)
+# Events whose already-sanitized aggregate scalars are carried into the terminal
+# operation summary verbatim. Nothing here is recomputed or inferred.
+_OPERATION_SUMMARY_SOURCES = frozenset(
+    {
+        "PATTERN_RETRIEVAL_COMPLETED",
+        "DEFICIT_CALCULATED",
+        "BLUEPRINT_COMPLETED",
+        "AI_USAGE_SUMMARY",
+        "llm_usage_summary",
+    }
 )
 _handler: SafeRequestBlockHandler | None = None
 _handler_lock = threading.Lock()
@@ -156,9 +216,11 @@ def configure_readable_request_log(
     max_bytes: int = _DEFAULT_MAX_BYTES,
     backup_count: int = _DEFAULT_BACKUP_COUNT,
     content_mode: str = "off",
+    detailed: bool = False,
 ) -> None:
-    global _content_mode, _handler
+    global _content_mode, _handler, _operation_detail_enabled
     _content_mode = content_mode if content_mode in {"preview", "full"} else "off"
+    _operation_detail_enabled = bool(detailed)
     with _handler_lock:
         if _handler is not None:
             try:
@@ -193,7 +255,138 @@ def reset_request_log(token: Token[RequestLogBuffer | None]) -> None:
     _buffer.reset(token)
 
 
+def begin_operation_log(
+    *,
+    operation_id: str,
+    test_id: str,
+    request_id: str | None = None,
+    execution_id: str | None = None,
+) -> Token[OperationLogBuffer | None]:
+    """Open an operation scope that outlives the request that launched it."""
+    buffer = OperationLogBuffer(
+        operation_id=operation_id,
+        test_id=test_id,
+        request_id=request_id,
+        execution_id=execution_id,
+    )
+    token = _operation_buffer.set(buffer)
+    if _operation_detail_enabled:
+        _write_operation_line(buffer, {"event": "operation_log_started", "status": "started"})
+    return token
+
+
+def reset_operation_log(token: Token[OperationLogBuffer | None]) -> None:
+    _operation_buffer.reset(token)
+
+
+def current_operation_log() -> OperationLogBuffer | None:
+    return _operation_buffer.get()
+
+
+def finalize_operation_log(*, status: str, error_code: str | None = None) -> None:
+    """Emit exactly one terminal aggregate summary for the active operation."""
+    operation = _operation_buffer.get()
+    if operation is None:
+        return
+    with operation.lock:
+        if operation.finalized:
+            return
+        operation.finalized = True
+        event_count = operation.event_count
+        aggregates = dict(operation.aggregates)
+    duration_ms = int((time.monotonic() - operation.started_at) * 1000)
+    fields = [
+        f"op={_clean(operation.operation_id, limit=64)}",
+        f"test={_clean(operation.test_id, limit=64)}",
+        f"exec={_clean(operation.execution_id or '-', limit=64)}",
+        f"req={_clean(operation.request_id or '-', limit=64)}",
+        f"status={_clean(status, limit=32)}",
+        f"error_code={_clean(error_code or '-', limit=96)}",
+        f"event_count={event_count}",
+        f"duration_ms={duration_ms}",
+    ]
+    fields.extend(
+        f"{_clean(key, limit=48)}={_clean(value, limit=48)}"
+        for key, value in sorted(aggregates.items())[:24]
+    )
+    _emit_operation_record(f"[operation-summary] {' '.join(fields)}")
+
+
+def _emit_operation_record(message: str) -> None:
+    with _handler_lock:
+        handler = _handler
+    if handler is None:
+        return
+    try:
+        handler.handle(
+            logging.LogRecord(
+                "agent.readable_operation_log",
+                logging.INFO,
+                "",
+                0,
+                message[:_MAX_OPERATION_LINE],
+                (),
+                None,
+            )
+        )
+    except Exception:
+        _warn_file_unavailable()
+
+
+def _write_operation_line(
+    operation: OperationLogBuffer,
+    event: dict[str, object],
+) -> None:
+    details = event.get("details")
+    detail_text = (
+        " ".join(
+            f"{_clean(key, limit=32)}={_clean(value, limit=48)}"
+            for key, value in list(details.items())[:8]
+            if str(key).strip().casefold() not in _OPERATION_CONTENT_KEYS
+        )
+        if isinstance(details, dict)
+        else ""
+    )
+    _emit_operation_record(
+        "[operation] "
+        f"op={_clean(operation.operation_id, limit=64)} "
+        f"test={_clean(operation.test_id, limit=64)} "
+        f"exec={_clean(operation.execution_id or '-', limit=64)} "
+        f"req={_clean(operation.request_id or '-', limit=64)} "
+        f"+{int((time.monotonic() - operation.started_at) * 1000)}ms "
+        f"event={_clean(event.get('event'), limit=64)} "
+        f"status={_clean(event.get('status') or '-', limit=32)} "
+        f"stage={_clean(event.get('stage') or '-', limit=32)} "
+        f"error_code={_clean(event.get('error_code') or '-', limit=96)} "
+        f"{detail_text}"
+    )
+
+
+def _collect_operation_event(event: dict[str, object]) -> None:
+    """Operation scope accepts any already-sanitized event, not the request allow-list."""
+    operation = _operation_buffer.get()
+    if operation is None:
+        return
+    with operation.lock:
+        if operation.finalized:
+            return
+        operation.event_count += 1
+        if str(event.get("event") or "") in _OPERATION_SUMMARY_SOURCES:
+            details = event.get("details")
+            if isinstance(details, dict):
+                operation.aggregates.update(
+                    {
+                        key: value
+                        for key, value in details.items()
+                        if isinstance(value, (str, int, float, bool))
+                    }
+                )
+    if _operation_detail_enabled:
+        _write_operation_line(operation, event)
+
+
 def collect_event(event: dict[str, object]) -> None:
+    _collect_operation_event(event)
     current = _buffer.get()
     if current is None or event.get("event") not in _READABLE_EVENTS:
         return

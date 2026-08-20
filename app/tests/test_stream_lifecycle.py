@@ -118,7 +118,12 @@ def _complete_event() -> DoubtSolverStreamEvent:
         request_id=_REQUEST_ID,
         stage="complete",
         label="Done",
-        metadata={"request_id": _REQUEST_ID},
+        metadata={
+            "request_id": _REQUEST_ID,
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "persisted": True,
+        },
         response=response,
     )
 
@@ -129,7 +134,12 @@ def _practice_started_event() -> DoubtSolverStreamEvent:
         request_id=_REQUEST_ID,
         stage="practice_generation_started",
         label="Your practice test is being prepared.",
-        metadata={"request_id": _REQUEST_ID},
+        metadata={
+            "request_id": _REQUEST_ID,
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "persisted": True,
+        },
         data=PracticeGenerationStartedData(
             practice_test_id="practice-123",
             message="Your practice test is being prepared.",
@@ -197,6 +207,122 @@ def test_provider_error_after_content_is_typed_partial_error(
         "code": "ANSWER_PARTIAL_STREAM_FAILED",
     }
     assert not any(event.type == "complete" for event in events)
+
+
+def test_post_answer_finalization_diagnostic_is_safe_and_precedes_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "private-answer-content-must-not-be-logged"
+    persistence_calls: list[str] = []
+
+    def fail_completed_turn(cls, **_: object) -> object:
+        raise ValueError(f"content={sentinel}")
+
+    class Persistence:
+        def persist_completed_turn(self, *_: object, **__: object) -> object:
+            persistence_calls.append("called")
+            return object()
+
+    monkeypatch.setattr(
+        streaming_module.CompletedConversationTurn,
+        "now",
+        classmethod(fail_completed_turn),
+    )
+    caplog.set_level(logging.ERROR, logger="agent.observability")
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                query="What is 20 percent of 100?",
+                original_query="What is 20 percent of 100?",
+                classification=dict(_CLASSIFICATION),
+                classifier_confidence=0.5,
+            ),
+            adapter=_Adapter(),  # type: ignore[arg-type]
+            conversation_persistence=Persistence(),
+        )
+    )
+
+    diagnostics = [
+        record.observability_event
+        for record in caplog.records
+        if getattr(record, "observability_event", {}).get("event")
+        == "post_answer_finalization_failed"
+    ]
+
+    assert events[-1].metadata == {
+        "retryable": False,
+        "code": "ANSWER_PARTIAL_STREAM_FAILED",
+    }
+    assert persistence_calls == []
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["stage"] == "persistence_payload_build"
+    details = diagnostics[0]["details"]
+    assert {
+        "operation_id": _REQUEST_ID,
+        "lifecycle_stage": "persistence_payload_build",
+        "exception_type": "ValueError",
+        "exception_message_short": "exception message redacted",
+        "origin_module": "app/tests/test_stream_lifecycle.py",
+        "origin_function": "fail_completed_turn",
+        "answer_emitted": True,
+        "persistence_payload_build_started": True,
+        "persistence_network_call_started": False,
+    }.items() <= details.items()
+    assert isinstance(details["origin_line"], int)
+    assert details["origin_line"] > 0
+    assert sentinel not in str(diagnostics[0])
+
+
+def test_post_answer_persistence_exception_is_controlled_and_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "private-persistence-exception-content"
+
+    class Persistence:
+        def persist_completed_turn(self, *_: object, **__: object) -> object:
+            raise ValueError(f"answer={sentinel}")
+
+    caplog.set_level(logging.ERROR, logger="agent.observability")
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                query="What is 20 percent of 100?",
+                original_query="What is 20 percent of 100?",
+                classification=dict(_CLASSIFICATION),
+                classifier_confidence=0.5,
+            ),
+            adapter=_Adapter(),  # type: ignore[arg-type]
+            conversation_persistence=Persistence(),
+        )
+    )
+
+    diagnostics = [
+        record.observability_event
+        for record in caplog.records
+        if getattr(record, "observability_event", {}).get("event")
+        == "post_answer_finalization_failed"
+    ]
+
+    assert sum(event.type == "error" for event in events) == 1
+    assert events[-1].metadata == {
+        "retryable": False,
+        "code": "ANSWER_PARTIAL_STREAM_FAILED",
+    }
+    assert not any(event.type == "complete" for event in events)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["stage"] == "persistence_coordinator_entry"
+    assert {
+        "answer_emitted": True,
+        "persistence_payload_build_started": True,
+        "persistence_network_call_started": False,
+        "exception_type": "ValueError",
+    }.items() <= diagnostics[0]["details"].items()
+    assert sentinel not in str(diagnostics[0])
 
 
 def test_verifier_exception_is_controlled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -762,7 +888,12 @@ def test_agentcore_invocations_preserves_event_contract(
             request_id=input.request_id,
             stage="complete",
             label="Done",
-            metadata={"request_id": input.request_id},
+            metadata={
+                "request_id": input.request_id,
+                "conversation_id": input.conversation_id,
+                "turn_id": input.turn_id,
+                "persisted": True,
+            },
             response=response,
         )
 

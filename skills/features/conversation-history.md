@@ -6,6 +6,19 @@ Dev infrastructure, persistence, Memory-first selection, exact-conversation Dyna
 independent-query isolation were previously live verified. The 2026-07-25 conditional-context
 implementation preserves those storage boundaries and makes reads conditional.
 
+## Latest Changes — Post-answer finalization reliability (2026-08-16)
+
+- `conversation_persistence_started` is a registered structured observability event. The existing
+  persistence coordinator can therefore enter its worker phase without an observability-whitelist
+  `ValueError` after a verified answer has been streamed.
+- A narrow post-answer failure diagnostic records only request-scoped lifecycle stage, exception
+  type, source-frame coordinates, answer-emitted state, and persistence boundary flags. It never
+  serializes the exception text, question, answer, prompt, JWT, or secret; local DEBUG adds only
+  sanitized frame coordinates.
+- The exact real-model blood-relation regression completed with one terminal `complete` frame after
+  History and Session succeeded. Local AgentCore Memory remained `failed_configuration`, which is
+  reported as partial persistence without replacing the accepted answer.
+
 ## Conditional-context boundary (2026-07-25)
 
 AgentCore Memory and DynamoDB remain context sources only. `ContextNeedGate` decides only whether a
@@ -59,7 +72,7 @@ session, and memory statuses. Accepted statuses are explicitly limited to `check
 `passed_quality_gate`; empty, language-noncompliant, failed-quality, cancelled, non-finalized, and
 clarification-only outputs are skipped. One safe structured summary is logged per decision.
 
-The shared observability layer also emits typed persistence completion, skip, or partial-failure
+The shared observability layer also emits typed persistence start, completion, skip, or partial-failure
 events and updates the request execution summary with history, session, and memory statuses.
 Recent-context loading emits source, usable-turn count, latency, fallback, and controlled failure
 reason only. Persistence worker threads explicitly copy request context. Questions, answers,
@@ -95,7 +108,11 @@ or be an idempotent replay before session persistence is attempted. Each compone
 for recognized transient AWS/network failures. A remaining partial failure is reported explicitly
 without replacing an accepted answer. Memory success with history failure emits a degraded-consistency
 metric. Equal timestamp retries are no-ops. Cross-actor conversation ID collisions raise a repository
-conflict. Streaming emits public `complete` only after persistence coordination returns.
+conflict. Streaming emits public terminal success only after persistence coordination returns.
+Every `complete` and `practice_generation_started` terminal event now includes safe
+`request_id`, `conversation_id`, `turn_id`, and `persisted` metadata. `persisted` is true only when
+the exact history write is `succeeded` or `idempotent_replay`; failed, skipped, unavailable, and
+clarification persistence never claim confirmation.
 The persistence deadline bounds request coordination, not an already-running synchronous AWS SDK
 call. A timed-out worker is marked `failed_transient`, may finish later, and is never treated as
 confirmed persistence for the terminal result.
@@ -135,9 +152,11 @@ The deployed Dev role was also inspected directly and contains exactly
 
 ## Unchanged boundaries
 
-Public request, JSON, and SSE schemas; retrieval; prompts; language policy; and AgentCore Memory
-resource design are unchanged. No cross-conversation retrieval, summaries, or long-term memory was
-added.
+Public request and JSON schemas, retrieval, prompts, language policy, and AgentCore Memory resource
+design are unchanged. The terminal SSE metadata contract now additionally proves request,
+conversation, turn, and confirmed-history identity without exposing question, answer, prompt,
+context, credential, or provider data. No cross-conversation retrieval, summaries, or long-term
+memory was added.
 
 The actor seam still uses validated `request.user_id`, but its production contract is now the
 verified Cognito `sub` inserted by the Amplify SSR proxy before IAM-authenticated AgentCore
@@ -157,6 +176,11 @@ infrastructure-owned and **[NOT VERIFIED]** in this runtime change.
   variants, numeric selection across two turns, unrelated questions, no-history clarification,
   streaming generation, persistence, and readable-log ordering.
 - Python Ruff: passed for all changed Python files.
+- Terminal stream tests cover normal, Practice, replay, and transport serialization paths. The
+  normal completion assertion verifies persistence returns before the public terminal frame and the
+  exact persisted identity is serialized.
+- The 2026-08-16 incident regression covers a post-answer `ValueError` before persistence I/O and
+  verifies the emitted diagnostic is content-free while the public error contract remains typed.
 - AgentCore CDK TypeScript build: passed.
 - AgentCore policy/source-staging synthesis tests: 3 passed.
 - Earlier full-gate counts are superseded by the final gate below.

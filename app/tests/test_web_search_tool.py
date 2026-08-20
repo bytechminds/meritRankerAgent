@@ -25,6 +25,7 @@ from services.context_retrieval.web_search_decision import (
 )
 from tools.web_search.formatter import format_web_context
 from tools.web_search.models import WebSearchItem, WebSearchProviderRequest, WebSearchRequest
+from tools.web_search.providers.fake_provider import FakeWebSearchProvider
 from tools.web_search.providers.tavily_provider import TavilyWebSearchProvider
 from tools.web_search.query_builder import WebSearchQueryBuilder
 from tools.web_search.source_policy import WebSourcePolicyResolver
@@ -411,6 +412,145 @@ class TestWebSearchToolProvider:
         assert result.used is True
         assert len(result.items) >= 1
 
+    def test_fresh_evidence_filters_undated_and_stale_results_before_reranking(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")
+        monkeypatch.setenv("WEB_SEARCH_REQUIRE_TRUSTED_FOR_CURRENT_AFFAIRS", "true")
+        _reset_settings()
+
+        class CountingProvider(FakeWebSearchProvider):
+            def __init__(self, items: list[WebSearchItem]) -> None:
+                super().__init__(items)
+                self.calls = 0
+
+            def search(self, request: WebSearchProviderRequest):
+                self.calls += 1
+                return super().search(request)
+
+        provider = CountingProvider(
+            [
+                WebSearchItem(
+                    title="2024 current affairs award update",
+                    url="https://pib.gov.in/fresh-one",
+                    snippet="A verified 2024 national award event with sufficient factual detail.",
+                    source="pib.gov.in",
+                    published_at="2024-07-20",
+                    score=0.8,
+                ),
+                WebSearchItem(
+                    title="2023 stale current affairs award update",
+                    url="https://pib.gov.in/stale",
+                    snippet="An older award event that must not satisfy a 2024 evidence request.",
+                    source="pib.gov.in",
+                    published_at="2023-12-31",
+                    score=0.99,
+                ),
+                WebSearchItem(
+                    title="Undated current affairs award update",
+                    url="https://pib.gov.in/undated",
+                    snippet=(
+                        "An undated article whose temporal relevance cannot be established safely."
+                    ),
+                    source="pib.gov.in",
+                    score=0.98,
+                ),
+                WebSearchItem(
+                    title="Second 2024 current affairs event",
+                    url="https://pib.gov.in/fresh-two",
+                    snippet=(
+                        "A second verified 2024 event with enough evidence for exam preparation."
+                    ),
+                    source="pib.gov.in",
+                    published_at="2024-06-15",
+                    score=0.75,
+                ),
+                WebSearchItem(
+                    title="Duplicate 2024 event",
+                    url="https://pib.gov.in/fresh-one",
+                    snippet="The duplicate URL must not inflate usable fresh evidence count.",
+                    source="pib.gov.in",
+                    published_at="2024-07-20",
+                    score=0.7,
+                ),
+            ]
+        )
+
+        result = WebSearchTool(provider=provider).search(
+            WebSearchRequest(
+                request_id="fresh-filter",
+                query="Create 2 current affairs questions from 2024 for SSC GD",
+                subject="general",
+                topic="current_affairs",
+                web_search_reason="current_affairs",
+                requires_fresh_evidence=True,
+                required_evidence_count=2,
+            )
+        )
+
+        assert provider.calls == 1
+        assert result.used is True
+        assert result.temporal_mode == "EXPLICIT_YEAR"
+        assert "current affairs" in result.query.lower()
+        assert "explicit_year coverage 2024-01-01 to 2024-12-31" in result.query
+        assert "ssc exam preparation" in result.query.lower()
+        assert result.stale_results_rejected == 2
+        assert {item.url for item in result.items} == {
+            "https://pib.gov.in/fresh-one",
+            "https://pib.gov.in/fresh-two",
+        }
+        assert result.fresh_evidence is not None
+        assert result.fresh_evidence.requested_window.temporal_mode == "EXPLICIT_YEAR"
+
+    def test_hundred_slot_fresh_request_uses_one_bounded_search_and_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("WEB_SEARCH_ENABLED", "true")
+        monkeypatch.setenv("WEB_SEARCH_RERANK_MIN_SCORE", "0.10")
+        monkeypatch.setenv("WEB_SEARCH_REQUIRE_TRUSTED_FOR_CURRENT_AFFAIRS", "true")
+        _reset_settings()
+
+        class CountingProvider(FakeWebSearchProvider):
+            def __init__(self) -> None:
+                super().__init__(
+                    [
+                        WebSearchItem(
+                            title="2024 current-affairs source",
+                            url="https://pib.gov.in/one",
+                            snippet="A verified current-affairs fact with enough factual detail.",
+                            source="pib.gov.in",
+                            published_at="2024-06-01",
+                        )
+                    ]
+                )
+                self.calls = 0
+
+            def search(self, request: WebSearchProviderRequest):
+                self.calls += 1
+                return super().search(request)
+
+        provider = CountingProvider()
+        result = WebSearchTool(provider=provider).search(
+            WebSearchRequest(
+                request_id="fresh-100",
+                query="Create 100 current affairs questions from 2024",
+                subject="general",
+                topic="current_affairs",
+                web_search_reason="current_affairs",
+                requires_fresh_evidence=True,
+                required_evidence_count=100,
+            )
+        )
+
+        assert provider.calls == 1
+        assert result.used is False
+        assert result.weak_context is True
+        assert result.eligible_evidence_count == 1
+        assert result.fresh_evidence is None
+
     def test_formatter_truncates_max_chars(self) -> None:
         items = [
             WebSearchItem(
@@ -444,7 +584,8 @@ class TestWebSearchToolProvider:
                 return None
 
         def _fake_urlopen(request, timeout=8):  # noqa: ANN001
-            captured["has_api_key"] = b"api_key" in request.data
+            captured["authorization"] = request.get_header("Authorization")
+            captured["body"] = request.data
             return _FakeResponse()
 
         monkeypatch.setattr(
@@ -461,7 +602,8 @@ class TestWebSearchToolProvider:
             )
         )
         assert len(result.items) == 1
-        assert captured["has_api_key"] is True
+        assert captured["authorization"] == "Bearer secret-key"
+        assert b"api_key" not in captured["body"]
 
     def test_disabled_tool_does_not_call_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WEB_SEARCH_ENABLED", "false")

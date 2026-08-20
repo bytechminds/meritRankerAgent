@@ -188,7 +188,12 @@ class TestStreamEventSchema:
             request_id=_REQUEST_ID,
             stage="complete",
             label="Done",
-            metadata={"request_id": _REQUEST_ID},
+            metadata={
+                "request_id": _REQUEST_ID,
+                "conversation_id": "conversation-1",
+                "turn_id": "turn-1",
+                "persisted": True,
+            },
             response=_complete_response(),
         )
         assert event.type == "complete"
@@ -300,20 +305,25 @@ class TestStreamingFlow:
     def test_persistence_finishes_before_public_complete_event(self) -> None:
         timeline: list[str] = []
         persistence = MagicMock()
-        persistence.persist_completed_turn.side_effect = lambda *args, **kwargs: timeline.append(
-            "persistence_finished"
+        persistence.persist_completed_turn.side_effect = (
+            lambda *args, **kwargs: (
+                timeline.append("persistence_finished"),
+                SimpleNamespace(history_write_status="succeeded"),
+            )[1]
         )
-        events = stream_doubt_solver(
-            StreamDoubtSolverInput(
-                request_id=_REQUEST_ID,
-                actor_id="student-1",
-                conversation_id="conversation-1",
-                turn_id="turn-1",
-                query="Explain percentages",
-                original_query="Explain percentages",
-            ),
-            adapter=_make_adapter("**Final Answer:** 25%"),
-            conversation_persistence=persistence,
+        events = list(
+            stream_doubt_solver(
+                StreamDoubtSolverInput(
+                    request_id=_REQUEST_ID,
+                    actor_id="student-1",
+                    conversation_id="conversation-1",
+                    turn_id="turn-1",
+                    query="Explain percentages",
+                    original_query="Explain percentages",
+                ),
+                adapter=_make_adapter("**Final Answer:** 25%"),
+                conversation_persistence=persistence,
+            )
         )
 
         for event in events:
@@ -323,6 +333,13 @@ class TestStreamingFlow:
         assert timeline == ["persistence_finished", "public_complete"]
         persistence.persist_completed_turn.assert_called_once()
         assert persistence.persist_completed_turn.call_args.kwargs["request_id"] == _REQUEST_ID
+        completion = events[-1]
+        assert completion.metadata == {
+            "request_id": _REQUEST_ID,
+            "conversation_id": "conversation-1",
+            "turn_id": "turn-1",
+            "persisted": True,
+        }
 
     def test_chunk_content_is_provider_chunk_content(self) -> None:
         content = "Let the cost price be ₹100. Marked price = ₹140."

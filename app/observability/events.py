@@ -16,6 +16,7 @@ SERVICE_NAME = "meritranker-tutor"
 EVENT_NAMES = frozenset(
     {
         "runtime_started",
+        "runtime_ready",
         "request_started",
         "request_execution_summary",
         "request_completed",
@@ -59,11 +60,14 @@ EVENT_NAMES = frozenset(
         "quality_rewrite_completed",
         "quality_repair_completed",
         "correctness_verification_completed",
+        "conversation_persistence_started",
         "conversation_persistence_completed",
         "conversation_persistence_skipped",
         "conversation_persistence_failed",
+        "post_answer_finalization_failed",
         "PRACTICE_REQUEST_RESOLVED",
         "PRACTICE_LAUNCH_DECISION",
+        "practice_language_resolved",
         "PRACTICE_DISPATCH_RESULT",
         "PRACTICE_RUNTIME_STARTED",
         "PRACTICE_RUNTIME_VALIDATED",
@@ -144,7 +148,17 @@ EVENT_NAMES = frozenset(
         "QUESTION_BANK_REUSE_QUERY_COMPLETED",
         "QUESTION_BANK_CATEGORY_FALLBACK",
         "QUESTION_BANK_REUSE_LIMIT_REACHED",
+        "QUESTION_BANK_REUSE_QUERY_DEBUG",
+        "QUESTION_SEMANTIC_RETRIEVAL_FAILED",
+        "QUESTION_SEMANTIC_CANDIDATE_DECISION",
+        "QUESTION_SEMANTIC_REUSE_COMPLETED",
         "PATTERN_QUESTION_BANK_LINK_FAILED",
+        "PATTERN_QUESTION_BANK_LINK_CONFLICT",
+        "PATTERN_RESOURCE_CONTRACT_LOADED",
+        "PATTERN_RETRIEVAL_STARTED",
+        "PATTERN_VECTOR_QUERY_COMPLETED",
+        "PATTERN_CANDIDATE_DECISION",
+        "PATTERN_LINKED_QUESTION_DECISION",
         "PATTERN_RETRIEVAL_COMPLETED",
         "PATTERN_REUSE_HISTORY_UNAVAILABLE",
         "QUESTION_MANIFEST_UPDATED",
@@ -223,6 +237,27 @@ _SAFE_USAGE_KEYS = frozenset(
         "cost_complete",
         "missing_usage_call_count",
         "missing_cost_profiles",
+        "exception_type",
+        "exception_message_short",
+        "lifecycle_stage",
+        "origin_module",
+        "origin_function",
+        "origin_line",
+        "answer_emitted",
+        "persistence_payload_build_started",
+        "persistence_network_call_started",
+    }
+)
+# Exact numeric usage metrics produced by the canonical metering/diagnostic path.
+# Matched exactly and admitted only when the value is a real number, so the general
+# answer/prompt/token privacy rule below is never broadened.
+_SAFE_NUMERIC_USAGE_KEYS = frozenset(
+    {
+        "answer_tokens",
+        "answertokens",
+        "outputtokenlimit",
+        "outputtokens",
+        "reasoningtokens",
     }
 )
 _MAX_DETAILS = 32
@@ -262,6 +297,11 @@ def sanitize_details(details: Mapping[str, object] | None) -> dict[str, object]:
         return {}
     safe: dict[str, object] = {}
     for key, value in list(details.items())[:_MAX_DETAILS]:
+        normalized = str(key).strip().lower()
+        if normalized in _SAFE_NUMERIC_USAGE_KEYS:
+            if not isinstance(value, bool) and isinstance(value, (int, float)):
+                safe[normalized] = _safe_value(value)
+            continue
         safe_key = _safe_key(key)
         if safe_key is not None:
             safe[safe_key] = _safe_value(value)
@@ -331,6 +371,10 @@ def log_event(
         concise.append(f"request_id={context.request_id[:8]}")
     if duration_ms is not None:
         concise.append(f"duration_ms={max(duration_ms, 0)}")
+    # A terminal failure must stay diagnosable in production, where details are
+    # suppressed. Only the canonical safe classification is surfaced.
+    if level >= logging.WARNING and payload["error_code"]:
+        concise.append(f"error_code={payload['error_code']}")
     if _detailed_logs or _logger.isEnabledFor(logging.DEBUG):
         concise.extend(f"{key}={value}" for key, value in payload["details"].items())
     collect_event(payload)

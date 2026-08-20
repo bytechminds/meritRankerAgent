@@ -34,6 +34,7 @@ from features.practice_generation.pattern_context import (
 from features.practice_generation.planning import (
     BlueprintManager,
     BlueprintPlanningError,
+    PracticeRequestCountError,
     apply_system_bucket_policy,
     decide_practice_launch,
     deterministic_blueprint,
@@ -88,9 +89,63 @@ def request(
     )
 
 
-def test_count_above_max_is_clamped_and_retained() -> None:
-    resolved = request("Create a full mock", count_query="Create 150 question full mock")
-    assert (resolved.requested_count, resolved.accepted_count) == (150, 100)
+@pytest.mark.parametrize("count", [1, 5, 6, 10, 20, 50, 99, 100])
+def test_valid_requested_count_is_preserved_exactly(count: int) -> None:
+    resolved = request(
+        f"Create {count} algebra questions",
+        count_query=f"Create {count} algebra questions",
+    )
+
+    assert (resolved.requested_count, resolved.accepted_count) == (count, count)
+
+
+@pytest.mark.parametrize("count", [0, -1, 101])
+def test_out_of_range_requested_count_is_rejected(count: int) -> None:
+    with pytest.raises(PracticeRequestCountError) as exc_info:
+        request(
+            f"Create {count} algebra questions",
+            count_query=f"Create {count} algebra questions",
+        )
+
+    assert exc_info.value.reason_code == "PRACTICE_REQUEST_COUNT_OUT_OF_RANGE"
+
+
+@pytest.mark.parametrize("count", [1, 5, 20, 50, 100])
+def test_hyphenated_requested_count_is_preserved_exactly(count: int) -> None:
+    """A '<N>-question' compound must not fall through to the practice-type default."""
+    query = f"Create a {count}-question Quick Practice on Algebra"
+    resolved = request(query, count_query=query)
+
+    assert (resolved.requested_count, resolved.accepted_count) == (count, count)
+
+
+def test_multi_topic_hyphenated_count_request_preserves_requested_total() -> None:
+    """Regression for the exact reported incident query — 20 must not collapse to 5."""
+    query = (
+        "Create a 20-question Percentage, time and work, profit loss, number system "
+        "Quick Practice for CAT Management — Pre."
+    )
+    resolved = request(
+        query,
+        count_query=query,
+        subject="math",
+        topic="Percentage, Time and Work, Profit Loss, Number System",
+    )
+
+    assert (resolved.requested_count, resolved.accepted_count) == (20, 20)
+    assert resolved.practice_type == PracticeType.QUICK_PRACTICE
+
+    blueprint = deterministic_blueprint(resolved)
+    assert sum(bucket.required_count for bucket in blueprint.buckets) == 20
+    assert blueprint.accepted_count == 20
+
+
+def test_unspecified_count_still_uses_quick_practice_default() -> None:
+    """Default-count regression: no explicit count must still fall back to 5."""
+    query = "Create a Quick Practice on Algebra"
+    resolved = request(query, count_query=query)
+
+    assert (resolved.requested_count, resolved.accepted_count) == (5, 5)
 
 
 def test_reuse_bucket_key_matches_backend_versioned_uri_contract() -> None:
@@ -773,6 +828,33 @@ def test_reuse_requires_explicit_verified_reusable_platform_metadata() -> None:
     assert candidate is not None
 
 
+def test_reuse_treats_legacy_missing_language_as_unknown() -> None:
+    candidate = reusable_question_from_item(
+        {
+            "qbId": "legacy-q1",
+            "question": "What is 2 + 2?",
+            "answers": json.dumps({"options": ["3", "4", "5", "6"]}),
+            "correctAnswer": "4",
+            "explanation": "Adding gives 4.",
+            "category": "math",
+            "difficulty": "MEDIUM",
+            "meta": json.dumps(
+                {
+                    "status": "ACTIVE",
+                    "qualityStatus": "VERIFIED",
+                    "reusable": True,
+                    "visibility": "PLATFORM",
+                    "subject": "math",
+                    "topic": "algebra",
+                    "questionType": "mcq",
+                }
+            ),
+        },
+        requested_language="english",
+    )
+    assert candidate is None
+
+
 def test_reuse_rejects_private_or_unverified_candidate() -> None:
     item = {
         "qbId": "q1",
@@ -912,6 +994,7 @@ def test_intermediate_generation_groups_are_capped_at_four() -> None:
         group_max=5,
     )
     assert [group.required_count for group in groups] == [4, 4, 4, 4, 4]
+    assert sum(group.required_count for group in groups) == 20
 
 
 def test_advanced_math_generation_groups_are_capped_at_two() -> None:
@@ -1159,6 +1242,42 @@ def test_partial_group_retains_valid_sibling_and_reports_deficit() -> None:
         existing_normalized_texts=set(),
     )
     assert (len(parsed.accepted), parsed.rejected_count) == (1, 2)
+
+
+def test_generation_rejects_a_clear_delivery_language_script_mismatch() -> None:
+    bucket = deterministic_blueprint(request("Create one algebra question")).buckets[0]
+    group = GenerationGroup(
+        group_id="g-language",
+        bucket_id=bucket.bucket_id,
+        required_count=1,
+    )
+    raw = json.dumps(
+        {
+            "questions": [
+                {
+                    "generation_item_id": "english-for-hindi",
+                    "bucket_id": bucket.bucket_id,
+                    "question": "What is the value of x plus two equals five?",
+                    "question_type": "mcq",
+                    "options": ["One", "Two", "Three", "Four"],
+                    "correct_answer": "Three",
+                    "solution": "Subtract two from both sides.",
+                    "subject": bucket.subject,
+                    "topic": bucket.topic,
+                    "difficulty": bucket.difficulty.value,
+                }
+            ]
+        }
+    )
+    parsed = parse_partial_generation(
+        raw,
+        group=group,
+        bucket=bucket,
+        existing_normalized_texts=set(),
+        requested_language="hindi",
+    )
+    assert parsed.accepted == ()
+    assert parsed.rejection_reason_codes == ("QUESTION_LANGUAGE_MISMATCH",)
 
 
 def test_slot_generation_normalizes_safe_subject_and_topic_labels() -> None:
@@ -1659,3 +1778,125 @@ def test_pattern_provider_is_noop_when_runtime_is_disabled() -> None:
         slots=(),
     ).guidance_by_slot == {}
     assert isinstance(build_pattern_context_provider(enabled=True), NoOpPatternContextProvider)
+
+
+_QB_DIFFICULTY = {"basic": "EASY", "intermediate": "MEDIUM", "advanced": "HARD"}
+
+
+def _linked_from_slot(slot, *, reused: bool, **overrides) -> dict:
+    """Build a linked Question row exactly as each admission path persists it."""
+    item = {
+        "questionId": f"q-{slot.slot_id}",
+        "question": f"Question for {slot.slot_id}?",
+        "options": ["A", "B", "C", "D"],
+        "answers": json.dumps({"correctAnswer": "A", "options": ["A", "B", "C", "D"]}),
+        "correctAnswer": "A",
+        "explanation": "A is correct.",
+        "topic": slot.topic_id,
+        # Reuse carries QuestionBank's backend vocabulary; generation carries the
+        # planner's. Both must satisfy the same slot contract.
+        "difficulty": (
+            _QB_DIFFICULTY[slot.difficulty.value] if reused else slot.difficulty.value
+        ),
+        "_practiceMeta": {
+            "bucketId": bucket_for_slot(_BLUEPRINT_HOLDER["blueprint"], slot).bucket_id,
+            "slotId": slot.slot_id,
+            "verified": True,
+            "sourceType": "QUESTION_BANK" if reused else "AI_GENERATED",
+            "source": "REUSED" if reused else "GENERATED",
+            "verificationMethod": (
+                "QUESTION_BANK_QUALITY" if reused else "INDEPENDENT_MODEL_V2"
+            ),
+            "verificationPolicy": "STORED_AUTHORITY" if reused else "MANDATORY",
+            "sourceQuestionBankId": f"qb-v2-{slot.slot_id}" if reused else None,
+            "questionType": slot.question_type.value,
+            "language": "english",
+        },
+    }
+    if not reused:
+        item["_practiceMeta"].pop("sourceQuestionBankId")
+    item.update(overrides)
+    return item
+
+
+_BLUEPRINT_HOLDER: dict = {}
+
+
+def _slot_blueprint(count: int):
+    resolved = request(f"Create {count} algebra questions")
+    blueprint = deterministic_blueprint(resolved)
+    _BLUEPRINT_HOLDER["blueprint"] = blueprint
+    return blueprint
+
+
+def test_reused_question_satisfies_the_final_slot_contract() -> None:
+    """Regression: QuestionBank stores EASY/MEDIUM/HARD, slots use basic/intermediate/
+    advanced. A raw comparison failed every reused Question after it had already
+    passed strict admission matching, failing the whole Practice."""
+    blueprint = _slot_blueprint(3)
+    linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+
+    validation = validate_final_set(blueprint=blueprint, linked_questions=linked)
+
+    assert validation.ready is True, validation.reason_code
+    assert validation.reason_code == "READY"
+
+
+def test_generated_and_reused_questions_mix_in_one_assessment() -> None:
+    blueprint = _slot_blueprint(3)
+    linked = [
+        _linked_from_slot(slot, reused=index % 2 == 0)
+        for index, slot in enumerate(blueprint.slots)
+    ]
+
+    assert validate_final_set(blueprint=blueprint, linked_questions=linked).ready is True
+
+
+def test_final_slot_contract_still_rejects_a_genuine_difficulty_mismatch() -> None:
+    blueprint = _slot_blueprint(3)
+    linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+    # A real mismatch, not a vocabulary difference.
+    other = "HARD" if linked[0]["difficulty"] != "HARD" else "EASY"
+    linked[0]["difficulty"] = other
+
+    validation = validate_final_set(blueprint=blueprint, linked_questions=linked)
+
+    assert validation.ready is False
+    assert validation.reason_code == "PLANNER_SLOT_CONTRACT_MISMATCH"
+
+
+def test_final_slot_contract_still_rejects_topic_and_unverified_drift() -> None:
+    blueprint = _slot_blueprint(3)
+
+    wrong_topic = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+    wrong_topic[0]["topic"] = "an_unrelated_topic"
+    assert (
+        validate_final_set(blueprint=blueprint, linked_questions=wrong_topic).reason_code
+        == "PLANNER_SLOT_CONTRACT_MISMATCH"
+    )
+
+    unverified = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+    unverified[1]["_practiceMeta"]["verified"] = False
+    assert validate_final_set(blueprint=blueprint, linked_questions=unverified).ready is False
+
+
+def test_one_hundred_reused_questions_pass_the_final_slot_contract() -> None:
+    blueprint = _slot_blueprint(100)
+    linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+
+    validation = validate_final_set(blueprint=blueprint, linked_questions=linked)
+
+    assert len(linked) == 100
+    assert validation.ready is True, validation.reason_code
+
+
+def test_one_incompatible_question_among_one_hundred_names_only_that_slot() -> None:
+    blueprint = _slot_blueprint(100)
+    linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
+    linked[42]["topic"] = "an_unrelated_topic"
+
+    validation = validate_final_set(blueprint=blueprint, linked_questions=linked)
+
+    assert validation.ready is False
+    # The safety net must identify the single offending slot, never blame the batch.
+    assert validation.failed_slot_ids == (linked[42]["_practiceMeta"]["slotId"],)

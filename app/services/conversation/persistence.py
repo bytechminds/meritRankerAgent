@@ -226,6 +226,13 @@ class ConversationPersistenceService:
                 skip_reason=cast(PersistenceSkipReason, decision.skip_reason),
             )
 
+        log_event(
+            "conversation_persistence_started",
+            component="conversation.persistence",
+            stage="persist_history",
+            status="started",
+        )
+
         pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conversation-write")
         try:
             history_future = pool.submit(

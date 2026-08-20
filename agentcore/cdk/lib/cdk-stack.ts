@@ -94,6 +94,17 @@ export class AgentCoreStack extends Stack {
     const practiceEnabled = runtimeEnvironment.PRACTICE_GENERATION_ENABLED === 'true';
     const patternIntelligenceEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_ENABLED === 'true';
     const patternReuseEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_REUSE_ENABLED === 'true';
+    // Case-folded to match the Python runtime, which reads this same value with
+    // .lower() == "true".  A bare === 'true' would let "TRUE" enable promotion in
+    // the runtime while leaving it without the dynamodb:PutItem grant.
+    const questionBankPromotionEnabled =
+      runtimeEnvironment.PRACTICE_QUESTION_BANK_PROMOTION_ENABLED?.toLowerCase() === 'true';
+    // Phase D: "shadow" validates without serving, "on" serves. Both need discovery.
+    const questionSemanticMode = (
+      runtimeEnvironment.PRACTICE_QUESTION_SEMANTIC_REUSE_MODE ?? 'off'
+    ).toLowerCase();
+    const questionSemanticEnabled =
+      questionSemanticMode === 'shadow' || questionSemanticMode === 'on';
 
     // Create AgentCoreApplication with all agents
     this.application = new AgentCoreApplication(this, 'Application', {
@@ -159,6 +170,12 @@ export class AgentCoreStack extends Stack {
       ? StringParameter.valueForStringParameter(
           this,
           '/meritranker/agent-runtime/v1/pattern-intelligence/pattern/table-arn'
+        )
+      : '';
+    const questionVectorIndexArn = questionSemanticEnabled
+      ? StringParameter.valueForStringParameter(
+          this,
+          '/meritranker/agent-runtime/v1/practice/question-bank/vector/index-arn'
         )
       : '';
     const patternVectorIndexArn = patternIntelligenceEnabled
@@ -267,14 +284,47 @@ export class AgentCoreStack extends Stack {
             resources: [memory.memoryArn],
           })
         );
-        if (patternReuseEnabled) {
-          environment.runtime.addToPolicy(
-            new iam.PolicyStatement({
-              actions: ['dynamodb:PutItem'],
-              resources: [practiceQuestionBankTableArn],
-            })
-          );
-        }
+      }
+      // QuestionBank promotion is trusted-Question capability, not Pattern reuse, so
+      // its write grant is gated on the promotion flag alone.  It also sits outside
+      // the memory loop above: nesting it there made the grant depend on how many
+      // memories exist.
+      if (questionSemanticEnabled) {
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.S3_VECTOR_QUESTION_INDEX_ARN',
+          questionVectorIndexArn
+        );
+        // Discovery only, questions-v1 only. Nothing on patterns-v1, no write actions.
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['s3vectors:QueryVectors'],
+            resources: [questionVectorIndexArn],
+          })
+        );
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['bedrock:InvokeModel'],
+            resources: [
+              this.formatArn({
+                service: 'bedrock',
+                account: '',
+                resource: 'foundation-model',
+                resourceName: 'amazon.titan-embed-text-v2:0',
+              }),
+            ],
+          })
+        );
+      }
+      if (questionBankPromotionEnabled) {
+        // PutItem creates the reusable row; UpdateItem exists solely so an existing
+        // Question can acquire authoritative Pattern linkage it did not have when it
+        // was first promoted.  Nothing else may mutate QuestionBank.
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'],
+            resources: [practiceQuestionBankTableArn],
+          })
+        );
       }
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({

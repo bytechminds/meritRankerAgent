@@ -246,3 +246,205 @@ test('enabled practice grants only its existing AppSync progress mutation', () =
   expect(rendered).not.toContain('appsync:*');
   expect(rendered).not.toContain('/types/Mutation/fields/*');
 });
+
+function practiceStack(
+  runtimeEnvironment: Record<string, string>,
+  memoryCount = 0
+): cdk.Stack {
+  return new AgentCoreStack(new cdk.App(), 'QuestionBankPromotionStack', {
+    spec: AgentCoreProjectSpecSchema.parse({
+      name: 'testproject',
+      version: 1,
+      managedBy: 'CDK',
+      runtimes: [
+        {
+          name: 'runtime',
+          build: 'CodeZip',
+          entrypoint: 'main.py',
+          codeLocation: 'app/',
+          runtimeVersion: 'PYTHON_3_14',
+        },
+      ],
+      memories: Array.from({ length: memoryCount }, (_unused, index) => ({
+        name: `meritranker_memory_${index}`,
+        eventExpiryDuration: 30,
+        strategies: [],
+      })),
+      credentials: [],
+      evaluators: [],
+      onlineEvalConfigs: [],
+      policyEngines: [],
+      agentCoreGateways: [],
+      mcpRuntimeTools: [],
+      unassignedTargets: [],
+    }),
+    deploymentEnvironment: 'dev',
+    runtimeEnvironment: {
+      AWS_REGION: 'ap-south-1',
+      APPSYNC_GRAPHQL_ENDPOINT:
+        'https://t37helcceraznaejlcm27uhmwi.appsync-api.ap-south-1.amazonaws.com/graphql',
+      PRACTICE_GENERATION_ENABLED: 'true',
+      ...runtimeEnvironment,
+    },
+  });
+}
+
+function questionBankPutStatements(stack: cdk.Stack): unknown[] {
+  const template = Template.fromStack(stack).toJSON();
+  const statements: unknown[] = [];
+  for (const resource of Object.values(template.Resources ?? {}) as any[]) {
+    if (resource.Type !== 'AWS::IAM::Policy') continue;
+    for (const statement of resource.Properties?.PolicyDocument?.Statement ?? []) {
+      const actions = Array.isArray(statement.Action) ? statement.Action : [statement.Action];
+      const mutates = actions.some(
+        (action: string) => action === 'dynamodb:PutItem' || action === 'dynamodb:UpdateItem'
+      );
+      if (!mutates) continue;
+      // CloudFormation strips hyphens from the SSM parameter logical id.
+      if (JSON.stringify(statement.Resource ?? '').includes('questionbanktablearn')) {
+        statements.push(statement);
+      }
+    }
+  }
+  return statements;
+}
+
+test('QuestionBank write is granted exactly once when promotion is enabled', () => {
+  const statements = questionBankPutStatements(
+    practiceStack({ PRACTICE_QUESTION_BANK_PROMOTION_ENABLED: 'true' })
+  );
+
+  expect(statements).toHaveLength(1);
+  const [statement] = statements as any[];
+  // Least privilege: create the row, plus Pattern enrichment. Nothing else.
+  expect(statement.Action).toEqual(['dynamodb:PutItem', 'dynamodb:UpdateItem']);
+  const rendered = JSON.stringify(statement);
+  for (const forbidden of [
+    'dynamodb:DeleteItem',
+    'dynamodb:Scan',
+    'dynamodb:BatchWriteItem',
+    'dynamodb:TransactWriteItems',
+    'dynamodb:*',
+  ]) {
+    expect(rendered).not.toContain(forbidden);
+  }
+});
+
+test('QuestionBank write is absent while promotion is disabled', () => {
+  expect(questionBankPutStatements(practiceStack({}))).toHaveLength(0);
+});
+
+test('Pattern reuse alone no longer grants QuestionBank write', () => {
+  const statements = questionBankPutStatements(
+    practiceStack({
+      PATTERN_INTELLIGENCE_ENABLED: 'true',
+      PATTERN_INTELLIGENCE_REUSE_ENABLED: 'true',
+    })
+  );
+
+  expect(statements).toHaveLength(0);
+});
+
+test.each(['true', 'TRUE', 'True'])(
+  'promotion value %s grants QuestionBank write exactly as the Python runtime reads it',
+  (value) => {
+    // config.py accepts any casing via .lower(); the grant must not disagree, or the
+    // runtime would attempt PutItem without permission.
+    expect(
+      questionBankPutStatements(
+        practiceStack({ PRACTICE_QUESTION_BANK_PROMOTION_ENABLED: value })
+      )
+    ).toHaveLength(1);
+  }
+);
+
+test.each(['false', 'FALSE', '0', 'yes', ''])(
+  'promotion value %s grants no QuestionBank write',
+  (value) => {
+    expect(
+      questionBankPutStatements(
+        practiceStack({ PRACTICE_QUESTION_BANK_PROMOTION_ENABLED: value })
+      )
+    ).toHaveLength(0);
+  }
+);
+
+test.each([0, 1, 2])(
+  'QuestionBank write grant is independent of memory count (%i memories)',
+  (memoryCount) => {
+    // The grant previously sat inside the per-memory loop, so its presence and
+    // count tracked how many memories the spec declared.
+    expect(
+      questionBankPutStatements(
+        practiceStack({ PRACTICE_QUESTION_BANK_PROMOTION_ENABLED: 'true' }, memoryCount)
+      )
+    ).toHaveLength(1);
+    expect(questionBankPutStatements(practiceStack({}, memoryCount))).toHaveLength(0);
+  }
+);
+
+test('no broad QuestionBank mutation action is ever granted', () => {
+  const template = Template.fromStack(
+    practiceStack({ PRACTICE_QUESTION_BANK_PROMOTION_ENABLED: 'true' })
+  ).toJSON();
+  const forbidden = [
+    'dynamodb:DeleteItem',
+    'dynamodb:Scan',
+    'dynamodb:BatchWriteItem',
+    'dynamodb:TransactWriteItems',
+    'dynamodb:*',
+  ];
+  for (const resource of Object.values(template.Resources ?? {}) as any[]) {
+    if (resource.Type !== 'AWS::IAM::Policy') continue;
+    for (const statement of resource.Properties?.PolicyDocument?.Statement ?? []) {
+      const rendered = JSON.stringify(statement);
+      if (!rendered.includes('questionbanktablearn')) continue;
+      for (const action of forbidden) {
+        expect(rendered).not.toContain(action);
+      }
+    }
+  }
+});
+
+function semanticStack(mode: string): cdk.Stack {
+  return practiceStack({ PRACTICE_QUESTION_SEMANTIC_REUSE_MODE: mode });
+}
+
+function questionVectorStatements(stack: cdk.Stack): any[] {
+  const template = Template.fromStack(stack).toJSON();
+  const found: any[] = [];
+  for (const resource of Object.values(template.Resources ?? {}) as any[]) {
+    if (resource.Type !== 'AWS::IAM::Policy') continue;
+    for (const statement of resource.Properties?.PolicyDocument?.Statement ?? []) {
+      const actions = Array.isArray(statement.Action) ? statement.Action : [statement.Action];
+      if (actions.some((a: string) => String(a).startsWith('s3vectors:'))) found.push(statement);
+    }
+  }
+  return found;
+}
+
+test.each(['shadow', 'on'])(
+  'semantic mode %s grants filtered questions-v1 discovery only',
+  (mode) => {
+    const statements = questionVectorStatements(semanticStack(mode));
+    expect(statements).toHaveLength(1);
+    expect(statements[0].Action).toEqual('s3vectors:QueryVectors');
+    const rendered = JSON.stringify(Template.fromStack(semanticStack(mode)).toJSON());
+    expect(rendered).toContain('S3_VECTOR_QUESTION_INDEX_ARN');
+    expect(rendered).toContain('question-bank/vector/index-arn');
+    for (const forbidden of [
+      's3vectors:PutVectors',
+      's3vectors:DeleteVectors',
+      's3vectors:*',
+      'pattern-intelligence/vector/index-arn',
+    ]) {
+      expect(rendered).not.toContain(forbidden);
+    }
+  }
+);
+
+test('semantic mode off grants no vector access and injects no ARN', () => {
+  expect(questionVectorStatements(semanticStack('off'))).toHaveLength(0);
+  const rendered = JSON.stringify(Template.fromStack(semanticStack('off')).toJSON());
+  expect(rendered).not.toContain('S3_VECTOR_QUESTION_INDEX_ARN');
+});

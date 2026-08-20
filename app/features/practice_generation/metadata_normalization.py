@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from features.practice_generation.schemas import PracticeType
@@ -108,6 +109,10 @@ def normalize_exam(value: object) -> str | None:
 
 
 def normalize_language(value: object) -> str | None:
+    if isinstance(value, str):
+        direct = unicodedata.normalize("NFKC", value).strip().casefold()
+        if direct in {"हिंदी", "हिन्दी"}:
+            return "hindi"
     return _LANGUAGE_ALIASES.get(_words(value))
 
 

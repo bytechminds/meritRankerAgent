@@ -17,6 +17,7 @@ Models:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -31,8 +32,21 @@ _LANGUAGE_ALIASES: dict[str, CanonicalLanguage] = {
     "english": "english",
     "hi": "hindi",
     "hindi": "hindi",
+    "हिंदी": "hindi",
+    "हिन्दी": "hindi",
     "hinglish": "hinglish",
 }
+
+
+def normalize_question_language(value: Any) -> CanonicalLanguage:
+    """Normalize the bounded question-delivery language contract."""
+    if not isinstance(value, str):
+        raise ValueError("language must be a supported string")
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    language = _LANGUAGE_ALIASES.get(normalized)
+    if language is None:
+        raise ValueError("language must be english, hinglish, or hindi")
+    return language
 
 
 def _normalize_retrieval_tags(raw_tags: Any, *, max_tags: int = 10) -> list[str]:
@@ -127,12 +141,7 @@ class DoubtSolverRequest(BaseModel):
     @field_validator("language", mode="before")
     @classmethod
     def _normalize_language(cls, value: Any) -> CanonicalLanguage:
-        if not isinstance(value, str):
-            raise ValueError("language must be a supported string")
-        normalized = _LANGUAGE_ALIASES.get(value.strip().lower())
-        if normalized is None:
-            raise ValueError("language must be english, hinglish, or hindi")
-        return normalized
+        return normalize_question_language(value)
 
     @model_validator(mode="after")
     def _require_query_or_image(self) -> DoubtSolverRequest:
@@ -547,6 +556,25 @@ class PracticeGenerationStartedData(BaseModel):
     model_config = {"populate_by_name": True, "extra": "forbid"}
 
 
+class TerminalConversationIdentity(BaseModel):
+    """Authoritative persisted-turn identity carried by terminal stream events."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=128)
+    conversation_id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    turn_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    persisted: bool
+
+
 class DoubtSolverStreamEvent(BaseModel):
     """A single event in an orchestrated Doubt Solver streaming response.
 
@@ -627,8 +655,27 @@ class DoubtSolverStreamEvent(BaseModel):
                 raise ValueError("complete event must have response")
             if self.response.request_id != self.request_id:
                 raise ValueError("complete response request_id must match event request_id")
+            self._validate_terminal_identity()
         elif self.type == "practice_generation_started":
             if self.data is None:
                 raise ValueError("practice_generation_started event must have data")
+            self._validate_terminal_identity()
 
         return self
+
+    def _validate_terminal_identity(self) -> None:
+        try:
+            identity = TerminalConversationIdentity.model_validate(
+                {
+                    "request_id": self.metadata.get("request_id"),
+                    "conversation_id": self.metadata.get("conversation_id"),
+                    "turn_id": self.metadata.get("turn_id"),
+                    "persisted": self.metadata.get("persisted"),
+                }
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "terminal event must include authoritative conversation identity"
+            ) from exc
+        if identity.request_id != self.request_id:
+            raise ValueError("terminal metadata request_id must match event request_id")

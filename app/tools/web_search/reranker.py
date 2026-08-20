@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from config import Settings, get_settings
-from tools.web_search.models import ContextStrength, SourceQuality, WebSearchItem
+from tools.web_search.models import (
+    MAX_FRESH_EVIDENCE_ITEMS,
+    ContextStrength,
+    SourceQuality,
+    WebSearchItem,
+)
 from tools.web_search.source_policy import WebSourcePolicy
 
 logger = logging.getLogger(__name__)
@@ -49,6 +54,7 @@ class WebSearchRerankInput:
     official_required: bool = False
     exam_prep_suitable: bool = False
     max_selected_results: int | None = None
+    requires_fresh_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,7 +103,12 @@ class WebSearchReranker:
             if rerank_input.max_selected_results is not None
             else settings.web_search_max_selected_results
         )
-        max_selected = min(max(max_selected, 1), 20)
+        max_selected = min(
+            max(max_selected, 1),
+            MAX_FRESH_EVIDENCE_ITEMS
+            if rerank_input.requires_fresh_evidence
+            else 20,
+        )
         if rerank_input.attempt_used == "exam_prep_fallback":
             max_selected = min(
                 max_selected,

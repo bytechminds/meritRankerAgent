@@ -18,7 +18,21 @@ S3 Vector candidate discovery
 → exact vector/DynamoDB version-hash parity
 → deterministic Pattern/slot compatibility
 → IGNORE | GUIDANCE_SAFE | REUSE_SAFE
+→ (Practice reuse only) at most ONE widened candidate window, then stop
 ```
+
+When a Practice demand group cannot be satisfied from the initial candidate window, the runtime
+widens that window exactly once (`_CANDIDATE_EXPANSION_MULTIPLIER`, capped at the schema's
+24-candidate bound) and evaluates only Pattern IDs it has not already seen. That 24 is a
+**cumulative per-demand-group** ceiling on unique Patterns evaluated, not a per-query one — the
+`PatternRuntimeResult.decisions` contract carries exactly one decision per evaluated candidate and
+is bounded at 24. Expansion therefore spends only the budget the initial window left, keeping the
+highest-ranked new candidates that fit; when the initial window already consumed the budget, the
+second vector query is skipped entirely rather than paid for and discarded. Retrieval breadth is
+the only thing that grows: the vector-score floor and every compatibility check are unchanged, so
+a wider window can never admit a candidate the narrow window would have rejected. If the widened
+window is still insufficient, retrieval stops and the remainder becomes generator deficit.
+Guidance-only Practice, server-selected exact plans, and Doubt never expand.
 
 DynamoDB Pattern records remain PatternGraph/SolveFlow authority. QuestionBank remains playable
 Question authority. Raw PatternQuestion records are never treated as playable and are no longer
@@ -37,9 +51,23 @@ The planner builds immutable slots before any Pattern or QuestionBank lookup. Ex
 QuestionBank reuse runs first. Deficit slots are conservatively grouped, resolved through the
 Pattern runtime, and receive either:
 
-- `REUSE_SAFE`: one exact verified playable QuestionBank row with explicit Pattern ID/version and
+- `REUSE_SAFE`: exact verified playable QuestionBank rows with explicit Pattern ID/version and
   `VERIFIED_GENERATION` or `VERIFIED_INGESTION` evidence, full slot compatibility, checked student
-  history, and no activity/seen/exclusion conflict.
+  history, and no activity/seen/exclusion conflict. One grouped demand may directly reuse up to
+  its own slot count (`reuseTarget`), drawn from one or more compatible Patterns. Ranked
+  compatible candidates are probed one QuestionBank page each while `direct_reuse < reuseTarget`,
+  and probing stops only when the demand is met, the candidate pool is exhausted, or the hard
+  candidate maximum is reached — whichever comes first. The probe count is never predicted from
+  the page size (`_MAX_QUESTIONS_PER_PATTERN`): that is a page ceiling, not a guaranteed yield, so
+  twelve Patterns holding one eligible question each are all probed rather than four. A
+  compatibility group may legitimately hold every slot in the assessment — the blueprint's
+  distinctness signature includes `variation_hint`, which the compatibility key excludes — so any
+  fixed or predicted probe ceiling would silently force safe reuse into generation. DynamoDB
+  cannot serve several GSI partitions in one call (`BatchGetItem` resolves table primary keys
+  only), so bounded per-Pattern probing is retained rather than inventing a new data layer.
+  Every slot in a group shares one compatibility key, so
+  allocating reuse to a prefix of the group cannot alter the planner's difficulty distribution.
+  Remaining slots fall through to `GUIDANCE_SAFE`, then to normal generation.
 - `GUIDANCE_SAFE`: compact answer-redacted Pattern target/givens/conditions/operations/traps and
   `not_same_when` supplied to the existing adaptive generator.
 - `IGNORE`: unchanged generation fallback.

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     decide_practice_launch,
+    resolve_practice_delivery_language,
     resolve_practice_request,
 )
 from features.practice_generation.schemas import PracticeLaunchResult
@@ -55,6 +56,17 @@ def graph_state(query: str = "Create five algebra questions") -> dict:
         "conversation_preparation": None,
         "source_modality": "text",
     }
+
+
+def test_explicit_practice_language_command_overrides_the_selected_language() -> None:
+    assert resolve_practice_delivery_language(
+        "Create five current affairs questions in Hindi",
+        "english",
+    ) == ("hindi", "EXPLICIT_QUERY")
+    assert resolve_practice_delivery_language(
+        "Create five questions",
+        "hinglish",
+    ) == ("hinglish", "REQUEST")
 
 
 def test_non_stream_creation_request_returns_controlled_disabled_result(

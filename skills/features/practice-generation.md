@@ -162,6 +162,76 @@ only resource/reuse contract versions, table names and ARNs, and the three GSI n
 incompatible database resources fail closed; failed SSM loads are not cached. An enabled practice
 runtime also requires `APPSYNC_GRAPHQL_ENDPOINT`; a disabled practice feature does not.
 
+### Startup resource-resolution invariant
+
+**Stable SSM-backed resource metadata resolves before the application is ready to accept
+invocations. Runtime request paths consume the cached values and must never perform SSM resource
+discovery.** Every reader executes at `main.py` module import — strictly before `@app.entrypoint`
+becomes reachable — and each caches an immutable process-scoped snapshot:
+
+| Reader | Feature | Required when |
+|---|---|---|
+| `features/practice_generation/resource_contract.py` | Practice core | `PRACTICE_GENERATION_ENABLED` |
+| `features/practice_generation/pattern_resource_contract.py` | Pattern Intelligence | `PATTERN_INTELLIGENCE_ENABLED` (attempt-history identifiers only when `PATTERN_INTELLIGENCE_REUSE_ENABLED`) |
+| `services/conversation/runtime_config.py` | history / session / memory | non-`test` `APP_ENV` |
+| `services/doubt_solver/exam_profile_cache.py` | exam profiles (Doubt + Practice planner) | non-`test` `APP_ENV` |
+
+There is no `ApplicationResourceSnapshot` aggregate and none is needed: composing these four
+already-startup-resolved, already-batched, already-process-cached contracts would duplicate them
+without changing behaviour. Resource identifiers are deployment-stable, so a restart or redeploy is
+the only refresh boundary — there is deliberately no TTL cache, background polling, or per-request
+`DescribeTable`/`GetIndex` verification.
+
+Precedence is `explicit environment value → SSM → explicit configuration failure`. Deployed
+runtimes receive CDK-injected environment variables and therefore make zero SSM calls for those
+fields; only genuinely missing identifiers are read.
+
+Fail-fast is part of the contract: for an explicitly **enabled** feature, a missing parameter,
+`AccessDenied`, or an unparseable resource identifier raises `PracticeConfigurationError` (or
+`ConversationConfigurationError`) out of module import, so the application never becomes
+importable. An enabled feature must never silently degrade to a no-op provider because its
+resources could not be resolved.
+
+**One intentional exception:** `ExamProfileRuntime.load()` is **fail-open** — it catches every
+exception and returns `False`, preserving the last-known-good snapshot, because exam-response
+profiles are advisory during migration. This is the only reader that does not block startup and is
+therefore the only divergence from the fail-fast contract above. Whether exam profiles should
+become mandatory is an open **advisory-vs-mandatory policy decision** and is deliberately out of
+scope for the resource-lifecycle work; it is recorded here so the exception is explicit rather
+than accidental.
+
+The invariant is enforced by `app/tests/test_startup_resource_contract.py`, which asserts a
+*bounded* number of batched startup calls plus a *zero* post-startup delta for first request,
+second request, Practice configuration, Pattern retrieval provider construction, Doubt Solver
+exam-profile resolution, and conversation/session/memory resolution — including under concurrent
+cold bootstrap. The exact startup call count is intentionally **not** pinned, so legitimately
+adding or re-batching a parameter does not produce a false failure.
+
+### Readiness lifecycle
+
+Two distinct startup events, and no event claims readiness while mandatory initialization can
+still fail:
+
+- `runtime_started` (`status=started`) — emitted early, immediately after runtime identity is
+  configured, so identity diagnostics survive a later startup failure. It deliberately does not
+  claim readiness.
+- `runtime_ready` (`status=ready`) — the authoritative readiness boundary, emitted only after
+  conversation persistence, resource contracts, DynamoDB resource validation, Practice/Pattern
+  runtime construction, and graph compilation have all succeeded. Details carry aggregate feature
+  flags only (`practiceEnabled`, `patternContextEnabled`, `patternReuseEnabled`,
+  `orchestratedDoubtSolverEnabled`) — never table names, ARNs, or index names.
+
+Because every mandatory step raises out of module import, a failure anywhere above makes the
+`runtime_ready` line unreachable and the application never importable. Prior to this split,
+`runtime_started` carried `status=ready` while Practice/Pattern bootstrap, DynamoDB validation,
+and graph construction all still followed — a false-ready window that is now closed and regression-
+tested.
+
+Local `agentcore dev` runs the sequence **twice** (`Started reloader process` then
+`Started server process`): this is normal uvicorn `StatReload` behaviour, two separate OS
+processes each performing a legitimate independent bootstrap. It is not deduplicated, and any
+startup benchmark should account for it.
+
 Supported settings:
 
 - `PRACTICE_GENERATION_ENABLED=false`
@@ -170,6 +240,15 @@ Supported settings:
 - `PRACTICE_RESOURCE_PARAMETER_ROOT=/meritranker/agent-runtime/v1/practice`
 - `PRACTICE_GENERATION_GROUP_SIZE=3`
 - `PRACTICE_GENERATION_GROUP_MAX=5`
+- `PRACTICE_VERIFICATION_MAX_CONCURRENCY=3` (1–5) — bounded fan-out for the existing
+  per-question verifier calls inside one generation group. Transport concurrency only: each
+  question still receives its own verifier call on the same route, model, prompt, and schema,
+  and outcomes are merged by `slot_id` in the original deterministic order, so completion order
+  can never determine identity or event ordering. Default 3 was chosen by measurement — at the
+  5-slot group maximum, bound 3 reaches the same wall time as bound 4, so 3 is the smallest
+  value achieving the best result. Worst-case in-flight verifier calls is
+  `PRACTICE_VERIFICATION_MAX_CONCURRENCY × 2` because up to two generation groups run
+  concurrently.
 - `PRACTICE_ITEM_RETRY_LIMIT=1`
 - `PRACTICE_PLANNER_REPAIR_LIMIT=1`
 - `PRACTICE_RECOVERY_STALE_SECONDS=120`
@@ -269,7 +348,8 @@ and the coordinator commits their results sequentially.
 
 - Logs exclude prompts, questions, solutions, provider bodies, credentials, and raw user IDs.
 - No cache, Redis, Step Functions, new database, or replacement async infrastructure was added.
-- Current-affairs set creation remains unsupported.
+- Fresh current-affairs creation is supported only with sufficient temporally eligible evidence;
+  the controlled fail-closed path is the expected outcome when provider evidence is insufficient.
 - Canonical Pattern context is implemented behind both disabled-by-default Pattern flags. It runs
   only after QuestionBank reuse for deficit slots, requires exact source compatibility, and falls
   back to ordinary generation when unavailable or unsafe. Live activation remains `[BLOCKED]` by
@@ -762,3 +842,116 @@ retained in the readable request log, so provider completion time, exact post-ca
 counts, and token savings could not be independently reconstructed. Therefore the strict
 real-provider event-level acceptance gate remains `[NOT VERIFIED]` and release remains
 `NOT_READY` despite the successful authenticated UI lifecycle check.
+
+## Question-language integrity (2026-08-15)
+
+Practice delivery now resolves one canonical `english`, `hindi`, or `hinglish` value. A validated
+request field remains the normal source; an unambiguous current query command such as `in Hindi`
+or `हिंदी में` overrides it only for Practice generation. The resolved value and source are stored
+inside the existing `practiceRequest` metadata, included in the idempotency key, passed unchanged
+to planner/generator/verifier routing, and emitted as the safe `practice_language_resolved` event.
+
+QuestionBank reuse requires explicit matching language metadata. A missing legacy language is
+`UNKNOWN`, not English, and is excluded from an explicit-language reuse path without a runtime LLM
+backfill. New assessment and Question persistence map canonical values to the existing backend
+codes `en`, `hi`, and `hinglish`; newly persisted private activities validate that top-level value
+before delivery. Historical private resume metadata lacking `languageSource` remains compatible
+with its prior validated Question metadata, so this hardening does not mutate old attempts.
+
+Generator, repair, replacement, and verifier prompts state that language applies to question,
+options, answer explanation, and solution. Before verifier acceptance a bounded script signal
+rejects clearly incompatible English/Hindi/Hinglish output; the existing bounded repair/replacement
+flow handles the deficit and never publishes a partial set. Hindi delivery retains an English-subject
+exception for textual grammar content. Current-affairs evidence source language remains independent
+from requested delivery language. No PatternGraph identity, retrieval index, cancellation fence,
+same-test resume, ExamProfile, Student Performance, outbox, provider, queue, or Production
+deployment changed. Focused offline tests pass; authenticated three-language browser/provider E2E
+is `[NOT VERIFIED]`.
+
+## Exact count and fresh-evidence hardening (2026-08-16)
+
+`MAX_PRACTICE_QUESTIONS` in `app/practice_limits.py` is the canonical
+Practice count authority. Explicit requests accept only `1..100`; `0`, negative values, and
+values above 100 return the typed `PRACTICE_REQUEST_COUNT_OUT_OF_RANGE` failure rather than
+silently clamping. `requested_count` and `accepted_count` must be equal for every accepted
+Practice request. The count travels unchanged into the blueprint, expected slots, persisted
+assessment request, and final manifest. `PRACTICE_GENERATION_GROUP_MAX=5` remains an internal
+bounded generation cap, never a total-assessment cap; the route capacity policy may use smaller
+groups (for example, five groups of four for a 20-slot intermediate set) without dropping slots.
+
+Fresh Practice now has an explicit deterministic temporal mode in the existing web-search policy:
+`CURRENT`, `LATEST`, `RECENT`, `EXPLICIT_YEAR`, `EXPLICIT_MONTH`, or `EXPLICIT_DATE_RANGE`.
+Explicit year/month/range intent takes precedence over generic current wording; latest/current
+windows end on the runtime date. The existing source-policy and query-builder layers add temporal
+coverage, competitive-exam context, and source-pack topic semantics to the provider-neutral request;
+the classifier still supplies semantic web demand only. Current-affairs packs already use Tavily's
+`news` topic. The Tavily adapter uses the documented Bearer authorization header and only the
+supported existing controls: topic, `start_date`, `end_date`, `time_range`, domain filters,
+`max_results`, and `search_depth`.
+
+For a freshness-required request, candidates missing a parseable publication date or outside the
+resolved date window are rejected **before** reranking. URL de-duplication then occurs while
+constructing the compact evidence bundle. Generator, repair/replacement, and verifier receive the
+same explicit `evidence_by_slot` subset; verifier approval still requires a cited selected URL and its prompt
+rejects stale or unsupported facts. Insufficient qualified evidence fails before Practice launch;
+no model-memory fallback is allowed. The web path records only safe counts, temporal mode/window,
+date range summaries, and stale-rejection counts, never page bodies or prompts.
+
+The normal provider limit remains 20 results for one Tavily call. A 100-slot fresh request performs
+one bounded retrieval and fails closed if it cannot provide 100 independent eligible evidence items;
+it never fans out to 100 searches. Deterministic tests can supply a complete 100-item evidence bundle
+to verify count and slot contracts without paid provider calls. A successful real-provider 100-slot
+fresh assessment is `[NOT VERIFIED]`; no source-category expansion or additional search service was
+introduced. Static math, reasoning, and grammar requests retain zero web-search calls.
+
+Focused offline evidence: count, freshness, Tavily adapter, query-builder, reranker, orchestration,
+async, cancellation/resume, Pattern context, billing, and routing suites passed on 2026-08-16.
+A live Tavily current-affairs call returned no dated, policy-eligible evidence and the fresh gate
+failed closed; successful real-provider fresh generation remains `[NOT VERIFIED]`. The Azure smoke
+is blocked by its endpoint/API-mode mismatch and the native OpenAI fallback by `RateLimitError`;
+therefore end-to-end real LLM generation is `[NOT VERIFIED]`. No Production deployment is authorized
+by this change. PatternGraph, cancellation/resume fencing, billing, provider/model routing, token
+budgets, player/scoring contracts, and backend data schemas were not modified.
+
+## Hyphenated-count parsing fix (2026-08-16)
+
+Production incident: a request phrased as `"Create a 20-question ... Quick Practice ..."`
+(count directly hyphen-attached to the unit word, e.g. `20-question`, not `20 question`)
+resolved to 5 questions instead of 20. Root cause: `_COUNT_PATTERN` in
+`app/features/practice_generation/planning.py` required literal whitespace between the
+digits and the trailing unit keyword (`question`, `quiz`, `mock`, etc.). A hyphenated
+compound never matched, so `resolve_requested_count` fell through the word-number
+dictionary (no match — the count was numeric, not spelled out) straight to
+`_DEFAULT_COUNTS[practice_type]`; since the query said "Quick Practice" and matched no
+other type keyword, `practice_type` resolved to `QUICK_PRACTICE`, whose default is 5. This
+predates the "Exact count and fresh-evidence hardening" work above — the `max(1, ...)` →
+`int(...)` clamp change there did not touch this defect, since it only fires once a count is
+already extracted. The existing test at `test_practice_core.py` covering
+`"Create a 5-question Quick Practice ..."` had masked the bug for years because 5 (the
+QUICK_PRACTICE default) happened to equal the intended count.
+
+Fix: `_COUNT_PATTERN` now matches the digit-hyphen-unit compound directly
+(`\d{1,3}-question\b`, no intervening words) as an explicit alternative, alongside the
+original whitespace-separated form; the "search up to 3 words ahead" lookahead itself
+still requires whitespace, so unrelated hyphenated compounds (`"10-minute mini mock"`)
+are not misread as a count. `sum(bucket.required_count) == accepted_count` was already
+enforced at the blueprint layer (`schemas.py`), and `GenerationGroup.required_count` was
+already a separate, independently bounded (≤5) generation-batch concept — total-count vs.
+batch-size separation required no change.
+
+The reported Practice-ID mismatch between the conversation turn and the displayed activity
+summary (`getPracticeActivitySummary`) could not be investigated from this repository:
+`app/main.py` threads a single `practice_test_id` synchronously from launch through to both
+the persisted conversation turn and the response payload, so this backend cannot itself
+produce two different IDs for one request. The summary query, card-to-conversation
+association, and any UI/query-variable selection are owned by the separate AI-tutor-backend
+(Next.js/Amplify) repository and remain `[NOT VERIFIED]` here.
+
+Regression tests added to `test_practice_core.py`: hyphenated counts at 1/5/20/50/100, the
+exact reported multi-topic query, and the unspecified-count default. Focused
+`practice_generation` suite (345 tests) and `ruff check` on the changed files pass. Full
+`make check` was run; 5 unrelated pre-existing failures in `test_azure_first_fallback.py`,
+`test_difficulty_classification.py`, `test_intent_overlay.py`, and
+`test_orchestrated_streaming.py` (stale `OrchestratedDoubtSolverState` field-set assertions
+missing `fresh_evidence`) predate this change and belong to the in-progress Doubt Solver
+freshness work already in the working tree — not touched, per scope.

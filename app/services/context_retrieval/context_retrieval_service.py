@@ -1087,6 +1087,14 @@ class ContextRetrievalService:
                 "official_count": web_result.official_count,
                 "reputable_count": web_result.reputable_count,
                 "context_characters": len(web_result.context_text),
+                "freshness_required": web_result.freshness_required,
+                "temporal_mode": web_result.temporal_mode,
+                "start_date": web_result.freshness_start_date,
+                "end_date": web_result.freshness_end_date,
+                "stale_results_rejected": web_result.stale_results_rejected,
+                "eligible_evidence_count": web_result.eligible_evidence_count,
+                "evidence_date_min": web_result.evidence_date_min,
+                "evidence_date_max": web_result.evidence_date_max,
             },
         )
         if web_result.weak_context or not web_result.items:

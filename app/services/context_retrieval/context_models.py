@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from retrieval.models import StudentRetrievalContext
 from retrieval.pattern_intelligence import DoubtPatternContext
-from tools.web_search.models import FreshEvidenceBundle
+from tools.web_search.models import MAX_FRESH_EVIDENCE_ITEMS, FreshEvidenceBundle
 
 ContextSourceType = Literal["bedrock_kb", "none"]
 PatternHintStrength = Literal["weak", "medium", "strong"]
@@ -63,7 +63,7 @@ class ContextRetrievalRequest(BaseModel):
     web_search_reason: str | None = Field(default=None, max_length=64)
     web_search_query: str | None = Field(default=None, max_length=256)
     requires_fresh_evidence: bool = False
-    required_evidence_count: int = Field(default=0, ge=0, le=20)
+    required_evidence_count: int = Field(default=0, ge=0, le=MAX_FRESH_EVIDENCE_ITEMS)
 
     model_config = {"str_strip_whitespace": True}
 
@@ -110,6 +110,6 @@ class ContextRetrievalResult(BaseModel):
     web_search_status: str = Field(default="skipped", max_length=32)
     web_search_provider: str = Field(default="", max_length=64)
     web_context_chars: int = Field(default=0, ge=0, le=8000)
-    web_result_count: int = Field(default=0, ge=0, le=20)
-    web_citation_count: int = Field(default=0, ge=0, le=20)
+    web_result_count: int = Field(default=0, ge=0, le=MAX_FRESH_EVIDENCE_ITEMS)
+    web_citation_count: int = Field(default=0, ge=0, le=MAX_FRESH_EVIDENCE_ITEMS)
     fresh_evidence: FreshEvidenceBundle | None = Field(default=None, exclude=True)

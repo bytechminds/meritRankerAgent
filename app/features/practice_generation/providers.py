@@ -123,6 +123,7 @@ def _fresh_evidence_payload(
     if not request.requires_fresh_evidence or request.fresh_evidence is None:
         return None
     items = request.fresh_evidence.items
+    evidence_by_slot: list[dict[str, object]] = []
     if slot_ids:
         selected = []
         for slot_id in slot_ids:
@@ -131,12 +132,22 @@ def _fresh_evidence_payload(
             except ValueError:
                 continue
             if 0 <= index < len(items):
-                selected.append(items[index])
+                evidence_item = items[index]
+                selected.append(evidence_item)
+                evidence_by_slot.append(
+                    {
+                        "slot_id": slot_id,
+                        "items": [evidence_item.model_dump(mode="json")],
+                    }
+                )
         items = selected
-    return {
+    payload: dict[str, object] = {
         "requested_window": request.fresh_evidence.requested_window.model_dump(mode="json"),
         "items": [item.model_dump(mode="json") for item in items],
     }
+    if evidence_by_slot:
+        payload["evidence_by_slot"] = evidence_by_slot
+    return payload
 
 
 def _enforce_evidence_citations(

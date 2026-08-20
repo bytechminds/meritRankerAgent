@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from practice_limits import MAX_PRACTICE_QUESTIONS
+
 SourceQuality = Literal["trusted", "reputed", "exam_prep", "generic", "blocked"]
 SearchAttemptKind = Literal[
     "authoritative",
@@ -14,6 +16,16 @@ SearchAttemptKind = Literal[
     "generic_fallback",
 ]
 ContextStrength = Literal["authoritative", "mixed", "supporting_only", "weak"]
+TemporalMode = Literal[
+    "CURRENT",
+    "LATEST",
+    "RECENT",
+    "EXPLICIT_YEAR",
+    "EXPLICIT_MONTH",
+    "EXPLICIT_DATE_RANGE",
+]
+
+MAX_FRESH_EVIDENCE_ITEMS = MAX_PRACTICE_QUESTIONS
 
 
 class WebSearchRequest(BaseModel):
@@ -27,7 +39,7 @@ class WebSearchRequest(BaseModel):
     retrieval_tags: list[str] = Field(default_factory=list, max_length=12)
     web_search_reason: str | None = Field(default=None, max_length=64)
     requires_fresh_evidence: bool = False
-    required_evidence_count: int = Field(default=0, ge=0, le=20)
+    required_evidence_count: int = Field(default=0, ge=0, le=MAX_FRESH_EVIDENCE_ITEMS)
     timeout_seconds: float = Field(default=8.0, ge=1.0, le=30.0)
 
     model_config = {"str_strip_whitespace": True}
@@ -73,6 +85,7 @@ class FreshnessWindow(BaseModel):
     start_date: str | None = Field(default=None, max_length=16)
     end_date: str | None = Field(default=None, max_length=16)
     source: Literal["default", "user_explicit", "none"] = "none"
+    temporal_mode: TemporalMode = "CURRENT"
     label: str = Field(default="", max_length=64)
 
     model_config = {"str_strip_whitespace": True, "frozen": True}
@@ -84,7 +97,10 @@ class FreshEvidenceBundle(BaseModel):
     requested_window: FreshnessWindow
     retrieved_at: str = Field(min_length=1, max_length=64)
     search_query: str = Field(min_length=1, max_length=500)
-    items: list[WebSearchItem] = Field(default_factory=list, max_length=20)
+    items: list[WebSearchItem] = Field(
+        default_factory=list,
+        max_length=MAX_FRESH_EVIDENCE_ITEMS,
+    )
 
     model_config = {"str_strip_whitespace": True, "frozen": True}
 
@@ -92,7 +108,10 @@ class FreshEvidenceBundle(BaseModel):
 class WebSearchProviderResult(BaseModel):
     """Provider adapter output."""
 
-    items: list[WebSearchItem] = Field(default_factory=list, max_length=20)
+    items: list[WebSearchItem] = Field(
+        default_factory=list,
+        max_length=MAX_FRESH_EVIDENCE_ITEMS,
+    )
     provider: str = Field(default="", max_length=64)
     attempt: SearchAttemptKind = "authoritative"
     error_kind: str | None = Field(default=None, max_length=64)
@@ -104,7 +123,10 @@ class WebSearchResult(BaseModel):
     used: bool = False
     provider: str = Field(default="", max_length=64)
     query: str = Field(default="", max_length=500)
-    items: list[WebSearchItem] = Field(default_factory=list, max_length=20)
+    items: list[WebSearchItem] = Field(
+        default_factory=list,
+        max_length=MAX_FRESH_EVIDENCE_ITEMS,
+    )
     context_text: str = Field(default="", max_length=8000)
     reason: str = Field(default="", max_length=128)
     error_kind: str | None = Field(default=None, max_length=64)
@@ -118,6 +140,14 @@ class WebSearchResult(BaseModel):
     official_count: int = Field(default=0, ge=0, le=20)
     reputable_count: int = Field(default=0, ge=0, le=20)
     duration_ms: int = Field(default=0, ge=0)
+    freshness_required: bool = False
+    freshness_start_date: str | None = Field(default=None, max_length=16)
+    freshness_end_date: str | None = Field(default=None, max_length=16)
+    temporal_mode: TemporalMode | None = None
+    stale_results_rejected: int = Field(default=0, ge=0)
+    eligible_evidence_count: int = Field(default=0, ge=0, le=MAX_FRESH_EVIDENCE_ITEMS)
+    evidence_date_min: str | None = Field(default=None, max_length=16)
+    evidence_date_max: str | None = Field(default=None, max_length=16)
     fresh_evidence: FreshEvidenceBundle | None = None
 
     model_config = {"str_strip_whitespace": True}

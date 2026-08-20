@@ -181,11 +181,13 @@ def test_default_and_explicit_month_windows_are_deterministic(monkeypatch) -> No
         "2026-08-14",
         "default",
     )
+    assert current.temporal_mode == "LATEST"
     assert (august.start_date, august.end_date, august.freshness_source) == (
         "2026-08-01",
         "2026-08-31",
         "user_explicit",
     )
+    assert august.temporal_mode == "EXPLICIT_MONTH"
 
 
 def test_current_affairs_graph_attaches_fresh_evidence_before_async_launch(monkeypatch) -> None:
@@ -275,7 +277,7 @@ def test_static_practice_bypasses_fresh_evidence_collection(monkeypatch) -> None
     assert result["practice_test_id"] == "practice-fresh"
 
 
-def test_fresh_practice_over_evidence_limit_does_not_search_or_launch(monkeypatch) -> None:
+def test_invalid_fresh_practice_count_does_not_search_or_launch(monkeypatch) -> None:
     monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "true")
     monkeypatch.setattr(
         "services.context_retrieval.context_retrieval_service.ContextRequestBuilder.from_query_and_classification",
@@ -284,7 +286,7 @@ def test_fresh_practice_over_evidence_limit_does_not_search_or_launch(monkeypatc
         ),
     )
     launched: list[object] = []
-    query = "Create 21 current affairs questions for SSC GD"
+    query = "Create 101 current affairs questions for SSC GD"
 
     result = build_orchestrated_doubt_solver_graph(
         _NoAnswerAdapter(),
@@ -339,12 +341,44 @@ def test_historical_current_affairs_window_and_evidence_filter_are_preserved() -
                 snippet="A duplicate source URL that must not be counted twice for evidence.",
                 published_at="2024-06-01",
             ),
+            WebSearchItem(
+                title="Undated event",
+                url="https://pib.gov.in/undated-event",
+                snippet="A result without a source publication date cannot prove freshness.",
+            ),
         ],
     )
 
     assert bundle.requested_window.start_date == "2024-01-01"
     assert bundle.requested_window.end_date == "2024-12-31"
     assert [item.url for item in bundle.items] == ["https://pib.gov.in/2024-event"]
+
+
+def test_hundred_current_affairs_slots_accept_a_complete_mock_evidence_bundle() -> None:
+    query = "Create 100 latest current affairs questions for SSC GD"
+    request = resolve_practice_request(
+        request_id="request-fresh-100",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+        query=query,
+        subject="general",
+        topic="current_affairs",
+        difficulty="intermediate",
+        language="english",
+        exam_id="SSC_GD",
+        exam_stage=None,
+        freshness_requirement=resolve_practice_freshness_requirement(
+            query,
+            {"intent": "practice", "web_search_reason": "current_affairs"},
+        ),
+        fresh_evidence=_evidence(100),
+    )
+
+    assert request.requested_count == 100
+    assert request.accepted_count == 100
+    assert request.fresh_evidence is not None
+    assert len(request.fresh_evidence.items) == 100
 
 
 def test_fresh_evidence_survives_practice_request_reconstruction() -> None:
@@ -517,4 +551,11 @@ def test_generator_uses_only_slot_relevant_fresh_evidence() -> None:
     assert [item["url"] for item in payload["fresh_evidence"]["items"]] == [
         "https://pib.gov.in/release-1",
         "https://pib.gov.in/release-2",
+    ]
+    assert [
+        (entry["slot_id"], entry["items"][0]["url"])
+        for entry in payload["fresh_evidence"]["evidence_by_slot"]
+    ] == [
+        ("slot-001", "https://pib.gov.in/release-1"),
+        ("slot-002", "https://pib.gov.in/release-2"),
     ]

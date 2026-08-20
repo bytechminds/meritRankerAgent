@@ -82,6 +82,7 @@ def validate_persisted_playable_question(
     expected_question_type: str,
     expected_language: str,
     solution_required: bool,
+    expected_storage_language: str | None = None,
 ) -> PlayableQuestionValidation:
     """Cross-check a stored Question record before it is delivered or made READY."""
     meta = item.get("_practiceMeta")
@@ -92,6 +93,12 @@ def validate_persisted_playable_question(
         return PlayableQuestionValidation(False, "RENDERER_CONTRACT_INVALID")
     if str(meta.get("language") or "").casefold() != expected_language.casefold():
         return PlayableQuestionValidation(False, "QUESTION_LANGUAGE_INVALID")
+    if (
+        expected_storage_language is not None
+        and str(item.get("language") or "").casefold()
+        != expected_storage_language.casefold()
+    ):
+        return PlayableQuestionValidation(False, "QUESTION_LANGUAGE_STORAGE_INVALID")
     raw_answers = item.get("answers")
     try:
         answers = json.loads(raw_answers) if isinstance(raw_answers, str) else raw_answers

@@ -110,6 +110,9 @@ class PatternRuntimeRequest(BaseModel):
         max_length=256,
     )
     candidate_limit: int = Field(default=12, ge=1, le=24, alias="candidateLimit")
+    # One demand group may need several directly reusable questions. The default of
+    # one preserves the original single-reuse contract for every existing caller.
+    reuse_target: int = Field(default=1, ge=1, le=100, alias="reuseTarget")
     max_linked_questions: int = Field(
         default=1,
         ge=0,
@@ -407,13 +410,20 @@ class PatternRuntimeResult(BaseModel):
         alias="generationContext",
     )
     doubt_context: DoubtPatternContext | None = Field(default=None, alias="doubtContext")
-    reuse_question: CanonicalPlayableQuestion | None = Field(
-        default=None,
-        alias="reuseQuestion",
+    reuse_questions: tuple[CanonicalPlayableQuestion, ...] = Field(
+        default_factory=tuple,
+        alias="reuseQuestions",
+        max_length=100,
     )
     decisions: tuple[PatternMatchDecision, ...] = Field(default_factory=tuple, max_length=24)
     warnings: tuple[str, ...] = Field(default_factory=tuple, max_length=8)
     rerank_used: bool = Field(default=False, alias="rerankUsed")
+    candidate_expansion_used: bool = Field(default=False, alias="candidateExpansionUsed")
+
+    @property
+    def reuse_question(self) -> CanonicalPlayableQuestion | None:
+        """Keep the original single-reuse read contract available to callers."""
+        return self.reuse_questions[0] if self.reuse_questions else None
 
 
 @dataclass(slots=True)
@@ -422,6 +432,12 @@ class PatternRuntimeMemo:
 
     candidate_ids: dict[tuple[str, str, int], tuple[str, ...]] = field(default_factory=dict)
     candidate_versions: dict[tuple[str, str, int], dict[str, str]] = field(
+        default_factory=dict
+    )
+    # Diagnostics only: raw vector-search yield before the confidence floor, and
+    # its top score, so callers can distinguish "nothing indexed" from "indexed
+    # but below threshold" without changing what is selected or hydrated.
+    raw_candidate_stats: dict[tuple[str, str, int], tuple[int, float | None]] = field(
         default_factory=dict
     )
     patterns: dict[str, CanonicalPatternRecord | None] = field(default_factory=dict)

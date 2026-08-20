@@ -584,3 +584,479 @@ def test_doubt_references_are_bounded_and_colbert_fallback_keeps_safe_references
     assert reranker.calls == [["question-1", "question-2", "question-3", "question-4"]]
     assert result.rerank_used is False
     assert result.warnings == ("colbert_timeout",)
+
+
+class _PatternScopedQuestionStore:
+    """Return only the questions actually linked to the requested Pattern."""
+
+    def __init__(self, questions: Sequence[Mapping[str, Any]]) -> None:
+        self._questions = questions
+        self.calls: list[tuple[str, int]] = []
+
+    def list_by_pattern_id(
+        self,
+        *,
+        pattern_id: str,
+        limit: int,
+    ) -> Sequence[Mapping[str, Any]]:
+        self.calls.append((pattern_id, limit))
+        return [
+            question
+            for question in self._questions
+            if question["patternId"] == pattern_id
+        ][:limit]
+
+
+class _WindowedFinder:
+    """Return a wider candidate list only when a wider window is requested."""
+
+    def __init__(self, windows: Mapping[int, Sequence[VectorPatternCandidate]]) -> None:
+        self._windows = windows
+        self.calls: list[int] = []
+
+    def find_candidates(
+        self,
+        *,
+        query: str,
+        subject: str | None,
+        limit: int,
+    ) -> Sequence[VectorPatternCandidate]:
+        del query, subject
+        self.calls.append(limit)
+        return self._windows.get(limit, ())
+
+
+def _linked_question(pattern_id: str, index: int) -> dict[str, Any]:
+    question = _playable_question(index)
+    question["qbId"] = f"{pattern_id}-question-{index}"
+    question["patternId"] = pattern_id
+    return question
+
+
+def _reuse_service(
+    *,
+    patterns: Mapping[str, Mapping[str, Any]],
+    questions: Sequence[Mapping[str, Any]],
+    finder: Any = None,
+) -> tuple[PatternRuntimeService, _PatternScopedQuestionStore]:
+    store = _PatternScopedQuestionStore(questions)
+    service = PatternRuntimeService(
+        vector_finder=finder
+        or _Finder([_candidate(pattern_id, 0.90) for pattern_id in patterns]),
+        pattern_store=_PatternStore(dict(patterns)),
+        playable_question_store=store,
+        reuse_enabled=True,
+    )
+    return service, store
+
+
+def _reuse_request(target: int, **overrides: Any) -> PatternRuntimeRequest:
+    return _request(
+        language="english",
+        studentHistoryChecked=True,
+        reuseTarget=target,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "available", "expected"),
+    [(1, 1, 1), (5, 5, 5), (8, 5, 5)],
+)
+def test_multi_slot_reuse_allocates_up_to_the_demand_without_overfilling(
+    target: int,
+    available: int,
+    expected: int,
+) -> None:
+    service, _ = _reuse_service(
+        patterns={"pattern-1": _pattern("pattern-1")},
+        questions=[_linked_question("pattern-1", index) for index in range(1, available + 1)],
+    )
+
+    result = service.resolve_practice(_reuse_request(target))
+
+    assert result.tier is PatternMatchTier.REUSE_SAFE
+    assert len(result.reuse_questions) == expected
+    assert len({question.question_id for question in result.reuse_questions}) == expected
+
+
+def test_reuse_spans_multiple_compatible_patterns_but_never_exceeds_demand() -> None:
+    service, store = _reuse_service(
+        patterns={
+            "pattern-1": _pattern("pattern-1"),
+            "pattern-2": _pattern("pattern-2"),
+        },
+        questions=[
+            _linked_question(pattern_id, index)
+            for pattern_id in ("pattern-1", "pattern-2")
+            for index in range(1, 6)
+        ],
+    )
+
+    result = service.resolve_practice(_reuse_request(8))
+
+    assert len(result.reuse_questions) == 8
+    assert len({question.question_id for question in result.reuse_questions}) == 8
+    assert [call[0] for call in store.calls] == ["pattern-1", "pattern-2"]
+
+
+def test_attempted_linked_questions_are_never_directly_reused() -> None:
+    service, _ = _reuse_service(
+        patterns={"pattern-1": _pattern("pattern-1")},
+        questions=[_linked_question("pattern-1", index) for index in range(1, 6)],
+    )
+
+    result = service.resolve_practice(
+        _reuse_request(
+            8,
+            seenQuestionIds=["pattern-1-question-2", "pattern-1-question-4"],
+        )
+    )
+
+    reused = {question.question_id for question in result.reuse_questions}
+    assert reused == {
+        "pattern-1-question-1",
+        "pattern-1-question-3",
+        "pattern-1-question-5",
+    }
+
+
+def test_guidance_only_runtime_never_returns_reuse_questions() -> None:
+    store = _PatternScopedQuestionStore([_linked_question("pattern-1", 1)])
+    service = PatternRuntimeService(
+        vector_finder=_Finder([_candidate("pattern-1", 0.90)]),
+        pattern_store=_PatternStore({"pattern-1": _pattern("pattern-1")}),
+        playable_question_store=store,
+        reuse_enabled=False,
+    )
+
+    result = service.resolve_practice(_reuse_request(8))
+
+    assert result.tier is PatternMatchTier.GUIDANCE_SAFE
+    assert result.reuse_questions == ()
+    assert store.calls == []
+
+
+def test_sufficient_initial_candidate_window_performs_no_expansion() -> None:
+    finder = _WindowedFinder({12: [_candidate("pattern-1", 0.90)]})
+    service, _ = _reuse_service(
+        patterns={"pattern-1": _pattern("pattern-1")},
+        questions=[_linked_question("pattern-1", index) for index in range(1, 4)],
+        finder=finder,
+    )
+
+    result = service.resolve_practice(_reuse_request(3))
+
+    assert len(result.reuse_questions) == 3
+    assert result.candidate_expansion_used is False
+    assert finder.calls == [12]
+
+
+def test_insufficient_window_triggers_exactly_one_bounded_expansion() -> None:
+    finder = _WindowedFinder(
+        {
+            12: [_candidate("pattern-1", 0.90)],
+            24: [_candidate("pattern-1", 0.90), _candidate("pattern-2", 0.90)],
+        }
+    )
+    service, store = _reuse_service(
+        patterns={
+            "pattern-1": _pattern("pattern-1"),
+            "pattern-2": _pattern("pattern-2"),
+        },
+        questions=[
+            _linked_question(pattern_id, index)
+            for pattern_id in ("pattern-1", "pattern-2")
+            for index in range(1, 4)
+        ],
+        finder=finder,
+    )
+
+    result = service.resolve_practice(_reuse_request(6))
+
+    assert finder.calls == [12, 24]
+    assert result.candidate_expansion_used is True
+    assert len(result.reuse_questions) == 6
+    # The already-evaluated Pattern is never hydrated or probed a second time.
+    assert [call[0] for call in store.calls] == ["pattern-1", "pattern-2"]
+
+
+def test_expansion_that_stays_insufficient_stops_searching() -> None:
+    finder = _WindowedFinder(
+        {
+            12: [_candidate("pattern-1", 0.90)],
+            24: [_candidate("pattern-1", 0.90)],
+        }
+    )
+    service, _ = _reuse_service(
+        patterns={"pattern-1": _pattern("pattern-1")},
+        questions=[_linked_question("pattern-1", 1)],
+        finder=finder,
+    )
+
+    result = service.resolve_practice(_reuse_request(6))
+
+    assert finder.calls == [12, 24]
+    assert len(result.reuse_questions) == 1
+    assert result.tier is PatternMatchTier.REUSE_SAFE
+
+
+def test_expansion_candidates_below_the_score_floor_are_still_rejected() -> None:
+    finder = _WindowedFinder(
+        {
+            12: [_candidate("pattern-1", 0.90)],
+            24: [_candidate("pattern-1", 0.90), _candidate("pattern-2", 0.10)],
+        }
+    )
+    service, store = _reuse_service(
+        patterns={
+            "pattern-1": _pattern("pattern-1"),
+            "pattern-2": _pattern("pattern-2"),
+        },
+        questions=[
+            _linked_question("pattern-1", 1),
+            *[_linked_question("pattern-2", index) for index in range(1, 6)],
+        ],
+        finder=finder,
+    )
+
+    result = service.resolve_practice(_reuse_request(6))
+
+    assert result.candidate_expansion_used is True
+    assert [question.question_id for question in result.reuse_questions] == [
+        "pattern-1-question-1"
+    ]
+    assert [call[0] for call in store.calls] == ["pattern-1"]
+
+
+def test_guidance_only_practice_never_triggers_candidate_expansion() -> None:
+    finder = _WindowedFinder({12: [_candidate("pattern-1", 0.90)]})
+    service = PatternRuntimeService(
+        vector_finder=finder,
+        pattern_store=_PatternStore({"pattern-1": _pattern("pattern-1")}),
+        reuse_enabled=False,
+    )
+
+    result = service.resolve_practice(_reuse_request(8))
+
+    assert finder.calls == [12]
+    assert result.candidate_expansion_used is False
+
+
+def test_doubt_resolution_never_expands_or_multi_reuses() -> None:
+    finder = _WindowedFinder({12: [_candidate("pattern-1", 0.90)]})
+    service, _ = _reuse_service(
+        patterns={"pattern-1": _pattern("pattern-1")},
+        questions=[_linked_question("pattern-1", index) for index in range(1, 6)],
+        finder=finder,
+    )
+
+    result = service.resolve_doubt(_reuse_request(8))
+
+    assert finder.calls == [12]
+    assert result.candidate_expansion_used is False
+    assert result.reuse_questions == ()
+    assert result.tier is PatternMatchTier.GUIDANCE_SAFE
+
+
+def _many_pattern_service(
+    *,
+    pattern_count: int,
+    questions_per_pattern: int,
+) -> tuple[PatternRuntimeService, _PatternScopedQuestionStore]:
+    pattern_ids = [f"pattern-{index}" for index in range(1, pattern_count + 1)]
+    return _reuse_service(
+        patterns={pattern_id: _pattern(pattern_id) for pattern_id in pattern_ids},
+        questions=[
+            _linked_question(pattern_id, index)
+            for pattern_id in pattern_ids
+            for index in range(1, questions_per_pattern + 1)
+        ],
+        finder=_Finder([_candidate(pattern_id, 0.90) for pattern_id in pattern_ids]),
+    )
+
+
+def test_reuse_stops_as_soon_as_the_demand_is_satisfied() -> None:
+    """A: 8 demanded, first two Patterns supply 5 + 3 — probing stops at two."""
+    service, store = _many_pattern_service(pattern_count=8, questions_per_pattern=5)
+
+    result = service.resolve_practice(_reuse_request(8))
+
+    assert len(result.reuse_questions) == 8
+    assert [call[0] for call in store.calls] == ["pattern-1", "pattern-2"]
+
+
+def test_full_yield_patterns_satisfy_a_twenty_slot_demand_exactly() -> None:
+    """B: 20 demanded, four Patterns supply 5 each — four probes, then stop."""
+    service, store = _many_pattern_service(pattern_count=8, questions_per_pattern=5)
+
+    result = service.resolve_practice(_reuse_request(20))
+
+    assert len(result.reuse_questions) == 20
+    assert len(store.calls) == 4
+
+
+def test_low_yield_patterns_are_all_probed_instead_of_being_capped() -> None:
+    """C: 20 demanded, twelve Patterns supply 1 each — probe all 12, deficit 8."""
+    service, store = _many_pattern_service(pattern_count=12, questions_per_pattern=1)
+
+    result = service.resolve_practice(_reuse_request(20))
+
+    assert len(store.calls) == 12
+    assert len(result.reuse_questions) == 12
+    assert 20 - len(result.reuse_questions) == 8
+
+
+def test_probing_halts_the_moment_the_demand_is_met_in_a_large_pool() -> None:
+    """D: pool larger than the demand must not be probed past satisfaction."""
+    service, store = _many_pattern_service(pattern_count=24, questions_per_pattern=1)
+
+    result = service.resolve_practice(_reuse_request(20, candidateLimit=24))
+
+    assert len(result.reuse_questions) == 20
+    assert len(store.calls) == 20
+
+
+def test_exhausted_candidate_pool_leaves_the_exact_remaining_deficit() -> None:
+    """E: fewer eligible questions than demanded — the shortfall is exact."""
+    service, store = _many_pattern_service(pattern_count=3, questions_per_pattern=2)
+
+    result = service.resolve_practice(_reuse_request(20))
+
+    assert len(store.calls) == 3
+    assert len(result.reuse_questions) == 6
+    assert 20 - len(result.reuse_questions) == 14
+
+
+def test_repeated_candidate_ids_never_cause_a_duplicate_questionbank_lookup() -> None:
+    """F: the expanded window repeats earlier IDs; each Pattern is probed once."""
+    pattern_ids = [f"pattern-{index}" for index in range(1, 5)]
+    finder = _WindowedFinder(
+        {
+            12: [_candidate(pattern_id, 0.90) for pattern_id in pattern_ids[:2]],
+            24: [_candidate(pattern_id, 0.90) for pattern_id in pattern_ids],
+        }
+    )
+    service, store = _reuse_service(
+        patterns={pattern_id: _pattern(pattern_id) for pattern_id in pattern_ids},
+        questions=[_linked_question(pattern_id, 1) for pattern_id in pattern_ids],
+        finder=finder,
+    )
+
+    result = service.resolve_practice(_reuse_request(20))
+
+    probed = [call[0] for call in store.calls]
+    assert finder.calls == [12, 24]
+    assert probed == pattern_ids
+    assert len(probed) == len(set(probed))
+    assert len(result.reuse_questions) == 4
+
+
+def test_hard_candidate_maximum_stops_safely_and_defers_the_rest() -> None:
+    """G: at the canonical hard candidate maximum no expansion is possible."""
+    service, store = _many_pattern_service(pattern_count=30, questions_per_pattern=1)
+
+    result = service.resolve_practice(_reuse_request(50, candidateLimit=24))
+
+    assert len(store.calls) == 24
+    assert len(result.reuse_questions) == 24
+    assert result.candidate_expansion_used is False
+    assert 50 - len(result.reuse_questions) == 26
+
+
+def _windowed_reuse_service(
+    *,
+    initial: Sequence[str],
+    expanded: Sequence[str],
+    questions_per_pattern: int = 1,
+) -> tuple[PatternRuntimeService, _PatternScopedQuestionStore, _WindowedFinder]:
+    pattern_ids = list(dict.fromkeys((*initial, *expanded)))
+    finder = _WindowedFinder(
+        {
+            12: [_candidate(pattern_id, 0.90) for pattern_id in initial],
+            24: [_candidate(pattern_id, 0.90) for pattern_id in expanded],
+        }
+    )
+    service, store = _reuse_service(
+        patterns={pattern_id: _pattern(pattern_id) for pattern_id in pattern_ids},
+        questions=[
+            _linked_question(pattern_id, index)
+            for pattern_id in pattern_ids
+            for index in range(1, questions_per_pattern + 1)
+        ],
+        finder=finder,
+    )
+    return service, store, finder
+
+
+def test_overlapping_expansion_window_is_deduplicated_before_evaluation() -> None:
+    """1: the widened window repeats the initial IDs; each is evaluated once."""
+    initial = [f"pattern-{index}" for index in range(1, 13)]
+    expanded = [*initial, "pattern-13", "pattern-14"]
+    service, store, finder = _windowed_reuse_service(initial=initial, expanded=expanded)
+
+    result = service.resolve_practice(_reuse_request(50))
+
+    probed = [call[0] for call in store.calls]
+    assert finder.calls == [12, 24]
+    assert probed == expanded
+    assert len(probed) == len(set(probed))
+    assert len(result.decisions) == len(set(expanded))
+
+
+def test_disjoint_expansion_never_exceeds_the_canonical_candidate_maximum() -> None:
+    """2: 12 initial + 24 wholly different IDs must still evaluate at most 24."""
+    initial = [f"pattern-{index}" for index in range(1, 13)]
+    expanded = [f"pattern-{index}" for index in range(13, 37)]
+    service, store, finder = _windowed_reuse_service(initial=initial, expanded=expanded)
+
+    result = service.resolve_practice(_reuse_request(50))
+
+    probed = [call[0] for call in store.calls]
+    assert finder.calls == [12, 24]
+    assert len(probed) == 24
+    assert len(probed) == len(set(probed))
+    assert len(result.decisions) == 24
+    assert probed[:12] == initial
+    # Only the highest-ranked new candidates that fit the remaining budget.
+    assert probed[12:] == expanded[:12]
+
+
+def test_satisfied_demand_stops_before_the_candidate_maximum() -> None:
+    """3: reuse_target met inside the initial window — no expansion at all."""
+    initial = [f"pattern-{index}" for index in range(1, 13)]
+    expanded = [f"pattern-{index}" for index in range(13, 37)]
+    service, store, finder = _windowed_reuse_service(initial=initial, expanded=expanded)
+
+    result = service.resolve_practice(_reuse_request(5))
+
+    assert finder.calls == [12]
+    assert len(store.calls) == 5
+    assert len(result.reuse_questions) == 5
+    assert result.candidate_expansion_used is False
+
+
+def test_candidate_maximum_reached_first_leaves_the_exact_deficit() -> None:
+    """4: the cumulative bound stops retrieval and the shortfall is exact."""
+    initial = [f"pattern-{index}" for index in range(1, 13)]
+    expanded = [f"pattern-{index}" for index in range(13, 37)]
+    service, _, _ = _windowed_reuse_service(initial=initial, expanded=expanded)
+
+    result = service.resolve_practice(_reuse_request(50))
+
+    assert result.candidate_expansion_used is True
+    assert len(result.reuse_questions) == 24
+    assert 50 - len(result.reuse_questions) == 26
+
+
+def test_exhausted_candidate_budget_skips_the_expansion_query_entirely() -> None:
+    """A full initial window leaves no budget, so no second vector call is paid for."""
+    initial = [f"pattern-{index}" for index in range(1, 25)]
+    service, store, finder = _windowed_reuse_service(initial=initial, expanded=initial)
+
+    result = service.resolve_practice(_reuse_request(50, candidateLimit=24))
+
+    assert finder.calls == [24]
+    assert len(store.calls) == 24
+    assert result.candidate_expansion_used is False
+    assert len(result.decisions) == 24

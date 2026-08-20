@@ -8,7 +8,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
@@ -25,6 +25,8 @@ from features.practice_generation.schemas import (
     QuestionType,
     VerificationPolicy,
 )
+from practice_limits import MAX_PRACTICE_QUESTIONS
+from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
 from services.classification.web_search_demand import is_freshness_sensitive_query
 from services.llm.orchestration.errors import ProviderExecutionError
 from tools.web_search.models import FreshEvidenceBundle
@@ -67,9 +69,11 @@ _NON_ARTIFACT_OBJECT = re.compile(
     r"importance|schedule)\b",
     re.IGNORECASE,
 )
+_COUNT_UNIT = (
+    r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|quiz|practice|mock|test)"
+)
 _COUNT_PATTERN = re.compile(
-    r"\b(\d{1,3})\b(?:\s+\S+){0,3}\s+"
-    r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|quiz|practice|mock|test)\b",
+    r"(?<!\w)(-?\d{1,3})\b(?:-" + _COUNT_UNIT + r"\b|(?:\s+\S+){0,3}\s+" + _COUNT_UNIT + r"\b)",
     re.IGNORECASE,
 )
 _MIXED_DIFFICULTY_SIGNAL = re.compile(r"\b(?:mixed|mix)\b", re.IGNORECASE)
@@ -78,7 +82,12 @@ _EXPLICIT_DIFFICULTY_SIGNAL = re.compile(
     r"difficult|expert)\b",
     re.IGNORECASE,
 )
-_MAX_FRESH_EVIDENCE_ITEMS = 20
+_EXPLICIT_DELIVERY_LANGUAGE = re.compile(
+    r"(?:\b(?:in|into|using)\s+(?P<english>english|hindi|hinglish)\b|"
+    r"\b(?P<roman>english|hindi|hinglish)\s+(?:me|mein)\b|"
+    r"(?P<hindi>हिंदी|हिन्दी)\s*(?:में|मे))",
+    re.IGNORECASE,
+)
 _WORD_COUNTS = {
     "one": 1,
     "two": 2,
@@ -125,6 +134,12 @@ _DEFAULT_COUNTS = {
 }
 
 PRACTICE_ASYNC_NOT_CONFIGURED = "PRACTICE_AGENTCORE_ASYNC_NOT_CONFIGURED"
+
+
+class PracticeRequestCountError(ValueError):
+    """Raised when an explicit Practice request is outside the supported range."""
+
+    reason_code = "PRACTICE_REQUEST_COUNT_OUT_OF_RANGE"
 
 
 def practice_async_unavailable_message(language: str) -> str:
@@ -402,7 +417,7 @@ def resolve_practice_type(query: str) -> PracticeType:
 def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
     numeric = _COUNT_PATTERN.search(query)
     if numeric is not None:
-        return max(1, int(numeric.group(1)))
+        return int(numeric.group(1))
     normalized = query.casefold()
     for word, count in _WORD_COUNTS.items():
         artifact = (
@@ -422,15 +437,25 @@ def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
 
 
 def required_fresh_evidence_count(query: str) -> int:
-    """Return the bounded number of independent facts needed for a fresh Practice set."""
+    """Return the exact number of independently grounded fresh facts required."""
     practice_type = resolve_practice_type(query)
-    return min(resolve_requested_count(query, practice_type), _MAX_FRESH_EVIDENCE_ITEMS)
+    return resolve_requested_count(query, practice_type)
 
 
 def is_fresh_evidence_request_supported(query: str) -> bool:
-    """Fresh Practice cannot safely ground more facts than the evidence contract permits."""
+    """Only a valid Practice count may enter a freshness-required retrieval path."""
     practice_type = resolve_practice_type(query)
-    return resolve_requested_count(query, practice_type) <= _MAX_FRESH_EVIDENCE_ITEMS
+    count = resolve_requested_count(query, practice_type)
+    return 1 <= count <= MAX_PRACTICE_QUESTIONS
+
+
+def validate_practice_requested_count(query: str) -> int:
+    """Resolve and validate the single user-requested Practice count authority."""
+    practice_type = resolve_practice_type(query)
+    requested_count = resolve_requested_count(query, practice_type)
+    if not 1 <= requested_count <= MAX_PRACTICE_QUESTIONS:
+        raise PracticeRequestCountError(PracticeRequestCountError.reason_code)
+    return requested_count
 
 
 def resolve_practice_request(
@@ -452,8 +477,8 @@ def resolve_practice_request(
     fresh_evidence: FreshEvidenceBundle | None = None,
 ) -> PracticeGenerationRequest:
     practice_type = resolve_practice_type(query)
-    requested_count = resolve_requested_count(query, practice_type)
-    accepted_count = min(requested_count, 100)
+    requested_count = validate_practice_requested_count(query)
+    accepted_count = requested_count
     normalized_difficulty = {
         "basic": Difficulty.BASIC,
         "intermediate": Difficulty.INTERMEDIATE,
@@ -461,6 +486,10 @@ def resolve_practice_request(
     }.get(difficulty, Difficulty.INTERMEDIATE)
     display_topic = topic or subject.replace("_", " ").title()
     title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
+    resolved_language, language_source = resolve_practice_delivery_language(
+        query,
+        language,
+    )
     freshness_requirement = freshness_requirement or PracticeFreshnessRequirement()
     return PracticeGenerationRequest(
         request_id=request_id,
@@ -478,7 +507,8 @@ def resolve_practice_request(
         explicit_difficulty_requested=bool(
             _EXPLICIT_DIFFICULTY_SIGNAL.search(query)
         ),
-        language=language,
+        language=resolved_language,
+        language_source=language_source,
         exam_id=exam_id,
         exam_stage=exam_stage,
         exam_profile_id=exam_profile_id,
@@ -488,6 +518,22 @@ def resolve_practice_request(
         fresh_evidence=fresh_evidence,
         assessment_title=title,
     )
+
+
+def resolve_practice_delivery_language(
+    query: str,
+    requested_language: str,
+) -> tuple[CanonicalLanguage, Literal["REQUEST", "EXPLICIT_QUERY"]]:
+    """Give an unambiguous current practice-language command precedence."""
+    requested = normalize_question_language(requested_language)
+    explicit: CanonicalLanguage | None = None
+    for match in _EXPLICIT_DELIVERY_LANGUAGE.finditer(query):
+        raw = match.group("english") or match.group("roman") or match.group("hindi")
+        if raw:
+            explicit = normalize_question_language(raw)
+    if explicit is not None:
+        return explicit, "EXPLICIT_QUERY"
+    return requested, "REQUEST"
 
 
 def request_idempotency_key(request: PracticeGenerationRequest) -> str:

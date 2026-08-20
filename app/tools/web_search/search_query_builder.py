@@ -17,6 +17,10 @@ def build_scope_aware_search_query(
     query: str,
     web_search_query: str | None,
     scope_policy: SourceScopePolicy,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    temporal_mode: str | None = None,
 ) -> str:
     """Compose a provider search query from user text, scope, and exam context."""
     base = (web_search_query or query).strip()
@@ -47,6 +51,9 @@ def build_scope_aware_search_query(
     elif scope_policy.source_need == "official_exam_update":
         if scope_policy.exam_context:
             parts.append(f"{scope_policy.exam_context} official update")
+
+    if temporal_mode and start_date and end_date:
+        parts.append(f"{temporal_mode.lower()} coverage {start_date} to {end_date}")
 
     text = " ".join(part for part in parts if part).strip()
     return text[:500]

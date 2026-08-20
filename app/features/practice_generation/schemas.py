@@ -7,6 +7,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from practice_limits import (
+    MAX_PRACTICE_QUESTIONS,
+    PRACTICE_SLOT_ID_PATTERN,
+)
+from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
 from services.llm.orchestration.prompt_budget import PromptInputBudget
 from tools.web_search.models import FreshEvidenceBundle
 
@@ -81,14 +86,15 @@ class PracticeGenerationRequest(BaseModel):
     turn_id: str = Field(min_length=1, max_length=128)
     original_query: str = Field(min_length=1, max_length=5000)
     practice_type: PracticeType
-    requested_count: int = Field(ge=1)
-    accepted_count: int = Field(ge=1, le=100)
+    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     subject: str = Field(min_length=1, max_length=64)
     topic: str | None = Field(default=None, max_length=128)
     difficulty: Difficulty = Difficulty.INTERMEDIATE
     mixed_difficulty_requested: bool = False
     explicit_difficulty_requested: bool = False
-    language: Literal["english", "hinglish", "hindi"] = "english"
+    language: CanonicalLanguage = "english"
+    language_source: Literal["REQUEST", "EXPLICIT_QUERY"] = "REQUEST"
     exam_id: str | None = Field(default=None, max_length=128)
     exam_stage: str | None = Field(default=None, max_length=64)
     exam_profile_id: str | None = Field(default=None, max_length=160)
@@ -99,10 +105,15 @@ class PracticeGenerationRequest(BaseModel):
     include_solutions: bool = True
     assessment_title: str = Field(min_length=1, max_length=180)
 
+    @field_validator("language", mode="before")
+    @classmethod
+    def _normalize_language(cls, value: object) -> CanonicalLanguage:
+        return normalize_question_language(value)
+
     @model_validator(mode="after")
-    def _accepted_count_is_clamped(self) -> PracticeGenerationRequest:
-        if self.accepted_count != min(self.requested_count, 100):
-            raise ValueError("accepted_count must equal min(requested_count, 100)")
+    def _accepted_count_matches_requested_count(self) -> PracticeGenerationRequest:
+        if self.accepted_count != self.requested_count:
+            raise ValueError("accepted_count must equal requested_count")
         if self.requires_fresh_evidence:
             if not self.freshness_reason:
                 raise ValueError("freshness-required practice needs a reason")
@@ -123,7 +134,7 @@ class DemandBucket(BaseModel):
     topic: str = Field(min_length=1, max_length=128)
     difficulty: Difficulty
     question_type: QuestionType
-    required_count: int = Field(ge=1, le=100)
+    required_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     keywords: list[str] = Field(default_factory=list, max_length=8)
     question_intent: str = Field(min_length=1, max_length=240)
     excluded_variants: list[str] = Field(default_factory=list, max_length=8)
@@ -179,7 +190,7 @@ class PlannerSlot(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
 
-    slot_id: str = Field(pattern=r"^slot-(?:00[1-9]|0[1-9][0-9]|100)$")
+    slot_id: str = Field(pattern=PRACTICE_SLOT_ID_PATTERN)
     subject_id: str = Field(min_length=1, max_length=64)
     topic_id: str = Field(min_length=1, max_length=128)
     category_id: str = Field(min_length=1, max_length=128)
@@ -255,10 +266,16 @@ class PracticeBlueprint(BaseModel):
 
     schema_version: Literal["1", "2"] = "1"
     practice_type: PracticeType
-    accepted_count: int = Field(ge=1, le=100)
+    accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     planner_family: PlannerFamily | None = None
-    slots: list[PlannerSlot] = Field(default_factory=list, max_length=100)
-    buckets: list[DemandBucket] = Field(default_factory=list, max_length=100)
+    slots: list[PlannerSlot] = Field(
+        default_factory=list,
+        max_length=MAX_PRACTICE_QUESTIONS,
+    )
+    buckets: list[DemandBucket] = Field(
+        default_factory=list,
+        max_length=MAX_PRACTICE_QUESTIONS,
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -376,7 +393,7 @@ class GeneratedQuestion(BaseModel):
     bucket_id: str = Field(min_length=1, max_length=128)
     slot_id: str | None = Field(
         default=None,
-        pattern=r"^slot-(?:00[1-9]|0[1-9][0-9]|100)$",
+        pattern=PRACTICE_SLOT_ID_PATTERN,
     )
     question: str = Field(min_length=8, max_length=4000)
     question_type: QuestionType
@@ -434,13 +451,13 @@ class GeneratedQuestion(BaseModel):
 class AssessmentProgress(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    requested_count: int = Field(ge=1)
-    accepted_count: int = Field(ge=1, le=100)
-    reused_count: int = Field(default=0, ge=0, le=100)
-    generated_count: int = Field(default=0, ge=0, le=100)
-    verified_count: int = Field(default=0, ge=0, le=100)
+    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    reused_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
+    generated_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
+    verified_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
     failed_count: int = Field(default=0, ge=0)
-    ready_question_count: int = Field(default=0, ge=0, le=100)
+    ready_question_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
     progress_percent: int = Field(default=0, ge=0, le=100)
     phase: InternalPhase = InternalPhase.QUEUED
     playable: bool = False
@@ -463,8 +480,8 @@ class PracticeLaunchResult(BaseModel):
 
     test_id: str = Field(min_length=1, max_length=128)
     status: Literal["GENERATING", "READY", "FAILED"]
-    requested_count: int = Field(ge=1)
-    accepted_count: int = Field(ge=1, le=100)
+    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     count_clamped: bool
     progress_percent: int = Field(ge=0, le=100)
     playable: bool
@@ -491,8 +508,8 @@ class PracticeControlResult(BaseModel):
     status: Literal["GENERATING", "CANCEL_REQUESTED", "CANCELLED", "READY", "FAILED"]
     execution_id: str | None = Field(default=None, max_length=128)
     already_active: bool = False
-    ready_count: int = Field(default=0, ge=0, le=100)
-    requested_count: int = Field(default=0, ge=0, le=100)
+    ready_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
+    requested_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
 
 
 class PracticeLaunchDecision(BaseModel):

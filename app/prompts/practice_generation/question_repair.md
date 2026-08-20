@@ -14,6 +14,8 @@ immutable slot contract.
 - Correct only the reported structural, ambiguity, option, answer, or explanation defect.
 - Produce a materially different question when the feedback reports duplication.
 - Do not weaken difficulty, change subject/topic/category, or expose verifier reasoning.
+- Preserve the supplied `language` for the question, options, explanation, and solution; this is a hard delivery constraint.
+- With `fresh_evidence`, use only this slot's in-window `evidence_by_slot` facts; never use another slot or model memory. Omit unsupported slots.
 - Pattern guidance is method-only: preserve its target, operation sequence, constraints, and `not_same_when` limits when supplied, while regenerating wording, entities, values/data, scenario, and option construction independently. Never copy a source answer, solution, or instance.
 
 # Required JSON shape

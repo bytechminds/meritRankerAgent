@@ -293,6 +293,7 @@ class FakeQuestions:
         topic_pages: list[list[dict]] | None = None,
     ) -> None:
         self.assessments = assessments
+        self.promoted: list[dict] = []
         self.topic_pages = deepcopy(topic_pages)
         self.reusable_items = list(reusable_items or [])
         if self.topic_pages is not None:
@@ -435,6 +436,26 @@ class FakeQuestions:
             item["_practiceMeta"]["bucketId"] = bucket_id
             repaired += 1
         return repaired
+
+    def persist_verified_question(
+        self,
+        *,
+        test_id,
+        question,
+        slot,
+        language,
+        pattern_id=None,
+        pattern_version_hash=None,
+    ):
+        self.promoted.append(
+            {
+                "slotId": slot.slot_id,
+                "language": language,
+                "patternId": pattern_id,
+                "patternVersionHash": pattern_version_hash,
+            }
+        )
+        return f"qb-v2-{slot.slot_id}"
 
     def link_generated(
         self,
@@ -689,12 +710,14 @@ def build_orchestrator(
     reject_once: bool = False,
     verifier=None,
     pattern_context=None,
+    question_bank_promotion_enabled: bool = False,
 ):
     return PracticeGenerationOrchestrator(
         config=PracticeGenerationConfig(
             enabled=True,
             pattern_context_enabled=False,
             pattern_reuse_enabled=False,
+            question_bank_promotion_enabled=question_bank_promotion_enabled,
             assessment_table="assessment",
             question_table="question",
             question_bank_table="bank",
@@ -779,6 +802,7 @@ def run_job(
     topic_pages: list[list[dict]] | None = None,
     reject_once: bool = False,
     verifier=None,
+    question_bank_promotion_enabled: bool = False,
 ):
     request = make_request(count, full_mock=count >= 50)
     assessments = FakeAssessments(request)
@@ -799,6 +823,7 @@ def run_job(
         fail_item_retry_once=fail_item_retry_once,
         reject_once=reject_once,
         verifier=verifier,
+        question_bank_promotion_enabled=question_bank_promotion_enabled,
     )
     runner = PracticeGraphRunner(orchestrator)
     runner.process(PracticeGraphCommand(operation="plan_and_fill", test_id="test-1"))
@@ -1114,8 +1139,9 @@ def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
         "plannerPhase": "fallback",
         "schemaName": "PracticeBlueprint",
         "validationErrorCount": 1,
-        "fieldPaths": ["$"],
-        "errorTypes": ["ValueError"],
+        # Joined strings, not lists: the sanitizer collapses non-scalars to "list".
+        "fieldPaths": "$",
+        "errorTypes": "ValueError",
         "durationMs": 0,
     }
     assert "planner_fallback_failed" in [name for name, _details in emitted]
@@ -1475,3 +1501,180 @@ def test_repeated_hundred_question_reliability_3_runs() -> None:
         assert assessments.item["status"] == "READY"
         assert len(questions.linked) == 100
         assert len(assessments.item["meta"].encode("utf-8")) < 100_000
+
+
+def test_legacy_bucket_path_never_promotes_even_when_promotion_is_enabled() -> None:
+    """generate_group() has no planner slot and may only be STRUCTURAL-verified.
+
+    Promotion is reserved for the planner-slot path, which is always
+    MANDATORY / INDEPENDENT_MODEL_V2, so the legacy path must never write a
+    reusable QuestionBank row.
+    """
+    _, questions, _ = run_job(3, question_bank_promotion_enabled=True)
+
+    assert len(questions.linked) == 3
+    assert questions.promoted == []
+
+
+class _SlotCommitQuestions:
+    """Minimal question repository for the planner-slot commit path."""
+
+    def __init__(self) -> None:
+        self.promoted: list[dict] = []
+        self.linked: list[dict] = []
+
+    def list_linked(self, _test_id, *, limit=100):
+        return []
+
+    def persist_verified_question(
+        self, *, test_id, question, slot, language, pattern_id=None, pattern_version_hash=None
+    ):
+        self.promoted.append(
+            {"slotId": slot.slot_id, "patternId": pattern_id, "language": language}
+        )
+        return f"qb-v2-{slot.slot_id}"
+
+    def link_generated(self, *, test_id, question, source_question_bank_id=None, **_kwargs):
+        self.linked.append(
+            {"slotId": _kwargs.get("slot_id"), "sourceQuestionBankId": source_question_bank_id}
+        )
+        return True
+
+
+def _slot_commit_fixture(promotion_enabled: bool, *, selection=None):
+    from features.practice_generation.orchestration import (
+        _SlotGenerationContext,
+        _SlotGenerationOutcome,
+        _VerifiedSlotQuestion,
+    )
+    from features.practice_generation.schemas import (
+        DemandBucket,
+        GeneratedQuestion,
+        GenerationGroup,
+        PlannerSlot,
+        VerificationResult,
+    )
+
+    request = make_request(1)
+    assessments = FakeAssessments(request)
+    assessments.item["status"] = "GENERATING"
+    assessments.item["meta"] = json.dumps(
+        {"generationGroups": {"group-1": {"groupId": "group-1", "state": "RUNNING"}}}
+    )
+    questions = _SlotCommitQuestions()
+    orchestrator = build_orchestrator(
+        assessments, questions, question_bank_promotion_enabled=promotion_enabled
+    )
+    slot = PlannerSlot(
+        slot_id="slot-001",
+        subject_id="math",
+        topic_id="geometry",
+        category_id="geometry",
+        difficulty="basic",
+        complexity="low",
+        exam_ids=["CAT"],
+        question_type="mcq",
+        target_skill="triangle_angle_sum",
+        variation_hint="vary_angles",
+        generator_route_hint="math.generator.basic",
+    )
+    question = GeneratedQuestion(
+        generation_item_id="item-slot-001",
+        bucket_id="slot-bucket-001",
+        slot_id="slot-001",
+        question="Two angles of a triangle are 55 and 75 degrees. Find the third.",
+        question_type="mcq",
+        options=["40", "50", "60", "70"],
+        correct_answer="50",
+        solution="Angles of a triangle sum to 180 degrees.",
+        subject="math",
+        topic="geometry",
+        difficulty="basic",
+    )
+    bucket = DemandBucket(
+        bucket_id="slot-bucket-001",
+        subject="math",
+        topic="geometry",
+        difficulty="basic",
+        question_type="mcq",
+        required_count=1,
+        question_intent="Find an unknown interior angle.",
+        verification_policy="MANDATORY",
+    )
+    context = _SlotGenerationContext(
+        test_id="test-1",
+        request=request,
+        blueprint=None,
+        group=GenerationGroup(
+            group_id="group-1",
+            bucket_id="slot-bucket-001",
+            required_count=1,
+            slot_ids=["slot-001"],
+        ),
+        bucket=bucket,
+        slots=(slot,),
+        excluded_texts=(),
+        pattern_guidance_by_slot={},
+        pattern_selections_by_slot=({"slot-001": selection} if selection else {}),
+    )
+    outcome = _SlotGenerationOutcome(
+        context=context,
+        accepted=(
+            _VerifiedSlotQuestion(
+                slot=slot,
+                question=question,
+                verification=VerificationResult(
+                    generation_item_id="item-slot-001", approved=True, reason_code="OK"
+                ),
+            ),
+        ),
+        unresolved_slot_ids=(),
+        reason_codes=("VERIFIED",),
+        route_id="route-1",
+        model="model-1",
+        replacement_wave_count=0,
+    )
+    return orchestrator, questions, outcome
+
+
+def test_slot_path_promotes_with_pattern_reuse_off_and_no_pattern_selection() -> None:
+    orchestrator, questions, outcome = _slot_commit_fixture(True)
+
+    orchestrator._commit_slot_outcome(outcome)
+
+    assert len(questions.promoted) == 1
+    assert questions.promoted[0]["patternId"] is None
+    assert questions.linked[0]["sourceQuestionBankId"] == "qb-v2-slot-001"
+
+
+def test_slot_path_skips_promotion_while_the_flag_is_off() -> None:
+    orchestrator, questions, outcome = _slot_commit_fixture(False)
+
+    orchestrator._commit_slot_outcome(outcome)
+
+    assert questions.promoted == []
+    assert questions.linked[0]["sourceQuestionBankId"] is None
+
+
+def test_promotion_only_ever_covers_independently_accepted_questions() -> None:
+    """Promotion iterates outcome.accepted, which _execute_slot_group only fills
+    when verification binding, independent answer agreement, and approval all hold."""
+    import dataclasses
+
+    orchestrator, questions, outcome = _slot_commit_fixture(True)
+    empty = dataclasses.replace(outcome, accepted=(), unresolved_slot_ids=("slot-001",))
+
+    orchestrator._commit_slot_outcome(empty)
+
+    assert questions.promoted == []
+
+
+def test_terminal_verifier_rejection_promotes_nothing() -> None:
+    import dataclasses
+
+    orchestrator, questions, outcome = _slot_commit_fixture(True)
+    rejected = dataclasses.replace(outcome, terminal_rejection=True)
+
+    orchestrator._commit_slot_outcome(rejected)
+
+    assert questions.promoted == []

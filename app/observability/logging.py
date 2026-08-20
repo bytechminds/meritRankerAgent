@@ -129,6 +129,11 @@ def configure_logging(
         enabled=bool(file_enabled and selected_format == "pretty_and_json_file"),
         file_path=file_path,
         content_mode=local_log_content,
+        # DEBUG is the documented level control for detailed Practice diagnostics
+        # (skills/features/agent-observability.md); AGENT_DETAILED_LOGS remains a
+        # supported opt-in for the same detail at a higher level. Production keeps
+        # an INFO floor, so this can never turn the timeline on there.
+        detailed=detailed_logs or level <= logging.DEBUG,
     )
     if file_enabled and selected_format == "pretty_and_json_file":
         event_path = Path(file_path).with_name("agent-events.jsonl")

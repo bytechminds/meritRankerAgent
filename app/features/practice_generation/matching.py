@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -78,6 +79,200 @@ def build_reuse_difficulty_prefix(difficulty: object) -> str | None:
         "advanced": "hard",
     }.get(normalized or "")
     return f"v1#{backend_value}#" if backend_value else None
+
+
+QB_IDENTITY_NAMESPACE = "qbid-v2"
+QB_ID_PREFIX = "qb-v2-"
+
+
+def normalize_question_for_identity(value: str) -> str:
+    """Case/whitespace-only normalization: digits and symbols stay significant."""
+    return " ".join(value.casefold().split())
+
+
+def _identity_segment(value: str) -> str:
+    """Length-prefix a segment so a separator inside content cannot forge identity."""
+    normalized = normalize_question_for_identity(value)
+    return f"{len(normalized)}:{normalized}"
+
+
+def build_question_bank_id(
+    *,
+    subject: object,
+    difficulty: object,
+    exam_ids: object,
+    language: object,
+    question_type: str,
+    question: str,
+    options: tuple[str, ...],
+    correct_answer: str,
+) -> str | None:
+    """Derive the Pattern-independent identity of one reusable Question scope.
+
+    Identity is the strict compatibility scope that authorizes reuse plus the exact
+    playable content.  Including the strict dimensions keeps one immutable row per
+    scope, so a Question first accepted as ``basic``/``CAT`` never decides the
+    classification of an independently accepted ``intermediate``/``GMAT`` occurrence.
+    Topic, category, and concept are deliberately excluded: planner taxonomy wording
+    varies, and bridging that variance is questions-v1's job, not durable identity's.
+
+    Returns ``None`` when any strict dimension fails canonicalization, so an
+    unclassifiable Question is never promoted under a guessed identity.
+    """
+    canonical_subject = normalize_subject(subject)
+    canonical_difficulty = normalize_difficulty(difficulty)
+    canonical_exams = normalize_exam_ids(exam_ids)
+    canonical_language = normalize_language(language)
+    if (
+        canonical_subject is None
+        or canonical_difficulty is None
+        or canonical_exams is None
+        or canonical_language is None
+        or not question_type
+    ):
+        return None
+    segments = (
+        QB_IDENTITY_NAMESPACE,
+        question_type,
+        canonical_subject,
+        canonical_difficulty,
+        ",".join(canonical_exams),
+        canonical_language,
+        question,
+        str(len(options)),
+        *options,
+        correct_answer,
+    )
+    digest = hashlib.sha256(
+        "|".join(_identity_segment(segment) for segment in segments).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"{QB_ID_PREFIX}{digest}"
+
+
+QB_VERSION_NAMESPACE = "qbver-v1"
+
+
+def build_question_bank_version_hash(
+    *,
+    subject: object,
+    difficulty: object,
+    exam_ids: object,
+    language: object,
+    question_type: str,
+    topic: object,
+    category: object,
+    question: str,
+    options: tuple[str, ...],
+    correct_answer: str,
+    solution: str,
+) -> str | None:
+    """Digest the current authoritative version of one reusable Question.
+
+    Coverage is the union of three sets, which is what makes a stale questions-v1
+    entry fail parity: what Phase D will embed (subject, topic, category, stem,
+    options), what will become vector metadata (subject, difficulty, exam scope,
+    language), and what is served to the student (correct answer, solution).
+
+    Pattern linkage is excluded because it is neither embedded nor vector metadata
+    nor student-facing, so enrichment must not invalidate an otherwise current
+    vector.  ``patternFamilyId`` is excluded for the same reason: it gates reuse,
+    but it is re-checked live against the row at hydration, so parity adds nothing.
+    Identifiers, timestamps, derived reuse keys, and eligibility flags are excluded
+    as transient or independently validated.
+    """
+    canonical_subject = normalize_subject(subject)
+    canonical_difficulty = normalize_difficulty(difficulty)
+    canonical_exams = normalize_exam_ids(exam_ids)
+    canonical_language = normalize_language(language)
+    canonical_topic = normalize_topic(topic)
+    canonical_category = normalize_category(category)
+    if (
+        canonical_subject is None
+        or canonical_difficulty is None
+        or canonical_exams is None
+        or canonical_language is None
+        or canonical_topic is None
+        or canonical_category is None
+        or not question_type
+    ):
+        return None
+    segments = (
+        QB_VERSION_NAMESPACE,
+        question_type,
+        canonical_subject,
+        canonical_difficulty,
+        ",".join(canonical_exams),
+        canonical_language,
+        canonical_topic,
+        canonical_category,
+        question,
+        str(len(options)),
+        *options,
+        correct_answer,
+        solution,
+    )
+    return hashlib.sha256(
+        "|".join(_identity_segment(segment) for segment in segments).encode("utf-8")
+    ).hexdigest()
+
+
+def _item_options(item: dict[str, Any]) -> tuple[str, ...]:
+    raw_answers = item.get("answers")
+    if isinstance(raw_answers, str):
+        try:
+            raw_answers = json.loads(raw_answers)
+        except json.JSONDecodeError:
+            raw_answers = {}
+    values = raw_answers.get("options", []) if isinstance(raw_answers, dict) else []
+    return tuple(str(option).strip() for option in values if str(option).strip())
+
+
+def question_bank_version_hash_from_item(item: dict[str, Any]) -> str | None:
+    """Recompute the version hash from a stored row.
+
+    The writer and every future reader go through this one function, so a stored
+    ``versionHash`` is only ever advisory: an administrative edit that forgets to
+    refresh it still fails parity against an indexed vector.
+    """
+    meta = _parse_meta(item.get("meta"))
+    return build_question_bank_version_hash(
+        subject=meta.get("subject") or item.get("category"),
+        difficulty=item.get("difficulty"),
+        exam_ids=meta.get("examIds", []),
+        language=meta.get("language"),
+        question_type=str(meta.get("questionType") or "").casefold(),
+        topic=meta.get("topic"),
+        category=item.get("category"),
+        question=str(item.get("question") or ""),
+        options=_item_options(item),
+        correct_answer=str(item.get("correctAnswer") or ""),
+        solution=str(item.get("explanation") or ""),
+    )
+
+
+def question_bank_identity_is_intact(item: dict[str, Any]) -> bool:
+    """Recompute the identity of a versioned row and compare it to the stored id.
+
+    Rows created before this identity scheme cannot be recomputed, so legacy ids keep
+    their existing eligibility.  Versioned rows fail closed: an in-place edit of any
+    identity-bearing field leaves the stored id unreachable and the row unusable for
+    reuse rather than silently serving mutated content.
+    """
+    qb_id = str(item.get("qbId") or "").strip()
+    if not qb_id.startswith(QB_ID_PREFIX):
+        return True
+    meta = _parse_meta(item.get("meta"))
+    expected = build_question_bank_id(
+        subject=meta.get("subject") or item.get("category"),
+        difficulty=item.get("difficulty"),
+        exam_ids=meta.get("examIds", []),
+        language=meta.get("language"),
+        question_type=str(meta.get("questionType") or "").casefold(),
+        question=str(item.get("question") or ""),
+        options=_item_options(item),
+        correct_answer=str(item.get("correctAnswer") or ""),
+    )
+    return expected == qb_id
 
 
 def _parse_meta(value: Any) -> dict[str, Any]:
@@ -182,8 +377,8 @@ def shortlist_reuse_candidate_ids(
                 or meta.get("reusable") is not True
                 or meta.get("needsReview") is True
                 or str(meta.get("visibility") or "PLATFORM").upper() not in {"PLATFORM", "PUBLIC"}
-                or str(meta.get("language") or "english").casefold()
-                != requested_language.casefold()
+                or normalize_language(meta.get("language"))
+                != normalize_language(requested_language)
                 or str(meta.get("subject") or item.get("category") or "").casefold()
                 != bucket.subject.casefold()
                 or str(meta.get("topic") or "").casefold() != bucket.topic.casefold()
@@ -226,7 +421,7 @@ def reusable_question_from_item(
     visibility = str(meta.get("visibility", "PLATFORM")).upper()
     if visibility not in {"PLATFORM", "PUBLIC"}:
         return None
-    language = normalize_language(meta.get("language", "english"))
+    language = normalize_language(meta.get("language"))
     if language is None or language != normalize_language(requested_language):
         return None
     canonical = normalize_question_metadata(
@@ -235,7 +430,7 @@ def reusable_question_from_item(
         category=item.get("category"),
         difficulty=item.get("difficulty"),
         exam_ids=meta.get("examIds", []),
-        language=meta.get("language", "english"),
+        language=meta.get("language"),
         pattern_family_id=meta.get("patternFamilyId"),
     )
     exam_ids = normalize_exam_ids(meta.get("examIds", []))
@@ -278,6 +473,8 @@ def reusable_question_from_item(
         return None
     question_id = str(item.get("qbId") or "").strip()
     if not question_id:
+        return None
+    if not question_bank_identity_is_intact(item):
         return None
     return ReusableQuestion(
         question_id=question_id,

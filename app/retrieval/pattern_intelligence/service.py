@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from retrieval.gates.score_policy import is_strong_runtime_match
@@ -68,6 +69,24 @@ _SAFE_RAW_CONDITION = re.compile(r"^[A-Za-z][A-Za-z ,;:()'/-]{0,159}[.!?]?$"
 _SAFE_STRUCTURED_GRAPH_TOKEN = re.compile(
     r"^[A-Za-z][A-Za-z0-9 _./:+*^()%-]{0,95}$"
 )
+# Single owner of Pattern candidate breadth. Breadth may grow once when a demand
+# group cannot be satisfied; acceptance criteria never weaken to fill inventory.
+_CANDIDATE_EXPANSION_MULTIPLIER = 2
+_MAX_CANDIDATE_LIMIT = 24
+# The bounded QuestionBank page read per Pattern. It is a page ceiling, never a
+# guaranteed yield, so it must not be used to predict how many Patterns to probe.
+_MAX_QUESTIONS_PER_PATTERN = 5
+
+
+@dataclass(slots=True)
+class _CandidateScan:
+    """Accumulator shared by the initial and the one expanded candidate pass."""
+
+    reuse_excluded: set[str] = field(default_factory=set)
+    decisions: list[PatternMatchDecision] = field(default_factory=list)
+    reuse_questions: list[CanonicalPlayableQuestion] = field(default_factory=list)
+    evaluated_pattern_ids: set[str] = field(default_factory=set)
+    selected: CanonicalPatternRecord | None = None
 
 
 class PatternCompatibilityGuard:
@@ -178,64 +197,91 @@ class PatternRuntimeService:
             memo=memo,
             warnings=warnings,
         )
-        records = self._hydrate_patterns(candidate_ids=candidate_ids, memo=memo, warnings=warnings)
-        decisions: list[PatternMatchDecision] = []
-        selected: CanonicalPatternRecord | None = None
-        for pattern_id in candidate_ids:
-            record = records.get(pattern_id)
-            if record is None:
-                decisions.append(_ignore(pattern_id, "pattern_not_found"))
-                continue
-            if plan.strategy == "vector":
-                version_hash = memo.candidate_versions.get(
-                    _candidate_cache_key(request, plan), {}
-                ).get(pattern_id)
-                if not version_hash or not record.current_version_hash:
-                    decisions.append(_ignore(pattern_id, "pattern_version_unavailable"))
-                    continue
-                if record.current_version_hash != version_hash:
-                    decisions.append(_ignore(pattern_id, "pattern_version_mismatch"))
-                    continue
-            elif (
-                request.server_pattern_version_hash
-                and record.current_version_hash != request.server_pattern_version_hash
-            ):
-                decisions.append(_ignore(pattern_id, "pattern_version_mismatch"))
-                continue
-            decision = self._compatibility_guard.evaluate(request=request, record=record)
-            decisions.append(decision)
-            if decision.tier is PatternMatchTier.GUIDANCE_SAFE:
-                selected = record
-                break
+        gather_reuse = (
+            request.mode is PatternRuntimeMode.PRACTICE
+            and self._reuse_enabled
+            and self._playable_question_store is not None
+            and request.student_history_checked
+        )
+        scan = _CandidateScan(
+            reuse_excluded={
+                value.strip()
+                for value in (*request.excluded_question_ids, *request.seen_question_ids)
+                if value.strip()
+            }
+        )
+        self._scan_candidates(
+            candidate_ids=candidate_ids,
+            request=request,
+            plan=plan,
+            memo=memo,
+            warnings=warnings,
+            gather_reuse=gather_reuse,
+            scan=scan,
+        )
+        expansion_used = False
+        # The canonical maximum bounds unique Patterns evaluated for one demand
+        # group, not one query, so expansion spends what the initial window left.
+        remaining_candidate_budget = _MAX_CANDIDATE_LIMIT - len(scan.evaluated_pattern_ids)
+        expanded_plan = (
+            _expanded_plan(plan)
+            if (
+                gather_reuse
+                and len(scan.reuse_questions) < request.reuse_target
+                and remaining_candidate_budget > 0
+            )
+            else None
+        )
+        if expanded_plan is not None:
+            expansion_used = True
+            expanded_ids = tuple(
+                pattern_id
+                for pattern_id in self._candidate_ids(
+                    request=request,
+                    plan=expanded_plan,
+                    memo=memo,
+                    warnings=warnings,
+                )
+                if pattern_id not in scan.evaluated_pattern_ids
+            )[:remaining_candidate_budget]
+            if expanded_ids:
+                self._scan_candidates(
+                    candidate_ids=expanded_ids,
+                    request=request,
+                    plan=expanded_plan,
+                    memo=memo,
+                    warnings=warnings,
+                    gather_reuse=gather_reuse,
+                    scan=scan,
+                )
+        selected = scan.selected
+        decisions = scan.decisions
 
         if selected is None:
             return PatternRuntimeResult(
                 plan=plan,
                 decisions=tuple(decisions),
                 warnings=tuple(warnings),
+                candidateExpansionUsed=expansion_used,
             )
 
         generation_context = build_generation_context(selected)
         if request.mode is PatternRuntimeMode.PRACTICE:
-            reuse_question = self._select_reuse_question(
-                request=request,
-                pattern=selected,
-                memo=memo,
-                warnings=warnings,
-            )
+            reuse_questions = tuple(scan.reuse_questions[: request.reuse_target])
             return PatternRuntimeResult(
                 plan=plan,
                 tier=(
                     PatternMatchTier.REUSE_SAFE
-                    if reuse_question is not None
+                    if reuse_questions
                     else PatternMatchTier.GUIDANCE_SAFE
                 ),
                 selectedPatternId=selected.pattern_id,
                 selectedPatternVersionHash=selected.current_version_hash,
                 generationContext=generation_context,
-                reuseQuestion=reuse_question,
+                reuseQuestions=reuse_questions,
                 decisions=tuple(decisions),
                 warnings=tuple(warnings),
+                candidateExpansionUsed=expansion_used,
             )
 
         references, rerank_used, rerank_warning = self._linked_references(
@@ -260,36 +306,97 @@ class PatternRuntimeService:
             rerankUsed=rerank_used,
         )
 
-    def _select_reuse_question(
+    def _scan_candidates(
+        self,
+        *,
+        candidate_ids: tuple[str, ...],
+        request: PatternRuntimeRequest,
+        plan: PatternRetrievalPlan,
+        memo: PatternRuntimeMemo,
+        warnings: list[str],
+        gather_reuse: bool,
+        scan: _CandidateScan,
+    ) -> None:
+        """Validate one candidate window, keeping acceptance criteria unchanged."""
+        records = self._hydrate_patterns(candidate_ids=candidate_ids, memo=memo, warnings=warnings)
+        for pattern_id in candidate_ids:
+            scan.evaluated_pattern_ids.add(pattern_id)
+            record = records.get(pattern_id)
+            if record is None:
+                scan.decisions.append(_ignore(pattern_id, "pattern_not_found"))
+                continue
+            if plan.strategy == "vector":
+                version_hash = memo.candidate_versions.get(
+                    _candidate_cache_key(request, plan), {}
+                ).get(pattern_id)
+                if not version_hash or not record.current_version_hash:
+                    scan.decisions.append(_ignore(pattern_id, "pattern_version_unavailable"))
+                    continue
+                if record.current_version_hash != version_hash:
+                    scan.decisions.append(_ignore(pattern_id, "pattern_version_mismatch"))
+                    continue
+            elif (
+                request.server_pattern_version_hash
+                and record.current_version_hash != request.server_pattern_version_hash
+            ):
+                scan.decisions.append(_ignore(pattern_id, "pattern_version_mismatch"))
+                continue
+            decision = self._compatibility_guard.evaluate(request=request, record=record)
+            scan.decisions.append(decision)
+            if decision.tier is not PatternMatchTier.GUIDANCE_SAFE:
+                continue
+            if scan.selected is None:
+                scan.selected = record
+            if not gather_reuse:
+                return
+            # Probe every ranked compatible candidate until the demand is met. The
+            # bounded candidate window is the only stop condition besides the demand;
+            # a Pattern's page size never predicts how much of it is actually eligible.
+            deficit = request.reuse_target - len(scan.reuse_questions)
+            if deficit < 1:
+                return
+            for question in self._select_reuse_questions(
+                request=request,
+                pattern=record,
+                memo=memo,
+                warnings=warnings,
+                excluded_question_ids=scan.reuse_excluded,
+                limit=deficit,
+            ):
+                scan.reuse_questions.append(question)
+                scan.reuse_excluded.add(question.question_id)
+
+    def _select_reuse_questions(
         self,
         *,
         request: PatternRuntimeRequest,
         pattern: CanonicalPatternRecord,
         memo: PatternRuntimeMemo,
         warnings: list[str],
-    ) -> CanonicalPlayableQuestion | None:
+        excluded_question_ids: set[str],
+        limit: int,
+    ) -> tuple[CanonicalPlayableQuestion, ...]:
         if (
             not self._reuse_enabled
             or self._playable_question_store is None
             or not request.student_history_checked
+            or limit < 1
         ):
-            return None
+            return ()
         questions = self._load_playable_questions(
             pattern_id=pattern.pattern_id,
             memo=memo,
             warnings=warnings,
         )
-        excluded = {
-            value.strip()
-            for value in (*request.excluded_question_ids, *request.seen_question_ids)
-            if value.strip()
-        }
+        selected: list[CanonicalPlayableQuestion] = []
         for question in questions:
-            if question.question_id in excluded:
+            if question.question_id in excluded_question_ids:
                 continue
             if _playable_question_matches(request, pattern, question):
-                return question
-        return None
+                selected.append(question)
+                if len(selected) == limit:
+                    break
+        return tuple(selected)
 
     def _candidate_ids(
         self,
@@ -314,6 +421,16 @@ class PatternRuntimeService:
         except Exception:
             warnings.append("vector_discovery_unavailable")
             return ()
+        raw_scores = [
+            candidate.score
+            for value in raw_candidates
+            if (candidate := VectorPatternCandidate.from_raw(value)) is not None
+            and candidate.score is not None
+        ]
+        memo.raw_candidate_stats[cache_key] = (
+            len(raw_candidates),
+            max(raw_scores) if raw_scores else None,
+        )
         candidates = _bounded_strong_candidates(raw_candidates, limit=plan.candidate_limit)
         pattern_ids = tuple(candidate.pattern_id for candidate in candidates)
         memo.candidate_versions[cache_key] = {
@@ -403,7 +520,7 @@ class PatternRuntimeService:
         try:
             raw_questions = self._playable_question_store.list_by_pattern_id(
                 pattern_id=pattern_id,
-                limit=5,
+                limit=_MAX_QUESTIONS_PER_PATTERN,
             )
         except Exception:
             if warnings is not None:
@@ -441,6 +558,19 @@ def build_retrieval_plan(request: PatternRuntimeRequest) -> PatternRetrievalPlan
         strategy="vector",
         candidateLimit=request.candidate_limit,
     )
+
+
+def _expanded_plan(plan: PatternRetrievalPlan) -> PatternRetrievalPlan | None:
+    """Widen the candidate window once; server-selected exact plans never expand."""
+    if plan.strategy != "vector":
+        return None
+    expanded_limit = min(
+        plan.candidate_limit * _CANDIDATE_EXPANSION_MULTIPLIER,
+        _MAX_CANDIDATE_LIMIT,
+    )
+    if expanded_limit <= plan.candidate_limit:
+        return None
+    return plan.model_copy(update={"candidate_limit": expanded_limit})
 
 
 def build_generation_context(record: CanonicalPatternRecord) -> PatternGenerationContext:

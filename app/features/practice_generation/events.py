@@ -18,6 +18,8 @@ _PRODUCTION_MILESTONE_EVENTS = frozenset(
         "EXISTING_MATCH_COMPLETED",
         "final_manifest_validation_completed",
         "practice_ready",
+        # Aggregate-only; candidate-by-candidate Pattern events stay DEBUG-default.
+        "PATTERN_RETRIEVAL_COMPLETED",
     }
 )
 _RECOVERY_WARNING_EVENTS = frozenset(
@@ -40,7 +42,12 @@ _RECOVERY_WARNING_EVENTS = frozenset(
         "final_manifest_validation_failed",
         "QUESTION_BANK_CATEGORY_FALLBACK",
         "QUESTION_BANK_REUSE_LIMIT_REACHED",
+        "QUESTION_BANK_REUSE_QUERY_DEBUG",
+        "QUESTION_SEMANTIC_RETRIEVAL_FAILED",
+        "QUESTION_SEMANTIC_CANDIDATE_DECISION",
+        "QUESTION_SEMANTIC_REUSE_COMPLETED",
         "PATTERN_QUESTION_BANK_LINK_FAILED",
+        "PATTERN_QUESTION_BANK_LINK_CONFLICT",
         "PATTERN_REUSE_HISTORY_UNAVAILABLE",
     }
 )

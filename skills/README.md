@@ -14,6 +14,12 @@ This directory contains **repo-local development knowledge** for AI coding agent
 2. Then read the relevant file(s) below before writing or reviewing code.
 3. When you create or change a feature, update the matching `features/<name>.md`.
 
+> **Claude Code specifically** auto-loads this knowledge via
+> `.claude/skills/*/SKILL.md` — one project skill per core/workflow concern and
+> one per feature (`meritranker-doubt-solver`, `meritranker-practice-generation`,
+> etc.), each a thin pointer into this directory, not a duplicate. Other agents
+> (Codex, Copilot) should keep reading this directory and `AGENTS.md` directly.
+
 ---
 
 ## Directory Map

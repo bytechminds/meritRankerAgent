@@ -8,9 +8,13 @@ process-wide retrieval cache.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from config import Settings, get_settings
+from features.practice_generation.pattern_resource_contract import (
+    load_pattern_resource_contract,
+)
 from retrieval.embeddings.bedrock_titan_embedder import BedrockTitanEmbedder
 from retrieval.interfaces import QueryEmbedder
 from retrieval.pattern_intelligence import (
@@ -218,25 +222,29 @@ def build_pattern_intelligence_runtime(
     if not resolved_settings.pattern_intelligence_enabled:
         return None
 
-    resolved_vector_finder = vector_finder
-    if resolved_vector_finder is None:
-        if not (
-            resolved_settings.s3_vector_pattern_index_arn
-            or (
-                resolved_settings.s3_vector_bucket_name
-                and resolved_settings.s3_vector_pattern_index_name
-            )
-        ):
-            return None
-        resolved_vector_finder = S3PatternIntelligenceCandidateFinder(settings=resolved_settings)
+    # Pattern Intelligence is explicitly enabled, so its resource identity is now
+    # mandatory. Explicit environment values still win; SSM supplies only the rest.
+    # A missing identifier is a configuration failure, never a silent NoOp.
+    needs_resources = (
+        vector_finder is None or pattern_store is None or playable_question_store is None
+    )
+    contract = load_pattern_resource_contract() if needs_resources else None
+    if contract is not None:
+        resolved_settings = replace(
+            resolved_settings,
+            s3_vector_pattern_index_arn=contract.pattern_vector_index_arn,
+            s3_vector_pattern_index_name=contract.pattern_vector_index_name,
+            dynamodb_pattern_table=contract.pattern_table_name,
+            dynamodb_question_bank_table=contract.question_bank_table_name,
+            dynamodb_question_bank_pattern_index=(contract.question_bank_pattern_index_name),
+        )
+
+    resolved_vector_finder = vector_finder or S3PatternIntelligenceCandidateFinder(
+        settings=resolved_settings
+    )
 
     resolved_pattern_store = pattern_store
     if resolved_pattern_store is None:
-        if not (
-            resolved_settings.dynamodb_pattern_table
-            and resolved_settings.dynamodb_pattern_pk
-        ):
-            return None
         resolved_pattern_store = DynamoDbCanonicalPatternStore(
             table_name=resolved_settings.dynamodb_pattern_table,
             partition_key=resolved_settings.dynamodb_pattern_pk,
@@ -271,17 +279,10 @@ def build_pattern_intelligence_runtime(
         resolved_settings.pattern_intelligence_reuse_enabled
         or include_linked_question_references
     ):
-        if not (
-            resolved_settings.dynamodb_question_bank_table
-            and resolved_settings.dynamodb_question_bank_pattern_index
-        ):
-            if resolved_settings.pattern_intelligence_reuse_enabled:
-                return None
-        else:
-            resolved_playable_store = DynamoDbPlayablePatternQuestionStore(
-                table_name=resolved_settings.dynamodb_question_bank_table,
-                pattern_index_name=resolved_settings.dynamodb_question_bank_pattern_index,
-            )
+        resolved_playable_store = DynamoDbPlayablePatternQuestionStore(
+            table_name=resolved_settings.dynamodb_question_bank_table,
+            pattern_index_name=resolved_settings.dynamodb_question_bank_pattern_index,
+        )
 
     return PatternRuntimeService(
         vector_finder=resolved_vector_finder,

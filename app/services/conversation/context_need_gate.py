@@ -54,10 +54,15 @@ _EXPLICIT_REFERENCE_FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        # Anaphoric by wording only. This family is the one that a current-turn
+        # source can satisfy on its own, so the gate consults the local antecedent
+        # before treating a match here as a history reference.
         "similar_reference",
         re.compile(
-            r"\b(?:same type|same method|similar questions?|more like this|"
-            r"another question like this|aise aur|isi method)\b"
+            r"\b(?:same type|same method|similar questions?|"
+            r"similar (?:practice |mock |quiz )?questions?|"
+            r"more like this|more like that|(?:questions?|problems?) like (?:this|that)|"
+            r"another question like this|what we just did|aise aur|isi method)\b"
         ),
     ),
     (
@@ -178,6 +183,17 @@ _NAMED_STANDALONE_TOPIC = re.compile(
     r"history|polity|science)\s+(?:question|problem|practice|quiz)\b",
     re.IGNORECASE,
 )
+_LOCAL_SOURCE_INTRODUCER = re.compile(
+    r"\b(?:here (?:is|are)|consider|take|given)\s+"
+    r"(?:the |this |my |a |an )?"
+    # Allows a short qualifier such as "a grammar sentence".
+    r"(?:\w+\s+){0,2}"
+    r"(?:question|problem|sentence|passage|paragraph|statement|equation|sum|"
+    r"exercise|example)s?\b|"
+    r"\b(?:similar|like|same as)\s+(?:to\s+)?(?:this|the following)\b",
+    re.IGNORECASE,
+)
+
 _LOCAL_DEMONSTRATIVE_TASK = re.compile(
     r"^(?:solve|calculate|compute|find|evaluate|determine|simplify|prove|"
     r"explain)\s+(?:this|that)\b",
@@ -256,14 +272,38 @@ def _is_clearly_self_contained(normalized: str) -> bool:
     )
 
 
+def _has_local_antecedent(normalized: str) -> bool:
+    """Does this turn carry its own educational object for "similar" to point at?
+
+    A word like "similar" is anaphoric by wording, not by meaning.  When the same
+    message already supplies the source question, the reference resolves locally and
+    conversation history is not required.
+    """
+    if _is_clearly_self_contained(normalized):
+        return True
+    if not _LOCAL_SOURCE_INTRODUCER.search(normalized):
+        return False
+    # An introducer alone is not enough; it must actually introduce something.
+    return len(_WORD.findall(normalized)) >= 8
+
+
 class ContextNeedGate:
     """Return only whether bounded recent context should be made available."""
 
     def evaluate(self, query: str) -> ContextNeedAssessment:
         started = time.monotonic()
         normalized = normalize_context_query(query)
+        local_antecedent = _has_local_antecedent(normalized)
         for reason, pattern in _EXPLICIT_REFERENCE_FAMILIES:
             if pattern.search(normalized):
+                if reason == "similar_reference" and local_antecedent:
+                    # The source lives in this turn; history adds nothing.
+                    return ContextNeedAssessment(
+                        decision="CONTEXT_NOT_NEEDED",
+                        reason_codes=("local_antecedent_resolved",),
+                        matched_signals=(reason,),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                    )
                 return ContextNeedAssessment(
                     decision="CONTEXT_REQUIRED",
                     reason_codes=("explicit_context_reference",),
@@ -287,6 +327,22 @@ class ContextNeedGate:
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
         reference = analyze_reference(query)
+        # A bare demonstrative ("like this") is satisfied by a local source, but an
+        # ordinal or explicitly prior reference ("the previous one") never is.
+        if (
+            reference.external_reference_detected
+            and local_antecedent
+            and set(reference.reference_types) <= {"object", "demonstrative"}
+        ):
+            return ContextNeedAssessment(
+                decision="CONTEXT_NOT_NEEDED",
+                reason_codes=("local_antecedent_resolved",),
+                matched_signals=tuple(
+                    f"{reference_type}_reference"
+                    for reference_type in reference.reference_types
+                )[:8],
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
         if reference.external_reference_detected:
             return ContextNeedAssessment(
                 decision="CONTEXT_REQUIRED",

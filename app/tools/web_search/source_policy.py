@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from tools.web_search.models import TemporalMode
 from tools.web_search.scope_policy import SourceScopePolicy, detect_source_scope_policy
 from tools.web_search.source_pack_loader import (
     SourcePackCatalog,
@@ -50,6 +51,7 @@ class WebSourcePolicy:
     start_date: str | None
     end_date: str | None
     time_range: str | None
+    temporal_mode: TemporalMode
     source_strictness: str
     freshness_label: str
     freshness_source: str
@@ -120,10 +122,14 @@ class WebSourcePolicyResolver:
             topic_value = india_pack.topic
         else:
             topic_value = world_pack.topic
-        start_date, end_date, time_range, freshness_label, freshness_source = _parse_freshness(
-            combined,
-            default_recent_days=default_recent_days,
-        )
+        (
+            start_date,
+            end_date,
+            time_range,
+            temporal_mode,
+            freshness_label,
+            freshness_source,
+        ) = _parse_freshness(combined, default_recent_days=default_recent_days)
         blocked = tuple(
             dict.fromkeys(
                 [
@@ -149,6 +155,7 @@ class WebSourcePolicyResolver:
             start_date=start_date,
             end_date=end_date,
             time_range=time_range,
+            temporal_mode=temporal_mode,
             source_strictness=source_strictness,
             freshness_label=freshness_label,
             freshness_source=freshness_source,
@@ -213,28 +220,9 @@ def _parse_freshness(
     text: str,
     *,
     default_recent_days: int,
-) -> tuple[str | None, str | None, str | None, str, str]:
+) -> tuple[str | None, str | None, str | None, TemporalMode, str, str]:
     today = date.today()
     lower = text.lower()
-
-    if "today" in lower:
-        iso = today.isoformat()
-        return iso, iso, None, today.strftime("%B %Y"), "user_explicit"
-
-    if "yesterday" in lower:
-        day = today - timedelta(days=1)
-        iso = day.isoformat()
-        return iso, iso, None, day.strftime("%B %Y"), "user_explicit"
-
-    if "last week" in lower or "past week" in lower:
-        start = today - timedelta(days=7)
-        return (
-            start.isoformat(),
-            today.isoformat(),
-            None,
-            today.strftime("%B %Y"),
-            "user_explicit",
-        )
 
     month_match = re.search(
         r"\b(january|february|march|april|may|june|july|august|september|october|november|december)"
@@ -253,6 +241,7 @@ def _parse_freshness(
             start.isoformat(),
             end.isoformat(),
             None,
+            "EXPLICIT_MONTH",
             start.strftime("%B %Y"),
             "user_explicit",
         )
@@ -270,21 +259,87 @@ def _parse_freshness(
             f"{year}-01-01",
             f"{year}-12-31",
             None,
+            "EXPLICIT_YEAR",
             str(year),
+            "user_explicit",
+        )
+
+    explicit_range = re.search(
+        r"\b(20\d{2}-\d{2}-\d{2})\b\s*(?:to|through|until|-)\s*"
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        lower,
+    )
+    if explicit_range:
+        start, end = explicit_range.groups()
+        try:
+            start_date = date.fromisoformat(start)
+            end_date = date.fromisoformat(end)
+        except ValueError:
+            pass
+        else:
+            if start_date <= end_date:
+                return (
+                    start,
+                    end,
+                    None,
+                    "EXPLICIT_DATE_RANGE",
+                    f"{start} to {end}",
+                    "user_explicit",
+                )
+
+    if "today" in lower:
+        iso = today.isoformat()
+        return (
+            iso,
+            iso,
+            None,
+            "EXPLICIT_DATE_RANGE",
+            today.strftime("%B %Y"),
+            "user_explicit",
+        )
+
+    if "yesterday" in lower:
+        day = today - timedelta(days=1)
+        iso = day.isoformat()
+        return (
+            iso,
+            iso,
+            None,
+            "EXPLICIT_DATE_RANGE",
+            day.strftime("%B %Y"),
+            "user_explicit",
+        )
+
+    if "last week" in lower or "past week" in lower:
+        start = today - timedelta(days=7)
+        return (
+            start.isoformat(),
+            today.isoformat(),
+            None,
+            "RECENT",
+            today.strftime("%B %Y"),
             "user_explicit",
         )
 
     if any(token in lower for token in ("recent", "latest", "current", "this month", "this year")):
         start = today - timedelta(days=default_recent_days)
+        temporal_mode: TemporalMode = (
+            "LATEST"
+            if "latest" in lower
+            else "RECENT"
+            if "recent" in lower
+            else "CURRENT"
+        )
         return (
             start.isoformat(),
             today.isoformat(),
             None,
+            temporal_mode,
             today.strftime("%B %Y"),
             "default",
         )
 
-    return None, None, None, today.strftime("%B %Y"), "none"
+    return None, None, None, "CURRENT", today.strftime("%B %Y"), "none"
 
 
 def _month_number(name: str) -> int:

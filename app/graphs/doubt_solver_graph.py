@@ -38,13 +38,14 @@ from config import get_settings
 from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
+    PracticeRequestCountError,
     decide_practice_launch,
-    is_fresh_evidence_request_supported,
     practice_async_unavailable_message,
     practice_route_enabled,
     required_fresh_evidence_count,
     resolve_practice_freshness_requirement,
     resolve_practice_request,
+    validate_practice_requested_count,
 )
 from features.practice_generation.schemas import (
     PracticeGenerationRequest,
@@ -922,21 +923,9 @@ def _orchestrated_collect_context_node(
             query,
             classification_dict,
         )
-        if (
-            freshness_requirement.requires_fresh_evidence
-            and not is_fresh_evidence_request_supported(state.get("original_query") or query)
-        ):
-            log_event(
-                "practice_freshness_evidence",
-                component="practice.freshness",
-                stage="retrieve",
-                status="unavailable",
-                error_code="PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT",
-                details={
-                    "required": True,
-                    "reason": freshness_requirement.freshness_reason,
-                },
-            )
+        try:
+            validate_practice_requested_count(state.get("original_query") or query)
+        except PracticeRequestCountError:
             return {"context_text": "", "retrieval_context": {}}
         retrieval_classification = dict(classification_dict)
         if freshness_requirement.requires_fresh_evidence:
@@ -1016,6 +1005,11 @@ def _orchestrated_collect_context_node(
                     ),
                     "windowEnd": (
                         fresh_evidence.requested_window.end_date
+                        if fresh_evidence is not None
+                        else ""
+                    ),
+                    "temporalMode": (
+                        fresh_evidence.requested_window.temporal_mode
                         if fresh_evidence is not None
                         else ""
                     ),
@@ -1393,15 +1387,6 @@ def build_orchestrated_doubt_solver_graph(
                     state.get("original_query") or state["query"],
                     classification,
                 )
-                if (
-                    freshness_requirement.requires_fresh_evidence
-                    and not is_fresh_evidence_request_supported(
-                        state.get("original_query") or state["query"]
-                    )
-                ):
-                    raise PracticeLaunchError(
-                        "PRACTICE_FRESH_EVIDENCE_COUNT_EXCEEDS_LIMIT"
-                    )
                 fresh_evidence = (
                     FreshEvidenceBundle.model_validate(state["fresh_evidence"])
                     if freshness_requirement.requires_fresh_evidence
@@ -1430,8 +1415,18 @@ def build_orchestrated_doubt_solver_graph(
                     freshness_requirement=freshness_requirement,
                     fresh_evidence=fresh_evidence,
                 )
+                log_event(
+                    "practice_language_resolved",
+                    component="practice.routing",
+                    stage="language",
+                    status="resolved",
+                    details={
+                        "language": request.language,
+                        "source": request.language_source,
+                    },
+                )
                 launch = practice_launcher(request)
-            except PracticeLaunchError:
+            except (PracticeLaunchError, PracticeRequestCountError):
                 message = "Practice generation could not be started. Please try again."
                 final = build_final_answer_result(
                     content=message,

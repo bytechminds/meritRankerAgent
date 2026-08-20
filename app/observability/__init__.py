@@ -18,7 +18,14 @@ from observability.llm_usage import (
     record_llm_call,
     snapshot_llm_usage_records,
 )
-from observability.readable_log import configure_runtime_identity, record_local_preview
+from observability.readable_log import (
+    begin_operation_log,
+    configure_runtime_identity,
+    current_operation_log,
+    finalize_operation_log,
+    record_local_preview,
+    reset_operation_log,
+)
 from observability.summary import (
     RequestExecutionSummary,
     begin_request_summary,
@@ -32,6 +39,7 @@ __all__ = [
     "RequestContext",
     "ExecutionContext",
     "RequestExecutionSummary",
+    "begin_operation_log",
     "begin_request_summary",
     "bind_execution_context",
     "bind_request_context",
@@ -39,9 +47,12 @@ __all__ = [
     "count_generator_calls",
     "configure_tracing",
     "configure_runtime_identity",
+    "current_operation_log",
     "current_request_context",
     "current_execution_context",
     "current_request_summary",
+    "finalize_operation_log",
+    "reset_operation_log",
     "current_llm_attempt_type",
     "emit_request_summary",
     "log_event",

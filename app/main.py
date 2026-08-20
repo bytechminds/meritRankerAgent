@@ -71,6 +71,7 @@ from schemas.doubt_solver import (
     DoubtSolverStreamEvent,
     FinalAnswerResult,
     ResponseContent,
+    TerminalConversationIdentity,
 )
 from schemas.image_question_classification import ImageClassificationStatus
 from schemas.request import AgentRequest
@@ -174,11 +175,15 @@ runtime_identity = configure_runtime_identity(
     ),
     code_location=__file__,
 )
+# Emitted here so runtime identity is still captured when a later mandatory step
+# fails. It deliberately does NOT claim readiness: Practice/Pattern resource
+# contracts, DynamoDB validation, and graph construction all still follow, and any
+# of them can abort startup. The authoritative ready event is emitted at the end.
 log_event(
     "runtime_started",
     component="runtime.bootstrap",
     stage="startup",
-    status="ready",
+    status="started",
     details=runtime_identity,
 )
 
@@ -259,6 +264,23 @@ logger.info(
     "Agent initialised app_env=%s default_model_provider=%s routing=dynamic",
     settings.app_env,
     settings.model_provider,
+)
+
+# Authoritative readiness boundary. Every mandatory startup step has now
+# succeeded: resource contracts, DynamoDB resource validation, Practice/Pattern
+# runtime construction, and graph compilation. Any failure above raises out of
+# module import, so this line is unreachable and no ready event is emitted.
+log_event(
+    "runtime_ready",
+    component="runtime.bootstrap",
+    stage="startup",
+    status="ready",
+    details={
+        "practiceEnabled": practice_async_launcher is not None,
+        "patternContextEnabled": settings.pattern_intelligence_enabled,
+        "patternReuseEnabled": settings.pattern_intelligence_reuse_enabled,
+        "orchestratedDoubtSolverEnabled": settings.enable_orchestrated_doubt_solver,
+    },
 )
 
 # ---------------------------------------------------------------------------
@@ -373,7 +395,15 @@ def _stream_replayed_turn(
                     request_id=request_id,
                     stage="complete",
                     label="Complete",
-                    metadata={"request_id": request_id, "replayed": True},
+                    metadata={
+                        **TerminalConversationIdentity(
+                            request_id=request_id,
+                            conversation_id=turn.conversation_id,
+                            turn_id=turn.turn_id,
+                            persisted=True,
+                        ).model_dump(mode="json"),
+                        "replayed": True,
+                    },
                     response=DoubtSolverFinalResponse(
                         request_id=request_id,
                         content=ResponseContent(value=turn.final_answer),

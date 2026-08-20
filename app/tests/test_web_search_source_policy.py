@@ -321,6 +321,7 @@ class TestProviderAbstraction:
 
         def _fake_urlopen(request, timeout=8):  # noqa: ANN001
             captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.get_header("Authorization")
             return _FakeResponse()
 
         monkeypatch.setattr(
@@ -349,7 +350,8 @@ class TestProviderAbstraction:
         assert body["include_domains"] == ["rbi.org.in"]
         assert body["exclude_domains"] == ["youtube.com"]
         assert body["topic"] == "finance"
-        assert "api_key" in body
+        assert "api_key" not in body
+        assert captured["authorization"] == "Bearer secret-key"
 
 
 class TestSearchAttemptsIntegration:

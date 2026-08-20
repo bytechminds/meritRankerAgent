@@ -75,6 +75,39 @@ class S3VectorClient:
             metadata_filter=metadata_filter,
         )
 
+    def query_question_candidates(
+        self,
+        *,
+        query_vector: list[float],
+        metadata_filter: dict[str, object] | None,
+        top_k: int,
+    ) -> list[RetrievedCandidate]:
+        """Discover reusable Question candidates in questions-v1.
+
+        Discovery only: every candidate is re-validated against the authoritative
+        QuestionBank row before it may be served.
+        """
+        index_arn = self._settings.s3_vector_question_index_arn
+        if not index_arn:
+            raise S3VectorQueryError("S3_VECTOR_QUESTION_INDEX_ARN must be configured.")
+        if len(query_vector) != self._settings.s3_vector_dimensions:
+            raise S3VectorQueryError("Query vector dimension does not match S3_VECTOR_DIMENSIONS.")
+        request: dict[str, object] = {
+            "indexArn": index_arn,
+            "queryVector": {"float32": query_vector},
+            "topK": max(1, top_k),
+            "returnDistance": True,
+            "returnMetadata": True,
+        }
+        if metadata_filter:
+            request["filter"] = metadata_filter
+        client = self._client_factory(self._settings.s3_vector_region or None)
+        try:
+            response = client.query_vectors(**request)
+        except ClientError as exc:
+            raise S3VectorQueryError("questions-v1 candidate query failed.") from exc
+        return map_query_vectors_response(response if isinstance(response, dict) else {})
+
     def _query(
         self,
         *,
