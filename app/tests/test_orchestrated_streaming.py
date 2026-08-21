@@ -154,7 +154,7 @@ class TestStreamEventSchema:
             type="status",
             request_id=_REQUEST_ID,
             stage="understanding",
-            label="Understanding...",
+            label="Thinking...",
         )
         assert event.type == "status"
 
@@ -165,7 +165,7 @@ class TestStreamEventSchema:
             type="status",
             request_id=_REQUEST_ID,
             stage="understanding",
-            label="Understanding...",
+            label="Thinking...",
         )
         framed = f"data: {json.dumps(event.model_dump(mode='json'))}\n\n"
         assert framed.startswith("data: {")
@@ -237,29 +237,29 @@ class TestStreamEventSchema:
 
 class TestStreamLabelHelper:
     def test_understanding(self) -> None:
-        assert get_stream_label("understanding") == "Understanding..."
+        assert get_stream_label("understanding") == "Thinking..."
 
     def test_thinking(self) -> None:
         assert get_stream_label("thinking") == "Thinking..."
 
     def test_solve(self) -> None:
-        assert get_stream_label("generating", "solve") == "Solving..."
+        assert get_stream_label("generating", "solve") == "Generating..."
 
     def test_explain(self) -> None:
-        assert get_stream_label("generating", "explain") == "Explaining..."
+        assert get_stream_label("generating", "explain") == "Generating..."
 
     def test_practice(self) -> None:
-        assert get_stream_label("generating", "practice") == "Creating practice questions..."
+        assert get_stream_label("generating", "practice") == "Generating practice questions..."
 
     def test_visualize(self) -> None:
-        assert get_stream_label("generating", "visualize") == "Preparing visual explanation..."
+        assert get_stream_label("generating", "visualize") == "Generating visual explanation..."
 
 
 class TestStreamingFlow:
     def test_first_event_is_understanding(self) -> None:
         events = _collect(_make_adapter())
         assert events[0].type == "status"
-        assert events[0].label == "Understanding..."
+        assert events[0].label == "Thinking..."
 
     def test_stream_lifecycle_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         import logging
@@ -409,7 +409,8 @@ class TestCarefulClassificationStreamStatus:
             )
 
         labels = [e.label for e in events if e.type == "status"]
-        assert labels.count("Understanding...") == 1
+        # Classification and reasoning both render as "Thinking...".
+        assert labels.count("Thinking...") == 2
         assert "Checking the question more carefully..." not in labels
         assert events[-1].type == "complete"
 
@@ -646,7 +647,8 @@ class TestWebSearchStreamStatus:
             events = _collect(_make_adapter("Current affairs answer."))
 
         labels = [e.label for e in events if e.type == "status"]
-        assert labels.count("Thinking...") == 1
+        # Classification and reasoning both render as "Thinking...".
+        assert labels.count("Thinking...") == 2
         assert "Checking recent information..." not in labels
 
     def test_required_web_failure_returns_verification_limited_response(self) -> None:
@@ -823,7 +825,8 @@ class TestExtendedStreamStatuses:
             events = _collect(_make_adapter("Answer."))
 
         labels = [e.label for e in events if e.type == "status"]
-        assert labels.count("Thinking...") == 1
+        # Classification and reasoning both render as "Thinking...".
+        assert labels.count("Thinking...") == 2
         assert "Looking for more reliable sources..." not in labels
 
     def test_generator_fallback_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -839,7 +842,7 @@ class TestExtendedStreamStatuses:
         adapter = AnswerGenerationAdapter(orchestrator=orchestrator)
         events = _collect(adapter)
         labels = [e.label for e in events if e.type == "status"]
-        assert labels.count("Explaining...") == 1
+        assert labels.count("Generating...") == 1
         assert "Preparing a more reliable answer..." not in labels
         cfg_module._settings = None
 

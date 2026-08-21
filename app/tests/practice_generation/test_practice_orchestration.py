@@ -595,6 +595,9 @@ class LegacyBlueprintManager:
         )
 
 
+_LAST_GENERATOR: dict[str, Generator] = {}
+
+
 class Generator:
     def __init__(
         self,
@@ -607,8 +610,12 @@ class Generator:
         self.fail_always = fail_always
         self.fail_item_retry_once = fail_item_retry_once
         self.calls: dict[str, int] = {}
+        # (group_id, attempt, required_count) per invocation, so tests can prove a
+        # retry asks only for the deficit rather than the whole group.
+        self.requests: list[tuple[str, int, int]] = []
 
     def generate(self, *, request, bucket, group, exclude_normalized_texts):
+        self.requests.append((group.group_id, group.attempt, group.required_count))
         if self.fail_always:
             raise TimeoutError("injected")
         if self.fail_item_retry_once and "-retry-" in group.group_id and group.attempt == 1:
@@ -712,6 +719,12 @@ def build_orchestrator(
     pattern_context=None,
     question_bank_promotion_enabled: bool = False,
 ):
+    generator = Generator(
+        partial_once=partial_once,
+        fail_always=fail_always,
+        fail_item_retry_once=fail_item_retry_once,
+    )
+    _LAST_GENERATOR["generator"] = generator
     return PracticeGenerationOrchestrator(
         config=PracticeGenerationConfig(
             enabled=True,
@@ -733,11 +746,7 @@ def build_orchestrator(
         progress=assessments,
         questions=questions,
         blueprint_manager=LegacyBlueprintManager(),
-        generator=Generator(
-            partial_once=partial_once,
-            fail_always=fail_always,
-            fail_item_retry_once=fail_item_retry_once,
-        ),
+        generator=generator,
         verifier=verifier or Verifier(reject_once=reject_once),
         pattern_context=pattern_context or NoOpPatternContextProvider(),
     )
@@ -1041,7 +1050,9 @@ def test_schema_v2_reasoning_cat_fallback_reaches_generation_started_with_backen
 
     meta = json.loads(assessments.item["meta"])
     assert assessments.item["status"] == "GENERATING"
-    assert meta["plannerDeterministicFallback"] is True
+    # Quick Practice now reaches the deterministic compiler directly rather than
+    # by falling back from a failed planner call.
+    assert meta["plannerDeterministicFallback"] is False
     assert meta["blueprint"]["schema_version"] == "2"
     slots = PracticeBlueprint.model_validate(meta["blueprint"]).slots
     assert [slot.slot_id for slot in slots] == [
@@ -1142,6 +1153,9 @@ def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
         # Joined strings, not lists: the sanitizer collapses non-scalars to "list".
         "fieldPaths": "$",
         "errorTypes": "ValueError",
+        # Which layer rejected the response, so the failing invariant is
+        # identifiable without the raw planner output.
+        "validationStage": "contract",
         "durationMs": 0,
     }
     assert "planner_fallback_failed" in [name for name, _details in emitted]
@@ -1678,3 +1692,93 @@ def test_terminal_verifier_rejection_promotes_nothing() -> None:
     orchestrator._commit_slot_outcome(rejected)
 
     assert questions.promoted == []
+
+
+# --- localized replacement characterization (TEST C / TEST D) ----------------
+
+def test_item_retry_requests_only_the_missing_item_not_approved_siblings() -> None:
+    """TEST C: a partial group must re-request only the deficit.
+
+    Extends test_partial_group_keeps_valid_items_and_repairs_only_deficit, which
+    proved the end state but not what the retry actually asked the generator for.
+    """
+    assessments, questions, _ = run_job(5, partial_once=True)
+    generator = _LAST_GENERATOR["generator"]
+
+    assert (assessments.item["status"], len(questions.linked)) == ("READY", 5)
+    initial = [entry for entry in generator.requests if entry[1] == 0]
+    retries = [entry for entry in generator.requests if entry[1] > 0]
+
+    # The five questions are planned across the normal groups first.
+    assert sum(entry[2] for entry in initial) == 5
+    assert retries, "a retry must have happened"
+    # Only the single missing item is re-requested; valid siblings are not.
+    assert all(entry[2] == 1 for entry in retries), generator.requests
+
+
+def test_verification_rejection_replacement_requests_only_the_rejected_item() -> None:
+    """TEST C (verification variant): approved siblings are not regenerated."""
+    assessments, questions, _ = run_job(5, reject_once=True)
+    generator = _LAST_GENERATOR["generator"]
+
+    assert (assessments.item["status"], len(questions.linked)) == ("READY", 5)
+    # attempt > 0 is a retry/replacement wave; attempt 0 entries are the initial groups.
+    follow_ups = [entry for entry in generator.requests if entry[1] > 0]
+
+    assert follow_ups, "a replacement must have happened"
+    assert all(entry[2] == 1 for entry in follow_ups), generator.requests
+
+
+def test_structured_parse_invalid_rejects_the_whole_model_response() -> None:
+    """TEST D: characterization only — no per-candidate localization is claimed.
+
+    A structurally invalid batch is rejected as a unit; recovery comes from the
+    existing retry/replacement waves, not from salvaging valid siblings.
+    """
+    from features.practice_generation.generation import parse_partial_generation
+    from features.practice_generation.schemas import GenerationGroup
+
+    request = make_request(2)
+    blueprint = LegacyBlueprintManager().build(request).blueprint
+    bucket = blueprint.buckets[0]
+    group = GenerationGroup(
+        group_id="group-1", bucket_id=bucket.bucket_id, required_count=2
+    )
+
+    def _question(index: int, *, valid: bool) -> dict:
+        item = {
+            "generation_item_id": f"item-{index}",
+            "bucket_id": bucket.bucket_id,
+            "question": f"Valid sibling question number {index} about addition?",
+            "question_type": bucket.question_type.value,
+            "options": ["2", "3", "4", "5"],
+            "correct_answer": "2",
+            "solution": "Add one to the stated integer.",
+            "subject": bucket.subject,
+            "topic": bucket.topic,
+            "difficulty": bucket.difficulty.value,
+        }
+        if not valid:
+            del item["options"]
+            del item["correct_answer"]
+        return item
+
+    mixed = parse_partial_generation(
+        json.dumps({"questions": [_question(1, valid=True), _question(2, valid=False)]}),
+        group=group,
+        bucket=bucket,
+        existing_normalized_texts=set(),
+    )
+    malformed = parse_partial_generation(
+        "{not json",
+        group=group,
+        bucket=bucket,
+        existing_normalized_texts=set(),
+    )
+
+    # A per-question schema failure is localized: the valid sibling survives.
+    assert len(mixed.accepted) == 1
+    assert mixed.rejected_count == 1
+    # An unparseable response has no salvageable candidates at all.
+    assert malformed.accepted == ()
+    assert "STRUCTURED_PARSE_INVALID" in malformed.rejection_reason_codes

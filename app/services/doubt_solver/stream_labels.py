@@ -10,18 +10,20 @@ provider internals.
 from __future__ import annotations
 
 _GENERATING_LABELS: dict[str, str] = {
-    "solve": "Solving...",
-    "explain": "Explaining...",
-    "practice": "Creating practice questions...",
-    "visualize": "Preparing visual explanation...",
+    "solve": "Generating...",
+    "explain": "Generating...",
+    "practice": "Generating practice questions...",
+    "visualize": "Generating visual explanation...",
 }
 
 _STAGE_LABELS: dict[str, str] = {
-    "understanding": "Understanding...",
-    "retrieving": "Retrieving context...",
+    # Classification reads as "Thinking..." rather than naming the internal stage,
+    # matching the assistant-style status wording students expect.
+    "understanding": "Thinking...",
+    "retrieving": "Searching...",
     "thinking": "Thinking...",
     "finalizing": "Finalizing...",
-    "verifying": "Verifying answer...",
+    "verifying": "Verifying...",
     "complete": "Done",
     "error": "Something went wrong. Please try again.",
 }

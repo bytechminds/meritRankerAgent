@@ -389,7 +389,12 @@ def test_planner_tiers_follow_complexity_not_subject() -> None:
     assert planner_tier(request("Create fifty question full mock")) == "strong"
 
 
-def test_invalid_planner_output_gets_one_repair_then_fallback() -> None:
+def test_invalid_planner_output_gets_one_repair_then_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercises the LLM planner path explicitly: Quick Practice now plans
+    # deterministically and never reaches the planner.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
     class Planner:
         calls = 0
 
@@ -454,7 +459,12 @@ def test_deterministic_fallback_distributes_multi_topic_requests(
     assert max(topic_counts.values()) - min(topic_counts.values()) <= 1
 
 
-def test_exact_multi_topic_failure_repairs_once_then_uses_valid_fallback() -> None:
+def test_exact_multi_topic_failure_repairs_once_then_uses_valid_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercises the LLM planner path explicitly: Quick Practice now plans
+    # deterministically and never reaches the planner.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
     class InvalidPlanner:
         def __init__(self) -> None:
             self.repair_feedback: list[str | None] = []
@@ -505,7 +515,12 @@ def test_exact_multi_topic_failure_repairs_once_then_uses_valid_fallback() -> No
     )
 
 
-def test_planner_topic_coverage_failure_uses_safe_reason_code() -> None:
+def test_planner_topic_coverage_failure_uses_safe_reason_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercises the LLM planner path explicitly: Quick Practice now plans
+    # deterministically and never reaches the planner.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
     resolved = request(
         "Create five questions on Time and Work, Number System",
         topic="Time and Work, Number System",
@@ -554,7 +569,12 @@ def test_invalid_deterministic_fallback_is_controlled_planning_error() -> None:
     assert error.value.diagnostics[-1].phase == "fallback"
 
 
-def test_unexpected_planner_exception_is_not_silently_recovered() -> None:
+def test_unexpected_planner_exception_is_not_silently_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercises the LLM planner path explicitly: Quick Practice now plans
+    # deterministically and never reaches the planner.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
     class BrokenPlanner:
         def plan(self, *_args, **_kwargs):
             raise RuntimeError("unexpected planner bug")
@@ -565,7 +585,13 @@ def test_unexpected_planner_exception_is_not_silently_recovered() -> None:
         )
 
 
-def test_planner_configuration_error_does_not_use_deterministic_fallback() -> None:
+def test_planner_configuration_error_does_not_use_deterministic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Misconfiguration must surface rather than be masked by the fallback. Quick
+    # Practice no longer calls the planner, so exercise the LLM path explicitly.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
+
     class MisconfiguredPlanner:
         def plan(self, *_args, **_kwargs):
             raise LlmConfigLoadError("invalid planner configuration")
@@ -576,7 +602,12 @@ def test_planner_configuration_error_does_not_use_deterministic_fallback() -> No
         )
 
 
-def test_valid_planner_slot_difficulty_is_not_overridden_by_classifier_difficulty() -> None:
+def test_valid_planner_slot_difficulty_is_not_overridden_by_classifier_difficulty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This invariant belongs to the LLM planner path; Quick Practice now plans
+    # deterministically from the classifier difficulty by design.
+    monkeypatch.setenv("PRACTICE_PLANNER_MODE", "llm")
     resolved = request("Create five algebra questions").model_copy(
         update={"difficulty": Difficulty.ADVANCED}
     )

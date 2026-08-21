@@ -285,6 +285,9 @@ class PlannerValidationDiagnostic:
     field_paths: tuple[str, ...]
     error_types: tuple[str, ...]
     reason_code: str
+    # Which layer rejected the response: json parse, Pydantic schema, or the
+    # semantic blueprint contract applied after model validation.
+    validation_stage: str = "schema"
     actual_slot_count: int | None = None
     duration_ms: int | None = None
 
@@ -358,10 +361,17 @@ def _planner_validation_diagnostic(
     elif isinstance(error, (TypeError, ValueError)):
         field_paths = ("$",)
         error_types = (type(error).__name__,)
+    if isinstance(error, ValidationError):
+        validation_stage = "schema"
+    elif isinstance(error, json.JSONDecodeError):
+        validation_stage = "parse"
+    else:
+        validation_stage = "contract"
     return PlannerValidationDiagnostic(
         attempt=attempt,
         phase=phase,
         schema_name=schema_name,
+        validation_stage=validation_stage,
         error_count=error_count,
         field_paths=field_paths,
         error_types=error_types,
@@ -615,9 +625,28 @@ def _canonical_fallback_topic(value: str) -> str:
     return normalized
 
 
+_LIST_CONJUNCTION_PREFIX = re.compile(r"^(?:and|or)\s+", re.IGNORECASE)
+
+
+def _strip_list_conjunction(value: str) -> str:
+    """Drop a leading list conjunction from an already-separated topic.
+
+    Applies only after the accepted delimiters have split the list, so an Oxford
+    comma ("percentage, ratio, and average") stops producing the topic
+    "and_average". Compound academic names keep their internal conjunction —
+    "profit and loss" has no leading "and" and is untouched — and a value that is
+    nothing but a conjunction is left alone rather than emptied.
+    """
+    stripped = _LIST_CONJUNCTION_PREFIX.sub("", value.strip(), count=1).strip()
+    return stripped or value
+
+
 def _requested_topic_ids(request: PracticeGenerationRequest) -> tuple[str, ...]:
     raw_topic = (request.topic or request.subject).strip()
-    values = _FALLBACK_TOPIC_SEPARATOR.split(raw_topic)
+    values = [
+        _strip_list_conjunction(value)
+        for value in _FALLBACK_TOPIC_SEPARATOR.split(raw_topic)
+    ]
     topics = tuple(
         dict.fromkeys(
             _canonical_fallback_topic(value)
@@ -674,7 +703,15 @@ def apply_system_bucket_policy(
         requested_subject = request.subject.casefold().replace("-", "_").replace(" ", "_")
         requested_topics = set(_requested_topic_ids(request))
         planned_topics = {slot.topic_id for slot in blueprint.slots}
-        if not requested_topics.issubset(planned_topics):
+        # Feasibility-aware coverage, not weaker coverage. One slot carries one
+        # topic, so a request for fewer questions than topics cannot cover them
+        # all; demanding it rejected every such blueprint outright. Above the
+        # boundary the original requirement is unchanged; below it the plan must
+        # still draw only from the requested topics, so no topic is ever invented.
+        if request.accepted_count >= len(requested_topics):
+            if not requested_topics.issubset(planned_topics):
+                raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
+        elif not planned_topics.issubset(requested_topics):
             raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
         for slot in blueprint.slots:
             if slot.question_type is not QuestionType.MCQ:
@@ -766,6 +803,18 @@ def parse_blueprint(raw: str, request: PracticeGenerationRequest) -> PracticeBlu
     )
 
 
+def _quick_practice_is_deterministic(request: PracticeGenerationRequest) -> bool:
+    """Quick Practice plans mechanically, so the planner LLM adds nothing.
+
+    Scoped to QUICK_PRACTICE only: every other practice type keeps the existing
+    LLM planner, and flipping PRACTICE_PLANNER_MODE back to "llm" restores the
+    previous behaviour without touching code.
+    """
+    if os.getenv("PRACTICE_PLANNER_MODE", "deterministic").strip().lower() != "deterministic":
+        return False
+    return request.practice_type is PracticeType.QUICK_PRACTICE
+
+
 class BlueprintManager:
     def __init__(self, planner: PlannerProvider, *, repair_limit: int = 1) -> None:
         self._planner = planner
@@ -818,7 +867,7 @@ class BlueprintManager:
 
     def build(self, request: PracticeGenerationRequest) -> BlueprintPlanResult:
         tier = planner_tier(request)
-        if request.accepted_count <= 2:
+        if request.accepted_count <= 2 or _quick_practice_is_deterministic(request):
             result = self._deterministic_result(
                 request,
                 planner_calls=0,

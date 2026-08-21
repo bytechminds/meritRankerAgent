@@ -355,20 +355,25 @@ class PracticeGenerationOrchestrator:
             fallback_result=fallback_result,
         )
         for diagnostic in diagnostics:
+            # Field ORDER is load-bearing: the operation log renders only the
+            # first eight detail fields, so the diagnostics that identify the
+            # failing invariant must lead. Emitted before the base context, which
+            # previously consumed five of the eight slots and pushed fieldPaths
+            # and errorTypes past the cut.
             details = {
-                **base,
                 "reasonCode": diagnostic.reason_code,
+                "expectedSlotCount": base.get("expectedSlotCount"),
                 "actualSlotCount": diagnostic.actual_slot_count,
                 "plannerAttempt": diagnostic.attempt,
+                "validationStage": diagnostic.validation_stage,
+                # Joined, not lists: the sanitizer replaces any non-scalar with its
+                # type name, which logged the literal string "list".
+                "errorTypes": ",".join(diagnostic.error_types)[:256],
+                "fieldPaths": ",".join(diagnostic.field_paths)[:512],
+                "validationErrorCount": diagnostic.error_count,
+                **{key: value for key, value in base.items() if key != "expectedSlotCount"},
                 "plannerPhase": diagnostic.phase,
                 "schemaName": diagnostic.schema_name,
-                "validationErrorCount": diagnostic.error_count,
-                # Joined, not lists: the observability sanitizer replaces any
-                # non-scalar with its type name, so emitting these as lists logged
-                # the literal string "list" and destroyed the only detail that
-                # identifies which planner field failed.
-                "fieldPaths": ",".join(diagnostic.field_paths)[:512],
-                "errorTypes": ",".join(diagnostic.error_types)[:256],
                 "durationMs": diagnostic.duration_ms,
             }
             emit_practice_event(
@@ -2066,7 +2071,17 @@ class PracticeGenerationOrchestrator:
                             "reasonCode": "VERIFIER_UNAVAILABLE",
                         },
                     )
-                    continue
+                    # An unavailable verifier is infrastructure failure, not a
+                    # content defect: a newly generated question cannot repair it.
+                    # Leave the content replacement waves alone, and stay
+                    # non-recoverable so the outer commit does not schedule a
+                    # PROVIDER_REPLACEMENT group and regenerate content either.
+                    # The already-generated candidate is not carried past this
+                    # return, so re-verifying it is not possible here.
+                    provider_failure_recoverable = False
+                    provider_failure_stage = "VERIFIER"
+                    terminal = False
+                    break
                 verification = outcome
                 binding_valid = (
                     verification.schema_version == "2"
@@ -2495,6 +2510,10 @@ class PracticeGenerationOrchestrator:
 
             if outcome.provider_failure_recoverable:
                 terminal_reason_code = "PRACTICE_REPLACEMENT_EXHAUSTED"
+            elif outcome.provider_failure_stage == "VERIFIER":
+                # Verification never completed; the questions themselves were
+                # never shown to be deficient.
+                terminal_reason_code = "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED"
             elif "STRUCTURED_PARSE_INVALID" in outcome.reason_codes:
                 terminal_reason_code = "PRACTICE_GENERATOR_OUTPUT_INVALID"
             else:

@@ -674,7 +674,7 @@ def test_client_disconnect_cancels_worker_and_logs_reason(
             type="status",
             request_id=_REQUEST_ID,
             stage="verifying",
-            label="Verifying answer...",
+            label="Verifying...",
         )
         time.sleep(0.1)
         yield _complete_event()
