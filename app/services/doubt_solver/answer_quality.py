@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -477,11 +478,28 @@ def build_rewrite_messages(
     base_messages: list[LlmMessage],
     *,
     draft_answer: str,
+    reason_codes: Sequence[str] | None = None,
 ) -> list[LlmMessage]:
+    """Compose the bounded rewrite request, naming what the gate actually rejected.
+
+    Without the reason codes the rewrite is effectively a blind retry: the generic
+    prompt asks only for a concise rewrite, so a presentation defect such as
+    math_line_too_long survives into the second candidate and the request fails.
+    """
+    instruction = REWRITE_USER_PROMPT
+    if reason_codes:
+        instruction = (
+            f"{REWRITE_USER_PROMPT}\n\n"
+            f"The previous answer was rejected for: {','.join(reason_codes[:8])}. "
+            "Fix exactly that presentation defect. Keep every fact, step, equation and "
+            "the final answer unchanged, and do not shorten the explanation. Put display "
+            "math on its own line and never leave a long sentence and math markup on the "
+            "same line."
+        )
     return [
         *base_messages,
         LlmMessage(role="assistant", content=draft_answer),
-        LlmMessage(role="user", content=REWRITE_USER_PROMPT),
+        LlmMessage(role="user", content=instruction),
     ]
 
 

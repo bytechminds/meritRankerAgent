@@ -361,6 +361,7 @@ class LlmOrchestrator:
             rewrite_messages = build_rewrite_messages(
                 messages,
                 draft_answer=working,
+                reason_codes=quality.reason_codes,
             )
             try:
                 with bind_llm_attempt_type("rewrite"):

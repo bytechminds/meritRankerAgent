@@ -287,3 +287,98 @@ class TestPromptContent:
 class TestDetectFinalAnswer:
     def test_detects_header(self) -> None:
         assert detect_final_answer("**Final Answer:**\n\\(5\\)")
+
+
+class TestMathLineProtectionUnchanged:
+    """The repair-feedback fix must not have weakened the math_line_too_long rule."""
+
+    _LONG_MIXED_LINE = (
+        "**Answer:** Newton's second law states that the net force acting on a body is equal "
+        "to the product of its mass and its acceleration, written as \\(F = ma\\), where F is "
+        "the net force in newtons, m is the mass in kilograms and a is the acceleration in "
+        "metres per second squared, so a heavier object needs more force.\n<ANSWER_DONE>"
+    )
+
+    def test_overlong_line_mixing_prose_and_math_is_still_rejected(self) -> None:
+        result = validate_answer_quality(
+            self._LONG_MIXED_LINE,
+            subject="general",
+            difficulty="default",
+            intent="explain",
+            policy=_policy(),
+        )
+
+        assert result.is_valid is False
+        assert "math_line_too_long" in result.reason_codes
+        assert result.severity == "rewrite_required"
+
+    def test_short_prose_with_inline_math_passes(self) -> None:
+        result = validate_answer_quality(
+            "**Answer:**\nForce equals mass times acceleration, \\(F = ma\\).\n<ANSWER_DONE>",
+            subject="general",
+            difficulty="default",
+            intent="explain",
+            policy=_policy(),
+        )
+
+        assert result.is_valid
+        assert "math_line_too_long" not in result.reason_codes
+
+    def test_display_equation_on_its_own_line_with_separate_prose_passes(self) -> None:
+        text = (
+            "**Answer:**\n"
+            "\\[F = ma\\]\n\n"
+            "Here F is the net force in newtons, m is the mass in kilograms and a is the "
+            "acceleration in metres per second squared.\n"
+            "The law explains why a heavier object needs more force for the same "
+            "acceleration.\n<ANSWER_DONE>"
+        )
+        result = validate_answer_quality(
+            text,
+            subject="general",
+            difficulty="default",
+            intent="explain",
+            policy=_policy(),
+        )
+
+        assert result.is_valid
+        assert "math_line_too_long" not in result.reason_codes
+
+
+class TestRewriteFeedbackCarriesRejectionReason:
+    """Incident 598805d6 / bb3a4eb0 / f8a86991 (route=orchestrated_non_stream).
+
+    The gate detects math_line_too_long, but the rewrite request sends a static prompt
+    that never names the defect and asks the model to "keep it concise". The model
+    shortens the answer while preserving the same one-line prose+math shape, so the same
+    rule fires again and the student receives nothing.
+    """
+
+    def test_rewrite_prompt_names_the_reason_codes(self) -> None:
+        messages = build_rewrite_messages(
+            [LlmMessage(role="system", content="base")],
+            draft_answer="**Answer:** long line \\(F = ma\\)",
+            reason_codes=["math_line_too_long"],
+        )
+
+        instruction = messages[-1].content
+        assert "math_line_too_long" in instruction
+
+    def test_rewrite_prompt_asks_for_reformatting_not_shortening(self) -> None:
+        messages = build_rewrite_messages(
+            [LlmMessage(role="system", content="base")],
+            draft_answer="**Answer:** long line \\(F = ma\\)",
+            reason_codes=["math_line_too_long"],
+        )
+
+        instruction = messages[-1].content
+        assert "own line" in instruction
+        assert "do not shorten" in instruction
+
+    def test_rewrite_without_reason_codes_keeps_the_existing_prompt(self) -> None:
+        messages = build_rewrite_messages(
+            [LlmMessage(role="system", content="base")],
+            draft_answer="draft",
+        )
+
+        assert messages[-1].content == REWRITE_USER_PROMPT
