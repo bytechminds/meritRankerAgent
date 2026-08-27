@@ -72,8 +72,27 @@ _NON_ARTIFACT_OBJECT = re.compile(
 _COUNT_UNIT = (
     r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|quiz|practice|mock|test)"
 )
+
+
+def _safe_count_filler(candidate: str) -> str:
+    """Return the filler allowed between a count candidate and its count unit.
+
+    Filler may not cross another count candidate or a hard clause boundary, so an
+    earlier unrelated number cannot reach past the real request to claim the unit:
+    without this, "in 2 weeks. Create 10 questions" resolved to 2.
+    """
+    return rf"(?:\s+(?!{candidate})[^\s.?!;:]+)"
+
+
+_COUNT_FILLER = _safe_count_filler(r"-?\d{1,3}\b")
 _COUNT_PATTERN = re.compile(
-    r"(?<!\w)(-?\d{1,3})\b(?:-" + _COUNT_UNIT + r"\b|(?:\s+\S+){0,3}\s+" + _COUNT_UNIT + r"\b)",
+    r"(?<!\w)(-?\d{1,3})\b(?:-"
+    + _COUNT_UNIT
+    + r"\b|"
+    + _COUNT_FILLER
+    + r"{0,3}\s+"
+    + _COUNT_UNIT
+    + r"\b)",
     re.IGNORECASE,
 )
 _MIXED_DIFFICULTY_SIGNAL = re.compile(r"\b(?:mixed|mix)\b", re.IGNORECASE)
@@ -123,6 +142,9 @@ _WORD_COUNTS = {
     "पचास": 50,
     "सौ": 100,
 }
+_WORD_COUNT_FILLER = _safe_count_filler(
+    r"(?:" + "|".join(re.escape(word) for word in _WORD_COUNTS) + r")(?!\w)"
+)
 _DEFAULT_COUNTS = {
     PracticeType.SIMILAR_QUESTION: 1,
     PracticeType.QUICK_PRACTICE: 5,
@@ -238,10 +260,14 @@ def decide_practice_launch(
             reason_code="EXPLICIT_PRACTICE_CREATION_REQUEST",
             requested_artifact=requested_artifact,
         )
+    # The classifier owns "does this student want practice content created?". Requiring
+    # the raw text to prove creation again re-ran that semantic decision with exact
+    # keywords and rejected legitimate misspelled requests. The advice guard above is
+    # retained as containment only; it never fires once a creation signal is present.
     return PracticeLaunchDecision(
-        eligible=False,
-        reason_code="PRACTICE_CREATION_SIGNAL_MISSING",
-        requested_artifact=None,
+        eligible=True,
+        reason_code="CLASSIFIER_PRACTICE_CREATION_INTENT",
+        requested_artifact=requested_artifact,
     )
 
 
@@ -439,7 +465,10 @@ def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
             )
         )
         if re.search(
-            rf"(?<!\w){re.escape(word)}(?!\w)(?:\s+\S+){{0,3}}\s+" + artifact,
+            rf"(?<!\w){re.escape(word)}(?!\w)"
+            + _WORD_COUNT_FILLER
+            + r"{0,3}\s+"
+            + artifact,
             normalized,
         ):
             return count

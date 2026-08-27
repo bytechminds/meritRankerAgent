@@ -367,3 +367,48 @@ def test_correctness_infrastructure_failure_is_controlled_without_regeneration_o
     assert events[-1].type == "error"
     assert events[-1].metadata["code"] == "ANSWER_VERIFICATION_UNAVAILABLE"
     assert not any(event.type == "complete" for event in events)
+
+
+def test_correctness_rejection_still_reports_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 4: the genuine correctness failure keeps ANSWER_VERIFICATION_FAILED.
+
+    The quality-stage taxonomy correction must not weaken the code that actually
+    means "the independent verifier rejected this answer".
+    """
+    monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
+    adapter = _FakeAdapter(generated_answers=[_VALID_ANSWER])
+    correctness = _FakeCorrectnessVerifier(
+        CorrectnessVerification(
+            status="mismatch",
+            independent_answer="25 m",
+            single_defensible_answer=True,
+            reason="independent result differs",
+            method="model",
+        )
+    )
+    adapter.correctness_verifier = correctness  # type: ignore[attr-defined]
+    classification = {
+        **_CLASSIFICATION,
+        "difficulty": "intermediate",
+        "classifier_confidence": 0.99,
+    }
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                query="Solve the quadratic and select the correct option.",
+                language="english",
+                classification=classification,
+                classifier_confidence=0.99,
+            ),
+            adapter=adapter,  # type: ignore[arg-type]
+            conversation_persistence=_NoPersistenceExpected(),
+        )
+    )
+
+    assert correctness.calls == 1
+    assert events[-1].type == "error"
+    assert events[-1].metadata["code"] == "ANSWER_VERIFICATION_FAILED"

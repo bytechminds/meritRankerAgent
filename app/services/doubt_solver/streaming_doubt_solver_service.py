@@ -1010,9 +1010,11 @@ def _iter_stream_doubt_solver(
                     repair_attempted,
                     count_generator_calls(),
                 )
+                # The correctness verifier runs only after this block, so naming it
+                # here blamed a stage that never executed.
                 yield _error_event(
                     request_id,
-                    code="ANSWER_VERIFICATION_FAILED",
+                    code="ANSWER_QUALITY_FAILED",
                     retryable=False,
                 )
                 return
@@ -1206,7 +1208,7 @@ def _iter_stream_doubt_solver(
             )
         yield _error_event(
             request_id,
-            code="ANSWER_VERIFICATION_FAILED",
+            code="ANSWER_QUALITY_FAILED",
             retryable=False,
         )
         return

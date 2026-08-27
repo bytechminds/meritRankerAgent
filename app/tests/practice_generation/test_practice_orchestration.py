@@ -613,9 +613,21 @@ class Generator:
         # (group_id, attempt, required_count) per invocation, so tests can prove a
         # retry asks only for the deficit rather than the whole group.
         self.requests: list[tuple[str, int, int]] = []
+        # (group_id, attempt, language, exam_id, exam_stage) per invocation, so tests
+        # can prove a replacement wave carries the same delivery context as attempt 0.
+        self.contexts: list[tuple[str, int, str, str | None, str | None]] = []
 
     def generate(self, *, request, bucket, group, exclude_normalized_texts):
         self.requests.append((group.group_id, group.attempt, group.required_count))
+        self.contexts.append(
+            (
+                group.group_id,
+                group.attempt,
+                request.language,
+                request.exam_id,
+                request.exam_stage,
+            )
+        )
         if self.fail_always:
             raise TimeoutError("injected")
         if self.fail_item_retry_once and "-retry-" in group.group_id and group.attempt == 1:
@@ -634,7 +646,12 @@ class Generator:
                 {
                     "generation_item_id": item_id,
                     "bucket_id": bucket.bucket_id,
-                    "question": (f"For generated item {item_id}, what is {index + 1} plus one?"),
+                    "question": (
+                        # Devanagari stem when Hindi is requested: the production
+                        # delivery-language gate rejects ASCII-only Hindi content.
+                        f"{'प्रश्न: ' if request.language == 'hindi' else ''}"
+                        f"For generated item {item_id}, what is {index + 1} plus one?"
+                    ),
                     "question_type": bucket.question_type.value,
                     "options": [answer, "10", "11", "12"],
                     "correct_answer": answer,
@@ -752,7 +769,14 @@ def build_orchestrator(
     )
 
 
-def make_request(count: int, *, full_mock: bool = False) -> PracticeGenerationRequest:
+def make_request(
+    count: int,
+    *,
+    full_mock: bool = False,
+    language: str = "english",
+    exam_id: str | None = "CAT",
+    exam_stage: str | None = None,
+) -> PracticeGenerationRequest:
     return PracticeGenerationRequest(
         request_id=f"request-{count}",
         user_id="user-1",
@@ -765,8 +789,9 @@ def make_request(count: int, *, full_mock: bool = False) -> PracticeGenerationRe
         subject="math",
         topic="algebra",
         difficulty="intermediate",
-        language="english",
-        exam_id="CAT",
+        language=language,
+        exam_id=exam_id,
+        exam_stage=exam_stage,
         assessment_title="Algebra Practice",
     )
 
@@ -812,8 +837,17 @@ def run_job(
     reject_once: bool = False,
     verifier=None,
     question_bank_promotion_enabled: bool = False,
+    language: str = "english",
+    exam_id: str | None = "CAT",
+    exam_stage: str | None = None,
 ):
-    request = make_request(count, full_mock=count >= 50)
+    request = make_request(
+        count,
+        full_mock=count >= 50,
+        language=language,
+        exam_id=exam_id,
+        exam_stage=exam_stage,
+    )
     assessments = FakeAssessments(request)
     questions = FakeQuestions(
         assessments,
@@ -1782,3 +1816,39 @@ def test_structured_parse_invalid_rejects_the_whole_model_response() -> None:
     # An unparseable response has no salvageable candidates at all.
     assert malformed.accepted == ()
     assert "STRUCTURED_PARSE_INVALID" in malformed.rejection_reason_codes
+
+
+def test_replacement_wave_preserves_language_exam_stage_and_group_identity() -> None:
+    """A rejected candidate must be regenerated in the same delivery context.
+
+    Losing language/exam/stage on the replacement wave would silently deliver a
+    question in the wrong language or for the wrong exam while the approved
+    siblings stay correct, which no downstream gate would catch.
+    """
+    assessments, questions, _ = run_job(
+        5,
+        reject_once=True,
+        language="hindi",
+        exam_id="SSC_CGL",
+        exam_stage="TIER_2",
+    )
+    generator = _LAST_GENERATOR["generator"]
+
+    assert (assessments.item["status"], len(questions.linked)) == ("READY", 5)
+
+    initial = [entry for entry in generator.contexts if entry[1] == 0]
+    replacements = [entry for entry in generator.contexts if entry[1] > 0]
+    assert initial, "an initial generation wave must have happened"
+    assert replacements, "a replacement wave must have happened"
+
+    for _group_id, _attempt, language, exam_id, exam_stage in generator.contexts:
+        assert (language, exam_id, exam_stage) == ("hindi", "SSC_CGL", "TIER_2")
+
+    # The replacement stays inside an existing group rather than opening a new one.
+    initial_groups = {entry[0] for entry in initial}
+    for group_id, *_ in replacements:
+        assert group_id.split("-retry-")[0] in initial_groups, group_id
+
+    # Sibling preservation: a replacement asks only for the rejected deficit.
+    follow_ups = [entry for entry in generator.requests if entry[1] > 0]
+    assert all(entry[2] == 1 for entry in follow_ups), generator.requests

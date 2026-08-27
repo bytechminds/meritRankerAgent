@@ -804,9 +804,11 @@ A child route may override individual intent keys; unspecified keys fall through
 
 #### `visualize` intent note
 
-The `visualize` overlay (`intents/visualize.md`) instructs the generator to use
-text, Markdown, and Mermaid diagrams only. The generator must never claim to produce
-an image or external graphic.
+The `visualize` overlay (`intents/visualize.md`) instructs the generator to use a
+conservative text and Markdown subset only: headings, bold labels, bullets, numbered
+steps, and plain-text arrow flows. Mermaid and other diagram markup are not emitted,
+because rendering support is not proven on both the web and Android clients. The
+generator must never claim to produce an image or external graphic.
 
 #### Non-goals (deferred)
 

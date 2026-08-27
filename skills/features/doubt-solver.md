@@ -497,6 +497,54 @@ SBI_JUNIOR_ASSOCIATE`, `RRB_LEVEL_1`/`RAILWAY_GROUP_D -> RRB_GROUP_D`,
 
 ---
 
+## Latest Changes — Student Answer Presentation V1
+
+Answers are now formatted for scanning rather than as dense prose, using the existing
+shared-contract plus subject-overlay plus intent-overlay composition. No classifier field,
+schema field, route, model, or config was added.
+
+- `app/prompts/generator_answer_contract.md` gained a `## Presentation and structure`
+  section (blank-line separation, bullets over paragraphs, length matched to the question,
+  no empty or duplicated headings, plain-text `→` / `↓` flows) and tightened Markdown rules
+  that forbid Mermaid, Graphviz, PlantUML, and SVG, discourage tables and fenced code
+  blocks, and require streaming-safe partial output.
+- `app/prompts/subjects/{math,reasoning,english}_generator.md` each gained an
+  `## Answer shape` section giving that subject its own layout.
+- `app/prompts/subjects/general_generator.md` gained `## Answer shape` and
+  `## Subject presentation`, carrying per-family guidance for physics, chemistry, biology,
+  history, geography, polity, economics, literature, computer science, and short factual
+  questions. These families all classify as `general`, so the guidance is selected by the
+  generator from question content — no new classifier field.
+- `app/prompts/intents/explain.md` gained presentation shapes for define, explain, why,
+  how/process, compare, and option-explanation requests; compare uses labelled blocks
+  rather than a table.
+- `app/prompts/intents/visualize.md` no longer permits Mermaid; it now prescribes
+  plain-text arrow flows, chronology lines, and labelled blocks.
+- `app/tests/test_answer_presentation_contract.py` composes real prompts through
+  `PromptResolver` and validates 15 golden answer shapes through
+  `validate_answer_quality`.
+
+**`**Answer:**` stays a bold label and is deliberately not a `## Answer` heading.**
+`detect_final_answer` in `app/services/doubt_solver/answer_quality.py` matches bold labels
+only, so a heading-style answer is read as `missing_final_answer` and triggers a rewrite.
+A regression test pins this. Structural `##` headings are used only below the answer line.
+
+No model, formatter, graph, retrieval, Pattern matching, SolveFlow, streaming, route/model,
+schema, classifier, token-budget, or frontend response-contract behavior changed.
+
+Prompt growth per generator call: about +736 tokens for math+solve, +678 for english+solve,
+and +1518 for general+explain, driven by the per-family guidance in the `general` prompt.
+
+- **[AI RISK]** Presentation is prompt-guided, not deterministically post-validated.
+  Prompt-composition and golden-shape coverage are complete, but live-provider adherence is
+  **[NOT VERIFIED]** until evaluated with representative questions.
+- **[AI RISK]** Web and Android renderers are not present in this repository, so the safe
+  Markdown subset is asserted against the backend quality gate only. Cross-platform
+  rendering is **[NOT PROVEN]**; tables, fenced code, and diagram markup stay excluded
+  until a client-side check exists.
+
+---
+
 ## Latest Changes — Subject-Specific Answer Formatting
 
 Generator prompts now use one shared policy plus the existing math, reasoning, English,

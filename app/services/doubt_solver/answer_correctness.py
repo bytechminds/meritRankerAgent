@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -127,6 +127,45 @@ def _deterministic_expected_answer(query: str) -> float | None:
     return None
 
 
+def _independent_number(independent_answer: str) -> float | None:
+    """Return the value of a concise independent answer only when unambiguous."""
+    numbers = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", independent_answer)
+    if len(numbers) != 1:
+        return None
+    try:
+        return float(numbers[0].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _enforce_match_self_consistency(
+    verification: CorrectnessVerification,
+    *,
+    candidate_answer: str,
+) -> CorrectnessVerification:
+    """Reject a MATCH that contradicts the verifier's own independent answer.
+
+    The verifier contract defines MATCH as the independently derived result agreeing
+    with the candidate, so a MATCH carrying a different answer is self-contradictory
+    and must not reach the student. Stays silent unless both sides reduce to a single
+    unambiguous number, leaving fractions, ratios, options, symbolic and text answers
+    to the model's own judgement.
+    """
+    if verification.status != "match" or verification.independent_answer is None:
+        return verification
+    independent = _independent_number(verification.independent_answer)
+    candidate = _candidate_number(candidate_answer)
+    if independent is None or candidate is None:
+        return verification
+    if abs(candidate - independent) <= max(0.01, abs(independent) * 0.0001):
+        return verification
+    return replace(
+        verification,
+        status="mismatch",
+        reason="verifier_self_contradiction",
+    )
+
+
 def deterministic_verify(
     *, query: str, candidate_answer: str
 ) -> CorrectnessVerification | None:
@@ -200,6 +239,10 @@ class AnswerCorrectnessVerifier:
                 single_defensible_answer=parsed.single_defensible_answer,
                 reason=parsed.reason,
                 method="model",
+            )
+            verification = _enforce_match_self_consistency(
+                verification,
+                candidate_answer=candidate_answer,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

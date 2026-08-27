@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     decide_practice_launch,
@@ -301,3 +303,59 @@ def test_practice_advice_remains_on_normal_doubt_solver_path() -> None:
 
     assert result.get("persistence_suppressed") is not True
     assert result["answer"] == "Use a focused practice schedule."
+
+
+@pytest.mark.parametrize(
+    ("query", "language"),
+    (
+        ("Create five percentage practice questions", "english"),
+        ("पाँच प्रतिशत के सवाल बनाओ", "hindi"),
+        ("Paanch percentage sawaal banao", "hinglish"),
+    ),
+)
+def test_practice_handoff_preserves_language_exam_and_stage(
+    query: str,
+    language: str,
+) -> None:
+    """No selected signal may disappear across the Doubt Solver → Practice handoff."""
+    request = resolve_practice_request(
+        request_id="request-1",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+        query=query,
+        subject="math",
+        topic="percentage",
+        difficulty="intermediate",
+        language=language,
+        exam_id="SSC_CGL",
+        exam_stage="TIER_2",
+    )
+
+    assert request.language == language
+    assert request.exam_id == "SSC_CGL"
+    assert request.exam_stage == "TIER_2"
+    assert request.accepted_count == 5
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "Create 5 advanced percentage questions",
+        "give me some english practice",
+        "cretae three percetnage practice qestions",
+    ),
+)
+def test_practice_creation_never_falls_through_to_the_inline_answer_path(query: str) -> None:
+    """Reliability lock for the observed quality-gate terminal failures.
+
+    Every real local quality-gate termination in the retained traces was a
+    practice-intent request rejected with PRACTICE_CREATION_SIGNAL_MISSING, answered
+    inline by practice.generator.default, and then discarded by the doubt-solver
+    answer-quality contract that a multi-question practice set cannot satisfy. The
+    inline fallthrough is the failure's antecedent, so it must stay unreachable.
+    """
+    decision = decide_practice_launch(query, {"intent": "practice"})
+
+    assert decision.eligible is True
+    assert decision.reason_code != "PRACTICE_CREATION_SIGNAL_MISSING"

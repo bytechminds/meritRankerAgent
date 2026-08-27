@@ -942,3 +942,86 @@ def test_agentcore_invocations_preserves_event_contract(
         "metadata",
         "response",
     }
+
+
+def test_quality_repair_exhaustion_does_not_claim_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The correctness verifier never runs on this path, so its code must not be used.
+
+    Quality validation rejects, the one bounded repair runs, revalidation still
+    rejects, and the stream terminates. Reporting that as ANSWER_VERIFICATION_FAILED
+    blames a stage that was never executed.
+    """
+    from services.doubt_solver.answer_quality import AnswerQualityResult
+
+    monkeypatch.setattr(
+        streaming_module,
+        "validate_answer_quality",
+        lambda *args, **kwargs: AnswerQualityResult(
+            is_valid=False,
+            severity="rewrite_required",
+            reason_codes=["too_many_visible_steps"],
+        ),
+    )
+
+    events = _service_events(_Adapter(generated=[_ANSWER, _ANSWER]))
+
+    assert events[-1].type == "error"
+    assert events[-1].metadata["code"] != "ANSWER_VERIFICATION_FAILED"
+    assert events[-1].metadata["code"] == "ANSWER_QUALITY_FAILED"
+    assert events[-1].metadata["retryable"] is False
+
+
+def test_clean_quality_completes_without_a_terminal_error() -> None:
+    """Case 1: unchanged success path."""
+    events = _service_events(_Adapter())
+
+    assert events[-1].type == "complete"
+    assert all(event.type != "error" for event in events)
+
+
+def test_successful_repair_still_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Case 2: first validation rejects, the bounded repair is accepted."""
+    from services.doubt_solver.answer_quality import AnswerQualityResult
+
+    results = [
+        AnswerQualityResult(
+            is_valid=False,
+            severity="rewrite_required",
+            reason_codes=["too_many_visible_steps"],
+        ),
+        AnswerQualityResult(is_valid=True, severity="clean", reason_codes=[]),
+    ]
+    monkeypatch.setattr(
+        streaming_module,
+        "validate_answer_quality",
+        lambda *args, **kwargs: results.pop(0) if results else results[-1],
+    )
+
+    events = _service_events(_Adapter(generated=[_ANSWER, _ANSWER]))
+
+    assert events[-1].type == "complete"
+
+
+def test_quality_failure_maps_to_its_own_terminal_reason() -> None:
+    """The transport must not fall back to unexpected_internal_error for the new code."""
+    from services.doubt_solver.stream_transport import _terminal_reason
+
+    quality = DoubtSolverStreamEvent(
+        type="error",
+        request_id=_REQUEST_ID,
+        stage="failed",
+        label="Unable to complete",
+        metadata={"retryable": False, "code": "ANSWER_QUALITY_FAILED"},
+    )
+    correctness = DoubtSolverStreamEvent(
+        type="error",
+        request_id=_REQUEST_ID,
+        stage="failed",
+        label="Unable to complete",
+        metadata={"retryable": False, "code": "ANSWER_VERIFICATION_FAILED"},
+    )
+
+    assert _terminal_reason(quality, visible=False) == "quality_failed"
+    assert _terminal_reason(correctness, visible=False) == "verification_failed"

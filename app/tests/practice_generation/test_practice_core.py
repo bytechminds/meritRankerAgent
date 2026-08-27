@@ -219,8 +219,47 @@ def test_requested_question_artifact_launches(query: str, artifact: str) -> None
         "Which questions should I practise?",
     ],
 )
-def test_non_question_artifact_does_not_launch(query: str) -> None:
-    assert decide_practice_launch(query, {"intent": "practice"}).eligible is False
+def test_study_guidance_does_not_launch_practice(query: str) -> None:
+    """Guidance is separated by the classifier, so the router sees a non-practice intent.
+
+    These queries were previously asserted against a synthetic {"intent": "practice"}
+    fixture, which the live classifier does not produce for any of them: each one
+    classifies as `general_doubt` (normalized `explain`). Feeding the intent the
+    classifier actually emits tests the router's real contract instead of prose.
+    """
+    assert decide_practice_launch(query, {"intent": "explain"}).eligible is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "How should I practise algebra?",
+        "Which topics should I practise?",
+        "Is this question good for practice?",
+    ],
+)
+def test_advice_wording_is_contained_even_if_intent_says_practice(query: str) -> None:
+    """Defensive containment: retained behind the classifier, not the primary decision.
+
+    The raw-text creation requirement was removed because it rejected legitimate
+    misspelled creation. The advice guard stays as a second line of defence and never
+    fires once a creation signal is present.
+    """
+    decision = decide_practice_launch(query, {"intent": "practice"})
+
+    assert decision.eligible is False
+    assert decision.reason_code == "PRACTICE_ADVICE_REQUEST"
+
+
+def test_misspelled_creation_reaches_practice_on_classifier_intent_alone() -> None:
+    """The reported incident: typos must not block a semantically confirmed request."""
+    decision = decide_practice_launch(
+        "cretae three percetnage practice qestions",
+        {"intent": "practice"},
+    )
+
+    assert decision.eligible is True
+    assert decision.reason_code == "CLASSIFIER_PRACTICE_CREATION_INTENT"
 
 
 def test_enabled_runtime_requires_existing_persistence_configuration() -> None:
@@ -1931,3 +1970,99 @@ def test_one_incompatible_question_among_one_hundred_names_only_that_slot() -> N
     assert validation.ready is False
     # The safety net must identify the single offending slot, never blame the batch.
     assert validation.failed_slot_ids == (linked[42]["_practiceMeta"]["slotId"],)
+
+
+# ---------------------------------------------------------------------------
+# Noisy student input — requested-count ownership
+# ---------------------------------------------------------------------------
+# The classifier never owns the requested count; `resolve_requested_count` does.
+# These pin that authority against conversational noise carrying rival numbers:
+# a candidate may not reach its count unit across another candidate or across a
+# hard clause boundary.
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_count"),
+    (
+        ("My exam is in 2 weeks. Create 10 questions on photosynthesis.", 10),
+        ("My exam is in 2 weeks, create 10 questions on photosynthesis.", 10),
+        ("I scored 30 marks today, give me 5 questions on ratio.", 5),
+        ("My teacher gave us 20 examples, but I only want 6 practice questions.", 6),
+        ("For class 10, create 5 questions on motion.", 5),
+        ("Chapter 2: create 10 questions on cells.", 10),
+        ("CAT 2026 — create 5 percentage questions.", 5),
+        ("Create 5 percentage questions.", 5),
+        ("Create 10 difficult practice questions.", 10),
+        ("Create a 10-question practice test.", 10),
+        ("Create 25 questions on averages.", 25),
+    ),
+)
+def test_noisy_query_resolves_the_requested_count_the_student_actually_asked_for(
+    query: str,
+    expected_count: int,
+) -> None:
+    resolved = request(query, count_query=query)
+
+    assert (resolved.requested_count, resolved.accepted_count) == (
+        expected_count,
+        expected_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_count"),
+    (
+        ("Create 7 questions on photosynthesis.", 7),
+        ("Create 8 questions on the French Revolution.", 8),
+        ("Create 6 questions on active and passive voice.", 6),
+        ("Create 9 questions on Newton's laws.", 9),
+        ("Create 5 questions on ratio.", 5),
+    ),
+)
+def test_requested_count_extraction_is_subject_neutral(
+    query: str,
+    expected_count: int,
+) -> None:
+    resolved = request(query, count_query=query)
+
+    assert resolved.requested_count == expected_count
+
+
+def test_revised_count_characterizes_first_match_wins_semantics() -> None:
+    """Current contract: the first stated count wins; a later revision is ignored.
+
+    The trailing "5" carries no count unit, so treating it as a correction would
+    be new natural-language semantics rather than a fix to unit association.
+    """
+    query = "Give me 10 questions — actually make it 5."
+    resolved = request(query, count_query=query)
+
+    assert (resolved.requested_count, resolved.accepted_count) == (10, 10)
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_count"),
+    (
+        ("My exam is in two weeks. Create ten questions on photosynthesis.", 10),
+        ("I scored thirty marks today. Give me five questions on ratio.", 5),
+        ("Chapter two: create ten questions on cells.", 10),
+        ("For class ten, create five questions on motion.", 5),
+        ("Create ten questions on photosynthesis.", 10),
+    ),
+)
+def test_spelled_out_count_uses_the_same_safe_filler_as_the_numeric_branch(
+    query: str,
+    expected_count: int,
+) -> None:
+    resolved = request(query, count_query=query)
+
+    assert resolved.requested_count == expected_count
+
+
+def test_spelled_out_count_does_not_depend_on_word_vocabulary_ordering() -> None:
+    """Both orderings must resolve by the filler rule, not by dict iteration luck."""
+    ten_first = "For class five, create ten questions on motion."
+    five_first = "For class ten, create five questions on motion."
+
+    assert request(ten_first, count_query=ten_first).requested_count == 10
+    assert request(five_first, count_query=five_first).requested_count == 5

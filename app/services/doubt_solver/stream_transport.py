@@ -130,6 +130,7 @@ def _terminal_reason(event: DoubtSolverStreamEvent, *, visible: bool) -> str:
         ),
         "ANSWER_PARTIAL_STREAM_FAILED": "provider_failed_after_content",
         "ANSWER_VERIFICATION_FAILED": "verification_failed",
+        "ANSWER_QUALITY_FAILED": "quality_failed",
         "ANSWER_REPAIR_FAILED": "repair_failed",
         "ANSWER_SERIALIZATION_FAILED": "serialization_failed",
     }.get(code, "unexpected_internal_error")
