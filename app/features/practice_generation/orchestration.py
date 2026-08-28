@@ -2069,6 +2069,9 @@ class PracticeGenerationOrchestrator:
                             "slotId": slot.slot_id,
                             "replacementWave": replacement_wave,
                             "reasonCode": "VERIFIER_UNAVAILABLE",
+                            # Exception class only: without it VERIFIER_UNAVAILABLE
+                            # cannot be told apart from provider capacity limits.
+                            "errorClass": type(outcome).__name__,
                         },
                     )
                     # An unavailable verifier is infrastructure failure, not a
