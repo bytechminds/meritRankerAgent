@@ -42,6 +42,53 @@ models:
     supports_thinking: false
     timeout_seconds: 30
 
+  openai_gpt_5_6_luna:
+    description: >-
+      Azure GPT-5.6 Luna. Deployment from AZURE_OPENAI_DEPLOYMENT_5.6_LUNA
+      (gpt-5.6-luna). Reasoning-capable with native Structured Outputs; effort is
+      supplied per route through provider_options so it reaches the payload.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5.6-luna
+    supports_streaming: true
+    supports_thinking: false
+    supports_reasoning: true
+    reasoning_effort: high
+    supported_reasoning_efforts: [low, medium, high, xhigh]
+    token_budget_param: max_completion_tokens
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 60
+
+  openai_gpt_5_6_terra:
+    description: >-
+      Azure GPT-5.6 Terra. Deployment from AZURE_OPENAI_DEPLOYMENT_5.6_TERRA
+      (gpt-5.6-terra). Wired for the later Advanced qualification; not yet routed.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5.6-terra
+    supports_streaming: true
+    supports_thinking: false
+    supports_reasoning: true
+    reasoning_effort: high
+    token_budget_param: max_completion_tokens
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 60
+
+  openai_gpt_5_mini:
+    description: >-
+      Azure GPT-5 Mini. Deployment from AZURE_OPENAI_DEPLOYMENT_5_MINI
+      (gpt-5-mini). Registered for resolution only; not placed on any route.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-5-mini
+    supports_streaming: true
+    supports_thinking: false
+    supports_reasoning: true
+    reasoning_effort: medium
+    token_budget_param: max_completion_tokens
+    supports_temperature: false
+    timeout_seconds: 30
+
   openai_gpt_4_1_mini:
     description: >-
       Azure GPT-4.1-mini deployment. From AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI
@@ -67,12 +114,21 @@ models:
   openai_gpt_5_4_mini:
     description: >-
       Optional Azure GPT-5.4-mini deployment. Active only when
-      AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI is set.
+      AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI is set. Reasoning model: the deployment
+      rejects max_tokens outright and reports reasoning tokens for every effort from
+      low through xhigh. Unlike gpt-5-mini it does accept temperature, so that stays
+      enabled rather than being copied from the sibling alias.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     deployment: gpt-5.4-mini
     supports_streaming: true
     supports_thinking: false
+    supports_reasoning: true
+    reasoning_effort: medium
+    supported_reasoning_efforts: [low, medium, high, xhigh]
+    token_budget_param: max_completion_tokens
+    supports_temperature: true
+    model_hard_max_output_tokens: 8000
     timeout_seconds: 25
 
   openai_gpt_5_5:
@@ -623,6 +679,174 @@ models:
     supports_streaming: false
     supports_thinking: false
     timeout_seconds: 25
+
+  # -------------------------------------------------------------------------
+  # Request Intelligence — small, fast, schema-constrained interpretation model
+  # -------------------------------------------------------------------------
+
+  practice_request_intelligence:
+    description: >-
+      GLM 4.7 Flash on Amazon Bedrock (in-region, on-demand) used only to interpret
+      a free-text Practice request into explicit constraints. No fallback alias:
+      when it is unavailable Practice falls back to the existing deterministic
+      request resolution rather than paying a second model.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [request_intelligence]
+    model_id: zai.glm-4.7-flash
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    timeout_seconds: 20
+
+  practice_request_intelligence_gemma:
+    description: >-
+      Gemma 3 12B IT on Amazon Bedrock (in-region, on-demand). Candidate for the
+      Request Intelligence role. Inactive until a route selects it — swapping the
+      interpretation model is a registry/route change only, never a code change.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [request_intelligence]
+    model_id: google.gemma-3-12b-it
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    timeout_seconds: 20
+
+  practice_request_intelligence_minimax:
+    description: >-
+      MiniMax M2.5 on Amazon Bedrock (in-region, on-demand). Candidate for the
+      Request Intelligence role. Inactive until a route selects it — swapping the
+      interpretation model is a registry/route change only, never a code change.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [request_intelligence]
+    model_id: minimax.minimax-m2.5
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    timeout_seconds: 20
+
+  qwen3_32b_bedrock:
+    description: >-
+      Qwen3-32B on Amazon Bedrock (in-region ap-south-1, on-demand). Candidate for
+      Intermediate Reasoning generation. Inactive until a route selects it.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    model_id: qwen.qwen3-32b-v1:0
+    supports_streaming: false
+    supports_thinking: true
+    supports_reasoning: true
+    reasoning_effort: none
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 120
+
+  glm5_bedrock:
+    description: >-
+      GLM 5 on Amazon Bedrock (in-region ap-south-1, on-demand). Candidate for
+      English reasoning generation and verification. Inactive until a route selects it.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    model_id: zai.glm-5
+    supports_streaming: false
+    supports_thinking: true
+    supports_reasoning: false
+    reasoning_effort: none
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 120
+
+  azure_deepseek_v4_pro:
+    description: >-
+      DeepSeek V4-Pro on the Azure/Foundry v1 API, where the request model parameter
+      is the deployment name. Additive and separate from `deepseek_v4pro`, which stays
+      on the direct api.deepseek.com path with its own historical callers and fallback
+      chains — remapping that alias would silently move them. The direct path also
+      returned HTTP 402 historically, so V4-Pro qualification must resolve here.
+      Probed: accepts reasoning_effort low/medium/high and temperature, and reports no
+      separate reasoning-token count.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    allowed_task_roles: [generator]
+    deployment: DeepSeek-V4-Pro
+    supports_streaming: true
+    supports_thinking: false
+    supports_reasoning: true
+    reasoning_effort: medium
+    supported_reasoning_efforts: [low, medium, high]
+    token_budget_param: max_completion_tokens
+    supports_temperature: true
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 90
+
+  glm47_flash_bedrock:
+    description: >-
+      GLM 4.7 Flash on Amazon Bedrock (in-region ap-south-1, on-demand). Candidate
+      for cheap English and short source-grounded authoring/verification. Distinct
+      from practice_request_intelligence, which stays scoped to interpretation only.
+      Provider output capacity is ~4K tokens, so large multi-question batches must
+      not be routed here. Inactive until a route selects it.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [generator, verifier]
+    model_id: zai.glm-4.7-flash
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    model_hard_max_output_tokens: 4000
+    timeout_seconds: 120
+
+  qwen3_next_80b_bedrock:
+    description: >-
+      Qwen3 Next 80B A3B on Amazon Bedrock (in-region ap-south-1, on-demand).
+      Candidate for cheap English/factual authoring and verification. Distinct from
+      practice_request_intelligence_qwen, which stays scoped to interpretation only.
+      Inactive until a route selects it.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [generator, verifier]
+    model_id: qwen.qwen3-next-80b-a3b
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 120
+
+  qwen3_235b_bedrock:
+    description: >-
+      Qwen3 235B A22B 2507 on Amazon Bedrock (in-region ap-south-1, on-demand).
+      Second-wave candidate for hard English reasoning, Math, and verification.
+      Registered for controlled evaluation only; run it only when first-wave
+      candidates leave a proven gap. Inactive until a route selects it.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [generator, verifier]
+    model_id: qwen.qwen3-235b-a22b-2507-v1:0
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 120
+
+  practice_request_intelligence_qwen:
+    description: >-
+      Qwen3 Next 80B A3B on Amazon Bedrock (in-region, on-demand, Standard tier).
+      Candidate for the Request Intelligence role. Inactive until a route selects it —
+      swapping the interpretation model is a registry/route change only.
+    provider: bedrock
+    provider_profile: bedrock_apsouth1
+    allowed_task_roles: [request_intelligence]
+    model_id: qwen.qwen3-next-80b-a3b
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    timeout_seconds: 20
 
   # -------------------------------------------------------------------------
   # Safe mock — always present for the nuclear fallback / dry-run path

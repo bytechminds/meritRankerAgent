@@ -12,6 +12,10 @@ Each slot must contain only:
 `generator_route_hint`, `reasoning_target`, `trap_type`, `not_same_when`,
 `generation_group_hint`.
 
+Also return `requestedTopicEvidence`: one per requested topic, not per slot.
+`sourceText` is an exact query span, own script, whole for compound names;
+`topicId` is your normalized English id. Invent neither.
+
 # Rules
 
 - Each supplied `topic` must be some slot's `topic_id`.

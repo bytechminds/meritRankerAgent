@@ -1170,29 +1170,38 @@ def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
 
     meta = json.loads(assessments.item["meta"])
     assert assessments.item["status"] == "FAILED"
-    assert meta["errorCode"] == "PRACTICE_PLANNER_FALLBACK_INVALID"
+    # C1: OLD CONTRACT — the deterministic fallback ran and was itself invalid
+    # (PRACTICE_PLANNER_FALLBACK_INVALID). NEW CONTRACT — the request carries no
+    # trustworthy structured topics, so planning stops before the fallback can widen
+    # the composition. Both end FAILED and non-playable; only the reason differs.
+    assert meta["errorCode"] == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
     diagnostics = [details for name, details in emitted if name == "planner_validation_failed"]
     assert diagnostics[-1] == {
         "expectedSlotCount": 5,
         "routeId": "quant_reasoning.planner.basic",
         "plannerTier": "light",
-        "fallbackInvoked": True,
-        "fallbackResult": "invalid",
-        "reasonCode": "PLANNER_SCHEMA_INVALID",
-        "actualSlotCount": None,
+        "fallbackInvoked": False,
+        "fallbackResult": "not_invoked",
+        "reasonCode": "PLANNER_SLOT_COUNT_MISMATCH",
+        "actualSlotCount": 0,
         "plannerAttempt": 2,
-        "plannerPhase": "fallback",
+        "plannerPhase": "repair",
         "schemaName": "PracticeBlueprint",
         "validationErrorCount": 1,
         # Joined strings, not lists: the sanitizer collapses non-scalars to "list".
         "fieldPaths": "$",
-        "errorTypes": "ValueError",
+        "errorTypes": "value_error",
         # Which layer rejected the response, so the failing invariant is
         # identifiable without the raw planner output.
-        "validationStage": "contract",
+        "validationStage": "schema",
         "durationMs": 0,
     }
-    assert "planner_fallback_failed" in [name for name, _details in emitted]
+    # C1: the fallback is no longer invoked, so no planner_fallback_failed event.
+    # The assessment still terminates FAILED through the existing bounded lifecycle.
+    emitted_names = [name for name, _details in emitted]
+    assert "planner_fallback_failed" not in emitted_names
+    assert "practice_failed" in emitted_names
+    assert "ASSESSMENT_FAILED" in emitted_names
 
 
 def test_duplicate_graph_operation_and_restart_are_idempotent() -> None:

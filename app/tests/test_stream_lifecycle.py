@@ -859,6 +859,7 @@ def test_agentcore_invocations_preserves_event_contract(
         follow_up_resolver=None,
         conversation_understanding=None,
         practice_launcher=None,
+        practice_request_interpreter=None,
     ) -> Iterator[DoubtSolverStreamEvent]:
         del (
             adapter,
@@ -866,6 +867,7 @@ def test_agentcore_invocations_preserves_event_contract(
             follow_up_resolver,
             conversation_understanding,
             practice_launcher,
+            practice_request_interpreter,
         )
         response = DoubtSolverFinalResponse(
             request_id=input.request_id,

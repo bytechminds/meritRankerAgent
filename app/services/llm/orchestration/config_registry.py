@@ -114,6 +114,7 @@ class LlmConfigRegistry:
         provider_profiles_path: Path | None = None,
     ) -> None:
         self._route_map: dict[tuple[str, str, str], ResolvedRouteEntry] = {}
+        self._language_override_map: dict[tuple[str, str, str, str], str] = {}
         self._model_map: dict[str, ModelConfig] = {}
         self._provider_profile_map: dict[str, ProviderProfile] = {}
         self._config_version: int = 1
@@ -146,6 +147,7 @@ class LlmConfigRegistry:
                 routes=routes_cfg.routes,
                 models=model_registry_cfg.models,
                 provider_profiles=provider_profiles_cfg.provider_profiles,
+                language_model_overrides=routes_cfg.language_model_overrides,
             )
 
     # ------------------------------------------------------------------
@@ -283,6 +285,8 @@ class LlmConfigRegistry:
         routes: dict[str, dict[str, dict[str, RouteEntry]]],
         models: dict[str, ModelConfig],
         provider_profiles: dict[str, ProviderProfile],
+        language_model_overrides: dict[str, dict[str, dict[str, dict[str, str]]]]
+        | None = None,
     ) -> None:
         """Resolve inheritance, compile maps, and cross-validate."""
         from services.llm.orchestration.model_registry_env import (  # noqa: PLC0415
@@ -293,6 +297,7 @@ class LlmConfigRegistry:
         apply_model_registry_env_overrides(self._model_map)
         self._provider_profile_map = dict(provider_profiles)
         self._build_route_map(routes)
+        self._build_language_override_map(language_model_overrides or {})
         self._cross_validate()
 
         logger.debug(
@@ -300,6 +305,35 @@ class LlmConfigRegistry:
             len(self._route_map),
             len(self._model_map),
             len(self._provider_profile_map),
+        )
+
+    def _build_language_override_map(
+        self,
+        overrides: dict[str, dict[str, dict[str, dict[str, str]]]],
+    ) -> None:
+        """Flatten the optional language override block into an exact-match map.
+
+        Absent config leaves the map empty, which is what keeps language a
+        passthrough dimension for every existing route.
+        """
+        for subject, roles in overrides.items():
+            for task_role, difficulties in roles.items():
+                for difficulty, languages in difficulties.items():
+                    for language, model_alias in languages.items():
+                        self._language_override_map[
+                            (subject, task_role, difficulty, language)
+                        ] = model_alias
+
+    def get_language_model_override(
+        self,
+        subject: str,
+        task_role: str,
+        difficulty: str,
+        language: str,
+    ) -> str | None:
+        """Return the configured model alias for this exact route+language, if any."""
+        return self._language_override_map.get(
+            (subject, task_role, difficulty, language)
         )
 
     def _build_route_map(
@@ -458,6 +492,7 @@ class LlmConfigRegistry:
     def _cross_validate(self) -> None:
         """Validate all referenced aliases and profiles exist."""
         self._validate_model_references()
+        self._validate_language_override_references()
         self._validate_provider_profile_references()
         self._validate_provider_consistency()
         self._validate_safe_mock_exists()
@@ -471,6 +506,30 @@ class LlmConfigRegistry:
                 raise LlmConfigValidationError(
                     f"Route {subject}.{task_role}.{difficulty} references model "
                     f"'{route.model}' which does not exist in the models catalog."
+                )
+
+    def _validate_language_override_references(self) -> None:
+        """A language override must name a real model and a route that exists.
+
+        Failing closed at build time keeps a typo from silently degrading to the
+        unrouted default at request time.
+        """
+        for (
+            subject,
+            task_role,
+            difficulty,
+            language,
+        ), model_alias in self._language_override_map.items():
+            if (subject, task_role, difficulty) not in self._route_map:
+                raise LlmConfigValidationError(
+                    f"Language override {subject}.{task_role}.{difficulty}.{language} "
+                    "targets a route that does not exist."
+                )
+            if model_alias not in self._model_map:
+                raise LlmConfigValidationError(
+                    f"Language override {subject}.{task_role}.{difficulty}.{language} "
+                    f"references model '{model_alias}' which does not exist in the "
+                    "models catalog."
                 )
 
     def _validate_provider_profile_references(self) -> None:

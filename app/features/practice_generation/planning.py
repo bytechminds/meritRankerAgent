@@ -7,11 +7,17 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
+from features.practice_generation.request_intelligence import (
+    PracticeRequestInterpreter,
+    interpret_practice_request,
+    interpreted_total_count,
+)
 from features.practice_generation.schemas import (
     Complexity,
     Difficulty,
@@ -25,8 +31,15 @@ from features.practice_generation.schemas import (
     QuestionType,
     VerificationPolicy,
 )
+from observability.events import log_event
 from practice_limits import MAX_PRACTICE_QUESTIONS
 from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
+from schemas.practice_request_intelligence import (
+    CustomDifficulty,
+    MixedDifficulty,
+    PracticeRequestIntelligence,
+    SingleDifficulty,
+)
 from services.classification.web_search_demand import is_freshness_sensitive_query
 from services.llm.orchestration.errors import ProviderExecutionError
 from tools.web_search.models import FreshEvidenceBundle
@@ -69,8 +82,13 @@ _NON_ARTIFACT_OBJECT = re.compile(
     r"importance|schedule)\b",
     re.IGNORECASE,
 )
+# The unit a student writes the number against. Devanagari forms and the common
+# clipped/misspelled English ones belong here for the same reason "sawal" already
+# does: the digit is explicit and unambiguous, and only the unit word varies. Longer
+# alternatives precede their prefixes so "questions" is never consumed as "ques".
 _COUNT_UNIT = (
-    r"(?:questions?|problems?|items?|sawaals?|sawals?|prashn|quiz|practice|mock|test)"
+    r"(?:questions?|quesitons?|questin|ques|problems?|items?|sawaals?|sawals?|prashn|"
+    r"सवाल|प्रश्न|quiz|practice|mock|test)"
 )
 
 
@@ -417,10 +435,25 @@ def _planner_repair_feedback(diagnostic: PlannerValidationDiagnostic) -> str:
     )
 
 
+_DIFFICULTY_ORDER: tuple[Difficulty, ...] = (
+    Difficulty.BASIC,
+    Difficulty.INTERMEDIATE,
+    Difficulty.ADVANCED,
+)
+
+
 def _deterministic_slot_difficulties(
     request: PracticeGenerationRequest,
 ) -> tuple[Difficulty, ...]:
     """Use a balanced generic fallback only for an explicitly mixed request."""
+    if request.difficulty_distribution:
+        # Explicit per-level counts are the most specific instruction there is, and
+        # the request contract already guarantees they sum to accepted_count.
+        return tuple(
+            level
+            for level in _DIFFICULTY_ORDER
+            for _ in range(request.difficulty_distribution.get(level, 0))
+        )
     requested_mixed = request.mixed_difficulty_requested or bool(
         _MIXED_DIFFICULTY_SIGNAL.search(request.original_query)
     )
@@ -429,8 +462,10 @@ def _deterministic_slot_difficulties(
     )
     if not requested_mixed or requested_difficulty:
         return (request.difficulty,) * request.accepted_count
-    levels = (Difficulty.BASIC, Difficulty.INTERMEDIATE, Difficulty.ADVANCED)
-    return tuple(levels[index % len(levels)] for index in range(request.accepted_count))
+    return tuple(
+        _DIFFICULTY_ORDER[index % len(_DIFFICULTY_ORDER)]
+        for index in range(request.accepted_count)
+    )
 
 
 def resolve_practice_type(query: str) -> PracticeType:
@@ -450,7 +485,14 @@ def resolve_practice_type(query: str) -> PracticeType:
     return PracticeType.QUICK_PRACTICE
 
 
-def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
+def explicit_requested_count(query: str) -> int | None:
+    """Return the count the student demonstrably wrote, or None when they wrote none.
+
+    Separating "no count found" from the practice-type default matters: a default is
+    not evidence of intent, so it must never be weighed against an interpretation of
+    the student's own words. The patterns themselves are unchanged — no new
+    language-specific parsing is added here.
+    """
     numeric = _COUNT_PATTERN.search(query)
     if numeric is not None:
         return int(numeric.group(1))
@@ -472,6 +514,14 @@ def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
             normalized,
         ):
             return count
+    return None
+
+
+def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
+    """Return the explicit count, or the practice-type default when none was written."""
+    explicit = explicit_requested_count(query)
+    if explicit is not None:
+        return explicit
     return _DEFAULT_COUNTS[practice_type]
 
 
@@ -506,6 +556,8 @@ def resolve_practice_request(
     query: str,
     subject: str,
     topic: str | None,
+    topics: list[str] | None = None,
+    requested_count: int | None = None,
     difficulty: str,
     language: str,
     exam_id: str | None,
@@ -514,22 +566,69 @@ def resolve_practice_request(
     source_question_reference: str | None = None,
     freshness_requirement: PracticeFreshnessRequirement | None = None,
     fresh_evidence: FreshEvidenceBundle | None = None,
+    request_interpreter: PracticeRequestInterpreter | None = None,
 ) -> PracticeGenerationRequest:
+    """Resolve one Practice request into deterministic, planner-ready constraints.
+
+    ``topics`` and ``requested_count`` carry constraints a caller already resolved
+    and trusts. Supplying either bypasses Request Intelligence entirely, so a
+    structured request never pays for interpretation it does not need; free text
+    reaches the interpreter instead. Language, practice type and every bound stay
+    deterministic either way — interpretation only supplies constraints the
+    deterministic layer cannot see.
+    """
     practice_type = resolve_practice_type(query)
-    requested_count = validate_practice_requested_count(query)
-    accepted_count = requested_count
+    explicit_count = explicit_requested_count(query)
     normalized_difficulty = {
         "basic": Difficulty.BASIC,
         "intermediate": Difficulty.INTERMEDIATE,
         "advanced": Difficulty.ADVANCED,
     }.get(difficulty, Difficulty.INTERMEDIATE)
-    display_topic = topic or subject.replace("_", " ").title()
-    title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
     resolved_language, language_source = resolve_practice_delivery_language(
         query,
         language,
     )
     freshness_requirement = freshness_requirement or PracticeFreshnessRequirement()
+    intelligence = (
+        None
+        if topics is not None or requested_count is not None
+        else interpret_practice_request(
+            request_interpreter,
+            request_id=request_id,
+            query=query,
+            subject=subject,
+            language=resolved_language,
+            exam_id=exam_id,
+            exam_stage=exam_stage,
+            explicit_count=explicit_count,
+        )
+    )
+    accepted_count = _resolve_practice_count(
+        practice_type,
+        structured_count=requested_count,
+        explicit_count=explicit_count,
+        intelligence=intelligence,
+        freshness_required=freshness_requirement.requires_fresh_evidence,
+    )
+    mixed_difficulty_requested = bool(_MIXED_DIFFICULTY_SIGNAL.search(query))
+    explicit_difficulty_requested = bool(_EXPLICIT_DIFFICULTY_SIGNAL.search(query))
+    difficulty_distribution: dict[Difficulty, int] | None = None
+    if intelligence is not None:
+        topics = _interpreted_topics(intelligence) or topics
+        difficulty_spec = intelligence.difficulty
+        if isinstance(difficulty_spec, MixedDifficulty):
+            mixed_difficulty_requested = True
+        elif isinstance(difficulty_spec, SingleDifficulty):
+            explicit_difficulty_requested = True
+            normalized_difficulty = Difficulty(difficulty_spec.level.lower())
+        elif isinstance(difficulty_spec, CustomDifficulty):
+            candidate = _interpreted_distribution(difficulty_spec)
+            # A breakdown is only usable when it still adds up to the count that
+            # was actually resolved; anything else is dropped rather than reconciled.
+            if sum(candidate.values()) == accepted_count:
+                difficulty_distribution = candidate
+    display_topic = topic or subject.replace("_", " ").title()
+    title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
     return PracticeGenerationRequest(
         request_id=request_id,
         user_id=user_id,
@@ -537,15 +636,15 @@ def resolve_practice_request(
         turn_id=turn_id,
         original_query=query,
         practice_type=practice_type,
-        requested_count=requested_count,
+        requested_count=accepted_count,
         accepted_count=accepted_count,
         subject=subject,
         topic=topic,
+        topics=topics,
         difficulty=normalized_difficulty,
-        mixed_difficulty_requested=bool(_MIXED_DIFFICULTY_SIGNAL.search(query)),
-        explicit_difficulty_requested=bool(
-            _EXPLICIT_DIFFICULTY_SIGNAL.search(query)
-        ),
+        mixed_difficulty_requested=mixed_difficulty_requested,
+        explicit_difficulty_requested=explicit_difficulty_requested,
+        difficulty_distribution=difficulty_distribution,
         language=resolved_language,
         language_source=language_source,
         exam_id=exam_id,
@@ -557,6 +656,59 @@ def resolve_practice_request(
         fresh_evidence=fresh_evidence,
         assessment_title=title,
     )
+
+
+def _resolve_practice_count(
+    practice_type: PracticeType,
+    *,
+    structured_count: int | None,
+    explicit_count: int | None,
+    intelligence: PracticeRequestIntelligence | None,
+    freshness_required: bool,
+) -> int:
+    """Resolve the single authoritative Practice count, in evidence order.
+
+    A trusted structured count wins; then an interpretation of the student's own
+    words; then a count the deterministic parser demonstrably found; then the
+    practice-type default. Interpretation is skipped when fresh evidence has already
+    been retrieved against the deterministic count, because generation must never be
+    allowed to outrun the evidence that was actually gathered.
+    """
+    if structured_count is not None:
+        return _validated_practice_count(structured_count)
+    if intelligence is not None and not freshness_required:
+        interpreted = interpreted_total_count(intelligence)
+        if interpreted is not None:
+            return _validated_practice_count(interpreted)
+    if explicit_count is not None:
+        return _validated_practice_count(explicit_count)
+    return _validated_practice_count(_DEFAULT_COUNTS[practice_type])
+
+
+def _validated_practice_count(count: int) -> int:
+    if not 1 <= count <= MAX_PRACTICE_QUESTIONS:
+        raise PracticeRequestCountError(PracticeRequestCountError.reason_code)
+    return count
+
+
+def _interpreted_topics(
+    intelligence: PracticeRequestIntelligence,
+) -> list[str] | None:
+    """Return the explicitly requested topic names, or None for a broad request."""
+    names = [topic.normalized_name for topic in intelligence.topics]
+    return names or None
+
+
+def _interpreted_distribution(
+    difficulty: CustomDifficulty,
+) -> dict[Difficulty, int]:
+    """Return validated per-level counts as the planner's difficulty vocabulary."""
+    distribution = difficulty.distribution
+    return {
+        Difficulty.BASIC: distribution.basic,
+        Difficulty.INTERMEDIATE: distribution.intermediate,
+        Difficulty.ADVANCED: distribution.advanced,
+    }
 
 
 def resolve_practice_delivery_language(
@@ -670,12 +822,94 @@ def _strip_list_conjunction(value: str) -> str:
     return stripped or value
 
 
+def _query_word_set(text: str) -> set[str]:
+    """Unicode-safe word set for the student's own text, script-independent."""
+    words: set[str] = set()
+    current: list[str] = []
+    for character in text.casefold():
+        if character.isalnum() or unicodedata.category(character).startswith("M"):
+            current.append(character)
+        elif current:
+            words.add("".join(current))
+            current = []
+    if current:
+        words.add("".join(current))
+    return words
+
+
+def _topics_grounded_in_query(topic_ids: set[str], query: str) -> bool:
+    """True when every one of these topics is spelled out in the student's own words.
+
+    No topic list, no translation, and no splitting on "and" — a single named concept
+    such as "Profit and Loss" is matched whole because every one of its words must be
+    present. Works in any script.
+    """
+    if not topic_ids:
+        return False
+    haystack = _query_word_set(query)
+    return all(
+        set(part for part in topic_id.split("_") if part).issubset(haystack)
+        for topic_id in topic_ids
+    )
+
+
+def _normalized_for_grounding(text: str) -> str:
+    """Casefold and collapse whitespace without stripping any script."""
+    return " ".join(text.casefold().split())
+
+
+def _grounded_topic_ids(
+    blueprint: PracticeBlueprint, request: PracticeGenerationRequest
+) -> set[str]:
+    """Return the planned topics the student demonstrably asked for.
+
+    The planner supplies the semantic normalization; this verifies only the source.
+    A span is accepted when it literally occurs in the original query, so a topic the
+    planner invented has nothing to stand on and is excluded. The span is compared
+    whole, which is what keeps "Profit and Loss" from being read as two topics.
+    """
+    evidence = blueprint.requested_topic_evidence
+    if not evidence:
+        return set()
+    haystack = _normalized_for_grounding(request.original_query)
+    planned = {slot.topic_id for slot in blueprint.slots}
+    grounded: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        key = (item.source_text.casefold(), item.topic_id)
+        if key in seen:
+            raise ValueError("PLANNER_TOPIC_EVIDENCE_DUPLICATE")
+        seen.add(key)
+        if _normalized_for_grounding(item.source_text) not in haystack:
+            raise ValueError("PLANNER_TOPIC_EVIDENCE_UNGROUNDED")
+        if item.topic_id in planned:
+            grounded.add(item.topic_id)
+    return grounded
+
+
+def _trusted_topic_constraints(request: PracticeGenerationRequest) -> tuple[str, ...]:
+    """Explicit topic constraints that did not come from the intelligence planner.
+
+    Only a structured topic list supplied with the request qualifies. The classifier's
+    ``topic`` is deliberately excluded: it is one broad label, and on this path the
+    student's actual composition lives only inside the planner response. Treating the
+    broad label as a constraint is what silently widened a specific request into a
+    subject-wide one.
+    """
+    return tuple(value for value in (request.topics or ()) if value.strip())
+
+
 def _requested_topic_ids(request: PracticeGenerationRequest) -> tuple[str, ...]:
-    raw_topic = (request.topic or request.subject).strip()
-    values = [
-        _strip_list_conjunction(value)
-        for value in _FALLBACK_TOPIC_SEPARATOR.split(raw_topic)
-    ]
+    if request.topics:
+        # An explicitly requested topic set is already separated, so it is used as
+        # given rather than re-split out of a single delimited label.
+        values = [value.strip() for value in request.topics if value.strip()]
+    else:
+        raw_topic = (request.topic or request.subject).strip()
+        values = [
+            _strip_list_conjunction(value)
+            for value in _FALLBACK_TOPIC_SEPARATOR.split(raw_topic)
+        ]
     topics = tuple(
         dict.fromkeys(
             _canonical_fallback_topic(value)
@@ -738,7 +972,15 @@ def apply_system_bucket_policy(
         # boundary the original requirement is unchanged; below it the plan must
         # still draw only from the requested topics, so no topic is ever invented.
         if request.accepted_count >= len(requested_topics):
-            if not requested_topics.issubset(planned_topics):
+            # The classifier may answer one broad label for a request that named
+            # several specific topics; requiring that label as a slot topic would
+            # erase the student's composition. Grounded evidence is what replaces it:
+            # when every planned topic is tied to words the student actually wrote,
+            # that composition is authoritative and the broad label is context only.
+            grounded = _grounded_topic_ids(blueprint, request)
+            if not requested_topics.issubset(planned_topics) and not (
+                grounded and grounded == planned_topics
+            ):
                 raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
         elif not planned_topics.issubset(requested_topics):
             raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
@@ -844,6 +1086,53 @@ def _quick_practice_is_deterministic(request: PracticeGenerationRequest) -> bool
     return request.practice_type is PracticeType.QUICK_PRACTICE
 
 
+# Above this count a request is worth one planning inference: the deterministic plan
+# distributes slots mechanically, which stops representing what a large multi-topic or
+# multilingual request actually asked for. Exclusive bound — 20 stays deterministic.
+INTELLIGENCE_PLANNING_COUNT_THRESHOLD = 20
+
+PlanningMode = Literal["DETERMINISTIC", "INTELLIGENCE"]
+
+
+def select_planning_mode(
+    request: PracticeGenerationRequest,
+) -> tuple[PlanningMode, str]:
+    """Return the single authoritative planning route for one Practice request.
+
+    The count is the one already resolved by ``resolve_practice_request``; nothing is
+    re-parsed here. Below the threshold the pre-existing routing rules are preserved
+    exactly, so cheap Practice keeps costing no planning inference.
+    """
+    # Precedence is explicit so the escalation below cannot capture a path that must
+    # stay deterministic. Each rule is evaluated in order and the first one wins.
+    # 1. Above the threshold, planning is already worth an inference.
+    if request.accepted_count > INTELLIGENCE_PLANNING_COUNT_THRESHOLD:
+        return "INTELLIGENCE", "COUNT_OVER_THRESHOLD"
+    # 2. Forced-deterministic cases keep their existing route untouched.
+    if request.accepted_count <= 2:
+        return "DETERMINISTIC", "EXISTING_DETERMINISTIC_RULE"
+    # 3. A structured topic list is trusted composition; nothing needs interpreting.
+    if _trusted_topic_constraints(request):
+        return "DETERMINISTIC", "TRUSTED_TOPIC_CONSTRAINTS"
+    if _quick_practice_is_deterministic(request):
+        # 4. The deterministic plan can only draw topics from the classifier label.
+        # That is safe when the student's own words contain it, and silently widens
+        # the request when they do not — so an ungrounded label escalates to the
+        # planner, where C1 fails closed if semantics still cannot be preserved.
+        try:
+            derived = set(_requested_topic_ids(request))
+        except ValueError:
+            # A classifier label that will not canonicalize cannot ground anything,
+            # and routing must stay total: escalate rather than raise here, so the
+            # existing deterministic validation still owns the malformed-topic error.
+            derived = set()
+        if derived and _topics_grounded_in_query(derived, request.original_query):
+            return "DETERMINISTIC", "EXISTING_DETERMINISTIC_RULE"
+        return "INTELLIGENCE", "CLASSIFIER_TOPIC_UNGROUNDED"
+    # 5. Every remaining practice type keeps the existing planner route.
+    return "INTELLIGENCE", "EXISTING_PRACTICE_TYPE_RULE"
+
+
 class BlueprintManager:
     def __init__(self, planner: PlannerProvider, *, repair_limit: int = 1) -> None:
         self._planner = planner
@@ -896,7 +1185,20 @@ class BlueprintManager:
 
     def build(self, request: PracticeGenerationRequest) -> BlueprintPlanResult:
         tier = planner_tier(request)
-        if request.accepted_count <= 2 or _quick_practice_is_deterministic(request):
+        mode, reason = select_planning_mode(request)
+        log_event(
+            "practice_planning_route_selected",
+            component="practice.planning",
+            stage="route",
+            status="selected",
+            details={
+                "planningMode": mode,
+                "planningReason": reason,
+                "requestedCount": request.accepted_count,
+                "practiceType": request.practice_type.value,
+            },
+        )
+        if mode == "DETERMINISTIC":
             result = self._deterministic_result(
                 request,
                 planner_calls=0,
@@ -956,6 +1258,16 @@ class BlueprintManager:
                         "PRACTICE_PLANNER_PROVIDER_UNAVAILABLE",
                         diagnostics=tuple(diagnostics),
                     ) from exc
+                if not _trusted_topic_constraints(request):
+                    # A planner failure may cost availability; it must never broaden
+                    # what the student asked for. Without trustworthy explicit topics
+                    # the only honest deterministic plan is the classifier's broad
+                    # label, which would admit subject-wide reuse the student never
+                    # requested. Fail closed instead.
+                    raise BlueprintPlanningError(
+                        "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE",
+                        diagnostics=tuple(diagnostics),
+                    ) from exc
                 return self._deterministic_result(
                     request,
                     planner_calls=calls,
@@ -971,6 +1283,11 @@ class BlueprintManager:
         }:
             raise BlueprintPlanningError(
                 "PRACTICE_PLANNER_REPAIR_FAILED",
+                diagnostics=tuple(diagnostics),
+            )
+        if not _trusted_topic_constraints(request):
+            raise BlueprintPlanningError(
+                "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE",
                 diagnostics=tuple(diagnostics),
             )
         return self._deterministic_result(

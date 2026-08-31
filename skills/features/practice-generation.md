@@ -955,3 +955,191 @@ exact reported multi-topic query, and the unspecified-count default. Focused
 `test_orchestrated_streaming.py` (stale `OrchestratedDoubtSolverState` field-set assertions
 missing `fresh_evidence`) predate this change and belong to the in-progress Doubt Solver
 freshness work already in the working tree — not touched, per scope.
+
+## Request Intelligence for free-text Practice requests (2026-08-28)
+
+### Why
+
+The classifier reports one broad `topic` per request, and `resolve_practice_request`
+derives count, mixed/explicit difficulty and delivery language from regexes. Nothing in
+that path could read a request such as `"ratio proporton aur percentge ke 50 questions,
+10 easy 30 medium 10 hard"`: every slot went to the single classifier topic and the
+explicit per-level counts were invisible. An earlier attempt resolved topics by matching
+the query against `ExamProfileSection.topics`; it was abandoned, and its
+`topic_resolution.py` module, the `ExamProfileSection.topics` field, and the ExamProfile
+vocabulary lookup in `doubt_solver_graph.py` were reverted with this change so no second
+dormant multi-topic architecture remains. The proven parts of that work —
+`PracticeGenerationRequest.topics`, multi-topic `_requested_topic_ids`, feasibility-aware
+slot-topic coverage, and the verifier `errorClass` diagnostic — were kept.
+
+### Shape
+
+```text
+free-text request → existing classifier (unchanged)
+→ resolve_practice_request  (deterministic count / type / language)
+→ Request Intelligence      (interpretation only)
+→ deterministic validation  (grounding, bounds, arithmetic)
+→ existing deterministic planner → reuse / deficit / generation / verification
+```
+
+The model **interprets**; deterministic code **validates, distributes and executes**. The
+model never allocates questions across topics, never chooses a mixed split, and never
+overrides the resolved count: 50 questions over 11 interpreted topics is still divided
+5/5/5/5/5/5/4/4/4/4/4 by `deterministic_blueprint`.
+
+### Contract and route
+
+`app/schemas/practice_request_intelligence.py` owns the shared contract and the single
+static JSON Schema `practice_request_intelligence_v2` (interpretation status, requested
+count, grounded topics, and one mutually exclusive difficulty object). It is shared
+because both the provider adapter and the Practice feature read it. The schema is static
+and versioned because Bedrock compiles and caches a structured-output grammar per schema;
+it uses only Bedrock-supported constructs — no `minimum`/`maxItems`/`maxLength` — and all
+business bounds are enforced afterwards in Python.
+
+Route `general.request_intelligence.default` → model alias
+`practice_request_intelligence` → provider `bedrock`, profile `bedrock_apsouth1`, model
+`zai.glm-4.7-flash`, standard on-demand tier, `fallback: []` and no `fallback_models`.
+
+`app/services/llm/providers/bedrock_provider.py` is a normal `ProviderAdapter` in the
+existing factory. It calls Converse with
+`outputConfig.textFormat = {type: json_schema, structure.jsonSchema}` — there is no
+"return JSON" instruction, no markdown fence stripping and no JSON-repair retry anywhere
+on this path. Authentication is the runtime's existing AWS IAM identity: no API key, no
+new secret, no SSM or Secrets Manager entry. `ProviderProfile.region_env` /
+`ProviderCredentials.region` were added so the region (`BEDROCK_LLM_REGION`, optional,
+defaults to the SDK region) travels through the existing credential seam; the region is
+not a secret and appears in `safe_metadata()`.
+
+### Deterministic validation and failure policy
+
+`app/features/practice_generation/request_intelligence.py` rejects any interpretation
+that: disagrees with the deterministically resolved count, exceeds the supported count
+bounds, reports a topic whose `sourceText` is not present in the student's own query,
+returns more than `MAX_INTERPRETED_TOPICS` (12) topics, carries topics on a `BROAD`
+status, or states per-level counts that do not sum to the requested count. Duplicate
+topics collapse using the same `&`/punctuation folding the planner's own topic
+canonicalization applies.
+
+Every failure mode — no interpreter configured, provider unavailable, malformed payload,
+failed semantic validation, or an `AMBIGUOUS` interpretation — resolves to `None` and
+Practice continues on exactly the pre-existing deterministic resolution. **There is no
+semantic retry**: the model is never called a second time to obtain a preferred answer,
+and infrastructure retry policy is unchanged. Both outcomes emit
+`practice_request_intelligence_resolved` / `practice_request_intelligence_unusable` with
+a reason code and no user text; token usage, latency and cost flow through the existing
+`ProviderAdapterExecutor` telemetry.
+
+### Invocation and bypass
+
+A caller that already holds trusted structured constraints passes `topics=` to
+`resolve_practice_request` and the interpreter is not consulted at all — no model call.
+Free-text Practice creation (both the non-streaming graph node and the streaming service)
+passes `request_interpreter=`; the interpreter is injected once at the composition root in
+`app/main.py`. Non-Practice routes never reach the seam.
+
+### Durability
+
+`topics` and `difficultyDistribution` are now persisted in `practiceRequest` meta and
+rehydrated in `orchestration._request`. Without this, a resumed multi-topic Practice would
+rehydrate a request whose topic set no longer matched its persisted blueprint and fail
+`apply_system_bucket_policy` coverage validation.
+
+### Stated limitation
+
+`difficulty_distribution` is honoured by `deterministic_blueprint`, which serves
+QUICK_PRACTICE (the default path) and every request of 2 or fewer questions. The LLM
+blueprint planner used for QUIZ/TOPIC_TEST/SECTIONAL_TEST/FULL_MOCK is unchanged in this
+round and does not receive the explicit per-level counts; interpreted **topics** do
+constrain it, through the existing `apply_system_bucket_policy` coverage check.
+
+A consequence to weigh in the next round: the planner payload in `providers.py` still
+carries only `request.topic`, so on those practice types an interpreted multi-topic
+request produces a blueprint the coverage check rejects, costing the one bounded repair
+attempt before the deterministic fallback produces the correct multi-topic plan. The
+outcome is correct either way; the wasted planner call is not. Deliberately not changed
+here — it needs a planner payload and prompt decision, which is outside this round.
+
+### Verification
+
+58 new tests in `tests/practice_generation/test_request_intelligence.py` and
+`tests/test_bedrock_provider.py` (classifier freeze, structured bypass with zero model
+calls, free-text seam, broad/single/multi-topic, mixed and custom difficulty, invalid
+arithmetic, ungrounded and duplicate topics, ambiguous handling, EN/HI/Hinglish fixtures,
+Converse request shape, response deserialization, failure-kind mapping). `ruff check`
+clean, `agentcore validate` Valid, full suite 3621 passed with the same 7 pre-existing
+failures recorded above plus the two timing-sensitive `test_exam_profile_cache` stress
+cases (both pass in isolation). Mocked fixtures prove the contract and the wiring only —
+**the real model's semantic quality is `[NOT VERIFIED]`** and requires live qualification.
+
+## Request Intelligence v2 — count authority and difficulty exclusivity (2026-08-28)
+
+Two contract defects found during live GLM qualification are closed here. The model
+choice is unaffected: `zai.glm-4.7-flash` remains `MODEL_QUALIFICATION_FAILED` on
+semantic grounds (Hindi topic accuracy 8.3%), and this work is what a *replacement*
+model will plug into.
+
+### Difficulty is mutually exclusive by construction
+
+The v1 contract carried three flat fields (`difficultyMode`, `singleDifficulty`,
+`difficultyDistribution`) and let deterministic code reject meaningless combinations
+afterwards. In live qualification the model emitted a non-null level in **50/50** calls,
+28 of them alongside `difficultyMode: UNSPECIFIED`, so 78% of interpretations were
+discarded and Practice silently fell back. Expressing the field as a null-typed union
+(`{"type": ["string","null"], "enum": [...]}`) did **not** change that — proven by a
+5-call live check. The flat shape itself was the problem.
+
+`practice_request_intelligence_v2` replaces those three fields with one `difficulty`
+object built from a closed `anyOf` branch per mode, each pinned by `const` and each
+`additionalProperties: false`:
+
+```text
+{mode: UNSPECIFIED}
+{mode: SINGLE,  level: BASIC|INTERMEDIATE|ADVANCED}   level required
+{mode: MIXED}
+{mode: CUSTOM,  distribution: {basic, intermediate, advanced}}   distribution required
+```
+
+SINGLE-without-level, MIXED-with-level, UNSPECIFIED-with-level, CUSTOM-without-
+distribution and CUSTOM-with-level are now unrepresentable in the grammar rather than
+rejected after the fact. The Pydantic side mirrors it exactly — a discriminated union
+whose branches set `extra="forbid"` — so the deserializer refuses anything the schema
+could not have produced. Deterministic code still owns everything the grammar cannot
+express: count bounds, non-negative counts, and custom-distribution arithmetic.
+
+The version moved because the wire contract genuinely changed shape. AWS documents
+grammar caching for identical schemas; there is no evidence the schema *name* alone owns
+cache identity, and the rename is not a workaround for one.
+
+### A default count is not evidence of intent
+
+`resolve_requested_count` previously collapsed "the student wrote no count" into the
+practice-type default, and the validator then compared that default against the model's
+reading — rejecting 15 of 50 live cases where the model was right and the parser was
+blind (Devanagari units, typo'd units, a total implied only by a distribution).
+
+`explicit_requested_count()` now returns `None` when nothing was written; the default is
+layered on top in `resolve_requested_count`, whose behaviour is unchanged for every
+existing caller. **No regex was added or modified, and no language-specific parsing
+exists.** Precedence in `_resolve_practice_count`:
+
+1. a trusted structured count supplied by the caller;
+2. the interpretation's count (or a CUSTOM distribution's deterministic sum);
+3. a count the parser demonstrably found;
+4. the practice-type default.
+
+Only a real explicit count can contradict the interpretation — a mismatch drops the whole
+interpretation rather than silently preferring either value.
+
+### Known ordering defect — reported, not fixed
+
+`DOES_PRE_INTELLIGENCE_EVIDENCE_WORK_DEPEND_ON_REQUESTED_COUNT = YES`. For
+freshness-sensitive Practice, `_orchestrated_collect_context_node` sizes web-evidence
+retrieval via `required_fresh_evidence_count(query)` **before** interpretation runs, so a
+request whose count the parser cannot see retrieves evidence for the default — measured:
+`"मुझे हाल की current affairs पर 30 सवाल दो"` retrieves 10 facts for a 30-question ask,
+while the English equivalent correctly retrieves 30. `_resolve_practice_count` therefore
+pins the count to the deterministic value on that path, so generation can never outrun
+the evidence actually gathered. That is a safety guard, **not** intended semantics: the
+real correction is to interpret before sizing retrieval, which is a graph-ordering change
+across two call sites and deliberately out of scope for this round.

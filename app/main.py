@@ -206,6 +206,7 @@ orchestrated_doubt_solver_graph = None
 orchestrated_adapter: AnswerGenerationAdapter | None = None
 follow_up_resolver = None
 practice_async_launcher = None
+practice_request_interpreter = None
 if settings.enable_orchestrated_doubt_solver:
     from services.llm.orchestration.orchestrator import LlmOrchestrator  # noqa: PLC0415
 
@@ -246,6 +247,10 @@ if settings.enable_orchestrated_doubt_solver:
         task_tracker=app,
         llm_orchestrator=_orchestrator,
     )
+    # Bypassed on the Practice path: the >20 deterministic router hands large requests
+    # straight to the existing intelligence planner, so no separate interpretation call
+    # runs ahead of it. The provider and its route stay in the repo, unwired.
+    practice_request_interpreter = None
     orchestrated_doubt_solver_graph = build_orchestrated_doubt_solver_graph(
         _adapter,
         conversation_persistence=conversation_persistence,
@@ -254,6 +259,7 @@ if settings.enable_orchestrated_doubt_solver:
         practice_launcher=(
             practice_async_launcher.launch if practice_async_launcher is not None else None
         ),
+        practice_request_interpreter=practice_request_interpreter,
     )
     logger.info(
         "Orchestrated graph built  enable_real_llm=%s",
@@ -770,6 +776,7 @@ def invoke(payload: dict) -> dict | Response:
                         "follow_up_resolver": follow_up_resolver,
                         "conversation_understanding": conversation_understanding,
                         "practice_launcher": (practice_async_launcher),
+                        "practice_request_interpreter": practice_request_interpreter,
                     }
                     events = stream_doubt_solver(
                         stream_input,

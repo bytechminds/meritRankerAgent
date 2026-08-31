@@ -181,9 +181,11 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "accepted_count": value.get("acceptedCount"),
             "subject": value.get("subject"),
             "topic": value.get("topic"),
+            "topics": value.get("topics"),
             "difficulty": value.get("difficulty"),
             "mixed_difficulty_requested": mixed_difficulty_requested,
             "explicit_difficulty_requested": explicit_difficulty_requested,
+            "difficulty_distribution": value.get("difficultyDistribution"),
             "language": value.get("language"),
             "language_source": value.get("languageSource", "REQUEST"),
             "exam_id": value.get("examId"),
@@ -1367,6 +1369,7 @@ class PracticeGenerationOrchestrator:
                     replacement=replacement,
                 )
                 if required_verification:
+                    verifier_error_class: str | None = None
                     try:
                         self._require_expensive_work_allowed(test_id)
                         result = self._verifier.verify(
@@ -1377,6 +1380,9 @@ class PracticeGenerationOrchestrator:
                     except PracticeExecutionStopped:
                         raise
                     except Exception as exc:  # noqa: BLE001
+                        # Exception class only: the slot path already records this and
+                        # without it here VERIFIER_UNAVAILABLE stays undiagnosable.
+                        verifier_error_class = type(exc).__name__
                         result = VerificationResult(
                             generation_item_id=question.generation_item_id,
                             approved=False,
@@ -1398,6 +1404,11 @@ class PracticeGenerationOrchestrator:
                             "groupId": group_id,
                             "bucketId": bucket_id,
                             "reasonCode": reason,
+                            **(
+                                {"errorClass": verifier_error_class}
+                                if verifier_error_class
+                                else {}
+                            ),
                         },
                     )
                 if approved and self._questions.link_generated(
@@ -2091,10 +2102,24 @@ class PracticeGenerationOrchestrator:
                     and verification.generation_item_id == question.generation_item_id
                     and verification.slot_id == slot.slot_id
                 )
-                answer_valid = (
-                    verification.independently_solved_option_id
-                    == question.correct_option_id
-                )
+                # The authority never saw the author's proposal, so this is a genuine
+                # two-source agreement rather than a confirmation. Exactly one option
+                # may be valid: agreement on a single id says nothing about whether a
+                # second id is also correct, which is why the count is gated first.
+                # Comparison is by option id only — never by answer text, whose
+                # representation ("48" vs "forty-eight") varies without changing meaning.
+                valid_option_ids = verification.valid_option_ids
+                if len(valid_option_ids) != 1:
+                    gate_reason = (
+                        "NO_VALID_OPTION"
+                        if not valid_option_ids
+                        else "MULTIPLE_VALID_OPTIONS"
+                    )
+                elif valid_option_ids[0] != question.correct_option_id:
+                    gate_reason = "AUTHOR_AUTHORITY_MISMATCH"
+                else:
+                    gate_reason = None
+                answer_valid = gate_reason is None
                 if (
                     binding_valid
                     and answer_valid
@@ -2142,10 +2167,22 @@ class PracticeGenerationOrchestrator:
                         },
                     )
                     continue
-                reasons.extend(verification.reason_codes)
+                # A deterministic gate failure is the real reason for rejection, so it
+                # leads the codes: the authority may have returned ACCEPT while the
+                # option count or the author comparison is what actually failed.
+                gate_reason_codes = (
+                    [gate_reason] if gate_reason is not None else []
+                )
+                if not binding_valid:
+                    gate_reason_codes.append("BINDING_INVALID")
+                combined_reason_codes = [
+                    *gate_reason_codes,
+                    *verification.reason_codes,
+                ]
+                reasons.extend(combined_reason_codes)
                 repair_candidates[slot.slot_id] = question
                 repair_reasons[slot.slot_id] = tuple(
-                    verification.reason_codes[:4]
+                    combined_reason_codes[:4]
                     or ["VERIFIER_REJECTED"]
                 )
                 emit_practice_event(
@@ -2158,8 +2195,8 @@ class PracticeGenerationOrchestrator:
                         "slotId": slot.slot_id,
                         "replacementWave": replacement_wave,
                         "reasonCode": (
-                            verification.reason_codes[0]
-                            if verification.reason_codes
+                            combined_reason_codes[0]
+                            if combined_reason_codes
                             else "VERIFIER_REJECTED"
                         ),
                     },
@@ -2167,7 +2204,10 @@ class PracticeGenerationOrchestrator:
                 if verification.decision is VerificationDecision.TERMINAL_REJECTION:
                     terminal = True
                     break
-                if verification.decision is VerificationDecision.REGENERATE:
+                if (
+                    verification.decision is VerificationDecision.REGENERATE
+                    or gate_reason is not None
+                ):
                     force_regeneration = True
             if provider_failure_stage is not None:
                 break

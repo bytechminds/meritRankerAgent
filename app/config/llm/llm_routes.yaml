@@ -59,7 +59,7 @@ routes:
 
       advanced:
         inherits: default
-        model: math_advanced_generator
+        model: openai_gpt_4_1
         overlays:
           - levels/advanced.md
         temperature: 0.15
@@ -144,6 +144,8 @@ routes:
         overlays:
           - levels/intermediate.md
         max_tokens: 1800
+        provider_options:
+          reasoning_effort: medium
         fallback:
           - basic
           - default
@@ -157,6 +159,7 @@ routes:
           - levels/advanced.md
         max_tokens: 3200
         provider_options:
+          reasoning_effort: medium
           thinking: true
         fallback:
           - intermediate
@@ -236,14 +239,14 @@ routes:
       intermediate:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 1800
+        max_tokens: 8000
         fallback:
           - default
           - safe_mock
       advanced:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 2600
+        max_tokens: 8000
         fallback:
           - intermediate
           - default
@@ -318,14 +321,14 @@ routes:
       intermediate:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 1800
+        max_tokens: 8000
         fallback:
           - default
           - safe_mock
       advanced:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 2600
+        max_tokens: 8000
         fallback:
           - intermediate
           - default
@@ -349,14 +352,14 @@ routes:
       intermediate:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 1800
+        max_tokens: 8000
         fallback:
           - default
           - safe_mock
       advanced:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 2600
+        max_tokens: 8000
         fallback:
           - intermediate
           - default
@@ -382,7 +385,7 @@ routes:
       intermediate:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 1800
+        max_tokens: 8000
         fallback:
           - default
           - safe_mock
@@ -390,7 +393,7 @@ routes:
       advanced:
         inherits: default
         model: openai_gpt_4_1
-        max_tokens: 2600
+        max_tokens: 8000
         fallback:
           - intermediate
           - default
@@ -398,7 +401,7 @@ routes:
 
     verifier:
       default:
-        model: openai_o4_mini
+        model: openai_gpt_5_6_terra
         prompt: answer_correctness_verifier.md
         temperature: 0.0
         max_tokens: 5000
@@ -412,6 +415,14 @@ routes:
         prompt: follow_up_query_resolver.md
         temperature: 0.0
         max_tokens: 220
+        fallback: []
+
+    request_intelligence:
+      default:
+        model: practice_request_intelligence
+        prompt: practice_generation/request_intelligence.md
+        temperature: 0.0
+        max_tokens: 700
         fallback: []
 
     classifier:

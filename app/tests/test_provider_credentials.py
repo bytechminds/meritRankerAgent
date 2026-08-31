@@ -248,6 +248,7 @@ class TestProviderCredentialsSafeMetadata:
             "has_endpoint",
             "has_api_version",
             "has_base_url",
+            "region",
             "azure_api_mode",
         }
 

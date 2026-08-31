@@ -21,6 +21,7 @@ from features.practice_generation.planning import (
     resolve_practice_request,
     validate_practice_requested_count,
 )
+from features.practice_generation.request_intelligence import PracticeRequestInterpreter
 from features.practice_generation.schemas import (
     PracticeGenerationRequest,
     PracticeLaunchResult,
@@ -259,6 +260,7 @@ def _iter_stream_doubt_solver(
     follow_up_resolver=None,
     conversation_understanding=None,
     practice_launcher: PracticeLauncher | None = None,
+    practice_request_interpreter: PracticeRequestInterpreter | None = None,
     post_answer_progress: _PostAnswerFinalizationProgress | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Yield live chunks only for low risk requests, otherwise replay approval."""
@@ -612,6 +614,7 @@ def _iter_stream_doubt_solver(
                 ),
                 freshness_requirement=freshness_requirement,
                 fresh_evidence=fresh_evidence,
+                request_interpreter=practice_request_interpreter,
             )
             log_event(
                 "practice_language_resolved",
@@ -1288,6 +1291,7 @@ def stream_doubt_solver(
     follow_up_resolver=None,
     conversation_understanding=None,
     practice_launcher: PracticeLauncher | None = None,
+    practice_request_interpreter: PracticeRequestInterpreter | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Enforce a terminal event unless cancellation is confirmed."""
     started_at = time.monotonic()
@@ -1341,6 +1345,7 @@ def stream_doubt_solver(
                         follow_up_resolver=follow_up_resolver,
                         conversation_understanding=conversation_understanding,
                         practice_launcher=practice_launcher,
+                        practice_request_interpreter=practice_request_interpreter,
                         post_answer_progress=post_answer_progress,
                     ):
                         if _cancelled(input):

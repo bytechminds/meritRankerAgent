@@ -78,7 +78,7 @@ class _Verifier:
                 slot_id=slot.slot_id,
                 approved=True,
                 reason_code="VERIFIER_APPROVED",
-                independently_solved_option_id=question.correct_option_id,
+                valid_option_ids=[question.correct_option_id],
             )
         return VerificationResult(
             generation_item_id=question.generation_item_id,

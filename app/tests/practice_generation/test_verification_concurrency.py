@@ -73,7 +73,7 @@ class _RecordingVerifier:
                     generation_item_id=question.generation_item_id,
                     slot_id=slot.slot_id,
                     decision=VerificationDecision.REGENERATE,
-                    independently_solved_option_id="1",
+                    valid_option_ids=["1"],
                     reason_codes=["INCORRECT_KEY"],
                 )
             return VerificationResult(
@@ -81,7 +81,7 @@ class _RecordingVerifier:
                 generation_item_id=question.generation_item_id,
                 slot_id=slot.slot_id,
                 decision=VerificationDecision.ACCEPT,
-                independently_solved_option_id=question.correct_option_id,
+                valid_option_ids=[question.correct_option_id],
                 reason_codes=["MATCH"],
             )
         finally:

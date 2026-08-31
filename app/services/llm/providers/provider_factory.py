@@ -17,6 +17,7 @@ Supported providers (Part 6):
     azure_openai → AzureOpenAIProviderAdapter
     gemini       → GeminiProviderAdapter
     deepseek     → DeepSeekProviderAdapter
+    bedrock      → BedrockProviderAdapter
 
 Unsupported provider raises LlmProviderConfigurationError.
 """
@@ -62,6 +63,9 @@ class ProviderAdapterFactory:
             from services.llm.providers.azure_openai_provider import (  # noqa: PLC0415
                 AzureOpenAIProviderAdapter,
             )
+            from services.llm.providers.bedrock_provider import (  # noqa: PLC0415
+                BedrockProviderAdapter,
+            )
             from services.llm.providers.gemini_provider import (  # noqa: PLC0415
                 GeminiProviderAdapter,
             )
@@ -79,6 +83,7 @@ class ProviderAdapterFactory:
                 "azure_openai": AzureOpenAIProviderAdapter(),
                 "gemini": GeminiProviderAdapter(),
                 "deepseek": DeepSeekProviderAdapter(),
+                "bedrock": BedrockProviderAdapter(),
             }
 
     def get_provider(self, provider: str) -> ProviderAdapter:

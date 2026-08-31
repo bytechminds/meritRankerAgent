@@ -696,14 +696,21 @@ class TestModelExecutionFallback:
         assert "private-provider-detail" not in caplog.text
         assert "RuntimeError" in caplog.text
 
-    def test_real_math_advanced_empty_response_uses_o3_fallback(self) -> None:
+    def test_real_math_advanced_empty_response_has_no_model_level_fallback(self) -> None:
+        """Fix A (50Q closure): advanced math generates on GPT-4.1.
+
+        The GPT-4.1 alias declares no ``fallback_models``, so the executor surfaces
+        the failure instead of stepping to o3. Recovery for this route is owned one
+        layer up by the route fallback chain (intermediate -> default -> general_default
+        -> safe_mock), which is unchanged.
+        """
         empty_response = LlmProviderResponseError(
             "response unavailable",
             failure_kind="empty_answer",
         )
         fake_executor = _AliasedFakeProviderExecutor(
             raise_for={
-                "math_advanced_generator": empty_response,
+                "openai_gpt_4_1": empty_response,
             },
             return_for={"openai_o3": "Fallback answer."},
         )
@@ -719,15 +726,11 @@ class TestModelExecutionFallback:
             )
         )
 
-        result = executor.execute(route_decision=decision, messages=_messages())
+        assert decision.model == "openai_gpt_4_1"
+        with pytest.raises(ProviderExecutionError):
+            executor.execute(route_decision=decision, messages=_messages())
 
-        assert decision.model == "math_advanced_generator"
-        assert fake_executor.call_log == [
-            "math_advanced_generator",
-            "openai_o3",
-        ]
-        assert result.model == "openai_o3"
-        assert result.fallback_used is True
+        assert fake_executor.call_log == ["openai_gpt_4_1"]
 
     def test_empty_response_uses_configured_fallback_with_safe_attempt_events(
         self,

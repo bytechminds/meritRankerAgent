@@ -197,6 +197,7 @@ def resolve_route(
             difficulty=difficulty,
             route=route,
             route_source="exact",
+            registry=reg,
         )
 
     # --- Step 2: subject default ---
@@ -215,6 +216,7 @@ def resolve_route(
                 difficulty="default",
                 route=route,
                 route_source="subject_default",
+                registry=reg,
             )
 
     # --- Step 3: general default ---
@@ -232,6 +234,7 @@ def resolve_route(
                 difficulty="default",
                 route=route,
                 route_source="general_default",
+                registry=reg,
             )
 
     # --- No route found ---
@@ -243,6 +246,40 @@ def resolve_route(
     )
 
 
+def _apply_language_override(
+    *,
+    registry: LlmConfigRegistry,
+    request: RouteRequest,
+    subject: str,
+    task_role: TaskRole,
+    difficulty: str,
+    model: str,
+) -> str:
+    """Swap the model only when this exact route has a configured language override.
+
+    Language is supplied by upstream trusted metadata, never inferred from request
+    text here. The override changes nothing but the model alias — prompt, overlays,
+    temperature, token budget, and the fallback chain stay with the resolved route.
+    """
+    override = registry.get_language_model_override(
+        subject, task_role, difficulty, request.language
+    )
+    if override is None or override == model:
+        return model
+    logger.debug(
+        "route_resolver.language_override  request_id=%s  route=%s.%s.%s  "
+        "language=%s  model=%s->%s",
+        request.request_id,
+        subject,
+        task_role,
+        difficulty,
+        request.language,
+        model,
+        override,
+    )
+    return override
+
+
 def _build_decision(
     *,
     request: RouteRequest,
@@ -251,11 +288,20 @@ def _build_decision(
     difficulty: str,
     route: ResolvedRouteEntry,
     route_source: str,
+    registry: LlmConfigRegistry,
 ) -> RouteDecision:
     """Build a RouteDecision from a resolved route entry."""
     assert isinstance(route, ResolvedRouteEntry)
 
     route_id = f"{subject}.{task_role}.{difficulty}"
+    model = _apply_language_override(
+        registry=registry,
+        request=request,
+        subject=subject,
+        task_role=task_role,
+        difficulty=difficulty,
+        model=route.model,
+    )
 
     # Translate YAML fallback symbols to typed FallbackAttempt objects
     fallback_attempts = [
@@ -273,7 +319,7 @@ def _build_decision(
         exam_stage=request.exam_stage,
         exam_profile_id=request.exam_profile_id,
         language=request.language,
-        model=route.model,
+        model=model,
         prompt=route.prompt,
         overlays=list(route.overlays),
         intent_overlays=dict(route.intent_overlays),
@@ -289,7 +335,7 @@ def _build_decision(
         "route_source=%s  fallback_count=%d",
         request.request_id,
         route_id,
-        route.model,
+        model,
         route_source,
         len(fallback_attempts),
     )

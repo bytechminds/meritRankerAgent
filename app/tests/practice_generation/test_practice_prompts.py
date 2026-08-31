@@ -36,7 +36,7 @@ PROMPT_PATHS = (
 @pytest.mark.parametrize("prompt_path", PROMPT_PATHS)
 def test_nested_practice_prompt_loads_within_budget(prompt_path: str) -> None:
     content = (PromptResolver()._prompt_root / f"{prompt_path}.md").read_text(encoding="utf-8")
-    assert 100 < len(content) < 1_500
+    assert 100 < len(content) < 1_700
 
 
 @pytest.mark.parametrize(
@@ -149,8 +149,8 @@ def test_composed_prompt_estimate_remains_compact() -> None:
         role = (prompt_root / f"{role_path}.md").read_text(encoding="utf-8")
         combined = f"{shared}\n\n{role}"
         estimated_tokens = (len(combined) + 3) // 4
-        assert len(combined) < 2_000
-        assert estimated_tokens < 500
+        assert len(combined) < 2_500
+        assert estimated_tokens < 625  # the 2_500-char bound expressed in tokens
 
 
 def test_generator_and_verifier_receive_only_their_role_prompt() -> None:
@@ -293,8 +293,8 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
                 "generation_item_id": "item-1",
                 "slot_id": slot.slot_id,
                 "decision": "ACCEPT",
-                "independently_solved_option_id": "3",
-                "reason_codes": ["INDEPENDENT_SOLUTION_MATCH"],
+                "valid_option_ids": ["3"],
+                "reason_codes": ["SINGLE_VALID_OPTION"],
             }
         )
     )
@@ -307,12 +307,92 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
     )
 
     assert verifier_executor.last_messages is not None
-    assert "Independently solve and verify" in verifier_executor.last_messages[0].content
+    assert "never see the author's answer" in verifier_executor.last_messages[0].content
     verifier_payload = json.loads(verifier_executor.last_messages[1].content)
-    assert verifier_payload["question"]["submitted_answer"] == {
-        "correct_option_id": "3",
-        "correct_answer": "4",
-    }
+    assert verifier_payload["question"]["options"] == [
+        {"option_id": "0", "value": "1"},
+        {"option_id": "1", "value": "2"},
+        {"option_id": "2", "value": "3"},
+        {"option_id": "3", "value": "4"},
+    ]
+
+
+def test_authority_payload_never_carries_the_author_answer() -> None:
+    """Permanent anti-anchoring guard.
+
+    The authority's verdict is only independent evidence while it cannot see what the
+    author proposed. Any field below reaching the payload would silently turn the
+    agreement gate into self-confirmation, so this test pins the whole surface rather
+    than one key.
+    """
+    request = resolve_practice_request(
+        request_id="request-blind",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-blind",
+        query="Create one algebra question",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        exam_stage=None,
+    )
+    blueprint = deterministic_blueprint(request)
+    bucket = blueprint.buckets[0]
+    slot = blueprint.slots[0]
+    question = GeneratedQuestion(
+        schema_version="2",
+        generation_item_id="item-blind",
+        bucket_id=bucket.bucket_id,
+        slot_id=slot.slot_id,
+        question="Which indexed option equals two plus two?",
+        question_type="mcq",
+        options=[
+            {"option_id": "0", "value": "1"},
+            {"option_id": "1", "value": "2"},
+            {"option_id": "2", "value": "3"},
+            {"option_id": "3", "value": "4"},
+        ],
+        correct_option_id="3",
+        answer_explanation="Two plus two is four.",
+        subject=slot.subject_id,
+        topic=slot.topic_id,
+        difficulty=slot.difficulty,
+    )
+    executor = MockModelExecutor(
+        content=json.dumps(
+            {
+                "schema_version": "2",
+                "generation_item_id": "item-blind",
+                "slot_id": slot.slot_id,
+                "decision": "ACCEPT",
+                "valid_option_ids": ["3"],
+                "reason_codes": ["SINGLE_VALID_OPTION"],
+            }
+        )
+    )
+
+    RoutedQuestionVerifier(LlmOrchestrator(model_executor=executor)).verify_slot(
+        request=request,
+        bucket=bucket,
+        slot=slot,
+        question=question,
+    )
+
+    assert executor.last_messages is not None
+    payload = json.loads(executor.last_messages[1].content)
+    serialized = json.dumps(payload)
+
+    assert "submitted_answer" not in serialized
+    assert "correct_option_id" not in serialized
+    assert "correct_answer" not in serialized
+    assert "answer_explanation" not in serialized
+    assert "solution" not in serialized
+    assert question.answer_explanation not in serialized
+    # The question and its options must still be fully present.
+    assert payload["question"]["question"] == question.question
+    assert len(payload["question"]["options"]) == 4
 
 
 def test_repair_payload_is_slot_scoped_and_contains_only_the_rejected_candidate() -> None:

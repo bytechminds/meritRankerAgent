@@ -484,13 +484,16 @@ def parse_partial_generation(
             rejected += 1
             rejection_reason_codes.append(_structured_parse_rejection_code(error))
             continue
+        # Schema v2 authors emit no solution or explanation, so the bucket's
+        # solution requirement applies only to the legacy v1 contract that still does.
+        solution_required = bucket.solution_required and question.schema_version != "2"
         contract = validate_playable_question(
             question_type=question.question_type,
             question=question.question,
             options=question.options,
             correct_answer=question.correct_answer,
             solution=question.solution,
-            solution_required=bucket.solution_required,
+            solution_required=solution_required,
         )
         if not contract.valid:
             rejected += 1
@@ -516,7 +519,7 @@ def parse_partial_generation(
             or canonical_topic != bucket.topic
             or question.difficulty is not bucket.difficulty
             or question.question_type is not bucket.question_type
-            or bucket.solution_required
+            or solution_required
             and not question.solution
             or slots
             and (

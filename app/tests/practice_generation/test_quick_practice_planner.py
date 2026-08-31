@@ -274,8 +274,11 @@ def test_twenty_across_three_topics_is_seven_seven_six() -> None:
 
 # --- deterministic Quick Practice routing ------------------------------------
 
-@pytest.mark.parametrize("count", [1, 2, 3, 5, 6, 10, 20, 50, 100])
-def test_quick_practice_routes_deterministically_at_every_count(count: int) -> None:
+# Above INTELLIGENCE_PLANNING_COUNT_THRESHOLD a Quick Practice request routes to the
+# intelligence planner instead; that side of the boundary is covered in
+# tests/practice_generation/test_planning_route.py.
+@pytest.mark.parametrize("count", [1, 2, 3, 5, 6, 10, 20])
+def test_quick_practice_routes_deterministically_up_to_the_threshold(count: int) -> None:
     planner = _ExplodingPlanner()
 
     result = BlueprintManager(planner).build(
@@ -294,7 +297,10 @@ def test_quick_practice_routing_survives_fewer_questions_than_topics(count: int)
     planner = _ExplodingPlanner()
 
     result = BlueprintManager(planner).build(
-        request_for(f"Create {count} questions", topic="percentage, ratio, average")
+        request_for(
+            f"Create {count} questions on percentage, ratio and average",
+            topic="percentage, ratio, average",
+        )
     )
 
     assert planner.call_count == 0

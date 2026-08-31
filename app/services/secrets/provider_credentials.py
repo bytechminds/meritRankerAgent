@@ -50,12 +50,14 @@ class ProviderCredentials(BaseModel):
     endpoint: str | None = None
     api_version: str | None = None
     base_url: str | None = None
+    # For bedrock provider: the AWS region. Not a secret — safe to log.
+    region: str | None = None
     # For azure_openai provider: the API mode selected via ProviderProfile.
     # None is treated as "azure_deployment_chat_completions" by the adapter.
     # This is NOT a secret — it is safe to log.
     azure_api_mode: str | None = None
 
-    @field_validator("api_key", "endpoint", "api_version", "base_url", mode="after")
+    @field_validator("api_key", "endpoint", "api_version", "base_url", "region", mode="after")
     @classmethod
     def validate_not_blank(cls, v: str | None) -> str | None:
         """Reject empty strings — field must be non-empty if present."""
@@ -77,6 +79,7 @@ class ProviderCredentials(BaseModel):
             "has_endpoint": self.endpoint is not None,
             "has_api_version": self.api_version is not None,
             "has_base_url": self.base_url is not None,
+            "region": self.region,
             "azure_api_mode": self.azure_api_mode,
         }
 
@@ -89,6 +92,7 @@ class ProviderCredentials(BaseModel):
             f"has_endpoint={self.endpoint is not None}, "
             f"has_api_version={self.api_version is not None}, "
             f"has_base_url={self.base_url is not None}, "
+            f"region={self.region!r}, "
             f"azure_api_mode={self.azure_api_mode!r}"
             f")"
         )
@@ -151,6 +155,10 @@ class ProviderCredentialResolver:
             profile.base_url_env,
             optional=profile.optional_base_url,
         )
+        region = self._resolve_optional_secret(
+            profile.region_env,
+            optional=profile.optional_region,
+        )
 
         return ProviderCredentials(
             provider=profile.provider,
@@ -158,6 +166,7 @@ class ProviderCredentialResolver:
             endpoint=endpoint,
             api_version=api_version,
             base_url=base_url,
+            region=region,
             azure_api_mode=profile.azure_api_mode,
         )
 

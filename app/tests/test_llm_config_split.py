@@ -232,7 +232,10 @@ class TestNewModelAliases:
         reg = LlmConfigRegistry()
         route = reg.get_route("math", "generator", "advanced")
         assert route is not None
-        assert route.model == "math_advanced_generator"
+        # Fix A (50Q closure): the advanced-math structured generator moved off
+        # deepseek-reasoner, whose hidden-reasoning variance exhausted the output
+        # budget on single-slot calls, to the already-configured GPT-4.1 route.
+        assert route.model == "openai_gpt_4_1"
 
     def test_math_intermediate_uses_math_intermediate_generator(self) -> None:
         reg = LlmConfigRegistry()

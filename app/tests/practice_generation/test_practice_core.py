@@ -306,14 +306,14 @@ def test_disabled_feature_ignores_invalid_tuning_configuration(
             "intermediate",
             "openai_gpt_4_1",
             "practice_generation/planners/quant_reasoning.md",
-            1800,
+            8000,
         ),
         (
             "english",
             "advanced",
             "openai_gpt_4_1",
             "practice_generation/planners/english.md",
-            2600,
+            8000,
         ),
         (
             "factual",
@@ -360,7 +360,10 @@ def test_practice_verifier_route_has_bounded_reasoning_budget() -> None:
         )
     )
 
-    assert (route.model, route.max_tokens) == ("openai_o4_mini", 5000)
+    # Authority qualified on the frozen v2 gold corpus: 0 critical false accepts and
+    # 0 false rejects, against o4-mini's 1 and 1. The budget is part of that qualified
+    # configuration, so it is pinned alongside the model.
+    assert (route.model, route.max_tokens) == ("openai_gpt_5_6_terra", 5000)
     assert route.provider_options == {"reasoning_effort": "medium"}
 
 
@@ -442,15 +445,17 @@ def test_invalid_planner_output_gets_one_repair_then_fallback(
             return '{"buckets":[]}'
 
     planner = Planner()
-    result = BlueprintManager(planner, repair_limit=1).build(
-        request("Create five algebra questions")
-    )
-    assert (planner.calls, result.repaired, result.deterministic_fallback) == (
-        2,
-        True,
-        True,
-    )
-    assert result.validation_reason_code == "PLANNER_SLOT_COUNT_MISMATCH"
+    # C1: OLD CONTRACT — two planner attempts then a deterministic fallback blueprint.
+    # NEW CONTRACT — the request carries no trustworthy structured `topics`, so the
+    # fallback could only re-plan from the classifier label; planning fails closed
+    # after the same bounded two attempts.
+    with pytest.raises(BlueprintPlanningError) as excinfo:
+        BlueprintManager(planner, repair_limit=1).build(
+            request("Create five algebra questions")
+        )
+
+    assert planner.calls == 2
+    assert excinfo.value.reason_code == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
 
 
 @pytest.mark.parametrize(
@@ -522,36 +527,15 @@ def test_exact_multi_topic_failure_repairs_once_then_uses_valid_fallback(
     ).model_copy(update={"exam_id": "SSC_GD", "exam_stage": "PRE"})
     planner = InvalidPlanner()
 
-    result = BlueprintManager(planner, repair_limit=1).build(resolved)
+    # C1: OLD CONTRACT — planner failure fell back to a deterministic blueprint built
+    # from the classifier's topic label and published READY.
+    # NEW CONTRACT — without trustworthy structured `topics` on the request, that
+    # fallback can only widen the student's composition, so planning fails closed.
+    with pytest.raises(BlueprintPlanningError) as excinfo:
+        BlueprintManager(planner, repair_limit=1).build(resolved)
 
-    assert (len(planner.repair_feedback), result.deterministic_fallback) == (2, True)
-    assert planner.repair_feedback[0] is None
-    assert planner.repair_feedback[1] == (
-        "reason=PLANNER_SLOT_COUNT_MISMATCH;fields=$;types=value_error;"
-        "schema=PracticeBlueprint"
-    )
-    assert [slot.topic_id for slot in result.blueprint.slots] == [
-        "time_and_work",
-        "number_system",
-        "time_and_work",
-        "number_system",
-        "time_and_work",
-    ]
-    assert result.validation_diagnostics == (
-        result.validation_diagnostics[0],
-        result.validation_diagnostics[1],
-    )
-    assert [diagnostic.phase for diagnostic in result.validation_diagnostics] == [
-        "initial",
-        "repair",
-    ]
-    assert all(
-        diagnostic.schema_name == "PracticeBlueprint"
-        and diagnostic.error_count == 1
-        and diagnostic.field_paths == ("$",)
-        and diagnostic.error_types == ("value_error",)
-        for diagnostic in result.validation_diagnostics
-    )
+    assert excinfo.value.reason_code == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
+
 
 
 def test_planner_topic_coverage_failure_uses_safe_reason_code(
@@ -579,14 +563,15 @@ def test_planner_topic_coverage_failure_uses_safe_reason_code(
             return json.dumps(payload)
 
     planner = IncompletePlanner()
-    result = BlueprintManager(planner, repair_limit=1).build(resolved)
+    # C1: OLD CONTRACT — planner failure fell back to a deterministic blueprint built
+    # from the classifier's topic label and published READY.
+    # NEW CONTRACT — without trustworthy structured `topics` on the request, that
+    # fallback can only widen the student's composition, so planning fails closed.
+    with pytest.raises(BlueprintPlanningError) as excinfo:
+        BlueprintManager(planner, repair_limit=1).build(resolved)
 
-    assert result.validation_reason_code == "PLANNER_TOPIC_COVERAGE_INVALID"
-    assert planner.repair_feedback[1] == (
-        "reason=PLANNER_TOPIC_COVERAGE_INVALID;fields=$;types=ValueError;"
-        "schema=PracticeBlueprint"
-    )
-    assert result.deterministic_fallback is True
+    assert excinfo.value.reason_code == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
+
 
 
 def test_invalid_deterministic_fallback_is_controlled_planning_error() -> None:
@@ -602,10 +587,14 @@ def test_invalid_deterministic_fallback_is_controlled_planning_error() -> None:
     with pytest.raises(BlueprintPlanningError) as error:
         BlueprintManager(InvalidPlanner(), repair_limit=1).build(resolved)
 
-    assert error.value.reason_code == "PRACTICE_PLANNER_FALLBACK_INVALID"
-    assert error.value.fallback_invoked is True
-    assert error.value.fallback_result == "invalid"
-    assert error.value.diagnostics[-1].phase == "fallback"
+    # C1 + C2: a malformed classifier label cannot ground anything, so the request
+    # escalates and then fails closed before the deterministic fallback is reached.
+    # OLD CONTRACT: fallback ran and was itself invalid (PRACTICE_PLANNER_FALLBACK_INVALID).
+    # NEW CONTRACT: planning stops earlier; both raise BlueprintPlanningError and
+    # neither is ever student-playable.
+    assert error.value.reason_code == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
+    assert error.value.fallback_invoked is False
+    assert error.value.diagnostics[-1].phase == "repair"
 
 
 def test_unexpected_planner_exception_is_not_silently_recovered(
@@ -1161,13 +1150,16 @@ def test_practice_capacity_policy_keeps_simple_work_small_and_complex_reasoning_
         "complexity": "low",
         "slot_count": 1,
     }
+    # Fix A (50Q closure): advanced math generates on GPT-4.1, which has no hidden
+    # reasoning to reserve for. The batch stays one slot; only the token figures and
+    # reasoning_effort move, and the ceiling is still bounded.
     assert advanced_capacity.model_dump() == {
-        "initial_max_output_tokens": 4000,
-        "escalation_max_output_tokens": 5600,
-        "product_hard_max_output_tokens": 5600,
+        "initial_max_output_tokens": 2600,
+        "escalation_max_output_tokens": 3600,
+        "product_hard_max_output_tokens": 4400,
         "model_hard_max_output_tokens": 8000,
         "max_slots_per_batch": 1,
-        "reasoning_effort": "high",
+        "reasoning_effort": "none",
         "complexity": "high",
         "slot_count": 1,
     }

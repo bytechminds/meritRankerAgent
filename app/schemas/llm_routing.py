@@ -43,7 +43,7 @@ from schemas.doubt_solver import CanonicalLanguage
 # Pydantic-friendly without extra wrappers)
 # ---------------------------------------------------------------------------
 
-ProviderName = Literal["gemini", "azure_openai", "openai", "mock", "deepseek"]
+ProviderName = Literal["gemini", "azure_openai", "openai", "mock", "deepseek", "bedrock"]
 
 # Azure API mode — determines how the adapter forms the HTTP request.
 # Set in provider_profiles.yaml.  Defaults to azure_deployment_chat_completions
@@ -70,6 +70,7 @@ TaskRole = Literal[
     "classifier",
     "classifier_strong",
     "follow_up_resolver",
+    "request_intelligence",
     "planner",
     "generator",
     "formatter",
@@ -92,7 +93,7 @@ CostTier = Literal["none", "low", "medium", "high"]
 
 CapabilityLevel = Literal["low", "medium", "high", "very_high"]
 
-ReasoningEffort = Literal["none", "low", "medium", "high"]
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 TokenBudgetParam = Literal["max_tokens", "max_completion_tokens", "max_output_tokens"]
 
@@ -375,6 +376,14 @@ class ModelConfig(BaseModel):
         default=True,
         description="When false, stop sequences are omitted from provider payloads.",
     )
+    supported_reasoning_efforts: list[ReasoningEffort] | None = Field(
+        default=None,
+        description=(
+            "Effort values this provider/model actually accepts. None keeps the "
+            "conservative default set, so a model that has not declared support "
+            "cannot be sent an effort the provider may reject."
+        ),
+    )
     send_reasoning_effort: bool = Field(
         default=False,
         description=(
@@ -526,6 +535,10 @@ class ProviderProfile(BaseModel):
     base_url_env: str | None = Field(
         default=None, description="Env var name holding a custom base URL (azure_openai_v1 mode)."
     )
+    region_env: str | None = Field(
+        default=None,
+        description="Env var name holding the AWS region (bedrock provider). Not a secret.",
+    )
     credential_ref: str | None = Field(
         default=None,
         max_length=256,
@@ -559,6 +572,13 @@ class ProviderProfile(BaseModel):
             "instead of raising SecretNotFoundError. Used for optional providers."
         ),
     )
+    optional_region: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing or blank region_env resolves to region=None instead of "
+            "raising SecretNotFoundError, leaving the SDK to use its default region."
+        ),
+    )
 
     model_config = {"str_strip_whitespace": True}
 
@@ -586,6 +606,12 @@ class ProviderProfile(BaseModel):
         v = _check_not_secret(v, "base_url_env")
         return _check_env_var_name(v, "base_url_env")
 
+    @field_validator("region_env")
+    @classmethod
+    def validate_region_env(cls, v: str | None) -> str | None:
+        v = _check_not_secret(v, "region_env")
+        return _check_env_var_name(v, "region_env")
+
     @field_validator("credential_ref")
     @classmethod
     def validate_credential_ref(cls, v: str | None) -> str | None:
@@ -603,6 +629,19 @@ class LlmRoutesConfig(BaseModel):
     version: int = Field(ge=1, description="Config schema version.")
     routes: dict[str, dict[str, dict[str, RouteEntry]]] = Field(
         description="Routing table: subject → task_role → difficulty → RouteEntry."
+    )
+    language_model_overrides: dict[
+        str, dict[str, dict[str, dict[CanonicalLanguage, str]]]
+    ] = Field(
+        default_factory=dict,
+        description=(
+            "Optional model overrides keyed subject → task_role → difficulty → "
+            "language. Consulted only on an exact match against the route already "
+            "resolved by subject/task_role/difficulty; every other routing input, "
+            "the prompt, and all generation parameters are untouched. An empty map "
+            "(the default) leaves route resolution exactly as it was before "
+            "language became a selection input."
+        ),
     )
 
 

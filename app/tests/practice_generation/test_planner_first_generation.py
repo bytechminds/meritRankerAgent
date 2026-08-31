@@ -220,8 +220,8 @@ class Verifier:
             generation_item_id=question.generation_item_id,
             slot_id=slot.slot_id,
             decision="ACCEPT",
-            independently_solved_option_id=question.correct_option_id,
-            reason_codes=["INDEPENDENT_SOLUTION_MATCH"],
+            valid_option_ids=[question.correct_option_id],
+            reason_codes=["SINGLE_VALID_OPTION"],
         )
 
 
@@ -367,8 +367,11 @@ class DecisionVerifier:
             generation_item_id=question.generation_item_id,
             slot_id=slot.slot_id,
             decision=decision,
-            independently_solved_option_id=(
-                question.correct_option_id if decision == "ACCEPT" else None
+            # REPAIRABLE means a bounded local defect (here an explanation mismatch),
+            # not a key defect: the authority still found exactly one valid option and
+            # it is the author's. Only REGENERATE models substantive invalidity.
+            valid_option_ids=(
+                [] if decision == "REGENERATE" else [question.correct_option_id]
             ),
             reason_codes=[
                 "INDEPENDENT_SOLUTION_MATCH"
@@ -397,8 +400,8 @@ class SelectiveProviderFailureVerifier:
             generation_item_id=question.generation_item_id,
             slot_id=slot.slot_id,
             decision="ACCEPT",
-            independently_solved_option_id=question.correct_option_id,
-            reason_codes=["INDEPENDENT_SOLUTION_MATCH"],
+            valid_option_ids=[question.correct_option_id],
+            reason_codes=["SINGLE_VALID_OPTION"],
         )
 
 
@@ -692,3 +695,70 @@ def test_verifier_provider_failure_preserves_verified_slots_without_content_repa
         "question-slot-001",
         "question-slot-002",
     }
+
+
+class GateVerifier:
+    """Returns a chosen valid-option set on the first call, then a clean ACCEPT."""
+
+    def __init__(self, first_valid_option_ids: list[str]) -> None:
+        self.first_valid_option_ids = first_valid_option_ids
+        self.calls = 0
+
+    def verify_slot(self, *, slot, question, **_kwargs):
+        self.calls += 1
+        valid = (
+            self.first_valid_option_ids
+            if self.calls == 1
+            else [question.correct_option_id]
+        )
+        # The authority reports ACCEPT throughout. The deterministic gate, not the
+        # model's own verdict, is what must refuse a zero/multiple/mismatched result.
+        return VerificationResult(
+            schema_version="2",
+            generation_item_id=question.generation_item_id,
+            slot_id=slot.slot_id,
+            decision="ACCEPT" if len(valid) == 1 else "REGENERATE",
+            valid_option_ids=valid,
+            reason_codes=["SINGLE_VALID_OPTION" if len(valid) == 1 else "REPORTED"],
+        )
+
+
+def test_zero_valid_options_is_rejected_and_forces_regeneration() -> None:
+    generator = WaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=GateVerifier([]),
+    )
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0, 2]
+    assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
+
+
+def test_multiple_valid_options_is_rejected_and_forces_regeneration() -> None:
+    generator = WaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=GateVerifier(["0", "2"]),
+    )
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0, 2]
+    assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
+
+
+def test_author_authority_mismatch_is_rejected_even_when_authority_accepts() -> None:
+    """One valid option, but not the author's: agreement fails, so the item cannot pass."""
+    generator = WaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        # The author keys "3"; the authority independently finds "1".
+        verifier=GateVerifier(["1"]),
+    )
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0, 2]
+    assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"

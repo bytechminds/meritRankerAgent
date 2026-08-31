@@ -77,9 +77,11 @@ def test_math_advanced_capacity_is_unchanged() -> None:
     capacity = _capacity("math", "advanced", complexity="high", slot_count=1)
 
     # Different provider, different measured reserve: must not move.
-    assert capacity.initial_max_output_tokens == 4000
-    assert capacity.escalation_max_output_tokens == 5600
-    assert capacity.product_hard_max_output_tokens == 5600
+    # GPT-4.1 reserves nothing for hidden reasoning, so the initial budget is the
+    # route's own figure; a single advanced question measured 150-600 output tokens.
+    assert capacity.initial_max_output_tokens == 2600
+    assert capacity.escalation_max_output_tokens == 3600
+    assert capacity.product_hard_max_output_tokens == 4400
 
 
 @pytest.mark.parametrize(

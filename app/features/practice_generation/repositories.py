@@ -292,6 +292,10 @@ class AssessmentRepository:
             "cancelRequested": False,
             "resumeReason": None,
             "practiceRequest": {
+                # Provenance for post-hoc correctness audit and replanning only. This
+                # is never a retrieval or matching key: reuse continues to match on the
+                # structured slot constraints alone.
+                "originalQuery": request.original_query,
                 "requestId": request.request_id,
                 "conversationId": request.conversation_id,
                 "turnId": request.turn_id,
@@ -300,9 +304,15 @@ class AssessmentRepository:
                 "acceptedCount": request.accepted_count,
                 "subject": request.subject,
                 "topic": request.topic,
+                "topics": request.topics,
                 "difficulty": request.difficulty.value,
                 "mixedDifficultyRequested": request.mixed_difficulty_requested,
                 "explicitDifficultyRequested": request.explicit_difficulty_requested,
+                "difficultyDistribution": (
+                    {level.value: count for level, count in request.difficulty_distribution.items()}
+                    if request.difficulty_distribution is not None
+                    else None
+                ),
                 "language": request.language,
                 "languageSource": request.language_source,
                 "examId": request.exam_id,

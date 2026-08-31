@@ -61,6 +61,10 @@ _ALLOWED_VERSIONED_TOKENS: frozenset[str] = frozenset({
     "_normalize_v1_base_url",  # Azure /openai/v1 path normalization helper
     "_build_client_v1",     # Azure v1-mode client builder
     "_validate_and_build_v1",  # Azure v1-mode credential validator
+    # Structured-output schema name sent to the provider on the wire. It versions
+    # a wire contract, not an app identifier, so it moves only when that contract
+    # genuinely changes shape.
+    "practice_request_intelligence_v4",
 })
 
 # Env-var / attribute pattern: must not appear in Python source.

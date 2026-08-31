@@ -482,7 +482,7 @@ def test_verifier_rejects_a_fresh_fact_without_a_selected_evidence_url() -> None
                 "generation_item_id": "item-1",
                 "slot_id": "slot-001",
                 "decision": "ACCEPT",
-                "independently_solved_option_id": "0",
+                "valid_option_ids": ["0"],
                 "reason_codes": ["INDEPENDENT_SOLUTION_MATCH"],
             }
         )

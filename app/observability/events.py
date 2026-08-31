@@ -68,6 +68,9 @@ EVENT_NAMES = frozenset(
         "PRACTICE_REQUEST_RESOLVED",
         "PRACTICE_LAUNCH_DECISION",
         "practice_language_resolved",
+        "practice_planning_route_selected",
+        "practice_request_intelligence_resolved",
+        "practice_request_intelligence_unusable",
         "PRACTICE_DISPATCH_RESULT",
         "PRACTICE_RUNTIME_STARTED",
         "PRACTICE_RUNTIME_VALIDATED",
@@ -340,6 +343,30 @@ def build_event(
     }
 
 
+# Classification fields that must survive into the production log line when an
+# event is a failure. Ordered by diagnostic value: what went wrong, then where, then
+# which attempt. Every key names a classification or identity, never student content
+# or model output, so promoting them cannot leak. Anything not listed stays in the
+# structured payload only.
+# sanitize_details lowercases every key, so these are matched in that form.
+_FAILURE_DIAGNOSTIC_KEYS: tuple[str, ...] = (
+    "reasoncode",
+    "errorclass",
+    "failurestage",
+    "validationstage",
+    "fieldpaths",
+    "routeid",
+    "modelalias",
+    "attempt",
+    "finishreason",
+    "expectedslotcount",
+    "actualslotcount",
+    "missing_cost_profiles",
+)
+_MAX_PROMOTED_DIAGNOSTICS = 8
+_MAX_PROMOTED_VALUE_CHARS = 120
+
+
 def log_event(
     event: str,
     *,
@@ -375,6 +402,22 @@ def log_event(
     # suppressed. Only the canonical safe classification is surfaced.
     if level >= logging.WARNING and payload["error_code"]:
         concise.append(f"error_code={payload['error_code']}")
+    # Details are suppressed in production, which previously left a failure line
+    # carrying only its event name — enough to see that something broke, not what.
+    # Promote a bounded allowlist of classification fields so a failure stays
+    # diagnosable from the log alone, without enlarging healthy log lines.
+    if level >= logging.WARNING and not (
+        _detailed_logs or _logger.isEnabledFor(logging.DEBUG)
+    ):
+        promoted = 0
+        for key in _FAILURE_DIAGNOSTIC_KEYS:
+            if promoted >= _MAX_PROMOTED_DIAGNOSTICS:
+                break
+            value = payload["details"].get(key)
+            if value in (None, "", (), []):
+                continue
+            concise.append(f"{key}={str(value)[:_MAX_PROMOTED_VALUE_CHARS]}")
+            promoted += 1
     if _detailed_logs or _logger.isEnabledFor(logging.DEBUG):
         concise.extend(f"{key}={value}" for key, value in payload["details"].items())
     collect_event(payload)

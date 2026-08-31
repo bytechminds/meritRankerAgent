@@ -17,7 +17,9 @@ from services.llm.orchestration.errors import (
 _SUPPORTED_PROVIDER_OPTIONS: frozenset[str] = frozenset(
     {"thinking", "stream", "reasoning_effort"}
 )
-_SUPPORTED_REASONING_EFFORTS: frozenset[str] = frozenset(
+# The conservative default. A model may widen this only by declaring
+# ``supported_reasoning_efforts``, so widening the type alone grants nothing.
+_DEFAULT_REASONING_EFFORTS: frozenset[str] = frozenset(
     {"low", "medium", "high"}
 )
 
@@ -97,13 +99,14 @@ class ModelConfigResolver:
 
         reasoning_effort = provider_options.get("reasoning_effort")
         if reasoning_effort is not None:
-            if (
-                not isinstance(reasoning_effort, str)
-                or reasoning_effort not in _SUPPORTED_REASONING_EFFORTS
-            ):
+            allowed = frozenset(
+                model_config.supported_reasoning_efforts
+                or _DEFAULT_REASONING_EFFORTS
+            )
+            if not isinstance(reasoning_effort, str) or reasoning_effort not in allowed:
                 raise ModelExecutionConfigError(
                     "Provider option 'reasoning_effort' must be one of "
-                    f"{sorted(_SUPPORTED_REASONING_EFFORTS)} for model '{model_alias}'."
+                    f"{sorted(allowed)} for model '{model_alias}'."
                 )
             if not model_config.supports_reasoning:
                 raise ModelExecutionConfigError(

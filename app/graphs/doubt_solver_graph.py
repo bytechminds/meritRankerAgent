@@ -47,6 +47,7 @@ from features.practice_generation.planning import (
     resolve_practice_request,
     validate_practice_requested_count,
 )
+from features.practice_generation.request_intelligence import PracticeRequestInterpreter
 from features.practice_generation.schemas import (
     PracticeGenerationRequest,
     PracticeLaunchResult,
@@ -1076,6 +1077,7 @@ def build_orchestrated_doubt_solver_graph(
     follow_up_resolver=None,
     conversation_understanding=None,
     practice_launcher: Callable[[PracticeGenerationRequest], PracticeLaunchResult] | None = None,
+    practice_request_interpreter: PracticeRequestInterpreter | None = None,
 ):
     """Construct and compile the lean Orchestrated Doubt Solver StateGraph.
 
@@ -1414,6 +1416,7 @@ def build_orchestrated_doubt_solver_graph(
                     or None,
                     freshness_requirement=freshness_requirement,
                     fresh_evidence=fresh_evidence,
+                    request_interpreter=practice_request_interpreter,
                 )
                 log_event(
                     "practice_language_resolved",

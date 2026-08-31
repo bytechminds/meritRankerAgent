@@ -115,7 +115,10 @@ class TestBenchmarkRouteResolution:
         assert self._route_model("math", "intermediate") == "math_intermediate_generator"
 
     def test_math_advanced_route(self):
-        assert self._route_model("math", "advanced") == "math_advanced_generator"
+        # Fix A (50Q closure): the advanced-math structured generator moved off
+        # deepseek-reasoner, whose hidden-reasoning variance exhausted the output
+        # budget on single-slot calls, to the already-configured GPT-4.1 route.
+        assert self._route_model("math", "advanced") == "openai_gpt_4_1"
 
     def test_reasoning_basic_route(self):
         assert self._route_model("reasoning", "basic") == "reasoning_basic_generator"

@@ -2,7 +2,7 @@
 # Provider invoices remain authoritative. Add an entry only after the price for
 # the exact provider/model or Azure deployment has been verified.
 
-pricing_version: "2026-07-27-reviewed"
+pricing_version: "2026-08-28-reviewed"
 billing_version: "billing-v1"
 metering_enabled: true
 credit_debit_enabled: false
@@ -20,6 +20,30 @@ models:
     output_cost_per_million_tokens: 8.00
     cached_input_cost_per_million_tokens: 0.50
     effective_from: "2026-07-27"
+  # AWS published Bedrock on-demand pricing for GLM 4.7 Flash, Asia Pacific
+  # (Mumbai) / ap-south-1. Reviewed 2026-08-28. Cached-input rate not published
+  # for this model, so it is intentionally absent rather than assumed.
+  - provider: bedrock
+    model_or_deployment: zai.glm-4.7-flash
+    input_cost_per_million_tokens: 0.08
+    output_cost_per_million_tokens: 0.48
+    effective_from: "2026-08-28"
+  # AWS published Bedrock on-demand pricing for MiniMax M2.5, Asia Pacific
+  # (Mumbai) / ap-south-1. Reviewed 2026-08-28. Cached-input rate not published
+  # for this model, so it is intentionally absent rather than assumed.
+  - provider: bedrock
+    model_or_deployment: minimax.minimax-m2.5
+    input_cost_per_million_tokens: 0.36
+    output_cost_per_million_tokens: 1.44
+    effective_from: "2026-08-28"
+  # AWS published Bedrock on-demand (Standard tier) pricing for Qwen3 Next 80B A3B,
+  # Asia Pacific (Mumbai) / ap-south-1. Reviewed 2026-08-29. Cached-input rate not
+  # published for this model, so it is intentionally absent rather than assumed.
+  - provider: bedrock
+    model_or_deployment: qwen.qwen3-next-80b-a3b
+    input_cost_per_million_tokens: 0.18
+    output_cost_per_million_tokens: 1.41
+    effective_from: "2026-08-29"
   - provider: gemini
     model_or_deployment: gemini-3.1-flash-lite
     input_cost_per_million_tokens: 0.25
@@ -76,6 +100,10 @@ model_alias_profiles:
   deepseek_azure_reasoning_generator: { provider: azure_openai, model_or_deployment: deepseek-reasoner, rate_status: unknown }
   deepseek_azure_standard_generator: { provider: azure_openai, model_or_deployment: deepseek-chat, rate_status: unknown }
   deepseek_azure_advanced_generator: { provider: azure_openai, model_or_deployment: deepseek-reasoner, rate_status: unknown }
+  practice_request_intelligence: { provider: bedrock, model_or_deployment: zai.glm-4.7-flash, rate_status: available }
+  practice_request_intelligence_gemma: { provider: bedrock, model_or_deployment: google.gemma-3-12b-it, rate_status: unknown }
+  practice_request_intelligence_minimax: { provider: bedrock, model_or_deployment: minimax.minimax-m2.5, rate_status: available }
+  practice_request_intelligence_qwen: { provider: bedrock, model_or_deployment: qwen.qwen3-next-80b-a3b, rate_status: available }
   safe_mock: { provider: mock, model_or_deployment: local-mock, rate_status: unknown }
 
 infra:

@@ -11,6 +11,10 @@ from features.practice_generation.execution_control import (
     current_expensive_attempt_guard,
 )
 from features.practice_generation.planning import select_planner_family
+from features.practice_generation.request_intelligence import (
+    token_id,
+    tokenize_query,
+)
 from features.practice_generation.schemas import (
     DemandBucket,
     GeneratedBatch,
@@ -200,6 +204,58 @@ def _combine_prompt_budgets(budgets: list[PromptInputBudget]) -> PromptInputBudg
         max_input_tokens=max_input_tokens,
         within_budget=all(item.within_budget for item in budgets),
     )
+
+
+class RoutedRequestIntelligenceProvider:
+    """Interpret one free-text Practice request through the shared LLM runtime.
+
+    The provider only transports; it applies no business rule. Shape is guaranteed
+    by the route's native structured-output schema, and every semantic invariant is
+    checked deterministically by ``features.practice_generation.request_intelligence``.
+    """
+
+    def __init__(self, orchestrator: LlmOrchestrator) -> None:
+        self._orchestrator = orchestrator
+
+    def interpret(
+        self,
+        *,
+        request_id: str,
+        query: str,
+        subject: str,
+        language: str,
+        exam_id: str | None,
+        exam_stage: str | None,
+    ) -> str:
+        payload = {
+            # The untranslated query is the semantic source of truth; the rest are
+            # hints the classifier already paid for. query_tokens carries the same
+            # query already split deterministically, each token labelled with the id
+            # a topic selects it by — so the model picks labels it can see rather
+            # than retyping the student's characters or counting positions.
+            "query": query,
+            "query_tokens": [
+                {"id": token_id(token.index), "text": token.text}
+                for token in tokenize_query(query)
+            ],
+            "classified_subject": subject,
+            "detected_language": language,
+            "exam_id": exam_id,
+            "exam_stage": exam_stage,
+        }
+        return self._orchestrator.generate_structured(
+            route_request=RouteRequest(
+                request_id=request_id,
+                subject="general",
+                task_role="request_intelligence",
+                difficulty="default",
+                intent="practice",
+                language=language,
+            ),
+            user_content=json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            prompt="practice_generation/request_intelligence.md",
+            overlays=[],
+        ).content
 
 
 class RoutedPlannerProvider:
@@ -776,6 +832,10 @@ class RoutedQuestionVerifier:
         payload: dict[str, Any] = {
             "schema_version": "2",
             "slot": slot.model_dump(mode="json"),
+            # Deliberately blind: the author's proposed option id, its free-text
+            # answer, its explanation and its solution are all withheld. The authority
+            # cannot confirm a key it has never seen, so its verdict is evidence
+            # independent of the author rather than agreement with it.
             "question": {
                 "schema_version": question.schema_version,
                 "generation_item_id": question.generation_item_id,
@@ -785,14 +845,12 @@ class RoutedQuestionVerifier:
                 "options": [
                     option.model_dump(mode="json") for option in question.canonical_options
                 ],
-                "submitted_answer": {
-                    "correct_option_id": question.correct_option_id,
-                    "correct_answer": question.correct_answer,
-                },
-                "answer_explanation": question.answer_explanation,
             },
             "language": request.language,
-            "instruction": "Solve independently before comparing the submitted option ID.",
+            "instruction": (
+                "Solve independently, then evaluate every supplied option and return "
+                "the id of every option that satisfies the question."
+            ),
         }
         if evidence is not None:
             payload["fresh_evidence"] = evidence

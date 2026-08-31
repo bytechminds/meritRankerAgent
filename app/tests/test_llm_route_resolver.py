@@ -155,7 +155,10 @@ class TestExactRouteResolution:
     ) -> None:
         req = _request("math", "generator", "advanced")
         decision = resolve_route(req, registry)
-        assert decision.model == "math_advanced_generator"
+        # Fix A (50Q closure): the advanced-math structured generator moved off
+        # deepseek-reasoner, whose hidden-reasoning variance exhausted the output
+        # budget on single-slot calls, to the already-configured GPT-4.1 route.
+        assert decision.model == "openai_gpt_4_1"
 
     def test_math_generator_default_resolves_exact(
         self, registry: LlmConfigRegistry

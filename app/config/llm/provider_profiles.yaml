@@ -83,3 +83,13 @@ provider_profiles:
     optional_api_key: true
     optional_endpoint: true
     optional_api_version: true
+
+  # Amazon Bedrock — authenticated by the runtime's existing AWS IAM identity.
+  # No API key and no secret: only the region travels through this profile, and
+  # BEDROCK_LLM_REGION is optional so an unset value falls back to the SDK default
+  # (the runtime's AWS_REGION). Set BEDROCK_LLM_REGION=ap-south-1 to pin in-region
+  # inference explicitly.
+  bedrock_apsouth1:
+    provider: bedrock
+    region_env: BEDROCK_LLM_REGION
+    optional_region: true
