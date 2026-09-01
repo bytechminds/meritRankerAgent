@@ -30,6 +30,34 @@ def normalize_question_text(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", value.casefold())).strip()
 
 
+def normalize_question_identity(value: str, options: object = None) -> str:
+    """Identity of a generated MCQ candidate: its stem plus its option set.
+
+    A generic instructional stem ("Which sentence is grammatically correct?") is
+    legitimate exam construction, and the question it actually asks then lives in the
+    options. Keying identity on the stem alone collapsed such items into one another.
+    Options are normalized and sorted, so a reordered option set is still a duplicate.
+
+    Reuse, PatternGraph and ingestion identity are unaffected: they keep using
+    ``normalize_question_text``.
+    """
+    stem = normalize_question_text(value)
+    if not options:
+        return stem
+    values: list[str] = []
+    for option in options:
+        if isinstance(option, dict):
+            candidate = option.get("value")
+        else:
+            candidate = getattr(option, "value", option)
+        normalized = normalize_question_text(str(candidate or ""))
+        if normalized:
+            values.append(normalized)
+    if not values:
+        return stem
+    return stem + "|" + "|".join(sorted(values))
+
+
 def normalize_reuse_key_segment(value: str) -> str:
     """Normalize one reuse-key segment under contract version 1."""
     normalized = re.sub(r"\s+", " ", value.strip()).lower()

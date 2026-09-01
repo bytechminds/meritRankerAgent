@@ -16,6 +16,18 @@ routes:
   # Generator routes
   # -------------------------------------------------------------------------
   math:
+    verifier:
+      default:
+        # Practice Answer Authority for Math. Gemini 3.7 Flash was the only
+        # candidate with 0 critical false accepts across three runs of the frozen
+        # 101-item hand-verified gold corpus (49 Math, 52 Reasoning). No reasoning
+        # effort is sent — this model declares none, and none is inferred.
+        model: gemini_3_7_flash
+        prompt: practice_generation/question_verifier_v2.md
+        temperature: 0.0
+        max_tokens: 5000
+        fallback: []
+
     generator:
       default:
         model: math_basic_generator
@@ -109,6 +121,18 @@ routes:
           - safe_mock
 
   reasoning:
+    verifier:
+      default:
+        # Practice Answer Authority for Reasoning. Gemini 3.7 Flash was the only
+        # candidate with 0 critical false accepts across three runs of the frozen
+        # 101-item hand-verified gold corpus (49 Math, 52 Reasoning). No reasoning
+        # effort is sent — this model declares none, and none is inferred.
+        model: gemini_3_7_flash
+        prompt: practice_generation/question_verifier_v2.md
+        temperature: 0.0
+        max_tokens: 5000
+        fallback: []
+
     generator:
       default:
         model: reasoning_basic_generator
@@ -130,6 +154,10 @@ routes:
 
       basic:
         inherits: default
+        # Basic Reasoning Author. Confirmed under the qualified Gemini Authority:
+        # 24/24 structural, 23/24 first-pass accepted, the single defect caught by
+        # the gate. Distinct from the Authority model, preserving independence.
+        model: openai_gpt_5_4_mini
         overlays:
           - levels/basic.md
         max_tokens: 1000
@@ -222,6 +250,17 @@ routes:
           - safe_mock
 
   english:
+    # Gemini 3.7 is the qualified English Answer Authority for rule-bound items.
+    # Author and Authority must stay different models, so the English Author is
+    # sourced from a non-Gemini alias.
+    verifier:
+      default:
+        model: gemini_3_7_flash
+        prompt: practice_generation/question_verifier_v2.md
+        temperature: 0.0
+        max_tokens: 5000
+        fallback: []
+
     planner:
       default:
         model: general_fast_generator
@@ -254,7 +293,7 @@ routes:
 
     generator:
       default:
-        model: english_fast_generator
+        model: openai_gpt_5_4_mini
         prompt: subjects/english_generator.md
         temperature: 0.3
         max_tokens: 1000
@@ -335,6 +374,31 @@ routes:
           - safe_mock
 
   factual:
+    # Qualified production routes for the factual family: Gemini 3.7 authors, GPT-5.6
+    # Luna is the blind Answer Authority. Author and Authority are deliberately
+    # different models so agreement is independent evidence, not one model agreeing
+    # with itself.
+    verifier:
+      default:
+        model: openai_gpt_5_6_luna
+        prompt: practice_generation/question_verifier_v2.md
+        temperature: 0.0
+        max_tokens: 5000
+        fallback: []
+
+    generator:
+      default:
+        model: gemini_3_7_flash
+        prompt: subjects/general_generator.md
+        temperature: 0.3
+        # 1500 reasoning reserve + 120 envelope + 840 visible, the smallest cap that keeps
+        # the batch sizes this route already produced (3 low / 2 medium / 2 high). At the
+        # previous 1000 the reserve was unrecorded, so batches were sized from visible
+        # output alone and over-packed into output_token_exhausted.
+        max_tokens: 2460
+        fallback:
+          - safe_mock
+
     planner:
       default:
         model: general_fast_generator
@@ -401,7 +465,10 @@ routes:
 
     verifier:
       default:
-        model: openai_gpt_5_6_terra
+        # Doubt Solver's answer-correctness verifier. Terra is qualified for the
+        # Practice Answer Authority contract only, so it is NOT applied here — this
+        # route keeps its previously qualified model until separately qualified.
+        model: openai_o4_mini
         prompt: answer_correctness_verifier.md
         temperature: 0.0
         max_tokens: 5000

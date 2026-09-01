@@ -26,7 +26,8 @@ _MONTH_YEAR = re.compile(
 )
 _FRESH_FACT_REQUEST = re.compile(
     r"\b(?:latest|recent|today|this\s+(?:week|month|year)|current(?:ly)?)\b.*\b(?:"
-    r"affairs?|events?|appointments?|awards?|office\s+holders?|holders?|scheme|policy|"
+    r"affairs?|events?|appointments?|awards?|office\s+holders?|holders?|schemes?|"
+    r"polic(?:y|ies)|rbi|repo\s*rate|budget|allocations?|"
     r"president|prime\s+minister|chief\s+justice|governor|minister|"
     r"sports?\s+result|results?)\b|"
     r"\bwho\s+is\s+(?:the\s+)?current\b",
@@ -34,9 +35,9 @@ _FRESH_FACT_REQUEST = re.compile(
 )
 _DATED_FACT_REQUEST = re.compile(
     r"\b20\d{2}\b.*\b(?:current\s+affairs?|events?|appointments?|awards?|"
-    r"office\s+holder|scheme|policy|sports?\s+result|results?)\b|"
+    r"office\s+holder|schemes?|polic(?:y|ies)|sports?\s+result|results?)\b|"
     r"\b(?:current\s+affairs?|events?|appointments?|awards?|office\s+holder|"
-    r"scheme|policy|sports?\s+result|results?)\b.*\b20\d{2}\b",
+    r"schemes?|polic(?:y|ies)|sports?\s+result|results?)\b.*\b20\d{2}\b",
     re.IGNORECASE,
 )
 _WEB_CONTEXT_ACTIONS = frozenset(

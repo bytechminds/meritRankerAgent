@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from schemas.llm_routing import RouteRequest
 from services.llm.orchestration.config_registry import LlmConfigRegistry
-from services.llm.orchestration.route_resolver import resolve_route
 
 
 @pytest.fixture(scope="module")
@@ -97,43 +95,120 @@ class TestDeepSeekV4ProProviderPath:
 
 
 class TestAuthorityRoute:
-    def test_authority_resolves_to_the_qualified_terra_alias(
-        self, registry: LlmConfigRegistry
-    ) -> None:
-        route = registry.get_route("general", "verifier", "default")
-        assert route is not None
-        assert route.model == "openai_gpt_5_6_terra"
+    """Authority selection lives in tests/test_authority_subject_routing.py.
 
-    def test_authority_keeps_the_configuration_that_passed_the_gold_corpus(
-        self, registry: LlmConfigRegistry
-    ) -> None:
-        """Changing effort or budget would invalidate the qualification result."""
-        route = registry.get_route("general", "verifier", "default")
-        assert route is not None
-        assert route.provider_options.get("reasoning_effort") == "medium"
-        assert route.max_tokens == 5000
+    Kept here: the retirement and isolation invariants this file is responsible for.
+    """
 
-    def test_no_route_uses_terra_as_an_author(
+    def test_no_verifier_route_uses_the_retired_terra_alias(
         self, registry: LlmConfigRegistry
     ) -> None:
-        """Author and Authority must stay different models or agreement proves nothing."""
-        authoring = [
-            f"{subject}.{task_role}.{difficulty}"
-            for (subject, task_role, difficulty), entry in registry.route_map.items()
-            if entry.model == "openai_gpt_5_6_terra" and task_role != "verifier"
+        """Terra is RETIRED_FOR_PRACTICE_AUTHORITY.
+
+        Across three runs of a 49-item Math and 52-item Reasoning gold corpus it
+        accepted 15 and 15 defective items, almost all by naming one valid option and
+        not evaluating the rest. The alias stays registered for rollback and other
+        roles; it must serve no verifier route.
+        """
+        serving = [
+            f"{s}.{r}.{d}"
+            for (s, r, d), entry in registry.route_map.items()
+            if r == "verifier" and entry.model == "openai_gpt_5_6_terra"
         ]
-        assert authoring == []
+        assert serving == []
+        assert "openai_gpt_5_6_terra" in registry.model_map
 
-    def test_verifier_requests_resolve_through_the_single_shared_route(self) -> None:
-        """Documents the blast radius: every verifier caller shares this one route."""
-        for subject in ("general", "math", "reasoning", "english"):
-            decision = resolve_route(
-                RouteRequest(
-                    request_id="cfg-1", subject=subject, task_role="verifier"
-                )
-            )
-            assert decision.route_id == "general.verifier.default"
-            assert decision.model == "openai_gpt_5_6_terra"
+    def test_every_verifier_route_keeps_a_bounded_output_budget(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        for (subject, task_role, difficulty), entry in registry.route_map.items():
+            if task_role != "verifier":
+                continue
+            assert entry.max_tokens == 5000, f"{subject}.{task_role}.{difficulty}"
+            assert entry.temperature == 0.0
+
+    def test_doubt_solver_keeps_its_own_verifier_entry(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        """Practice Authority selection must never move Doubt Solver."""
+        assert ("general", "verifier", "default") in registry.route_map
+        general = registry.get_route("general", "verifier", "default")
+        assert general is not None
+        assert general.model == "openai_o4_mini"
+
+
+class TestGeminiIntegration:
+    def test_the_classifier_route_is_unchanged(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        route = registry.get_route("general", "classifier", "default")
+        assert route is not None
+        assert route.model == "doubt_solver_classifier_gemini"
+
+    def test_gemini_3_7_reuses_the_existing_provider_and_credentials(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        """One Gemini provider path only — no second abstraction, no new credential."""
+        candidate = registry.model_map["gemini_3_7_flash"]
+        classifier = registry.model_map["doubt_solver_classifier_gemini"]
+        assert candidate.provider == "gemini"
+        assert candidate.provider_profile == classifier.provider_profile
+        assert candidate.model_id == "gemini-3.7-flash"
+
+    def test_gemini_3_7_declares_no_unprobed_effort_levels(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        """Nothing is claimed from documentation alone."""
+        candidate = registry.model_map["gemini_3_7_flash"]
+        assert candidate.supported_reasoning_efforts is None
+        assert candidate.supports_reasoning is False
+
+    def test_gemini_3_7_serves_only_its_qualified_authority_families(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        """Authority for Math, Reasoning and English; Author for the factual family."""
+        routed = sorted(
+            f"{s}.{r}.{d}"
+            for (s, r, d), entry in registry.route_map.items()
+            if entry.model == "gemini_3_7_flash"
+        )
+        assert routed == [
+            "english.verifier.default",
+            "factual.generator.default",
+            "math.verifier.default",
+            "reasoning.verifier.default",
+        ]
+
+
+class TestDeterministicInternalIds:
+    def test_generation_item_id_is_derived_not_authored(self) -> None:
+        """The author copying a placeholder must not cost the question."""
+        from features.practice_generation.schemas import GeneratedQuestion
+
+        base = {
+            "schema_version": "2",
+            "bucket_id": "b",
+            "question": "Which option equals two plus two?",
+            "question_type": "mcq",
+            "options": [
+                {"option_id": "0", "value": "1"},
+                {"option_id": "1", "value": "2"},
+                {"option_id": "2", "value": "3"},
+                {"option_id": "3", "value": "4"},
+            ],
+            "correct_option_id": "3",
+            "subject": "math",
+            "topic": "t",
+            "difficulty": "basic",
+        }
+        derived = [
+            GeneratedQuestion.model_validate(
+                {**base, "slot_id": f"slot-00{n}", "generation_item_id": "i"}
+            ).generation_item_id
+            for n in (1, 2, 3)
+        ]
+        assert derived == ["item-slot-001", "item-slot-002", "item-slot-003"]
+        assert len(set(derived)) == 3
 
 
 class TestFrozenRoutesPreserved:

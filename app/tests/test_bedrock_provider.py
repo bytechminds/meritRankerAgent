@@ -206,23 +206,54 @@ class TestBedrockStructuredOutputRequestShape:
         assert "performanceConfig" not in client.captured
 
     def test_role_without_a_static_schema_sends_no_output_config(self, tmp_path: Path) -> None:
-        """``verifier`` has no registered grammar, so it stays a free-text call.
+        """``planner`` has no registered grammar, so it stays a free-text call.
 
-        The role here must be one genuinely absent from the schema map. ``generator``
-        is now intentionally supported, so using it would assert the opposite of the
-        contract rather than the invariant.
+        The role here must be one genuinely absent from the schema map. Both
+        ``request_intelligence`` and ``verifier`` are now intentionally constrained, so
+        using either would assert the opposite of the contract rather than the invariant.
         """
         client = _FakeBedrockClient(_converse_response("plain text answer"))
         adapter = BedrockProviderAdapter(client_factory=lambda _c, _t: client)
 
         result = adapter.generate(
-            request=_execution_request(tmp_path, task_role="verifier"),
+            request=_execution_request(tmp_path, task_role="planner"),
             credentials=_credentials(),
         )
 
         assert client.captured is not None
         assert "outputConfig" not in client.captured
         assert result.metadata["native_structured_output"] is False
+
+    def test_verifier_role_is_grammar_constrained(self, tmp_path: Path) -> None:
+        """The Answer Authority wire shape, so a Bedrock Authority cannot emit prose."""
+        client = _FakeBedrockClient(_converse_response(json.dumps(_VALID_RESPONSE)))
+        adapter = BedrockProviderAdapter(client_factory=lambda _c, _t: client)
+
+        adapter.generate(
+            request=_execution_request(tmp_path, task_role="verifier"),
+            credentials=_credentials(),
+        )
+
+        assert client.captured is not None
+        json_schema = client.captured["outputConfig"]["textFormat"]["structure"][
+            "jsonSchema"
+        ]
+        assert json_schema["name"] == "practice_verification_result"
+        schema = json.loads(json_schema["schema"])
+        assert set(schema["required"]) == {
+            "schema_version",
+            "generation_item_id",
+            "slot_id",
+            "decision",
+            "valid_option_ids",
+            "reason_codes",
+        }
+        assert schema["properties"]["valid_option_ids"]["items"]["enum"] == [
+            "0",
+            "1",
+            "2",
+            "3",
+        ]
 
     def test_generator_role_is_not_grammar_constrained(self, tmp_path: Path) -> None:
         """Authoring must stay free-text JSON on this provider.

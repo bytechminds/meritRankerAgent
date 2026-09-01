@@ -36,7 +36,7 @@ from features.practice_generation.matching import (
     build_slot_reuse_bucket_key,
     match_existing_questions,
     match_existing_questions_to_slots,
-    normalize_question_text,
+    normalize_question_identity,
     reusable_question_from_item,
     shortlist_reuse_candidate_ids,
 )
@@ -1247,7 +1247,10 @@ class PracticeGenerationOrchestrator:
         )
         linked = self._questions.list_linked(test_id)
         existing_texts = {
-            normalize_question_text(str(item.get("question") or "")) for item in linked
+            normalize_question_identity(
+                str(item.get("question") or ""), item.get("options")
+            )
+            for item in linked
         }
         from features.practice_generation.schemas import GenerationGroup  # noqa: PLC0415
 
@@ -1695,7 +1698,9 @@ class PracticeGenerationOrchestrator:
             linked = self._questions.list_linked(test_id)
             excluded = tuple(
                 sorted(
-                    normalize_question_text(str(item.get("question") or ""))
+                    normalize_question_identity(
+                        str(item.get("question") or ""), item.get("options")
+                    )
                     for item in linked
                     if item.get("question")
                 )
@@ -2130,7 +2135,9 @@ class PracticeGenerationOrchestrator:
                         question=question,
                         verification=verification,
                     )
-                    excluded.add(normalize_question_text(question.question))
+                    excluded.add(
+                        normalize_question_identity(question.question, question.options)
+                    )
                     pending.pop(slot.slot_id, None)
                     if replacement_wave == 1:
                         emit_practice_event(
@@ -2216,13 +2223,19 @@ class PracticeGenerationOrchestrator:
             if pending and not terminal:
                 if force_regeneration:
                     excluded.update(
-                        normalize_question_text(repair_candidates[slot_id].question)
+                        normalize_question_identity(
+                            repair_candidates[slot_id].question,
+                            repair_candidates[slot_id].options,
+                        )
                         for slot_id in pending
                         if slot_id in repair_candidates
                     )
                 if replacement_wave == 1:
                     excluded.update(
-                        normalize_question_text(repair_candidates[slot_id].question)
+                        normalize_question_identity(
+                            repair_candidates[slot_id].question,
+                            repair_candidates[slot_id].options,
+                        )
                         for slot_id in pending
                         if slot_id in repair_candidates
                     )

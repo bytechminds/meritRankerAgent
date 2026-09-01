@@ -440,3 +440,93 @@ class TestWebSearchFormatter:
             context_strength="authoritative",
         )
         assert "exam-prep/supporting" not in text
+
+
+class TestEvidenceArticleDeduplication:
+    """One article must not fill several evidence slots.
+
+    Live PIB results returned the same press release under two URLs differing only by
+    `&reg=3&lang=1`, so a three-item bundle carried only two distinct facts and two
+    slots were handed identical evidence.
+    """
+
+    @staticmethod
+    def _item(url: str, title: str, published_at: str) -> WebSearchItem:
+        return WebSearchItem(
+            title=title,
+            url=url,
+            snippet=(
+                "India current affairs August 2026: government announcement "
+                "covering the current affairs of India in August 2026."
+            ),
+            source="pib.gov.in",
+            published_at=published_at,
+            score=0.9,
+        )
+
+    def test_same_article_under_tracking_variants_is_selected_once(self) -> None:
+        base = "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2293440"
+        items = [
+            self._item(
+                f"{base}&reg=3&lang=1",
+                "India current affairs August 2026 innovation update - PIB",
+                "2026-08-02",
+            ),
+            self._item(
+                base,
+                "India current affairs August 2026 innovation update - pib.gov.in",
+                "2026-08-02",
+            ),
+            self._item(
+                "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2293020",
+                "India current affairs August 2026 self-reliance update",
+                "2026-08-01",
+            ),
+        ]
+        result = WebSearchReranker().rerank(
+            items,
+            WebSearchRerankInput(
+                request_id="dedup",
+                query="current affairs India August 2026",
+                web_search_query="current affairs India August 2026",
+                topic="current affairs",
+                retrieval_tags=["current affairs", "india"],
+                web_search_reason="current_event",
+                source_pack_name="current_affairs_india",
+                attempt_used="authoritative",
+                requires_fresh_evidence=True,
+            ),
+        )
+        urls = [item.url for item in result.selected]
+        assert len(result.selected) == 2, urls
+        assert sum("PRID=2293440" in url for url in urls) == 1, urls
+
+    def test_distinct_articles_are_both_kept(self) -> None:
+        """Dedup keys on the article, so different releases must survive."""
+        items = [
+            self._item(
+                "https://www.pib.gov.in/PressReleasePage.aspx?PRID=1",
+                "India current affairs August 2026 first release",
+                "2026-08-02",
+            ),
+            self._item(
+                "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2",
+                "India current affairs August 2026 second release",
+                "2026-08-02",
+            ),
+        ]
+        result = WebSearchReranker().rerank(
+            items,
+            WebSearchRerankInput(
+                request_id="dedup2",
+                query="current affairs India August 2026",
+                web_search_query="current affairs India August 2026",
+                topic="current affairs",
+                retrieval_tags=["current affairs", "india"],
+                web_search_reason="current_event",
+                source_pack_name="current_affairs_india",
+                attempt_used="authoritative",
+                requires_fresh_evidence=True,
+            ),
+        )
+        assert len({item.title for item in result.selected}) == 2

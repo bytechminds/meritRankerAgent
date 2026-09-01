@@ -7,6 +7,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 
 _CURRENT_PLAYER_QUESTION_TYPE = "mcq"
 _CURRENT_PLAYER_OPTION_COUNT = 4
@@ -107,6 +108,53 @@ def _validated_options(options: object) -> tuple[list[str] | None, PlayableQuest
     if _duplicate_numeric_option(values):
         return None, PlayableQuestionValidation(False, "SEMANTIC_DUPLICATE_OPTIONS")
     return values, PlayableQuestionValidation(True, "PLAYABLE")
+
+
+class SemanticBasis(StrEnum):
+    """How a question's single correct answer can be established.
+
+    RULE_BOUND items are decidable from grammar, usage in a supplied context, or an
+    explicit passage. EVIDENCE_REQUIRED items assert lexical equivalence — synonym,
+    antonym, near-synonym, substitution, idiomatic equivalence — where correctness
+    rests on a lexicon rather than a rule, and several options can be defensible.
+    """
+
+    RULE_BOUND = "RULE_BOUND"
+    EVIDENCE_REQUIRED = "EVIDENCE_REQUIRED"
+
+
+# Closed set of RULE_BOUND question forms: those whose single correct answer is
+# decidable from grammar, sentence structure, an explicit passage, or the usage of a
+# word supplied in the stem. This is an allowlist, so any form not recognised here —
+# including every future or unseen one — falls through to EVIDENCE_REQUIRED and fails
+# closed. It classifies the question's FORM, never its topic: it reads no topic_id,
+# target_skill or model-authored label, and adds no model call.
+_RULE_BOUND_STEM = re.compile(
+    r"\bgrammatical(?:ly)?\b"
+    r"|\bgrammar\b"
+    r"|\bcontains?\s+(?:an?\s+)?error\b"
+    r"|\berror\s+(?:in|detection|part)\b"
+    r"|\bidentify\s+the\s+(?:part|segment|portion)\b"
+    r"|\b(?:best\s+)?order\s+(?:for|of)\s+the\s+sentences?\b"
+    r"|\b(?:correct|proper|logical)\s+(?:order|sequence)\b"
+    r"|\brearrange\b"
+    r"|\bread\s+the\s+(?:passage|paragraph|text)\b"
+    r"|\buses?\s+the\s+word\s+.{0,40}?\s*correctly\b"
+    r"|\bused\s+correctly\b",
+    re.IGNORECASE,
+)
+
+
+def classify_semantic_basis(question: object) -> SemanticBasis:
+    """Deterministically classify a question stem's semantic basis.
+
+    Safe by default: only recognised rule-bound forms are RULE_BOUND. Anything else,
+    recognised lexical-equivalence operator or not, is EVIDENCE_REQUIRED.
+    """
+    stem = str(question or "")
+    if stem and _RULE_BOUND_STEM.search(stem):
+        return SemanticBasis.RULE_BOUND
+    return SemanticBasis.EVIDENCE_REQUIRED
 
 
 def validate_playable_question(

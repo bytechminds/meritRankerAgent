@@ -6,6 +6,8 @@ import json
 from datetime import date
 from types import SimpleNamespace
 
+import pytest
+
 from features.practice_generation.orchestration import _request
 from features.practice_generation.planning import (
     is_fresh_evidence_request_supported,
@@ -431,10 +433,13 @@ class _StructuredCapture:
 
 
 def test_verifier_rejects_a_fresh_fact_without_a_selected_evidence_url() -> None:
+    # A qualified family, because this test exercises evidence citation rather than
+    # subject routing. Practice now fails closed for families with no qualified
+    # Answer Authority, and "general" is the shared cross-feature entry, not one.
     request = _current_request()
     bucket = DemandBucket(
         bucket_id="slot-bucket-001",
-        subject="general",
+        subject="reasoning",
         topic="current_affairs",
         difficulty=Difficulty.INTERMEDIATE,
         question_type=QuestionType.MCQ,
@@ -444,7 +449,7 @@ def test_verifier_rejects_a_fresh_fact_without_a_selected_evidence_url() -> None
     )
     slot = PlannerSlot(
         slot_id="slot-001",
-        subject_id="general",
+        subject_id="reasoning",
         topic_id="current_affairs",
         category_id="current_affairs",
         difficulty=Difficulty.INTERMEDIATE,
@@ -559,3 +564,59 @@ def test_generator_uses_only_slot_relevant_fresh_evidence() -> None:
         ("slot-001", "https://pib.gov.in/release-1"),
         ("slot-002", "https://pib.gov.in/release-2"),
     ]
+
+
+class TestCurrentFactualDetectorCoverage:
+    """Explicit current/dynamic economics and scheme requests must demand evidence.
+
+    Plural forms were previously unreachable: ``awards``/``events`` accepted a
+    trailing ``s`` but ``scheme``/``policy`` did not, so "recent government
+    schemes" resolved as a static request and skipped grounding entirely.
+    """
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "current RBI repo rate",
+            "latest Union Budget allocation",
+            "recent government schemes",
+            "current government policies",
+            "latest economic policy announcement",
+            "Create 5 questions on the current repo rate",
+            "Give me questions on recent government scheme launches",
+        ],
+    )
+    def test_explicit_current_requests_require_evidence(self, query: str) -> None:
+        assert is_freshness_sensitive_query(query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "define repo rate",
+            "explain monetary policy",
+            "what is fiscal policy",
+            "functions of RBI",
+            "features of government schemes",
+            "What is repo rate?",
+            "Explain fiscal policy.",
+            "What is a government scheme?",
+            "What is RBI?",
+            "Create 5 questions on budget line items in cost accounting",
+        ],
+    )
+    def test_static_definitional_requests_stay_offline(self, query: str) -> None:
+        """No freshness marker means no search, so search cost cannot regress."""
+        assert is_freshness_sensitive_query(query) is False
+
+    @pytest.mark.parametrize(
+        ("singular", "plural"),
+        [
+            ("recent government scheme", "recent government schemes"),
+            ("current government policy", "current government policies"),
+            ("latest award", "latest awards"),
+        ],
+    )
+    def test_singular_and_plural_agree(self, singular: str, plural: str) -> None:
+        assert is_freshness_sensitive_query(singular) == is_freshness_sensitive_query(
+            plural
+        ) is True

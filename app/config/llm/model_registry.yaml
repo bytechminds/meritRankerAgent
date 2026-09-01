@@ -649,6 +649,30 @@ models:
     supports_thinking: false
     timeout_seconds: 20
 
+  gemini_3_7_flash:
+    description: >-
+      Qualified Practice Answer Authority for Math and Reasoning, and the qualified
+      Author for the factual family, on the existing Gemini provider and credential
+      path. Capability metadata stays at the conservative defaults, with one probed
+      exception: structured_output_reasoning_reserve_tokens records measured hidden
+      reasoning consumption. No effort level is declared from documentation alone.
+    provider: gemini
+    provider_profile: gemini_primary
+    allowed_task_roles: [generator, verifier]
+    model_id: gemini-3.7-flash
+    supports_streaming: false
+    supports_thinking: false
+    supports_reasoning: false
+    reasoning_effort: none
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 60
+    # Measured over 695 production-path calls: this model spends hidden reasoning against
+    # the completion budget on essentially every call (p50 156, p95 565, p99 1042, max
+    # 1441) while visible output stays at 149-344. Every other alias measures 0. This
+    # records observed consumption so batching stops treating the whole budget as usable;
+    # it does not enable a reasoning feature. 1500 covers the full observed sample.
+    structured_output_reasoning_reserve_tokens: 1500
+
   doubt_solver_classifier_gemini:
     description: Native Gemini 3.1 Flash-Lite primary classifier.
     provider: gemini
@@ -769,7 +793,7 @@ models:
       separate reasoning-token count.
     provider: azure_openai
     provider_profile: azure_foundry_v1
-    allowed_task_roles: [generator]
+    allowed_task_roles: [generator, verifier]
     deployment: DeepSeek-V4-Pro
     supports_streaming: true
     supports_thinking: false

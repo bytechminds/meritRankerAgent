@@ -402,6 +402,7 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "source_modality",
         "response_type",
         "practice_test_id",
+        "fresh_evidence",
     }, f"State fields changed: {set(annotations.keys())}"
 
 

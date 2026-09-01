@@ -224,6 +224,44 @@ class TestWebSourcePolicyResolver:
 
 
 class TestQueryBuilderAttempts:
+    def test_evidence_required_current_affairs_tries_trusted_alone_first(self) -> None:
+        """Evidence-required current affairs must satisfy min_trusted_results.
+
+        A merged trusted+reputed query lets high-volume news domains outrank
+        government ones, so official sources never surfaced and every such request
+        failed closed. Broad exam-prep digests keep the cheaper merged-first plan.
+        """
+        policy = WebSourcePolicyResolver().resolve(
+            query="current affairs India August 2026",
+            web_search_query="current affairs India August 2026",
+            subject="polity",
+            topic=None,
+            retrieval_tags=[],
+            web_search_reason="current_event",
+            source_strictness="authoritative_first",
+            default_recent_days=30,
+        )
+        grounded = WebSearchQueryBuilder.plan_attempts(
+            policy,
+            allow_generic_fallback=True,
+            allow_exam_prep_fallback=True,
+            exam_prep_suitable=True,
+            official_only=False,
+            requires_fresh_evidence=True,
+        )
+        assert grounded[0].kind == "authoritative"
+        assert grounded[0].include_domains == policy.trusted_domains
+        assert grounded[1].kind == "authoritative_plus_reputed"
+
+        ungrounded = WebSearchQueryBuilder.plan_attempts(
+            policy,
+            allow_generic_fallback=True,
+            allow_exam_prep_fallback=True,
+            exam_prep_suitable=True,
+            official_only=False,
+        )
+        assert ungrounded[0].kind == "authoritative_plus_reputed"
+
     def test_broad_current_affairs_starts_with_combined_trusted_sources(self) -> None:
         policy = WebSourcePolicyResolver().resolve(
             query="monthly current affairs summary for SSC",

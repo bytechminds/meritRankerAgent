@@ -148,10 +148,10 @@ def test_verifier_route_has_reasoning_and_json_output_budget() -> None:
         )
     )
 
-    # Shared route: Practice's Answer Authority and this correctness verifier both
-    # resolve to general.verifier.default, so the qualified-Authority switch moves
-    # both. Scoping them apart would require a separate Practice verifier route.
-    assert route.model == "openai_gpt_5_6_terra"
+    # Doubt Solver keeps its own verifier model. Practice's Answer Authority now has
+    # a dedicated route, so Terra — qualified only for that contract — does not reach
+    # this caller.
+    assert route.model == "openai_o4_mini"
     assert route.max_tokens == 5000
     assert route.provider_options == {"reasoning_effort": "medium"}
     assert route.fallback_attempts == []

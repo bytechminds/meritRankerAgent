@@ -64,11 +64,12 @@ class PracticeGenerationCapacityPolicy:
             complexity=workload.complexity,
             slot_count=workload.slot_count,
         )
-        reasoning_reserve = (
-            model_config.structured_output_reasoning_reserve_tokens
-            if is_reasoning_model
-            else 0
-        )
+        # The reserve records how many completion tokens a model actually spends on
+        # hidden reasoning, which is independent of whether the model exposes reasoning
+        # controls: gemini-3.7-flash declares no reasoning support yet spends the budget
+        # on every call. Gating it on that flag left the reserve unused and over-packed
+        # the batch.
+        reasoning_reserve = model_config.structured_output_reasoning_reserve_tokens
         model_hard_cap = model_config.model_hard_max_output_tokens
         product_hard_cap = min(band.product_hard_cap, model_hard_cap)
         initial_cap = min(

@@ -352,7 +352,7 @@ def test_practice_verifier_route_has_bounded_reasoning_budget() -> None:
     route = resolve_route(
         RouteRequest(
             request_id="practice-verifier-route",
-            subject="general",
+            subject="reasoning",
             task_role="verifier",
             difficulty="default",
             intent="practice",
@@ -360,11 +360,13 @@ def test_practice_verifier_route_has_bounded_reasoning_budget() -> None:
         )
     )
 
-    # Authority qualified on the frozen v2 gold corpus: 0 critical false accepts and
-    # 0 false rejects, against o4-mini's 1 and 1. The budget is part of that qualified
-    # configuration, so it is pinned alongside the model.
-    assert (route.model, route.max_tokens) == ("openai_gpt_5_6_terra", 5000)
-    assert route.provider_options == {"reasoning_effort": "medium"}
+    # Practice's Answer Authority is the tournament winner: the only candidate with 0
+    # critical false accepts across three runs of the 101-item gold corpus. It has its
+    # own route entry so this selection never reaches Doubt Solver.
+    assert (route.model, route.max_tokens) == ("gemini_3_7_flash", 5000)
+    # No reasoning effort is sent: the winner does not declare support for one, and an
+    # undeclared effort must never be inferred from another model.
+    assert route.provider_options == {}
 
 
 @pytest.mark.parametrize(
@@ -1445,7 +1447,7 @@ def test_slot_generation_reports_safe_schema_v2_identity_failure() -> None:
                 }
             ]
         }
-    ).replace('"generation_item_id": "item-slot-001"', '"generation_item_id": ""')
+    ).replace(f'"bucket_id": "{bucket.bucket_id}"', '"bucket_id": ""', 1)
 
     parsed = parse_partial_generation(
         raw,
@@ -1457,6 +1459,66 @@ def test_slot_generation_reports_safe_schema_v2_identity_failure() -> None:
 
     assert parsed.accepted == ()
     assert parsed.rejection_reason_codes == ("SCHEMA_V2_IDENTITY_CONTRACT_INVALID",)
+
+
+def test_slot_generation_repairs_an_author_supplied_item_id() -> None:
+    """`generation_item_id` is code-owned, so the author cannot fail on it.
+
+    Models copied the prompt's placeholder verbatim and the duplicate check discarded
+    two of every three questions. The id is now derived from the slot, so an empty or
+    repeated value is repaired instead of costing the question.
+    """
+    resolved = request(
+        "Create one time and work question",
+        subject="math",
+        topic="time_and_work",
+    )
+    blueprint = deterministic_blueprint(
+        resolved.model_copy(update={"difficulty": Difficulty.BASIC})
+    )
+    slot = blueprint.slots[0]
+    bucket = blueprint.buckets[0]
+    group = GenerationGroup(
+        group_id="g1",
+        bucket_id=bucket.bucket_id,
+        required_count=1,
+        slot_ids=[slot.slot_id],
+    )
+    raw = json.dumps(
+        {
+            "questions": [
+                {
+                    "schema_version": "2",
+                    "generation_item_id": "",
+                    "bucket_id": bucket.bucket_id,
+                    "slot_id": slot.slot_id,
+                    "question": "A worker completes a task in six days. What is the rate?",
+                    "question_type": "mcq",
+                    "options": [
+                        {"option_id": "0", "value": "One sixth"},
+                        {"option_id": "1", "value": "One third"},
+                        {"option_id": "2", "value": "One half"},
+                        {"option_id": "3", "value": "One"},
+                    ],
+                    "correct_option_id": "0",
+                    "subject": slot.subject_id,
+                    "topic": slot.topic_id,
+                    "difficulty": slot.difficulty.value,
+                }
+            ]
+        }
+    )
+
+    parsed = parse_partial_generation(
+        raw,
+        group=group,
+        bucket=bucket,
+        existing_normalized_texts=set(),
+        slots=(slot,),
+    )
+
+    assert len(parsed.accepted) == 1
+    assert parsed.accepted[0].generation_item_id == f"item-{slot.slot_id}"
 
 
 def test_every_item_is_independently_verified_even_for_legacy_selective_policy() -> None:

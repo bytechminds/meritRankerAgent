@@ -63,6 +63,49 @@ def _classifier_response_schema() -> dict[str, Any]:
     return schema
 
 
+def _verifier_response_schema() -> dict[str, Any]:
+    """Return the schema-v2 Answer Authority wire shape.
+
+    Written out rather than derived from ``VerificationResult`` because that model
+    still carries the legacy v1 fields, and their optionality compiles to ``anyOf``
+    with ``$ref``/``$defs`` — constructs this API rejects. The fields below are exactly
+    the ones the v2 verifier prompt asks for, and the canonical model remains the
+    authority: it re-validates every response after parsing.
+    """
+    option_id = {"type": "string", "enum": ["0", "1", "2", "3"]}
+    return {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["2"]},
+            "generation_item_id": {"type": "string"},
+            "slot_id": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["ACCEPT", "REPAIRABLE", "REGENERATE", "TERMINAL_REJECTION"],
+            },
+            "valid_option_ids": {"type": "array", "items": option_id, "maxItems": 4},
+            "reason_codes": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        },
+        "required": [
+            "schema_version",
+            "generation_item_id",
+            "slot_id",
+            "decision",
+            "valid_option_ids",
+            "reason_codes",
+        ],
+    }
+
+
+# Native response schemas keyed by execution role. A role absent from this map is
+# executed as an ordinary free-text call. Keyed by role, never by model, so no
+# model-specific branch exists.
+_NATIVE_RESPONSE_SCHEMAS: dict[str, Callable[[], dict[str, Any]]] = {
+    "classifier": _classifier_response_schema,
+    "verifier": _verifier_response_schema,
+}
+
+
 class GeminiProviderAdapter:
     """Execute Gemini through the native ``google-genai`` SDK."""
 
@@ -158,11 +201,14 @@ class GeminiProviderAdapter:
             "temperature": request.temperature,
             "max_output_tokens": request.max_tokens,
         }
-        if request.route_decision.task_role == "classifier":
+        schema_builder = _NATIVE_RESPONSE_SCHEMAS.get(
+            request.route_decision.task_role
+        )
+        if schema_builder is not None:
             values.update(
                 {
                     "response_mime_type": "application/json",
-                    "response_json_schema": _classifier_response_schema(),
+                    "response_json_schema": schema_builder(),
                 }
             )
         return types.GenerateContentConfig(**values)
@@ -234,7 +280,7 @@ class GeminiProviderAdapter:
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
                 "native_structured_output": (
-                    request.route_decision.task_role == "classifier"
+                    request.route_decision.task_role in _NATIVE_RESPONSE_SCHEMAS
                 ),
             },
         )

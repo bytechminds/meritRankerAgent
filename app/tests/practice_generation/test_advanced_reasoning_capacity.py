@@ -87,7 +87,13 @@ def test_math_advanced_capacity_is_unchanged() -> None:
 @pytest.mark.parametrize(
     ("subject", "difficulty", "complexity", "expected_initial"),
     [
-        ("reasoning", "basic", "low", 900),
+        # Basic Reasoning now routes to a reasoning-capable Author, so the capacity
+        # policy selects its reasoning band (1600) instead of the non-reasoning one
+        # (900). The policy itself is unchanged — the band is keyed on the model's
+        # declared capability, and a model that spends tokens on hidden reasoning
+        # needs the larger initial budget. This row tracks that deliberate route
+        # change; the other three rows still guard against capacity drift.
+        ("reasoning", "basic", "low", 1600),
         ("reasoning", "intermediate", "medium", 2600),
         ("math", "basic", "low", 900),
         ("math", "intermediate", "medium", 1600),

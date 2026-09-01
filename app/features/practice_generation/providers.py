@@ -30,6 +30,8 @@ from schemas.llm_routing import PracticeGenerationWorkload, RouteRequest
 from services.doubt_solver.exam_profile_cache import get_exam_profile_runtime
 from services.llm.orchestration.orchestrator import LlmOrchestrator
 from services.llm.orchestration.prompt_budget import PromptInputBudget
+from services.llm.orchestration.prompt_resolver import DEFAULT_PROMPT_ROOT
+from services.llm.orchestration.route_resolver import normalize_subject, resolve_route
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,21 @@ _PRACTICE_GENERATOR_OVERLAYS = [
     *_PRACTICE_OVERLAYS,
     "practice_generation/generator_output_policy.md",
 ]
+# Factual authoring replaces the generic role prompt and output-policy overlay rather
+# than stacking on top of them, so the composed prompt stays inside the frozen budget.
+# The family comes from the central route resolver, so no second taxonomy exists here
+# and a newly qualified family is a routing-config change, not a code change.
+_FACTUAL_GENERATOR_PROMPT = "practice_generation/question_generator_factual"
+
+
+def _factual_subject_profile(subject: str) -> str | None:
+    """Return the subject's authoring profile when it belongs to the factual family."""
+    if normalize_subject(subject) != "factual":
+        return None
+    overlay = f"practice_generation/subjects/{subject}.md"
+    if (DEFAULT_PROMPT_ROOT / overlay).is_file():
+        return overlay
+    return None
 _DEFAULT_PATTERN_INPUT_MAX_TOKENS = 3_800
 
 
@@ -53,10 +70,18 @@ def _execute(
     payload: dict[str, Any],
     prompt_input_budget: PromptInputBudget | None = None,
     practice_generation_workload: PracticeGenerationWorkload | None = None,
+    subject_profile: str | None = None,
 ) -> GeneratedBatch:
-    overlays = (
-        _PRACTICE_GENERATOR_OVERLAYS if task_role == "generator" else _PRACTICE_OVERLAYS
-    )
+    if subject_profile is not None:
+        # Replacement, not addition: the subject profile takes the generic output
+        # policy's place so the composed prompt stays inside the frozen budget.
+        overlays = [*_PRACTICE_OVERLAYS, subject_profile]
+    else:
+        overlays = (
+            _PRACTICE_GENERATOR_OVERLAYS
+            if task_role == "generator"
+            else _PRACTICE_OVERLAYS
+        )
     result = orchestrator.generate_structured(
         route_request=RouteRequest(
             request_id=request_id,
@@ -381,13 +406,17 @@ class RoutedQuestionGenerator:
         replacement_wave: int = 0,
         pattern_guidance_by_slot: Mapping[str, PatternGenerationContext] | None = None,
     ) -> GeneratedBatch:
-        prompt_name = (
-            "practice_generation/question_generator_v2"
-            if replacement_wave == 0
-            else "practice_generation/question_repair"
-            if replacement_wave == 1
-            else "practice_generation/question_regenerator"
-        )
+        subject_profile = _factual_subject_profile(bucket.subject)
+        if replacement_wave == 0:
+            prompt_name = (
+                _FACTUAL_GENERATOR_PROMPT
+                if subject_profile is not None
+                else "practice_generation/question_generator_v2"
+            )
+        elif replacement_wave == 1:
+            prompt_name = "practice_generation/question_repair"
+        else:
+            prompt_name = "practice_generation/question_regenerator"
         guidance = dict(pattern_guidance_by_slot or {})
         initial_payload = self._slot_payload(
             request=request,
@@ -592,6 +621,13 @@ class RoutedQuestionGenerator:
             budget.reference_tokens,
             budget.within_budget,
         )
+        # The subject profile travels with the factual role prompt that expects it, so
+        # repair and regeneration waves keep their own prompts and overlays unchanged.
+        subject_profile = (
+            _factual_subject_profile(bucket.subject)
+            if prompt_name == _FACTUAL_GENERATOR_PROMPT
+            else None
+        )
         return _execute(
             self._orchestrator,
             request_id=request.request_id,
@@ -602,6 +638,7 @@ class RoutedQuestionGenerator:
             prompt_name=prompt_name,
             payload=payload,
             prompt_input_budget=budget,
+            subject_profile=subject_profile,
             practice_generation_workload=PracticeGenerationWorkload(
                 complexity=slots[0].complexity.value,
                 slot_count=len(slots),
@@ -780,6 +817,54 @@ class RoutedQuestionGenerator:
         )
 
 
+class PracticeAuthorityUnavailableError(RuntimeError):
+    """No qualified Answer Authority is routed for this Practice subject family.
+
+    Practice must never verify a student-facing question with an Authority that has
+    not passed the role's qualification gate. Falling through to the shared
+    ``general.verifier.default`` entry would do exactly that — it exists for other
+    callers and carries no Practice qualification — so Practice fails closed instead.
+    """
+
+
+def _require_qualified_authority(*, request_id: str, subject: str, language: str) -> str:
+    """Return the qualified Authority route id, or fail closed.
+
+    The check is on routing metadata only: an exact subject match means a family
+    Authority was deliberately configured, while any fallback means none was. No
+    subject or model name is tested here, so adding a newly qualified family is a
+    configuration change and never a code change.
+    """
+    decision = resolve_route(
+        RouteRequest(
+            request_id=request_id,
+            subject=subject,
+            task_role="verifier",
+            difficulty="default",
+            intent="practice",
+            language=language,
+        )
+    )
+    # ``general`` is the shared cross-feature verifier entry, not a Practice family
+    # Authority, and normalize_subject() collapses every unknown or malformed subject
+    # onto it. Requiring a non-general exact match therefore makes unknown input fail
+    # closed for the same reason an unqualified family does, without guessing.
+    if decision.route_source != "exact" or decision.subject == "general":
+        logger.warning(
+            "practice_authority_unavailable request_id=%s subject=%s language=%s "
+            "resolved_route=%s route_source=%s",
+            request_id,
+            subject,
+            language,
+            decision.route_id,
+            decision.route_source,
+        )
+        raise PracticeAuthorityUnavailableError(
+            f"PRACTICE_AUTHORITY_NOT_QUALIFIED subject={subject}"
+        )
+    return decision.route_id
+
+
 class RoutedQuestionVerifier:
     def __init__(self, orchestrator: LlmOrchestrator) -> None:
         self._orchestrator = orchestrator
@@ -859,10 +944,20 @@ class RoutedQuestionVerifier:
                 request.request_id,
                 len(evidence["items"]),
             )
+        _require_qualified_authority(
+            request_id=request.request_id,
+            subject=bucket.subject,
+            language=request.language,
+        )
         raw = _execute(
             self._orchestrator,
             request_id=request.request_id,
-            subject="general",
+            # The bucket's canonical subject, not a literal, so the central resolver can
+            # place a subject-qualified Authority. A single literal previously sent every
+            # Practice subject and language to one model, which made evidence-based
+            # selection impossible. Nothing is re-classified here: this value is the
+            # planner's own normalized subject.
+            subject=bucket.subject,
             task_role="verifier",
             difficulty="default",
             language=request.language,

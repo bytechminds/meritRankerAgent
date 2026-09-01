@@ -461,6 +461,15 @@ class GeneratedQuestion(BaseModel):
             updated["canonical_options"] = [option.model_dump() for option in canonical]
             updated["options"] = [option.value for option in canonical]
         if updated.get("schema_version") == "2":
+            # Bookkeeping the code owns. A schema-v2 item is addressed by its slot, so
+            # the item id is derivable and the author never needs to invent one. Models
+            # copied the prompt's placeholder verbatim and the duplicate check then
+            # discarded two of every three questions, which is a contract defect rather
+            # than a model defect. Derived unconditionally so a stale or repeated value
+            # cannot reach the dedupe set.
+            slot_id = updated.get("slot_id")
+            if isinstance(slot_id, str) and slot_id:
+                updated["generation_item_id"] = f"item-{slot_id}"
             # The author emits only the option id. ``correct_answer`` is the exact
             # value at that id, so deriving it here removes a field the author could
             # contradict its own options with, and keeps every downstream consumer

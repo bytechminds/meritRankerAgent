@@ -1855,6 +1855,7 @@ class TestGenerateNodeProviderFailureHandling:
             "source_modality",
             "response_type",
             "practice_test_id",
+            "fresh_evidence",
         }, f"OrchestratedDoubtSolverState fields changed: {fields}"
 
     def test_unexpected_error_propagates_loudly(self) -> None:
@@ -2083,6 +2084,7 @@ class TestRegressionGuards:
             "source_modality",
             "response_type",
             "practice_test_id",
+            "fresh_evidence",
         }
 
 

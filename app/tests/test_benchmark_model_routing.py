@@ -121,7 +121,7 @@ class TestBenchmarkRouteResolution:
         assert self._route_model("math", "advanced") == "openai_gpt_4_1"
 
     def test_reasoning_basic_route(self):
-        assert self._route_model("reasoning", "basic") == "reasoning_basic_generator"
+        assert self._route_model("reasoning", "basic") == "openai_gpt_5_4_mini"
 
     def test_reasoning_intermediate_route(self):
         assert self._route_model("reasoning", "intermediate") == "reasoning_intermediate_generator"

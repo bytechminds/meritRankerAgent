@@ -950,11 +950,16 @@ class TestSubjectDifficultyRouteAliases:
         assert route.model == "openai_gpt_4_1"
 
     def test_reasoning_basic_route_alias(self) -> None:
+        """Only `basic` was moved to the qualified Author; `default` is untouched."""
         reg = LlmConfigRegistry()
-        for difficulty in ("default", "basic"):
+        expected = {
+            "default": "reasoning_basic_generator",
+            "basic": "openai_gpt_5_4_mini",
+        }
+        for difficulty, model in expected.items():
             route = reg.get_route("reasoning", "generator", difficulty)
             assert route is not None
-            assert route.model == "reasoning_basic_generator"
+            assert route.model == model
 
     def test_reasoning_intermediate_route_alias(self) -> None:
         reg = LlmConfigRegistry()

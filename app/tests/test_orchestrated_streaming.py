@@ -526,6 +526,7 @@ class TestNonStreamRegression:
             "conversation_preparation",
             "query_classification",
             "source_modality",
+            "fresh_evidence",
         }
         assert fields == expected
 

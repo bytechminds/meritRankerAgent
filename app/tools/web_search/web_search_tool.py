@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from config import Settings, get_settings
@@ -153,6 +154,7 @@ class WebSearchTool:
             allow_exam_prep_fallback=allow_exam_prep,
             exam_prep_suitable=exam_prep_suitable,
             official_only=official_only,
+            requires_fresh_evidence=request.requires_fresh_evidence,
         )
 
         best_items = []
@@ -370,6 +372,7 @@ class WebSearchTool:
             max_results=self._max_results_for_attempt(attempt, request, settings),
             search_depth=settings.web_search_search_depth,
             timeout_seconds=request.timeout_seconds,
+            requires_fresh_evidence=request.requires_fresh_evidence,
         )
         provider = self._provider_override or self._build_provider(settings)
         return provider.search(provider_request)
@@ -517,10 +520,20 @@ def _normalized_url(value: str) -> str:
 
 
 def _published_date(value: str | None) -> str | None:
+    """Normalize a provider publish date to ISO ``YYYY-MM-DD``.
+
+    Tavily returns RFC-1123 HTTP-dates, so ISO-only parsing silently discarded
+    every dated result as undated. Unparseable values still return ``None`` and
+    remain ineligible for freshness-required evidence.
+    """
     if not value:
         return None
-    match = value.strip()[:10]
+    candidate = value.strip()
     try:
-        return datetime.fromisoformat(match).date().isoformat()
+        return datetime.fromisoformat(candidate[:10]).date().isoformat()
     except ValueError:
+        pass
+    try:
+        return parsedate_to_datetime(candidate).date().isoformat()
+    except (TypeError, ValueError):
         return None

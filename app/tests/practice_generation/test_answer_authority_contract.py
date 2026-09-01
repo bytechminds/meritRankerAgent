@@ -304,3 +304,48 @@ class TestDeterministicOptionEquivalence:
         )
         assert validation.valid is False
         assert validation.reason_code == "DUPLICATE_OPTIONS"
+
+
+class TestEnglishSoftSemanticGate:
+    """Soft-semantic English is gated per item, not per category.
+
+    Synonym/antonym/near-synonym/idiomatic items are unsafe only when more than one
+    option is defensible. The Authority already reports every defensible option in
+    `valid_option_ids`, and an ACCEPT carrying more than one is refused outright. That
+    is strictly more precise than a category-level RULE_BOUND/EVIDENCE_REQUIRED enum,
+    which would also block wide-gap synonym items that are genuinely single-answer.
+
+    Live evidence (Gemini 3.7 Authority, production v2 path): five crafted
+    near-synonym items — happy/glad/joyful/cheerful, quick/fast/rapid/swift,
+    begin/start/commence/initiate, died/passed away/expired/perished, and
+    increase/decrease/reduce/diminish — each returned ["0","1","2"] and were rejected;
+    abundant/plentiful and fragile/durable returned ["0"] and were accepted.
+    """
+
+    @pytest.mark.parametrize(
+        "valid_option_ids",
+        [["0", "1"], ["0", "1", "2"], ["0", "1", "2", "3"]],
+    )
+    def test_accept_cannot_carry_several_defensible_options(
+        self, valid_option_ids: list[str]
+    ) -> None:
+        """A soft-semantic item with several readings can never be an ACCEPT."""
+        with pytest.raises(ValueError):
+            _result(valid_option_ids, decision="ACCEPT")
+
+    @pytest.mark.parametrize(
+        "valid_option_ids",
+        [["0", "1"], ["0", "1", "2"]],
+    )
+    def test_several_defensible_options_survive_only_as_regenerate(
+        self, valid_option_ids: list[str]
+    ) -> None:
+        result = _result(valid_option_ids, decision="REGENERATE")
+        assert len(result.valid_option_ids) > 1
+
+    def test_no_defensible_option_cannot_reach_ready(self) -> None:
+        assert _result([], decision="REGENERATE").valid_option_ids == []
+
+    def test_single_defensible_option_is_the_only_ready_shape(self) -> None:
+        result = _result(["0"], decision="ACCEPT")
+        assert result.valid_option_ids == ["0"]

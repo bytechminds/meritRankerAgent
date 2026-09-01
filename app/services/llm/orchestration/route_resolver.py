@@ -64,7 +64,23 @@ _SUBJECT_ALIASES: dict[str, str] = {
     "grammar": "english",
     "vocabulary": "english",
     "quant_reasoning": "quant_reasoning",
+    # Factual Authority family. These are distinct product subjects, but they share one
+    # semantic verification contract: options are judged against trusted evidence rather
+    # than re-derived. Collapsing them onto "general" is what left ten supported
+    # subjects with no Authority family of their own. This is a routing-domain mapping,
+    # not a new intelligence layer — no classifier, no per-subject models, no topic
+    # routes. "other" is deliberately absent so genuinely unknown content still fails
+    # closed instead of inheriting a family it was never qualified for.
     "factual": "factual",
+    "science": "factual",
+    "physics": "factual",
+    "chemistry": "factual",
+    "biology": "factual",
+    "history": "factual",
+    "geography": "factual",
+    "polity": "factual",
+    "economics": "factual",
+    "computer_science": "factual",
     "general": "general",
     "current_affairs": "current_affairs",
     "current affairs": "current_affairs",

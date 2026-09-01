@@ -10,13 +10,18 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from features.practice_generation.matching import normalize_question_text
+from features.practice_generation.matching import (
+    normalize_question_identity,
+    normalize_question_text,
+)
 from features.practice_generation.metadata_normalization import (
     normalize_difficulty,
     normalize_subject,
     normalize_topic,
 )
 from features.practice_generation.question_contract import (
+    SemanticBasis,
+    classify_semantic_basis,
     validate_persisted_playable_question,
     validate_playable_question,
 )
@@ -507,7 +512,19 @@ def parse_partial_generation(
             rejected += 1
             rejection_reason_codes.append("QUESTION_LANGUAGE_MISMATCH")
             continue
-        normalized = normalize_question_text(question.question)
+        # Lexical-equivalence English items rest on a lexicon rather than a rule, and
+        # several options can be defensible. The Authority is necessary but has been
+        # observed to miss a co-valid alternative, so availability must not depend on
+        # it alone. No trusted lexical basis exists in the system, so these fail closed.
+        if (
+            normalize_subject(question.subject) == "english"
+            and classify_semantic_basis(question.question)
+            is SemanticBasis.EVIDENCE_REQUIRED
+        ):
+            rejected += 1
+            rejection_reason_codes.append("SOFT_SEMANTIC_WITHOUT_TRUSTED_BASIS")
+            continue
+        normalized = normalize_question_identity(question.question, question.options)
         slot = slots_by_id.get(str(question.slot_id or "")) if slots else None
         canonical_subject = normalize_subject(question.subject)
         canonical_topic = normalize_topic(question.topic)

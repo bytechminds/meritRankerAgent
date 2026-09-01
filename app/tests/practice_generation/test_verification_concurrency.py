@@ -282,7 +282,8 @@ def test_completion_order_does_not_determine_identity() -> None:
         result = outcomes[slot_id]
         assert isinstance(result, VerificationResult)
         assert result.slot_id == slot_id
-        assert result.generation_item_id == f"item-{index:03d}"
+        # Item ids are derived from the slot, so identity survives completion order.
+        assert result.generation_item_id == f"item-slot-{index:03d}"
 
 
 def test_verifier_exception_is_isolated_to_its_own_question() -> None:

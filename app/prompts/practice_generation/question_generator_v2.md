@@ -5,7 +5,7 @@ Generate one independently playable MCQ for each assigned immutable planner slot
 # Contract
 
 - Return only `{"questions":[...]}`.
-- Emit each supplied `slot_id` once, and give every item a distinct `generation_item_id`; never invent, omit, or repeat either.
+- Emit each supplied `slot_id` exactly once; never invent, omit, or duplicate one.
 - Use exactly the item keys shown below.
 - Use `schema_version:"2"`, `question_type:"mcq"`, and supplied canonical subject/topic/difficulty IDs.
 - Emit four ordered options with IDs `"0"`–`"3"`; set `correct_option_id` to the only option that satisfies the stem. Two options meaning the same value (`48`/`forty-eight`) or two defensible synonyms make the item invalid.
@@ -18,4 +18,4 @@ Generate one independently playable MCQ for each assigned immutable planner slot
 
 # Shape
 
-`{"questions":[{"schema_version":"2","generation_item_id":"i","bucket_id":"b","slot_id":"s","question":"Q?","question_type":"mcq","options":[{"option_id":"0","value":"A"},{"option_id":"1","value":"B"},{"option_id":"2","value":"C"},{"option_id":"3","value":"D"}],"correct_option_id":"0","subject":"math","topic":"topic_id","difficulty":"basic"}]}`
+`{"questions":[{"schema_version":"2","bucket_id":"b","slot_id":"s","question":"Q?","question_type":"mcq","options":[{"option_id":"0","value":"A"},{"option_id":"1","value":"B"},{"option_id":"2","value":"C"},{"option_id":"3","value":"D"}],"correct_option_id":"0","subject":"math","topic":"topic_id","difficulty":"basic"}]}`

@@ -18,6 +18,24 @@ from tools.web_search.source_policy import WebSourcePolicy
 
 logger = logging.getLogger(__name__)
 
+
+_MAX_SOURCE_SUFFIX_CHARS = 40
+
+
+def _article_title_key(title: str) -> str:
+    """Identify an article by title, ignoring the provider's source suffix.
+
+    The same press release comes back as "... Ecosystem - PIB" and
+    "... Ecosystem - pib.gov.in", so a trailing attribution segment is dropped
+    before comparing. Only a short final segment is removed, which leaves titles
+    that genuinely contain a dash intact.
+    """
+    normalized = " ".join(title.split()).casefold()
+    head, separator, tail = normalized.rpartition(" - ")
+    if separator and head and len(tail) <= _MAX_SOURCE_SUFFIX_CHARS:
+        return head
+    return normalized
+
 _FRESHNESS_REASONS: frozenset[str] = frozenset(
     {
         "current_affairs",
@@ -158,15 +176,27 @@ class WebSearchReranker:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         selected: list[WebSearchItem] = []
         selected_urls: set[str] = set()
+        # The same article often comes back under several URLs that differ only by
+        # tracking parameters, which filled evidence bundles with one fact repeated.
+        # Title plus publish date identifies the article; the URL alone does not.
+        selected_articles: set[tuple[str, str]] = set()
         for score, item in scored:
             if score < min_score:
                 continue
             url_key = item.url.strip().lower()
             if url_key and url_key in selected_urls:
                 continue
+            article_key = (
+                _article_title_key(item.title),
+                (item.published_at or "").strip(),
+            )
+            if article_key[0] and article_key in selected_articles:
+                continue
             selected.append(item)
             if url_key:
                 selected_urls.add(url_key)
+            if article_key[0]:
+                selected_articles.add(article_key)
             if len(selected) >= max_selected:
                 break
 

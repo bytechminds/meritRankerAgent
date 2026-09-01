@@ -13,6 +13,7 @@ pay compilation repeatedly.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _verifier_schema_json() -> str:
+    """Schema-v2 Answer Authority wire shape, shared with the other native providers.
+
+    Written out rather than derived from ``VerificationResult`` because that model still
+    carries legacy v1 fields whose optionality compiles to ``anyOf``/``$ref``. The
+    canonical model still re-validates every response after parsing. Unlike the
+    generator envelope, this shape has no array-of-strings/array-of-objects conflict,
+    so constraining it here is safe.
+    """
+    option_id = {"type": "string", "enum": ["0", "1", "2", "3"]}
+    return json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "schema_version": {"type": "string", "enum": ["2"]},
+                "generation_item_id": {"type": "string"},
+                "slot_id": {"type": "string"},
+                "decision": {
+                    "type": "string",
+                    "enum": [
+                        "ACCEPT",
+                        "REPAIRABLE",
+                        "REGENERATE",
+                        "TERMINAL_REJECTION",
+                    ],
+                },
+                "valid_option_ids": {
+                    "type": "array",
+                    "items": option_id,
+                    "maxItems": 4,
+                },
+                "reason_codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 8,
+                },
+            },
+            "required": [
+                "schema_version",
+                "generation_item_id",
+                "slot_id",
+                "decision",
+                "valid_option_ids",
+                "reason_codes",
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+
 # Static structured-output grammars, selected by execution role. A role absent
 # from this map is executed as an ordinary free-text Converse call.
 #
@@ -52,6 +103,7 @@ _STATIC_OUTPUT_SCHEMAS: dict[str, tuple[str, Callable[[], str]]] = {
         PRACTICE_REQUEST_INTELLIGENCE_SCHEMA_NAME,
         practice_request_intelligence_schema_json,
     ),
+    "verifier": ("practice_verification_result", _verifier_schema_json),
 }
 
 

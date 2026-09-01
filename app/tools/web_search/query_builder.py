@@ -28,10 +28,24 @@ class WebSearchQueryBuilder:
         allow_exam_prep_fallback: bool,
         exam_prep_suitable: bool,
         official_only: bool,
+        requires_fresh_evidence: bool = False,
     ) -> list[SearchAttemptPlan]:
         exclude = policy.global_blocked
         if policy.source_need == "practice_current_affairs" and not official_only:
-            attempts: list[SearchAttemptPlan] = [
+            # Evidence-required current affairs must satisfy min_trusted_results, but a
+            # merged trusted+reputed query lets high-volume news domains outrank
+            # government ones so no official source ever surfaces. Ask for those alone
+            # first; broad exam-prep digests keep the cheaper merged-first plan.
+            attempts: list[SearchAttemptPlan] = []
+            if requires_fresh_evidence and policy.trusted_domains:
+                attempts.append(
+                    SearchAttemptPlan(
+                        kind="authoritative",
+                        include_domains=policy.trusted_domains,
+                        exclude_domains=exclude,
+                    )
+                )
+            attempts.append(
                 SearchAttemptPlan(
                     kind="authoritative_plus_reputed",
                     include_domains=tuple(
@@ -41,7 +55,7 @@ class WebSearchQueryBuilder:
                     ),
                     exclude_domains=exclude,
                 )
-            ]
+            )
         else:
             attempts = [
                 SearchAttemptPlan(
@@ -91,10 +105,15 @@ class WebSearchQueryBuilder:
         max_results: int,
         search_depth: str,
         timeout_seconds: float,
+        requires_fresh_evidence: bool = False,
     ) -> WebSearchProviderRequest:
+        # Freshness-required evidence is discarded without a publish date, and Tavily
+        # only returns one for its "news" topic. Packs that prefer "finance"/"general"
+        # would otherwise have every dated candidate rejected as undated.
+        topic = "news" if requires_fresh_evidence else policy.topic
         return WebSearchProviderRequest(
             query=search_query,
-            topic=policy.topic,
+            topic=topic,
             include_domains=list(attempt.include_domains),
             exclude_domains=list(attempt.exclude_domains),
             start_date=policy.start_date,

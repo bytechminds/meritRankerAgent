@@ -6,6 +6,7 @@ Unit tests for conditional web search tool and decision rules.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -29,7 +30,12 @@ from tools.web_search.providers.fake_provider import FakeWebSearchProvider
 from tools.web_search.providers.tavily_provider import TavilyWebSearchProvider
 from tools.web_search.query_builder import WebSearchQueryBuilder
 from tools.web_search.source_policy import WebSourcePolicyResolver
-from tools.web_search.web_search_tool import WebSearchTool, build_fake_web_search_tool
+from tools.web_search.web_search_tool import (
+    WebSearchTool,
+    _filter_temporally_eligible_items,
+    _published_date,
+    build_fake_web_search_tool,
+)
 
 
 def _reset_settings() -> None:
@@ -632,3 +638,79 @@ class TestWebSearchDecisionLogging:
         req = _request(need_web_search=True, web_search_reason="current_affairs")
         decision = evaluate_web_search_decision(req, settings)
         assert decision.will_call is False
+
+
+class TestPublishedDateParsing:
+    """Provider publish dates must normalize before temporal eligibility runs.
+
+    Tavily returns RFC-1123 HTTP-dates; ISO-only parsing discarded every dated
+    result as undated, so freshness-required searches never produced evidence.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2026-08-31", "2026-08-31"),
+            ("2026-08-31T12:00:00Z", "2026-08-31"),
+            ("2026-08-31T12:00:00+05:30", "2026-08-31"),
+            ("Mon, 31 Aug 2026 12:00:00 GMT", "2026-08-31"),
+            ("Sat, 22 Aug 2026 10:10:31 GMT", "2026-08-22"),
+            ("Fri, 28 Aug 2026 11:00:00 +0000", "2026-08-28"),
+            ("31 Aug 2026 12:00:00 GMT", "2026-08-31"),
+        ],
+    )
+    def test_supported_formats_normalize_to_iso_date(
+        self, raw: str, expected: str
+    ) -> None:
+        assert _published_date(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [None, "", "   ", "not-a-date", "Mon, 99 Zzz 2026 12:00:00 GMT", "2026-13-45"],
+    )
+    def test_unparseable_dates_stay_none(self, raw: str | None) -> None:
+        assert _published_date(raw) is None
+
+    def test_rfc1123_result_is_temporally_eligible(self) -> None:
+        """The exact production shape that was being discarded as stale."""
+        policy = SimpleNamespace(start_date="2026-08-01", end_date="2026-08-31")
+        item = WebSearchItem(
+            title="Current affairs",
+            url="https://pib.gov.in/a",
+            snippet="s" * 40,
+            source="pib.gov.in",
+            published_at="Mon, 31 Aug 2026 12:00:00 GMT",
+        )
+        selected, rejected = _filter_temporally_eligible_items(
+            [item], policy=policy, required=True
+        )
+        assert (len(selected), rejected) == (1, 0)
+
+    def test_undated_result_still_rejected_when_freshness_required(self) -> None:
+        """Temporal eligibility itself is unchanged: unknown dates stay ineligible."""
+        policy = SimpleNamespace(start_date="2026-08-01", end_date="2026-08-31")
+        item = WebSearchItem(
+            title="Undated",
+            url="https://pib.gov.in/b",
+            snippet="s" * 40,
+            source="pib.gov.in",
+            published_at=None,
+        )
+        selected, rejected = _filter_temporally_eligible_items(
+            [item], policy=policy, required=True
+        )
+        assert (selected, rejected) == ([], 1)
+
+    def test_out_of_window_rfc1123_result_rejected(self) -> None:
+        policy = SimpleNamespace(start_date="2026-08-01", end_date="2026-08-31")
+        item = WebSearchItem(
+            title="Stale",
+            url="https://pib.gov.in/c",
+            snippet="s" * 40,
+            source="pib.gov.in",
+            published_at="Tue, 15 Jul 2025 12:00:00 GMT",
+        )
+        selected, rejected = _filter_temporally_eligible_items(
+            [item], policy=policy, required=True
+        )
+        assert (selected, rejected) == ([], 1)
