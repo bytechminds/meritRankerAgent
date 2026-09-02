@@ -103,6 +103,8 @@ class PracticeRepositoryError(RuntimeError):
         aws_error_code: str | None = None,
         fallback_decision: str | None = None,
         progress_detail: str | None = None,
+        progress_error_type: str | None = None,
+        progress_retryable: bool | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -113,6 +115,8 @@ class PracticeRepositoryError(RuntimeError):
         self.aws_error_code = aws_error_code
         self.fallback_decision = fallback_decision
         self.progress_detail = progress_detail
+        self.progress_error_type = progress_error_type
+        self.progress_retryable = progress_retryable
 
     def safe_details(self) -> dict[str, str]:
         return {
@@ -125,6 +129,12 @@ class PracticeRepositoryError(RuntimeError):
                 "awsErrorCode": self.aws_error_code,
                 "fallbackDecision": self.fallback_decision,
                 "progressDetail": self.progress_detail,
+                "progressErrorType": self.progress_error_type,
+                "progressRetryable": (
+                    None
+                    if self.progress_retryable is None
+                    else str(self.progress_retryable).casefold()
+                ),
             }.items()
             if value
         }
@@ -1335,11 +1345,15 @@ class QuestionRepository:
             if not slot_id:
                 continue
             item["_practiceMeta"] = practice_meta
+            # Schema-v2 questions are authored without a solution by contract, so a
+            # resume must not invalidate slots that were already verified. v1/legacy
+            # items keep the original requirement.
+            item_schema_v2 = str(practice_meta.get("schemaVersion") or "") == "2"
             contract = validate_persisted_playable_question(
                 item,
                 expected_question_type=str(practice_meta.get("questionType") or "mcq"),
                 expected_language=language,
-                solution_required=solution_required,
+                solution_required=solution_required and not item_schema_v2,
             )
             if (
                 contract.valid

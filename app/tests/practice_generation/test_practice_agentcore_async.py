@@ -944,3 +944,62 @@ def test_actual_agentcore_health_is_busy_until_tracked_task_completes() -> None:
     function(*args)
 
     assert app.get_current_ping_status().value == "Healthy"
+
+
+def test_graphql_rejection_diagnostics_reach_the_failure_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q20-6a: the AppSync error class must be visible on the fatal event."""
+    events: list[str] = []
+    assessments = Assessments(events)
+    tracker = Tracker(events)
+    emitted: list[tuple[str, dict | None]] = []
+    monkeypatch.setattr(
+        agentcore_async,
+        "emit_practice_event",
+        lambda event_name, **kwargs: emitted.append((event_name, kwargs.get("details"))),
+    )
+
+    class ClassifiedFailureGraph:
+        def process(self, _command) -> None:
+            raise agentcore_async.PracticeRepositoryError(
+                "PRACTICE_PROGRESS_GRAPHQL_REJECTED",
+                operation="appsync.updatePracticeGenerationProgress",
+                logical_table="MockTestQuiz",
+                fallback_decision="fatal_progress_publication_failure",
+                progress_error_type="DynamoDB:ConditionalCheckFailedException",
+                progress_retryable=False,
+            )
+
+    launcher = AgentCorePracticeAsyncLauncher(
+        task_tracker=tracker,
+        assessments=assessments,
+        progress=assessments,
+        graph_runner=ClassifiedFailureGraph(),
+        executor=ImmediateExecutor(),
+    )
+
+    launch = launcher.launch(request())
+    launcher.start(launch.test_id)
+
+    failure = next(details for name, details in emitted if name == "practice_async_task_failed")
+    assert failure["progressErrorType"] == "DynamoDB:ConditionalCheckFailedException"
+    assert failure["progressRetryable"] == "false"
+    assert failure["repositoryOperation"] == "appsync.updatePracticeGenerationProgress"
+    assert failure["requestId"] == "request-1"
+    assert assessments.failed_code == "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+
+
+def test_absent_graphql_diagnostics_add_no_event_keys() -> None:
+    """Backwards compatibility: unset diagnostics must not appear at all."""
+    from features.practice_generation.repositories import PracticeRepositoryError
+
+    assert PracticeRepositoryError("X").safe_details() == {}
+    assert "progressRetryable" not in PracticeRepositoryError(
+        "X", progress_retryable=None
+    ).safe_details()
+    # False is a real classification, not an absent one.
+    assert PracticeRepositoryError("X", progress_retryable=False).safe_details() == {
+        "progressRetryable": "false"
+    }
+

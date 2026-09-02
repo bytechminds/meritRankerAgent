@@ -83,3 +83,70 @@ def test_missing_options_fall_back_to_the_stem() -> None:
 def test_reuse_identity_is_unchanged() -> None:
     """Semantic duplicate protection for reuse/ingestion must not be weakened."""
     assert normalize_question_text(GENERIC_STEM) == "which sentence is grammatically correct"
+
+
+class TestFinalSetUsesTheSameIdentity:
+    """validate_final_set was the last stage still keying on the stem alone.
+
+    Generation dedup and replacement exclusion already used stem + canonicalized
+    options; the final gate did not, so a legitimate English set with a shared generic
+    stem was rejected as DUPLICATE_OR_EMPTY_QUESTION_TEXT after passing every earlier
+    stage. Reuse identity (matching.py) deliberately still uses normalize_question_text.
+    """
+
+    @staticmethod
+    def _linked(question: str, options: list[str], slot: str) -> dict[str, object]:
+        meta = {
+            "slotId": slot,
+            "bucketId": "bucket-1",
+            "verified": True,
+            "schemaVersion": "2",
+            "questionType": "mcq",
+            "language": "english",
+        }
+        return {
+            "questionId": f"q-{slot}",
+            "question": question,
+            "options": list(options),
+            "correctAnswer": options[0],
+            "_practiceMeta": meta,
+        }
+
+    def _texts(self, items: list[dict[str, object]]) -> list[str]:
+        return [
+            normalize_question_identity(
+                str(item.get("question") or ""), item.get("options")
+            )
+            for item in items
+        ]
+
+    def test_generic_stem_with_different_options_is_distinct(self) -> None:
+        items = [
+            self._linked(GENERIC_STEM, [o["value"] for o in OPTIONS_A], "slot-001"),
+            self._linked(GENERIC_STEM, [o["value"] for o in OPTIONS_B], "slot-002"),
+        ]
+        texts = self._texts(items)
+        assert len(texts) == len(set(texts))
+
+    def test_identical_stem_and_options_is_duplicate(self) -> None:
+        values = [o["value"] for o in OPTIONS_A]
+        items = [
+            self._linked(GENERIC_STEM, values, "slot-001"),
+            self._linked(GENERIC_STEM, values, "slot-002"),
+        ]
+        texts = self._texts(items)
+        assert len(texts) != len(set(texts))
+
+    def test_reordered_options_is_duplicate(self) -> None:
+        values = [o["value"] for o in OPTIONS_A]
+        items = [
+            self._linked(GENERIC_STEM, values, "slot-001"),
+            self._linked(GENERIC_STEM, list(reversed(values)), "slot-002"),
+        ]
+        texts = self._texts(items)
+        assert len(texts) != len(set(texts))
+
+    def test_empty_question_text_is_still_rejected(self) -> None:
+        """Emptiness must remain detectable, so the falsy check still fires."""
+        item = self._linked("", [o["value"] for o in OPTIONS_A], "slot-001")
+        assert not normalize_question_identity("", item["options"]).split("|")[0]

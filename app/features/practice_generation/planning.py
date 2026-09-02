@@ -7,8 +7,11 @@ import json
 import os
 import re
 import time
+import traceback
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import ValidationError
@@ -334,6 +337,58 @@ class PlannerValidationDiagnostic:
     validation_stage: str = "schema"
     actual_slot_count: int | None = None
     duration_ms: int | None = None
+    # Verbatim text of the failing invariant, populated ONLY when the message is one
+    # of our own literals. Model and student text can never appear here.
+    owned_message: str = ""
+    # "module.py:line" of the raise inside our own source tree. Code location only —
+    # it carries no model, student or field content, and is empty for anything raised
+    # outside this application.
+    owned_origin: str = ""
+
+
+@lru_cache(maxsize=1)
+def _owned_value_error_messages() -> frozenset[str]:
+    """Literal ValueError messages raised by this package's own contract code.
+
+    Only these may be logged verbatim. Anything else — including any message that
+    interpolates model output, student text or field values — stays hidden behind the
+    reason code. Built by reading this package's own source; if that is unavailable the
+    set is empty, so the safe default is to log nothing.
+    """
+    package_root = Path(__file__).resolve().parent
+    literal = re.compile(r'raise ValueError\(\s*"([^"\\]*)"\s*\)')
+    messages: set[str] = set()
+    try:
+        for module_path in package_root.rglob("*.py"):
+            messages.update(literal.findall(module_path.read_text(encoding="utf-8")))
+    except OSError:
+        return frozenset()
+    return frozenset(messages)
+
+
+def _owned_error_origin(error: Exception) -> str:
+    """Return "module.py:line" for the deepest frame inside this application.
+
+    A dynamic ValueError (an enum coercion, a stdlib call) carries a message we must
+    not log. Its raise site is our own code metadata and identifies the invariant
+    exactly, so it is safe to disclose and is what the message allowlist cannot cover.
+    """
+    app_root = Path(__file__).resolve().parents[2]
+    origin = ""
+    for frame in traceback.extract_tb(error.__traceback__):
+        try:
+            path = Path(frame.filename).resolve()
+        except OSError:
+            continue
+        if app_root in path.parents and "site-packages" not in str(path):
+            origin = f"{path.name}:{frame.lineno}"
+    return origin
+
+
+def _owned_error_message(error: Exception) -> str:
+    """Return the message only when it is one of our own literals."""
+    message = str(error)
+    return message if message in _owned_value_error_messages() else ""
 
 
 def _planner_validation_reason(
@@ -367,6 +422,24 @@ def _planner_validation_reason(
         return "PLANNER_MISSING_CATEGORY", actual_slot_count
     if "accepted" in message or "required_count" in message:
         return "PLANNER_INVALID_TOTAL", actual_slot_count
+    # Contract invariants that previously collapsed into the catch-all, which made a
+    # production planner failure impossible to identify from logs alone.
+    if "intentionally distinct" in message:
+        return "PLANNER_SLOTS_NOT_DISTINCT", actual_slot_count
+    if "planner_family" in message:
+        return "PLANNER_FAMILY_MISSING", actual_slot_count
+    if "unsupported" in message and "subject" in message:
+        return "PLANNER_UNSUPPORTED_SUBJECT", actual_slot_count
+    if "exam ids must be unique" in message:
+        return "PLANNER_DUPLICATE_EXAM_ID", actual_slot_count
+    if "variation constraints must be unique" in message:
+        return "PLANNER_DUPLICATE_VARIATION_CONSTRAINT", actual_slot_count
+    if "schema-v1 blueprint cannot contain" in message:
+        return "PLANNER_SCHEMA_VERSION_MISMATCH", actual_slot_count
+    if "compatibility buckets" in message:
+        return "PLANNER_BUCKETS_MISSING", actual_slot_count
+    if "bucket ids must be unique" in message:
+        return "PLANNER_DUPLICATE_BUCKET", actual_slot_count
     return "PLANNER_SCHEMA_INVALID", actual_slot_count
 
 
@@ -416,6 +489,8 @@ def _planner_validation_diagnostic(
         phase=phase,
         schema_name=schema_name,
         validation_stage=validation_stage,
+        owned_message=_owned_error_message(error),
+        owned_origin=_owned_error_origin(error),
         error_count=error_count,
         field_paths=field_paths,
         error_types=error_types,
@@ -545,6 +620,47 @@ def validate_practice_requested_count(query: str) -> int:
     if not 1 <= requested_count <= MAX_PRACTICE_QUESTIONS:
         raise PracticeRequestCountError(PracticeRequestCountError.reason_code)
     return requested_count
+
+
+# Closed set of factual families Practice may adopt from the classifier's
+# `pattern_family_candidate`. The classifier is instructed to label every factual
+# subject as `general` (classification_semantics.md), which the Practice Authority guard
+# refuses, so the qualified factual family was unreachable. The candidate field is
+# model-authored and unconstrained in its own schema, so Practice validates it against
+# this allowlist before trusting it and otherwise keeps the existing fail-closed path.
+# Scoped to the Practice routing boundary: the shared classifier contract is unchanged.
+_FACTUAL_FAMILY_CANDIDATES: frozenset[str] = frozenset(
+    {
+        "HISTORY",
+        "GEOGRAPHY",
+        "POLITY",
+        "ECONOMICS",
+        "SCIENCE",
+        "PHYSICS",
+        "CHEMISTRY",
+        "BIOLOGY",
+        "COMPUTER_SCIENCE",
+    }
+)
+
+
+def canonical_practice_subject(
+    subject: object,
+    pattern_family_candidate: object = None,
+) -> str:
+    """Resolve the Practice subject, adopting a factual family only when allowlisted.
+
+    An explicit subject always wins: a candidate can never override math, english or any
+    other classified subject. Only the `general` catch-all may be narrowed, and only to
+    one of the nine approved factual families.
+    """
+    resolved = str(subject or "general").strip().casefold() or "general"
+    if resolved != "general":
+        return resolved
+    candidate = str(pattern_family_candidate or "").strip().upper()
+    if candidate in _FACTUAL_FAMILY_CANDIDATES:
+        return candidate.casefold()
+    return resolved
 
 
 def resolve_practice_request(
@@ -880,7 +996,29 @@ def _grounded_topic_ids(
         if key in seen:
             raise ValueError("PLANNER_TOPIC_EVIDENCE_DUPLICATE")
         seen.add(key)
-        if _normalized_for_grounding(item.source_text) not in haystack:
+        normalized_span = _normalized_for_grounding(item.source_text)
+        if normalized_span not in haystack:
+            # Content-free shape of the mismatch: lengths and two booleans only. This
+            # distinguishes a planner that did not return a verbatim span from a
+            # normalizer that rejects one it should accept, without logging the span
+            # or the student's words.
+            log_event(
+                "planner_topic_evidence_ungrounded",
+                component="practice.planning",
+                stage="plan",
+                status="failed",
+                details={
+                    "sourceEmpty": not item.source_text.strip(),
+                    "sourceLength": len(item.source_text),
+                    "groundingTextLength": len(request.original_query),
+                    # What providers.py hands the planner. Equal to groundingTextLength
+                    # means planner and validator saw the same text; different means they
+                    # did not, which is a plumbing defect rather than a planner defect.
+                    "constraintsLength": len(request.original_query[:1000]),
+                    "exactSubstring": item.source_text in request.original_query,
+                    "normalizedSubstring": normalized_span in haystack,
+                },
+            )
             raise ValueError("PLANNER_TOPIC_EVIDENCE_UNGROUNDED")
         if item.topic_id in planned:
             grounded.add(item.topic_id)

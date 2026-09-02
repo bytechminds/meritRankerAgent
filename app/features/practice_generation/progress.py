@@ -177,6 +177,8 @@ class AppSyncAssessmentProgressRepository:
                 logical_table="MockTestQuiz",
                 fallback_decision="fatal_progress_publication_failure",
                 progress_detail=exc.safe_detail,
+                progress_error_type=exc.error_type,
+                progress_retryable=exc.retryable,
             ) from exc
         updated = dict(assessment)
         updated.update(

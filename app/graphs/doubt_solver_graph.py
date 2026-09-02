@@ -39,6 +39,7 @@ from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     PracticeRequestCountError,
+    canonical_practice_subject,
     decide_practice_launch,
     practice_async_unavailable_message,
     practice_route_enabled,
@@ -1403,7 +1404,10 @@ def build_orchestrated_doubt_solver_graph(
                     conversation_id=state["conversation_id"],
                     turn_id=state["turn_id"],
                     query=state.get("original_query") or state["query"],
-                    subject=str(classification.get("subject") or "general"),
+                    subject=canonical_practice_subject(
+                        classification.get("subject"),
+                        classification.get("pattern_family_candidate"),
+                    ),
                     topic=(str(classification["topic"]) if classification.get("topic") else None),
                     difficulty=str(classification.get("difficulty") or "default"),
                     language=state.get("language", "english"),

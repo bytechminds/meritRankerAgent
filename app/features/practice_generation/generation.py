@@ -12,7 +12,6 @@ from pydantic import ValidationError
 
 from features.practice_generation.matching import (
     normalize_question_identity,
-    normalize_question_text,
 )
 from features.practice_generation.metadata_normalization import (
     normalize_difficulty,
@@ -610,6 +609,20 @@ def deterministic_question_id(
     return f"pq-{digest[:32]}"
 
 
+def _is_persisted_schema_v2(practice_meta: object) -> bool:
+    """True when a persisted question was authored under the schema-v2 contract.
+
+    The v2 Author deliberately emits no `solution`; the in-batch check already exempts
+    it (see the solution_required expression in parse_partial_generation). Persisted
+    validation has to apply the same exemption or every verified v2 item is rejected
+    at the final gate. v1/legacy/reused items keep the original requirement.
+    """
+    return (
+        isinstance(practice_meta, dict)
+        and str(practice_meta.get("schemaVersion") or "") == "2"
+    )
+
+
 def validate_final_set(
     *,
     blueprint: PracticeBlueprint,
@@ -663,8 +676,15 @@ def validate_final_set(
             "DUPLICATE_OR_MISSING_QUESTION_ID",
             failed_slot_ids=duplicate_slots,
         )
+    # Same identity as generation dedup and replacement exclusion. A generic
+    # instructional stem is legitimate exam construction — English error-detection items
+    # carry their content in the options — so keying the final set on the stem alone
+    # collapsed genuinely distinct questions and rejected the whole set.
     normalized_texts = [
-        normalize_question_text(str(item.get("question") or "")) for item in linked_questions
+        normalize_question_identity(
+            str(item.get("question") or ""), item.get("options")
+        )
+        for item in linked_questions
     ]
     if not all(normalized_texts) or len(normalized_texts) != len(set(normalized_texts)):
         duplicate_slots = {
@@ -698,7 +718,9 @@ def validate_final_set(
             item,
             expected_question_type=bucket.question_type.value,
             expected_language=requested_language,
-            solution_required=bucket.solution_required,
+            solution_required=(
+                bucket.solution_required and not _is_persisted_schema_v2(meta)
+            ),
         )
         if not contract.valid:
             return result(

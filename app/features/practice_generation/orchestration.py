@@ -168,8 +168,15 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "user_id": assessment.get("userId"),
             "conversation_id": value.get("conversationId"),
             "turn_id": value.get("turnId"),
+            # The repository persists this as `originalQuery` (repositories.py); the
+            # reader previously asked only for `querySummary`, a key nothing writes and
+            # progress.py deliberately strips. Every reconstructed request therefore
+            # carried the placeholder, which broke topic-evidence grounding for any
+            # request large enough to reach the intelligence planner. `querySummary`
+            # stays as a fallback for meta written before that key was retired.
             "original_query": (
-                value.get("querySummary")
+                value.get("originalQuery")
+                or value.get("querySummary")
                 or (
                     "Mixed difficulty practice request"
                     if mixed_difficulty_requested
@@ -377,6 +384,17 @@ class PracticeGenerationOrchestrator:
                 "plannerPhase": diagnostic.phase,
                 "schemaName": diagnostic.schema_name,
                 "durationMs": diagnostic.duration_ms,
+                # Present only for our own literal contract messages; never model text.
+                **(
+                    {"validationMessage": diagnostic.owned_message}
+                    if diagnostic.owned_message
+                    else {}
+                ),
+                **(
+                    {"validationOrigin": diagnostic.owned_origin}
+                    if diagnostic.owned_origin
+                    else {}
+                ),
             }
             emit_practice_event(
                 "planner_validation_failed",

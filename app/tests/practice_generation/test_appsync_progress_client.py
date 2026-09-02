@@ -319,3 +319,136 @@ def _contract():
         question_bank_category_index="byCategory",
         question_bank_reuse_index="byReuse",
     )
+
+
+@pytest.mark.parametrize(
+    "error_body, expected_type",
+    [
+        ({"errorType": "DynamoDB:ConditionalCheckFailedException"},
+         "DynamoDB:ConditionalCheckFailedException"),
+        ({"errorType": "Unauthorized"}, "Unauthorized"),
+        ({"errorType": "Lambda:Unhandled"}, "Lambda:Unhandled"),
+        ({"errorType": "MappingTemplate",
+          "extensions": {"code": "CONFLICT"}}, "MappingTemplate"),
+        ({"errorType": "x", "extensions": {"errorType": "BadRequest"}}, "x"),
+    ],
+)
+def test_graphql_rejection_exposes_the_sanitized_appsync_error_type(
+    error_body: dict, expected_type: str
+) -> None:
+    """Q20-6a: the unclassified branch must name the AppSync error class."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": [error_body]})
+
+    with pytest.raises(PracticeProgressError) as raised:
+        asyncio.run(
+            client(handler).update_progress(
+                test_id="test-1",
+                user_id="user-1",
+                status="GENERATING",
+                meta={"readyCount": 0},
+                live=False,
+                expected_updated_at="before",
+            )
+        )
+
+    assert raised.value.code == "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+    assert raised.value.error_type == expected_type
+    assert raised.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "student asked: what is 2+2",
+        "Bearer abc.def.ghi",
+        'DynamoDB {"question": "who won"}',
+        "A" * 200,
+        "",
+        "9LeadingDigit",
+    ],
+)
+def test_unsafe_graphql_error_type_is_never_exposed(unsafe: str) -> None:
+    """Anything that is not a bare classification label is dropped, not logged."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": [{"errorType": unsafe}]})
+
+    with pytest.raises(PracticeProgressError) as raised:
+        asyncio.run(
+            client(handler).update_progress(
+                test_id="test-1",
+                user_id="user-1",
+                status="GENERATING",
+                meta={"readyCount": 0},
+                live=False,
+                expected_updated_at="before",
+            )
+        )
+
+    assert raised.value.code == "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+    assert raised.value.error_type is None
+
+
+def test_graphql_message_is_never_used_as_the_error_type() -> None:
+    """The GraphQL message may embed request data; it must not reach the field."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {
+                        "message": "Conditional check failed for testId practice-abc",
+                        "errorType": "DynamoDB:ConditionalCheckFailedException",
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(PracticeProgressError) as raised:
+        asyncio.run(
+            client(handler).update_progress(
+                test_id="test-1",
+                user_id="user-1",
+                status="GENERATING",
+                meta={"readyCount": 0},
+                live=False,
+                expected_updated_at="before",
+            )
+        )
+
+    assert raised.value.error_type == "DynamoDB:ConditionalCheckFailedException"
+    assert "practice-abc" not in (raised.value.error_type or "")
+    assert "Conditional check failed" not in (raised.value.error_type or "")
+
+
+def test_graphql_scan_order_is_unchanged_by_the_diagnostic() -> None:
+    """Behaviour guard: an unsanitizable first errorType still terminates the scan."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {"errorType": "has spaces so unsafe"},
+                    {"message": "PRACTICE_PROGRESS_OWNER_MISMATCH"},
+                ]
+            },
+        )
+
+    with pytest.raises(PracticeProgressError) as raised:
+        asyncio.run(
+            client(handler).update_progress(
+                test_id="test-1",
+                user_id="user-1",
+                status="GENERATING",
+                meta={"readyCount": 0},
+                live=False,
+                expected_updated_at="before",
+            )
+        )
+
+    assert raised.value.code == "PRACTICE_PROGRESS_GRAPHQL_REJECTED"
+    assert raised.value.error_type is None

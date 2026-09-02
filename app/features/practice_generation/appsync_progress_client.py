@@ -58,6 +58,13 @@ _NON_RETRYABLE_CODES = (
     "GRAPHQL_VALIDATION_FAILED",
 )
 
+# AppSync errorType / extensions.code are controlled classification labels
+# ("Unauthorized", "DynamoDB:ConditionalCheckFailedException", "Lambda:Unhandled").
+# The pattern admits only that shape, so a GraphQL message carrying request data
+# can never reach a log through this field.
+_SAFE_ERROR_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,79}")
+
+
 def _json_compatible(value: object) -> object:
     """Convert DynamoDB number values without changing their JSON meaning."""
     if isinstance(value, Decimal):
@@ -99,11 +106,13 @@ class PracticeProgressError(RuntimeError):
         *,
         retryable: bool = False,
         safe_detail: str | None = None,
+        error_type: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
         self.safe_detail = safe_detail
+        self.error_type = error_type
 
 
 class PracticeProgressResult(BaseModel):
@@ -246,8 +255,13 @@ class AppSyncPracticeProgressClient:
             raise PracticeProgressError("PRACTICE_PROGRESS_INVALID_RESPONSE") from exc
         errors = payload.get("errors") if isinstance(payload, dict) else None
         if isinstance(errors, list) and errors:
-            code, safe_detail = self._graphql_error(errors)
-            raise PracticeProgressError(code, retryable=False, safe_detail=safe_detail)
+            code, safe_detail, error_type = self._graphql_error(errors)
+            raise PracticeProgressError(
+                code,
+                retryable=False,
+                safe_detail=safe_detail,
+                error_type=error_type,
+            )
         try:
             result = payload["data"]["updatePracticeGenerationProgress"]
             return PracticeProgressResult.model_validate(result)
@@ -282,7 +296,19 @@ class AppSyncPracticeProgressClient:
             ) from exc
 
     @staticmethod
-    def _graphql_error(errors: list[Any]) -> tuple[str, str | None]:
+    def _safe_error_type(error: dict[str, Any]) -> str | None:
+        """Sanitized AppSync classification label, never the GraphQL message."""
+        candidates = [error.get("errorType")]
+        extensions = error.get("extensions")
+        if isinstance(extensions, dict):
+            candidates.extend((extensions.get("errorType"), extensions.get("code")))
+        for candidate in candidates:
+            if isinstance(candidate, str) and _SAFE_ERROR_TYPE.fullmatch(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _graphql_error(errors: list[Any]) -> tuple[str, str | None, str | None]:
         for error in errors:
             if not isinstance(error, dict):
                 continue
@@ -299,10 +325,16 @@ class AppSyncPracticeProgressClient:
                             candidate,
                         ):
                             safe_detail = candidate
+                    error_type = AppSyncPracticeProgressClient._safe_error_type(error)
                     if any(marker in code for marker in _NON_RETRYABLE_CODES):
-                        return code, safe_detail
-                    return code, safe_detail
-            error_type = str(error.get("errorType") or "")
-            if error_type:
-                return "PRACTICE_PROGRESS_GRAPHQL_REJECTED", None
-        return "PRACTICE_PROGRESS_GRAPHQL_REJECTED", None
+                        return code, safe_detail, error_type
+                    return code, safe_detail, error_type
+            # Gate stays on raw presence, exactly as before: the sanitizer decides
+            # what may be logged, never which error terminates the scan.
+            if str(error.get("errorType") or ""):
+                return (
+                    "PRACTICE_PROGRESS_GRAPHQL_REJECTED",
+                    None,
+                    AppSyncPracticeProgressClient._safe_error_type(error),
+                )
+        return "PRACTICE_PROGRESS_GRAPHQL_REJECTED", None, None

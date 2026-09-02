@@ -1176,7 +1176,11 @@ def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
     # the composition. Both end FAILED and non-playable; only the reason differs.
     assert meta["errorCode"] == "PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE"
     diagnostics = [details for name, details in emitted if name == "planner_validation_failed"]
-    assert diagnostics[-1] == {
+    assert {
+        key: value
+        for key, value in diagnostics[-1].items()
+        if key != "validationOrigin"
+    } == {
         "expectedSlotCount": 5,
         "routeId": "quant_reasoning.planner.basic",
         "plannerTier": "light",
@@ -1196,6 +1200,12 @@ def test_invalid_deterministic_fallback_fails_with_safe_planner_diagnostics(
         "validationStage": "schema",
         "durationMs": 0,
     }
+    # Raise site inside our own source. Code location only — no message text, no model
+    # output, no student content. The line number is deliberately not pinned: it moves
+    # with any edit, and the safety property is the shape, not the literal.
+    origin = diagnostics[-1]["validationOrigin"]
+    assert origin.startswith("planning.py:")
+    assert origin.split(":")[1].isdigit()
     # C1: the fallback is no longer invoked, so no planner_fallback_failed event.
     # The assessment still terminates FAILED through the existing bounded lifecycle.
     emitted_names = [name for name, _details in emitted]

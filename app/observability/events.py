@@ -117,6 +117,7 @@ EVENT_NAMES = frozenset(
         "generator_fallback_skipped",
         "generator_fallback_exhausted",
         "planner_validation_failed",
+        "planner_topic_evidence_ungrounded",
         "planner_repair_started",
         "planner_repair_completed",
         "planner_repair_failed",
