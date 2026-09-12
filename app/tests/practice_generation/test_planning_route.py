@@ -282,3 +282,185 @@ def test_duplicate_evidence_is_rejected() -> None:
             ["percentage", "percentage"],
             "Create 50 questions on Percentage",
         )
+
+
+# --- coverage decides before grounding is consulted --------------------------
+#
+# A plan whose slots already cover every requested topic is complete on its own
+# terms; the grounding result is never read for it. Evaluating grounding first
+# turned an unusable evidence span into a fatal planner error for such plans.
+
+
+def _reasoning_request(query: str, count: int):
+    return PracticeGenerationRequest(
+        request_id="r", user_id="u", conversation_id="c", turn_id="t",
+        original_query=query, practice_type=PracticeType.QUICK_PRACTICE,
+        requested_count=count, accepted_count=count, subject="reasoning",
+        topic="Logical Reasoning", difficulty=Difficulty.INTERMEDIATE,
+        assessment_title="T",
+    )
+
+
+def _math_request(query: str, count: int):
+    return PracticeGenerationRequest(
+        request_id="r", user_id="u", conversation_id="c", turn_id="t",
+        original_query=query, practice_type=PracticeType.QUICK_PRACTICE,
+        requested_count=count, accepted_count=count, subject="math",
+        topic="Quantitative Aptitude", difficulty=Difficulty.INTERMEDIATE,
+        assessment_title="T",
+    )
+
+
+def _parse_for(request, evidence, topic_ids):
+    from features.practice_generation.planning import parse_blueprint
+
+    slots = [
+        dict(
+            slot_id=f"slot-{i:03d}",
+            subject_id=request.subject,
+            topic_id=t,
+            category_id=t,
+            difficulty="intermediate",
+            complexity="medium",
+            exam_ids=[],
+            question_type="mcq",
+            target_skill=f"skill_{i}",
+            variation_hint=f"variation {i}",
+            pattern_family_id=None,
+            generator_route_hint=f"{request.subject}.generator.intermediate",
+            reasoning_target="numerical",
+            trap_type=None,
+            not_same_when=[],
+            generation_group_hint=None,
+        )
+        for i, t in enumerate(topic_ids, start=1)
+    ]
+    payload = {"slots": slots, "requestedTopicEvidence": evidence}
+    return parse_blueprint(json.dumps(payload), request)
+
+
+def _grounding_spy(monkeypatch):
+    """Wrap _grounded_topic_ids so a test can assert whether it was consulted."""
+    from features.practice_generation import planning
+
+    calls: list[int] = []
+    original = planning._grounded_topic_ids
+
+    def _spy(blueprint, request):
+        calls.append(1)
+        return original(blueprint, request)
+
+    monkeypatch.setattr(planning, "_grounded_topic_ids", _spy)
+    return calls
+
+
+def test_complete_coverage_does_not_consult_grounding(monkeypatch) -> None:
+    """The exact production failure: 6 reasoning slots, an unusable evidence span.
+
+    Every requested topic is already planned, so grounding cannot change the
+    outcome and must not be able to fail the plan.
+    """
+    calls = _grounding_spy(monkeypatch)
+    request = _reasoning_request(
+        "Create a 6 Reasoning mini mock for CAT Management — Pre.", 6
+    )
+
+    blueprint = _parse_for(
+        request,
+        # The span the planner returned twice in production; it never occurs in
+        # the student's words, so _grounded_topic_ids would reject it.
+        [{"sourceText": "Logical Reasoning", "topicId": "logical_reasoning"}],
+        ["logical_reasoning"] * 6,
+    )
+
+    assert calls == []
+    assert len(blueprint.slots) == 6
+    assert {s.topic_id for s in blueprint.slots} == {"logical_reasoning"}
+
+
+def test_incomplete_coverage_still_consults_grounding(monkeypatch) -> None:
+    calls = _grounding_spy(monkeypatch)
+    request = _math_request("Create questions on Percentage and Average", 2)
+
+    blueprint = _parse_for(
+        request,
+        [
+            {"sourceText": "Percentage", "topicId": "percentage"},
+            {"sourceText": "Average", "topicId": "average"},
+        ],
+        ["percentage", "average"],
+    )
+
+    assert calls == [1]
+    assert {s.topic_id for s in blueprint.slots} == {"percentage", "average"}
+
+
+def test_incomplete_coverage_still_rejects_an_ungrounded_span() -> None:
+    """Fix B must not weaken safety where the grounding result is actually read."""
+    request = _math_request("Create questions on Percentage and Average", 2)
+
+    with pytest.raises(ValueError, match="PLANNER_TOPIC_EVIDENCE_UNGROUNDED"):
+        _parse_for(
+            request,
+            [
+                {"sourceText": "Percentage", "topicId": "percentage"},
+                {"sourceText": "Trigonometry", "topicId": "average"},
+            ],
+            ["percentage", "average"],
+        )
+
+
+def test_incomplete_coverage_still_rejects_duplicate_evidence() -> None:
+    request = _math_request("Create questions on Percentage and Average", 2)
+
+    with pytest.raises(ValueError, match="PLANNER_TOPIC_EVIDENCE_DUPLICATE"):
+        _parse_for(
+            request,
+            [
+                {"sourceText": "Percentage", "topicId": "percentage"},
+                {"sourceText": "Percentage", "topicId": "percentage"},
+            ],
+            ["percentage", "average"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # The two invariants that previously reported as PLANNER_SCHEMA_INVALID.
+        ("PLANNER_TOPIC_EVIDENCE_UNGROUNDED", "PLANNER_TOPIC_EVIDENCE_UNGROUNDED"),
+        ("PLANNER_TOPIC_EVIDENCE_DUPLICATE", "PLANNER_TOPIC_EVIDENCE_DUPLICATE"),
+        # Pre-existing mappings must keep their reason codes.
+        ("PLANNER_TOPIC_COVERAGE_INVALID", "PLANNER_TOPIC_COVERAGE_INVALID"),
+        ("slot count must equal accepted_count", "PLANNER_SLOT_COUNT_MISMATCH"),
+        ("planner_family is required", "PLANNER_FAMILY_MISSING"),
+        ("slots must be intentionally distinct", "PLANNER_SLOTS_NOT_DISTINCT"),
+    ],
+)
+def test_planner_validation_reason_names_the_failed_invariant(
+    message: str, expected: str
+) -> None:
+    from features.practice_generation.planning import _planner_validation_reason
+
+    assert _planner_validation_reason(ValueError(message), raw="")[0] == expected
+
+
+def test_repair_feedback_carries_the_named_invariant() -> None:
+    """The single repair attempt must be told which invariant failed."""
+    from features.practice_generation.planning import (
+        _planner_repair_feedback,
+        _planner_validation_diagnostic,
+    )
+
+    diagnostic = _planner_validation_diagnostic(
+        ValueError("PLANNER_TOPIC_EVIDENCE_UNGROUNDED"),
+        raw="",
+        attempt=1,
+        phase="plan",
+        duration_ms=1,
+    )
+
+    assert diagnostic.reason_code == "PLANNER_TOPIC_EVIDENCE_UNGROUNDED"
+    assert "reason=PLANNER_TOPIC_EVIDENCE_UNGROUNDED" in _planner_repair_feedback(
+        diagnostic
+    )

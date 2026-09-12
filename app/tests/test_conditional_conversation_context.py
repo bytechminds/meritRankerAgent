@@ -339,3 +339,221 @@ def test_local_precedence_never_overrides_an_ordinal_history_reference() -> None
 def test_a_bare_local_source_introducer_is_not_treated_as_an_anchor() -> None:
     # The introducer must actually introduce something substantial.
     assert ContextNeedGate().evaluate("Here is a question.").decision != "CONTEXT_NOT_NEEDED"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "explain simpler",
+        "explain again",
+        "explain in Hindi",
+        "explain another way",
+        "explain differently",
+        "explain step 2",
+        "explain more",
+        "explain briefly",
+        "explain once more",
+        "explain in detail",
+        "aur simple samjhao",
+        "dobara samjhao",
+        "hindi me samjhao",
+    ),
+)
+def test_modifier_only_imperative_does_not_suppress_retrieval(query: str) -> None:
+    """"explain <modifier>" names nothing to work on, so history stays eligible."""
+    assert ContextNeedGate().evaluate(query).decision != "CONTEXT_NOT_NEEDED"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "explain photosynthesis",
+        "explain compound interest",
+        "explain profit and loss",
+        "explain Article 21",
+        "explain Newton's first law",
+        "explain blood relation",
+        "explain computer memory",
+        "explain power",
+        "explain number system",
+        "explain photosynthesis in detail",
+        "explain the difference between speed and velocity",
+        "explain step 2 of the water cycle",
+        "define integer",
+        "describe the water cycle",
+    ),
+)
+def test_named_object_stays_self_contained(query: str) -> None:
+    assert ContextNeedGate().evaluate(query).decision == "CONTEXT_NOT_NEEDED"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "One of my friend is coming - which part is wrong and why?",
+        "I have went there yesterday - what is incorrect here?",
+        "Which option is wrong here? A, B, C, D",
+        "What is wrong in 2x + 3 = 9?",
+        "Tell me why this sentence is incorrect: She go to school",
+    ),
+)
+def test_correction_word_alone_is_not_a_conversation_reference(query: str) -> None:
+    """A student asking what is wrong with material they supplied needs no history."""
+    assessment = ContextNeedGate().evaluate(query)
+    assert assessment.decision != "CONTEXT_REQUIRED"
+    assert "correction_reference" not in assessment.matched_signals
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "your answer is wrong",
+        "your solution is incorrect",
+        "why was your answer wrong?",
+        "why is your answer wrong?",
+        "you are wrong",
+    ),
+)
+def test_correction_of_a_named_assistant_answer_still_requires_context(
+    query: str,
+) -> None:
+    assessment = ContextNeedGate().evaluate(query)
+    assert assessment.decision == "CONTEXT_REQUIRED"
+    assert "correction_reference" in assessment.matched_signals
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "the previous answer is wrong",
+        "the last solution is incorrect",
+        "check your previous solution",
+    ),
+)
+def test_previous_reference_wording_still_requires_context(query: str) -> None:
+    """These stay contextual through previous_reference, not correction_reference."""
+    assessment = ContextNeedGate().evaluate(query)
+    assert assessment.decision == "CONTEXT_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "explain this grammar rule: subject verb agreement",
+        "explain this sentence - He does not go",
+        "check this equation: 2x + 3 = 9",
+        "verify this calculation: 20% of 500 = 100",
+        "explain this concept: photosynthesis",
+    ),
+)
+def test_demonstrative_with_supplied_target_is_locally_resolved(query: str) -> None:
+    """The turn supplies what "this" points at, so recent history adds nothing."""
+    assessment = ContextNeedGate().evaluate(query)
+    assert assessment.decision != "CONTEXT_REQUIRED"
+    assert "selected_object_reference" not in assessment.matched_signals
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "explain this",
+        "check this",
+        "verify this",
+        "explain this answer",
+        "check this solution",
+        "explain this again",
+        "explain this in hindi",
+        "check this properly",
+    ),
+)
+def test_demonstrative_without_a_target_still_requires_context(query: str) -> None:
+    assessment = ContextNeedGate().evaluate(query)
+    assert assessment.decision == "CONTEXT_REQUIRED"
+    assert "selected_object_reference" in assessment.matched_signals
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    (
+        ("ye wala kaise hoga", "CONTEXT_REQUIRED"),
+        ("isko samjhao", "CONTEXT_REQUIRED"),
+        ("ye kaise", "CONTEXT_REQUIRED"),
+        ("iska answer kya hai", "CONTEXT_REQUIRED"),
+        ("What is the capital of Australia?", "CONTEXT_NOT_NEEDED"),
+        ("explain simpler", "UNCERTAIN"),
+        ("aur simple samjhao", "UNCERTAIN"),
+        ("are you sure?", "UNCERTAIN"),
+    ),
+)
+def test_reference_and_follow_up_gate_decisions_are_preserved(
+    query: str, expected: str
+) -> None:
+    assert ContextNeedGate().evaluate(query).decision == expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        # supplied sentence, pronoun first
+        "He don't like tea. What is wrong in this sentence?",
+        "She go to school daily correct this sentence",
+        "what is wrong in this sentence: she have two books",
+        # multi-part: complete first proposition, pronoun in the second half
+        "what is GDP and how is it calculated",
+        "What is repo rate and how does RBI use it to control inflation",
+        "largest gland in human body kaun si hai aur iska function kya hai",
+        "Who appoints the governor and what is his tenure",
+        # supplied equation, statement and option
+        "this calculation is incorrect: 20% of 500 = 50",
+        "which statement is wrong among these: A) Earth is flat B) Earth is round",
+        "check this option: B. New Delhi",
+    ),
+)
+def test_turn_that_supplies_its_own_referent_needs_no_history(query: str) -> None:
+    assert ContextNeedGate().evaluate(query).decision != "CONTEXT_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "ye wala kaise hoga",
+        "iska answer kya hai",
+        "ye wrong kyu hai",
+        "wo wala question phir se",
+        "dusra option kyu sahi hai",
+        "isko samjhao",
+    ),
+)
+def test_reference_naming_nothing_still_requires_context(query: str) -> None:
+    """The collision case: a bare demonstrative plus a placeholder resolves nothing."""
+    assert ContextNeedGate().evaluate(query).decision == "CONTEXT_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    (
+        # a deictic followed by a conversational placeholder is not a local antecedent
+        ("iska answer kya hai", False),
+        ("uska solution batao", False),
+        # a bare possessive question is still a follow-up: nothing here names the subject
+        ("iska function kya hai", False),
+        # the subject is supplied in the first half of the same turn
+        ("what is GDP and how is it calculated", True),
+        ("Who appoints the governor and what is his tenure", True),
+    ),
+)
+def test_local_antecedent_distinguishes_placeholder_from_content(
+    query: str, expected: bool
+) -> None:
+    from services.conversation.reference_resolution import analyze_reference
+
+    assert analyze_reference(query).local_reference is expected
+
+
+def test_first_reference_at_index_zero_without_local_content_stays_unresolved() -> None:
+    """'ye wala kaise hoga' must not become answerable via the new whole-turn scan."""
+    from services.conversation.reference_resolution import analyze_reference
+
+    analysis = analyze_reference("ye wala kaise hoga")
+    assert analysis.external_reference_detected is True
+    assert analysis.local_reference is False

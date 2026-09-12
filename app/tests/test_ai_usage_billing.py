@@ -92,9 +92,13 @@ def test_billing_uses_decimal_rates_and_ceiling_credit_conversion() -> None:
         config=_config(),
     )
 
-    assert summary.total_llm_cost_usd == Decimal("10")
-    assert summary.actual_usage_cost_usd == Decimal("10.001")
-    assert summary.calculated_credits == 20_002
+    # 200k of the 1M input tokens were cached, so they price at the verified
+    # cached rate (0.5) rather than the normal input rate (2.0):
+    # 800k*2 + 200k*0.5 + 1M*8 = 9.70
+    assert summary.total_llm_cost_usd == Decimal("9.70")
+    assert summary.actual_usage_cost_usd == Decimal("9.701")
+    assert summary.calculated_credits == 19_402
+    assert summary.cost_complete is True
     assert summary.credit_debit_enabled is False
     assert summary.credits_debited == 0
     assert summary.cost_complete is True

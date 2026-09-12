@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+# Published SSM root for the credit table identity; named here only so a
+# configuration error can tell an operator exactly where it looked.
+STUDENT_CREDIT_PARAMETER_ROOT = "/meritranker/agent-runtime/v1/credits"
 
 # Load .env.local sitting next to this file.
 # override=False means real env vars always win — safe for production too.
@@ -108,6 +113,14 @@ class Settings:
     dynamodb_practice_attempt_user_index: str
     dynamodb_default_index: str  # empty string means "no default index"
     dynamodb_region: str  # empty string means "use AWS_REGION or boto3 default"
+    # Student runtime credits — authoritative wallet owned by the AI Tutor backend
+    student_credit_enforcement_enabled: bool
+    student_credit_dry_run: bool
+    student_credit_credits_per_usd: Decimal
+    student_credit_target_gross_margin: Decimal
+    student_credit_rounding_mode: str
+    dynamodb_user_credits_table: str
+    dynamodb_credit_ledger_table: str
     # Context builder
     doubt_solver_max_context_chars: int  # hard cap on context string passed to answer generator
     # Context retrieval (Part 13.1)
@@ -314,6 +327,25 @@ def _classifier_confidence_threshold_from_env() -> float:
     return _parse_confidence_threshold(legacy)
 
 
+def _decimal_from_env(name: str, default: str) -> Decimal:
+    """Parse one monetary/rate setting. Money never uses binary floating point."""
+    raw_value = os.getenv(name, default).strip() or default
+    try:
+        return Decimal(raw_value)
+    except InvalidOperation as exc:
+        raise ConfigurationError(f"{name} must be a decimal number.") from exc
+
+
+def _credit_tables_from_ssm() -> tuple[str, str]:
+    """Resolve (user_credits_table, credit_ledger_table) from the published contract."""
+    from services.student_credits.resource_contract import (  # noqa: PLC0415
+        load_student_credit_resource_contract,
+    )
+
+    contract = load_student_credit_resource_contract()
+    return contract.user_credits_table, contract.credit_ledger_table
+
+
 def get_settings() -> Settings:
     """Return the singleton Settings instance.
 
@@ -448,6 +480,63 @@ def get_settings() -> Settings:
             if not 0.0 <= image_classifier_min_confidence <= 1.0:
                 raise ConfigurationError(
                     "IMAGE_CLASSIFIER_MIN_CONFIDENCE must be between 0.0 and 1.0."
+                )
+
+        # Student runtime credits. Policy is validated only when enforcement is
+        # enabled so an unconfigured deployment keeps starting unchanged.
+        student_credit_enforcement_enabled = (
+            os.getenv("STUDENT_CREDIT_ENFORCEMENT_ENABLED", "false").strip().lower() == "true"
+        )
+        student_credit_dry_run = (
+            os.getenv("STUDENT_CREDIT_DRY_RUN", "true").strip().lower() == "true"
+        )
+        student_credit_credits_per_usd = _decimal_from_env("CREDITS_PER_USD", "50")
+        student_credit_target_gross_margin = _decimal_from_env("TARGET_GROSS_MARGIN", "0.40")
+        student_credit_rounding_mode = (
+            os.getenv("STUDENT_CREDIT_ROUNDING_MODE", "CEIL").strip().upper()
+        )
+        dynamodb_user_credits_table = os.getenv("DYNAMODB_USER_CREDITS_TABLE", "").strip()
+        dynamodb_credit_ledger_table = os.getenv("DYNAMODB_CREDIT_LEDGER_TABLE", "").strip()
+        ssm_credit_tables_error = ""
+        if student_credit_enforcement_enabled and not (
+            dynamodb_user_credits_table and dynamodb_credit_ledger_table
+        ):
+            # Explicit environment values always win, so a deployment that
+            # already receives both from the CDK performs no SSM lookup at all.
+            # Only an unresolved name falls back to the published contract.
+            try:
+                ssm_user_credits, ssm_credit_ledger = _credit_tables_from_ssm()
+            except Exception as exc:  # noqa: BLE001 - validation below fails fast
+                ssm_credit_tables_error = f" {type(exc).__name__}: {exc}"
+            else:
+                dynamodb_user_credits_table = (
+                    dynamodb_user_credits_table or ssm_user_credits
+                )
+                dynamodb_credit_ledger_table = (
+                    dynamodb_credit_ledger_table or ssm_credit_ledger
+                )
+        if student_credit_enforcement_enabled:
+            if student_credit_credits_per_usd <= 0:
+                raise ConfigurationError("CREDITS_PER_USD must be greater than zero.")
+            if not 0 <= student_credit_target_gross_margin < 1:
+                raise ConfigurationError(
+                    "TARGET_GROSS_MARGIN must be at least 0 and less than 1."
+                )
+            if student_credit_rounding_mode != "CEIL":
+                raise ConfigurationError("STUDENT_CREDIT_ROUNDING_MODE must be 'CEIL'.")
+            if not dynamodb_user_credits_table:
+                raise ConfigurationError(
+                    "DYNAMODB_USER_CREDITS_TABLE is required when "
+                    "STUDENT_CREDIT_ENFORCEMENT_ENABLED=true. It was not set and "
+                    "could not be resolved from "
+                    f"{STUDENT_CREDIT_PARAMETER_ROOT}.{ssm_credit_tables_error}"
+                )
+            if not dynamodb_credit_ledger_table:
+                raise ConfigurationError(
+                    "DYNAMODB_CREDIT_LEDGER_TABLE is required when "
+                    "STUDENT_CREDIT_ENFORCEMENT_ENABLED=true. It was not set and "
+                    "could not be resolved from "
+                    f"{STUDENT_CREDIT_PARAMETER_ROOT}.{ssm_credit_tables_error}"
                 )
 
         answer_delivery_policy = os.getenv("ANSWER_DELIVERY_POLICY", "adaptive").strip()
@@ -634,6 +723,13 @@ def get_settings() -> Settings:
             dynamodb_region=os.getenv(
                 "DYNAMODB_REGION", os.getenv("AWS_REGION", "")
             ),
+            student_credit_enforcement_enabled=student_credit_enforcement_enabled,
+            student_credit_dry_run=student_credit_dry_run,
+            student_credit_credits_per_usd=student_credit_credits_per_usd,
+            student_credit_target_gross_margin=student_credit_target_gross_margin,
+            student_credit_rounding_mode=student_credit_rounding_mode,
+            dynamodb_user_credits_table=dynamodb_user_credits_table,
+            dynamodb_credit_ledger_table=dynamodb_credit_ledger_table,
             doubt_solver_max_context_chars=int(
                 os.getenv("DOUBT_SOLVER_MAX_CONTEXT_CHARS", "6000")
             ),

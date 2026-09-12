@@ -50,47 +50,128 @@ models:
     output_cost_per_million_tokens: 1.50
     cached_input_cost_per_million_tokens: 0.025
     effective_from: "2026-07-27"
+  # Google Gemini Developer API, Standard (non-batch) paid tier, verified
+  # 2026-09-11 against ai.google.dev/gemini-api/docs/pricing. The runtime issues
+  # synchronous calls, so the Batch tier ($0.375/$1.875) does not apply.
+  # WARNING: these are INTRODUCTORY rates that Google publishes as valid
+  # "through December 31, 2026"; from 2027-01-01 the standard rates become
+  # $1.50 / $7.50. _find_rate performs no date-based selection, so this row must
+  # be updated on 2027-01-01 or every operation using it will be under-charged
+  # by half. Cached-input pricing is not published for this model and is
+  # therefore intentionally absent rather than assumed.
+  - provider: gemini
+    model_or_deployment: gemini-3.7-flash
+    input_cost_per_million_tokens: 0.75
+    output_cost_per_million_tokens: 3.75
+    effective_from: "2026-09-11"
+  # OpenAI public API, Standard (non-batch) tier, verified 2026-09-11 against
+  # developers.openai.com/api/docs/pricing. Reached only as a provider-failure
+  # fallback for reasoning_basic_generator.
+  - provider: openai
+    model_or_deployment: gpt-4o-mini
+    input_cost_per_million_tokens: 0.15
+    output_cost_per_million_tokens: 0.60
+    cached_input_cost_per_million_tokens: 0.075
+    effective_from: "2026-09-11"
+
+  # ---------------------------------------------------------------------------
+  # Azure OpenAI — South India deployments. Rates supplied by the project owner
+  # from the authoritative Azure pricing sheet for this subscription and
+  # validated manually on 2026-09-11. Azure rates are deployment-specific and are
+  # NOT inferred from OpenAI public API pricing. Keyed on the deployment name,
+  # which uniquely identifies the routed model.
+  # Context-tier note: the runtime's worst-case context is ~14k tokens (query
+  # <=5000 chars, doubt context <=6000, retrieval <=2500, web <=2500, prompt
+  # <=8000 chars; output hard-capped at 8000 by the route schema). gpt-5.4
+  # therefore always bills under its <272k tier and gpt-5.6-luna always bills at
+  # its short-context tier.
+  - provider: azure_openai
+    model_or_deployment: gpt-4.1-mini
+    input_cost_per_million_tokens: 0.40
+    output_cost_per_million_tokens: 1.60
+    cached_input_cost_per_million_tokens: 0.10
+    effective_from: "2026-09-11"
+  - provider: azure_openai
+    model_or_deployment: gpt-4.1
+    input_cost_per_million_tokens: 2.00
+    output_cost_per_million_tokens: 8.00
+    cached_input_cost_per_million_tokens: 0.50
+    effective_from: "2026-09-11"
+  - provider: azure_openai
+    model_or_deployment: o4-mini
+    input_cost_per_million_tokens: 1.10
+    output_cost_per_million_tokens: 4.40
+    cached_input_cost_per_million_tokens: 0.28
+    effective_from: "2026-09-11"
+  - provider: azure_openai
+    model_or_deployment: o3
+    input_cost_per_million_tokens: 2.00
+    output_cost_per_million_tokens: 8.00
+    cached_input_cost_per_million_tokens: 0.50
+    effective_from: "2026-09-11"
+  - provider: azure_openai
+    model_or_deployment: gpt-5.4-mini
+    input_cost_per_million_tokens: 0.75
+    output_cost_per_million_tokens: 4.50
+    cached_input_cost_per_million_tokens: 0.08
+    effective_from: "2026-09-11"
+  # Short-context tier (confirmed above).
+  - provider: azure_openai
+    model_or_deployment: gpt-5.6-luna
+    input_cost_per_million_tokens: 0.20
+    output_cost_per_million_tokens: 1.20
+    cached_input_cost_per_million_tokens: 0.02
+    effective_from: "2026-09-11"
+  # <272k context tier (confirmed above).
+  - provider: azure_openai
+    model_or_deployment: gpt-5.4
+    input_cost_per_million_tokens: 2.50
+    output_cost_per_million_tokens: 15.00
+    cached_input_cost_per_million_tokens: 0.25
+    effective_from: "2026-09-11"
 
 # Runtime aliases are an audit map, not a provider-price inference mechanism.
 # `unknown` means the deployment price has not been supplied by the project and
 # must yield an incomplete shadow total rather than a guessed price.
 model_alias_profiles:
-  doubt_solver_classifier: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
+  doubt_solver_classifier: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   doubt_solver_classifier_gemini: { provider: gemini, model_or_deployment: gemini-3.1-flash-lite, rate_status: available }
   doubt_solver_classifier_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  doubt_solver_classifier_strong: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: unknown }
-  english_fast_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
+  doubt_solver_classifier_strong: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: available }
+  english_fast_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   english_fast_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  general_fast_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
+  general_fast_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   general_fast_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  math_basic_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
+  math_basic_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   math_basic_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  math_intermediate_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
+  math_intermediate_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   math_intermediate_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
   math_advanced_generator: { provider: deepseek, model_or_deployment: deepseek-reasoner, rate_status: unknown }
   math_cat_advanced_generator: { provider: azure_openai, model_or_deployment: o3, rate_status: unknown }
-  math_reasoning_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: unknown }
+  math_reasoning_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: available }
   math_reasoning_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  openai_gpt_4_1: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: unknown }
-  openai_gpt_4_1_mini: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
-  openai_gpt_5_4: { provider: azure_openai, model_or_deployment: gpt-5.4, rate_status: unknown }
-  openai_gpt_5_4_mini: { provider: azure_openai, model_or_deployment: gpt-5.4-mini, rate_status: unknown }
+  openai_gpt_4_1: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: available }
+  openai_gpt_4_1_mini: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
+  openai_gpt_5_4: { provider: azure_openai, model_or_deployment: gpt-5.4, rate_status: available }
+  openai_gpt_5_6_luna: { provider: azure_openai, model_or_deployment: gpt-5.6-luna, rate_status: available }
+  openai_gpt_5_4_mini: { provider: azure_openai, model_or_deployment: gpt-5.4-mini, rate_status: available }
   openai_gpt_5_5: { provider: azure_openai, model_or_deployment: gpt-5.5, rate_status: unknown }
-  openai_o4_mini: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: unknown }
-  openai_o3: { provider: azure_openai, model_or_deployment: o3, rate_status: unknown }
+  openai_o4_mini: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: available }
+  openai_o3: { provider: azure_openai, model_or_deployment: o3, rate_status: available }
   deepseek_v4pro: { provider: deepseek, model_or_deployment: deepseek-reasoner, rate_status: unknown }
-  reasoning_basic_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: unknown }
-  reasoning_basic_generator_openai_native: { provider: openai, model_or_deployment: gpt-4o-mini, rate_status: unknown }
-  reasoning_intermediate_generator: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: unknown }
+  reasoning_basic_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
+  reasoning_basic_generator_openai_native: { provider: openai, model_or_deployment: gpt-4o-mini, rate_status: available }
+  reasoning_intermediate_generator: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: available }
   reasoning_intermediate_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
-  reasoning_advanced_generator: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: unknown }
+  reasoning_advanced_generator: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: available }
   reasoning_advanced_generator_deepseek: { provider: deepseek, model_or_deployment: deepseek-reasoner, rate_status: unknown }
-  reasoning_advanced_complex_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: unknown }
+  reasoning_advanced_complex_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: available }
   reasoning_advanced_complex_generator_deepseek: { provider: deepseek, model_or_deployment: deepseek-reasoner, rate_status: unknown }
   reasoning_sbi_po_complex_generator: { provider: azure_openai, model_or_deployment: o3, rate_status: unknown }
   reasoning_cat_lrdi_generator: { provider: azure_openai, model_or_deployment: o3, rate_status: unknown }
-  reasoning_standard_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: unknown }
+  reasoning_standard_generator: { provider: azure_openai, model_or_deployment: gpt-4.1, rate_status: available }
   reasoning_standard_generator_openai_native: { provider: openai, model_or_deployment: gpt-4.1-mini, rate_status: available }
+  gemini_3_7_flash: { provider: gemini, model_or_deployment: gemini-3.7-flash, rate_status: available }
   gemini_flash_lite_text: { provider: gemini, model_or_deployment: gemini-2.5-flash-lite, rate_status: unknown }
   gemini_flash_text: { provider: gemini, model_or_deployment: gemini-2.5-flash, rate_status: unknown }
   gemini_image_extractor: { provider: gemini, model_or_deployment: gemini-2.5-flash-lite, rate_status: unknown }

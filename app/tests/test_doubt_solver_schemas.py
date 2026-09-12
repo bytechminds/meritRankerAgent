@@ -79,6 +79,55 @@ class TestDoubtSolverRequest:
         with pytest.raises(ValidationError):
             DoubtSolverRequest(mode="doubt_solver", query="hello", language="fr")  # type: ignore[arg-type]
 
+    def test_canonical_taxonomy_pair_is_retained_as_passive_request_context(self):
+        baseline = DoubtSolverRequest(
+            mode="doubt_solver", query="Create practice questions", **_REQUEST_IDS
+        )
+        req = DoubtSolverRequest(
+            mode="doubt_solver",
+            query="Create practice questions",
+            canonical_subject_id="QUANTITATIVE_APTITUDE",
+            canonical_topic_id="PERCENTAGE",
+            **_REQUEST_IDS,
+        )
+
+        assert req.canonical_subject_id == "QUANTITATIVE_APTITUDE"
+        assert req.canonical_topic_id == "PERCENTAGE"
+        assert req.model_dump()["canonical_subject_id"] == "QUANTITATIVE_APTITUDE"
+        assert req.model_dump()["canonical_topic_id"] == "PERCENTAGE"
+        assert {
+            key: value
+            for key, value in req.model_dump().items()
+            if key not in {"canonical_subject_id", "canonical_topic_id"}
+        } == {
+            key: value
+            for key, value in baseline.model_dump().items()
+            if key not in {"canonical_subject_id", "canonical_topic_id"}
+        }
+
+    @pytest.mark.parametrize(
+        ("subject_id", "topic_id"),
+        [
+            ("QUANTITATIVE_APTITUDE", None),
+            (None, "PERCENTAGE"),
+            ("quantitative aptitude", "PERCENTAGE"),
+            ("QUANTITATIVE_APTITUDE", "percentage"),
+        ],
+    )
+    def test_incomplete_or_malformed_canonical_taxonomy_is_dropped(
+        self, subject_id, topic_id
+    ):
+        req = DoubtSolverRequest(
+            mode="doubt_solver",
+            query="Create practice questions",
+            canonical_subject_id=subject_id,
+            canonical_topic_id=topic_id,
+            **_REQUEST_IDS,
+        )
+
+        assert req.canonical_subject_id is None
+        assert req.canonical_topic_id is None
+
 
 class TestQueryClassification:
     def test_valid_classification(self):

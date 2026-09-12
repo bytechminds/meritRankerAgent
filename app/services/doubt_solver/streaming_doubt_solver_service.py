@@ -98,6 +98,11 @@ from services.llm.billing import (
     begin_operation,
     emit_operation_billing_summary,
 )
+from services.student_credits.errors import InsufficientStudentCreditsError
+from services.student_credits.runtime import (
+    StudentCreditRuntime,
+    doubt_reference_id,
+)
 from tools.web_search.models import FreshEvidenceBundle
 
 logger = logging.getLogger(__name__)
@@ -157,6 +162,14 @@ class StreamDoubtSolverInput:
     defer_practice_start_until_committed: bool = False
     initial_llm_usage_records: tuple[LLMUsageRecord, ...] = ()
     operation_accumulator: OperationUsageAccumulator | None = None
+    # Admission runs in the invocation entrypoint, whose summary is discarded for
+    # streaming responses. Carrying the outcome keeps the request report truthful.
+    credit_admission: str | None = None
+    credit_mode: str | None = None
+    credit_balance: int | None = None
+    # Entrypoint monotonic clock. The stream's own timer measures orchestration
+    # only, so pre-admission work would otherwise be invisible.
+    entrypoint_started_at: float | None = None
 
 
 @dataclass
@@ -261,6 +274,7 @@ def _iter_stream_doubt_solver(
     conversation_understanding=None,
     practice_launcher: PracticeLauncher | None = None,
     practice_request_interpreter: PracticeRequestInterpreter | None = None,
+    student_credits: StudentCreditRuntime | None = None,
     post_answer_progress: _PostAnswerFinalizationProgress | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Yield live chunks only for low risk requests, otherwise replay approval."""
@@ -1258,6 +1272,32 @@ def _iter_stream_doubt_solver(
             final_answer,
             request_id=request_id,
         )
+    if student_credits is not None:
+        if post_answer_progress is not None:
+            post_answer_progress.lifecycle_stage = "student_credit_settlement"
+        try:
+            student_credits.settle(
+                user_id=input.actor_id,
+                reference_id=doubt_reference_id(
+                    user_id=input.actor_id, turn_id=input.turn_id
+                ),
+                feature="doubt",
+                operation_status="completed",
+            )
+        except InsufficientStudentCreditsError:
+            yield _error_event(request_id, code="INSUFFICIENT_CREDITS", retryable=False)
+            return
+        except Exception as exc:  # noqa: BLE001
+            # The answer is already delivered; no credit-store, pricing, or
+            # unexpected settlement failure may retract it. Nothing is charged
+            # and the failure is recorded with a locatable reason code.
+            logger.error(
+                "student_credit_settlement_unavailable request_id=%s reason_code=%s "
+                "error_type=%s",
+                request_id,
+                getattr(exc, "reason_code", "STUDENT_CREDIT_UNEXPECTED_ERROR"),
+                type(exc).__name__,
+            )
     if post_answer_progress is not None:
         post_answer_progress.lifecycle_stage = "terminal_event_build"
     logger.debug(
@@ -1292,6 +1332,7 @@ def stream_doubt_solver(
     conversation_understanding=None,
     practice_launcher: PracticeLauncher | None = None,
     practice_request_interpreter: PracticeRequestInterpreter | None = None,
+    student_credits: StudentCreditRuntime | None = None,
 ) -> Iterator[DoubtSolverStreamEvent]:
     """Enforce a terminal event unless cancellation is confirmed."""
     started_at = time.monotonic()
@@ -1323,6 +1364,12 @@ def stream_doubt_solver(
             summary_token = begin_request_summary(
                 initial_llm_usage_records=input.initial_llm_usage_records
             )
+            if input.credit_admission is not None or input.credit_mode is not None:
+                update_request_summary(
+                    credit_admission=input.credit_admission,
+                    credit_mode=input.credit_mode,
+                    credit_balance=input.credit_balance,
+                )
             visible = False
             terminal = False
             terminal_reason = "unexpected_internal_error"
@@ -1346,6 +1393,7 @@ def stream_doubt_solver(
                         conversation_understanding=conversation_understanding,
                         practice_launcher=practice_launcher,
                         practice_request_interpreter=practice_request_interpreter,
+                        student_credits=student_credits,
                         post_answer_progress=post_answer_progress,
                     ):
                         if _cancelled(input):
@@ -1447,6 +1495,11 @@ def stream_doubt_solver(
                     terminal_status=status,
                     terminal_reason=terminal_reason,
                     total_duration_ms=duration_ms,
+                    wall_clock_duration_ms=(
+                        int((time.monotonic() - input.entrypoint_started_at) * 1000)
+                        if input.entrypoint_started_at is not None
+                        else None
+                    ),
                 )
                 emit_request_summary()
                 emit_operation_billing_summary(operation_status=status)

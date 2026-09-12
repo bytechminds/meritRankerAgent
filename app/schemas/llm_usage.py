@@ -62,6 +62,9 @@ class LLMUsageRecord(BaseModel):
     duration_ms: int = Field(default=0, ge=0)
     status: UsageStatus
     error_type: str | None = Field(default=None, max_length=128)
+    # Provider failure classification (ProviderFailureKind) preserved from the
+    # originating exception so failures stay diagnosable after the fact.
+    failure_kind: str | None = Field(default=None, max_length=64)
 
     model_config = {"frozen": True, "extra": "forbid"}
 

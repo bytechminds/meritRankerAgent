@@ -303,12 +303,15 @@ models:
     reasoning_effort: medium
     timeout_seconds: 45
     fallback_models:
+      # deepseek_v4pro removed 2026-09-11: deepseek-reasoner is retired and no
+      # longer callable, so it was dead weight in the chain, not availability.
+      # The alias itself is preserved in this catalog for historical and config
+      # compatibility and is deliberately NOT remapped.
       - openai_gpt_4_1_mini
-      - deepseek_v4pro
 
   reasoning_advanced_generator:
     description: >-
-      Advanced reasoning — o4-mini primary; o3 and DeepSeek v4pro fallback.
+      Advanced reasoning — o4-mini primary; o3 fallback.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     deployment: o4-mini
@@ -318,8 +321,8 @@ models:
     reasoning_effort: medium
     timeout_seconds: 45
     fallback_models:
+      # deepseek_v4pro removed 2026-09-11 — see reasoning_intermediate_generator.
       - openai_o3
-      - deepseek_v4pro
 
   reasoning_sbi_po_complex_generator:
     description: >-

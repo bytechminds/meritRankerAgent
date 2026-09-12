@@ -1877,6 +1877,27 @@ def _latest_candidate_question(
     return questions[-1].strip() if questions else None
 
 
+def _normalize_verification_relation(
+    classification: QueryClassification,
+) -> QueryClassification:
+    """Re-label the one relation both classifier models get wrong on "are you sure?".
+
+    VERIFY_AND_CORRECT is legal only under CORRECTION, yet both models pair it with
+    FOLLOW_UP while selecting the right turn.  No consumer reads the relation for this
+    action — selected_context_builder and answer_correctness both key on the action —
+    so re-labelling restores a shape the contract already permits and changes nothing
+    downstream.  Only a fully resolved pair is re-labelled; an unresolved one keeps
+    falling through to clarification.
+    """
+    if (
+        classification.relation == "FOLLOW_UP"
+        and classification.requested_action == "VERIFY_AND_CORRECT"
+        and classification.selected_turn_id is not None
+    ):
+        return classification.model_copy(update={"relation": "CORRECTION"})
+    return classification
+
+
 def _parse_classifier_orchestrated_content(
     content: str,
     *,
@@ -1894,7 +1915,9 @@ def _parse_classifier_orchestrated_content(
             route_id,
         )
     classification = QueryClassification.model_validate(raw_dict)
-    return _build_query_classification(classification, classification_source="llm")
+    return _normalize_verification_relation(
+        _build_query_classification(classification, classification_source="llm")
+    )
 
 
 def _classify_with_llm_orchestrated(

@@ -32,6 +32,10 @@ from services.context_retrieval.context_models import ContextRetrievalRequest
 
 logger = logging.getLogger(__name__)
 
+
+def _elapsed_ms(started: float) -> int:
+    return max(int((time.monotonic() - started) * 1000), 0)
+
 _SUBJECT_TO_RUNTIME_SUBJECT: dict[str, str] = {
     "math": "QUANT",
     "quant": "QUANT",
@@ -87,12 +91,22 @@ class StudentRetrievalService:
 
         try:
             query_text = build_retrieval_query_text(request)
+            _embed_started = time.monotonic()
             query_vector = self._embedder.embed_query(query_text)
+            trace = trace.model_copy(
+                update={"embedding_ms": _elapsed_ms(_embed_started)}
+            )
             if len(query_vector) != 1024:
                 raise EmbeddingConfigurationError("Query embedding dimension did not equal 1024.")
             subject_filter = _subject_filter(request)
+            _runtime_started = time.monotonic()
             runtime_candidates = self._query_runtime(query_vector, subject_filter, query_text)
-            trace = trace.model_copy(update={"runtime_candidates_count": len(runtime_candidates)})
+            trace = trace.model_copy(
+                update={
+                    "runtime_candidates_count": len(runtime_candidates),
+                    "runtime_query_ms": _elapsed_ms(_runtime_started),
+                }
+            )
             logger.info(
                 "STUDENT_S3_VECTOR_RUNTIME_QUERY_COMPLETED queryId=%s candidates=%d",
                 request.request_id,
@@ -110,8 +124,14 @@ class StudentRetrievalService:
             if self._exceeded_budget(started):
                 return self._fresh(request, trace, started, "latency_budget_exceeded")
 
+            _pattern_started = time.monotonic()
             pattern_candidates = self._query_pattern(query_vector, subject_filter, query_text)
-            trace = trace.model_copy(update={"pattern_candidates_count": len(pattern_candidates)})
+            trace = trace.model_copy(
+                update={
+                    "pattern_candidates_count": len(pattern_candidates),
+                    "pattern_query_ms": _elapsed_ms(_pattern_started),
+                }
+            )
             logger.info(
                 "STUDENT_S3_VECTOR_PATTERN_QUERY_COMPLETED queryId=%s candidates=%d",
                 request.request_id,
@@ -119,6 +139,7 @@ class StudentRetrievalService:
             )
 
             rerank_used = False
+            _rerank_started = time.monotonic()
             warnings: list[str] = []
             if self._settings.enable_colbert_rerank and should_rerank(
                 query=request.query,
@@ -129,6 +150,7 @@ class StudentRetrievalService:
                     request.request_id,
                     len(pattern_candidates),
                 )
+                _rerank_started = time.monotonic()
                 pattern_candidates, rerank_used, rerank_warning = self._reranker.rerank(
                     query=request.query,
                     candidates=pattern_candidates,
@@ -142,7 +164,12 @@ class StudentRetrievalService:
                     rerank_warning or "",
                 )
 
-            trace = trace.model_copy(update={"rerank_used": rerank_used})
+            trace = trace.model_copy(
+                update={
+                    "rerank_used": rerank_used,
+                    "rerank_ms": _elapsed_ms(_rerank_started),
+                }
+            )
             pattern_context = self._select_pattern_assist(
                 request=request,
                 candidates=pattern_candidates,

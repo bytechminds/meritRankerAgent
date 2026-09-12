@@ -119,6 +119,7 @@ def record_llm_call(
     duration_ms: int,
     status: UsageStatus,
     error_type: str | None = None,
+    failure_kind: str | None = None,
     model_alias: str | None = None,
 ) -> LLMUsageRecord | None:
     """Record and log one call without allowing telemetry to affect execution."""
@@ -154,6 +155,7 @@ def record_llm_call(
             duration_ms=max(duration_ms, 0),
             status=status,
             error_type=error_type,
+            failure_kind=failure_kind,
         )
         current = _collector.get()
         if current is not None:

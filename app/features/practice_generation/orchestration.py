@@ -80,8 +80,22 @@ from retrieval.pattern_intelligence import (
     PatternGenerationContext,
     PatternMatchTier,
 )
+from schemas.llm_usage import LLMUsageRecord
+from services.llm.billing import (
+    capture_llm_usage,
+    chargeable_operation_billing,
+    commit_chargeable_usage,
+    feature_for_practice_type,
+)
 from services.llm.orchestration.errors import ProviderExecutionError
 from services.llm.providers.errors import FALLBACK_ELIGIBLE_FAILURE_KINDS
+from services.student_credits import (
+    InsufficientStudentCreditsError,
+    StudentCreditPricingIncompleteError,
+    StudentCreditRepositoryError,
+    StudentCreditRuntime,
+    practice_reference_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +255,7 @@ class PracticeGenerationOrchestrator:
         verifier: QuestionVerifier,
         pattern_context: PatternContextProvider,
         semantic_resolver: QuestionSemanticReuseResolver | None = None,
+        student_credits: StudentCreditRuntime | None = None,
     ) -> None:
         self._config = config
         self._assessments = assessments
@@ -252,6 +267,9 @@ class PracticeGenerationOrchestrator:
         self._pattern_context = pattern_context
         # Absent unless Phase D is configured; "off" never constructs one.
         self._semantic_resolver = semantic_resolver
+        # Absent when credit enforcement is disabled; Practice then has no credit
+        # dependency at all.
+        self._student_credits = student_credits
 
     def _require_expensive_work_allowed(self, test_id: str) -> None:
         if current_practice_execution_id() is None:
@@ -443,7 +461,8 @@ class PracticeGenerationOrchestrator:
             )
             try:
                 self._require_expensive_work_allowed(test_id)
-                plan = self._blueprints.build(request)
+                with capture_llm_usage() as planner_usage:
+                    plan = self._blueprints.build(request)
             except PracticeExecutionStopped:
                 raise
             except BlueprintPlanningError as exc:
@@ -506,6 +525,16 @@ class PracticeGenerationOrchestrator:
                         "reasonCode": plan.validation_reason_code or "PLANNER_SCHEMA_VALID",
                     },
                 )
+            # Only the attempt that produced the accepted blueprint is chargeable.
+            # A rejected attempt still returns content, so it is the last succeeded
+            # call that is billable — and none is, when the deterministic fallback
+            # produced the plan instead.
+            if not plan.deterministic_fallback:
+                accepted_planner_calls = [
+                    record for record in planner_usage if record.status == "succeeded"
+                ]
+                if accepted_planner_calls:
+                    commit_chargeable_usage((accepted_planner_calls[-1],))
             plan_meta = {
                 "blueprint": blueprint.model_dump(mode="json"),
                 "plannerCalls": plan.planner_calls,
@@ -1783,30 +1812,35 @@ class PracticeGenerationOrchestrator:
         context: _SlotGenerationContext,
         slot: PlannerSlot,
         question: GeneratedQuestion,
-    ) -> VerificationResult | BaseException:
+    ) -> tuple[VerificationResult | BaseException, tuple[LLMUsageRecord, ...]]:
         """Run one unchanged verifier call, returning its failure instead of raising.
 
         Returning the exception keeps every worker terminally resolved, so no task
         is ever abandoned and the caller applies the existing failure policy in a
-        single deterministic place.
+        single deterministic place. The call's own usage travels with the outcome
+        so student charging can follow the per-question accept/reject decision
+        without any billing state shared between verifier threads.
         """
+        usage: list[LLMUsageRecord] = []
         try:
             self._require_expensive_work_allowed(context.test_id)
-            return self._verifier.verify_slot(
-                request=context.request,
-                bucket=context.bucket,
-                slot=slot,
-                question=question,
-            )
+            with capture_llm_usage() as usage:
+                verification = self._verifier.verify_slot(
+                    request=context.request,
+                    bucket=context.bucket,
+                    slot=slot,
+                    question=question,
+                )
+            return verification, tuple(usage)
         except BaseException as exc:  # noqa: BLE001
-            return exc
+            return exc, tuple(usage)
 
     def _verify_slots_bounded(
         self,
         *,
         context: _SlotGenerationContext,
         units: list[tuple[PlannerSlot, GeneratedQuestion]],
-    ) -> dict[str, VerificationResult | BaseException]:
+    ) -> dict[str, tuple[VerificationResult | BaseException, tuple[LLMUsageRecord, ...]]]:
         """Fan the existing per-question verifier calls out under a bounded pool."""
         if not units:
             return {}
@@ -1818,7 +1852,9 @@ class PracticeGenerationOrchestrator:
                 )
                 for slot, question in units
             }
-        outcomes: dict[str, VerificationResult | BaseException] = {}
+        outcomes: dict[
+            str, tuple[VerificationResult | BaseException, tuple[LLMUsageRecord, ...]]
+        ] = {}
         # Bounded and fully joined: the pool never exceeds `limit` in-flight calls and
         # the context manager waits for every worker before returning.
         with ThreadPoolExecutor(
@@ -1841,7 +1877,7 @@ class PracticeGenerationOrchestrator:
                 try:
                     outcomes[slot_id] = future.result()
                 except BaseException as exc:  # noqa: BLE001
-                    outcomes[slot_id] = exc
+                    outcomes[slot_id] = (exc, ())
         return outcomes
 
     def _execute_slot_group(
@@ -1917,12 +1953,14 @@ class PracticeGenerationOrchestrator:
                     "routeId": wave_slots[0].generator_route_hint,
                 },
             )
+            wave_generator_usage: tuple[LLMUsageRecord, ...] = ()
+            wave_generator_charged = False
             try:
                 with bind_execution_context(
                     activity_id=context.test_id,
                     batch_id=context.group.group_id,
                     slot_ids=tuple(slot.slot_id for slot in wave_slots),
-                ):
+                ), capture_llm_usage() as generator_usage:
                     batch = self._generator.generate_slots(
                         request=context.request,
                         bucket=context.bucket,
@@ -1939,6 +1977,7 @@ class PracticeGenerationOrchestrator:
                             if slot.slot_id in context.pattern_guidance_by_slot
                         },
                     )
+                wave_generator_usage = tuple(generator_usage)
                 route_id = batch.route_id
                 model = batch.model
                 wave_excluded = set(excluded)
@@ -2043,7 +2082,9 @@ class PracticeGenerationOrchestrator:
                 units=verification_units,
             )
             for slot, question in verification_units:
-                outcome = verification_outcomes.get(slot.slot_id)
+                outcome, verifier_usage = verification_outcomes.get(
+                    slot.slot_id, (None, ())
+                )
                 if isinstance(outcome, PracticeExecutionStopped):
                     cancelled = True
                     break
@@ -2153,6 +2194,14 @@ class PracticeGenerationOrchestrator:
                         question=question,
                         verification=verification,
                     )
+                    # The student pays for the accepted path only. The authoring
+                    # call is charged once per wave, on the first question it got
+                    # through; a wave whose questions are all rejected is charged
+                    # nothing, and neither is the verifier call that rejected one.
+                    if not wave_generator_charged:
+                        wave_generator_charged = True
+                        commit_chargeable_usage(wave_generator_usage)
+                    commit_chargeable_usage(verifier_usage)
                     excluded.add(
                         normalize_question_identity(question.question, question.options)
                     )
@@ -2882,6 +2931,8 @@ class PracticeGenerationOrchestrator:
         )
         self._questions.assign_positions(linked)
         reused_count, generated_count = self._source_counts(linked)
+        if not self._settle_student_credits(test_id, request):
+            return
         ready_updated = self._progress_updates.mark_ready(
             test_id,
             request.accepted_count,
@@ -2954,6 +3005,59 @@ class PracticeGenerationOrchestrator:
                 "verifiedCount": request.accepted_count,
             },
         )
+
+    def _settle_student_credits(
+        self,
+        test_id: str,
+        request: PracticeGenerationRequest,
+    ) -> bool:
+        """Charge the accepted Practice once, before READY is published.
+
+        Runs inside the existing background worker, so the student's original
+        request carries no extra latency. Returns False only when a real charge
+        could not be confirmed: READY must not be published on an unconfirmed
+        debit. Dry run always calculates and always continues.
+        """
+        if self._student_credits is None:
+            return True
+        summary = chargeable_operation_billing(operation_status="ready")
+        reference_id = practice_reference_id(
+            user_id=request.user_id, test_id=test_id
+        )
+        try:
+            self._student_credits.settle(
+                user_id=request.user_id,
+                reference_id=reference_id,
+                feature=feature_for_practice_type(request.practice_type.value),
+                operation_status="ready",
+                summary=summary,
+            )
+        except StudentCreditPricingIncompleteError:
+            # An unpriced call on the accepted path is never guessed at. The
+            # questions are already verified and persisted, so the student keeps
+            # them; the refusal to debit is recorded by the runtime itself.
+            return True
+        except (
+            InsufficientStudentCreditsError,
+            StudentCreditRepositoryError,
+        ):
+            if self._student_credits.policy.dry_run:
+                return True
+            self._mark_failed(test_id, "PRACTICE_CREDIT_SETTLEMENT_FAILED")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            # Never let an unexpected settlement defect strand a Practice that is
+            # otherwise complete; dry run in particular must stay observational.
+            logger.warning(
+                "practice credit settlement unavailable test_id=%s error_type=%s",
+                test_id,
+                type(exc).__name__,
+            )
+            if self._student_credits.policy.dry_run:
+                return True
+            self._mark_failed(test_id, "PRACTICE_CREDIT_SETTLEMENT_FAILED")
+            return False
+        return True
 
     def _update_progress(
         self,

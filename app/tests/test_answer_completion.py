@@ -22,7 +22,10 @@ from services.doubt_solver.answer_completion import (
     should_run_continuation,
     strip_completion_marker,
 )
-from services.doubt_solver.answer_quality import detect_final_answer
+from services.doubt_solver.answer_quality import (
+    detect_final_answer,
+    generation_failure_message,
+)
 from services.llm.orchestration.orchestrator import LlmOrchestrator, MockModelExecutor
 
 
@@ -298,8 +301,13 @@ class TestOrchestratorContinuation:
             content="Actually check setup. Final Answer: $15$ km/h",
             finish_reason="stop",
         )
+        # The rewrite must be an answer the final gate accepts: an intermediate solve
+        # needs visible working, otherwise the rejected-content substitution replaces
+        # it and this test can no longer observe what the rewrite produced.
         rewrite = MockModelExecutor(
             content=(
+                "Distance is 30 km and time is 2 hours.\n"
+                "Speed = distance divided by time, so \\(30 / 2\\).\n"
                 "**Final Answer:**\n\\(15\\) km/h\n<ANSWER_DONE>"
             ),
             finish_reason="stop",
@@ -510,3 +518,124 @@ class TestOrchestratorEmptyStream:
                     query="A reasoning puzzle",
                 )
             )
+
+
+class TestFailedQualityContentSubstitution:
+    """A rejected final answer must never carry the model text it rejected."""
+
+    @staticmethod
+    def _generate(body: str, *, language: str = "english", subject: str = "general"):
+        """Drive the real rewrite path so final validation, not the sanitizer, decides.
+
+        Rewrite is enabled and the rewrite attempt returns the same rejected body, so
+        rewrite_used is True, the pre-final sanitizer branch is skipped, and the final
+        quality gate is what produces the verdict — the H10 shape.
+        """
+        marked = f"{body}\n<ANSWER_DONE>"
+
+        class _Executor:
+            last_stream_finish_reason = "stop"
+
+            def execute(self, *, route_decision, messages):
+                return ModelExecutionResult(
+                    content=marked,
+                    model=route_decision.model,
+                    finish_reason="stop",
+                )
+
+        return LlmOrchestrator(model_executor=_Executor()).generate(
+            route_request=RouteRequest(
+                request_id="n1b",
+                subject=subject,
+                task_role="generator",
+                difficulty="basic",
+                intent="explain",
+                language=language,  # type: ignore[arg-type]
+            ),
+            query="list the items",
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "body"),
+        (
+            ("too_many_visible_steps", "\n".join(f"{i}. item {i}" for i in range(1, 12))),
+            ("incomplete_ending", "**Answer:** the value is. Therefore"),
+            ("markdown_unclosed_fence", "**Answer:** see below\n\n```python\nx = 1\n"),
+            ("math_unbalanced_display", "**Answer:** value \\[ x = 1 "),
+        ),
+    )
+    def test_rejected_content_is_replaced_by_the_failure_message(
+        self, monkeypatch: pytest.MonkeyPatch, label: str, body: str
+    ) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        result = self._generate(body)
+        final = result.final_answer
+        assert final is not None, label
+        assert final.quality_status == "failed_quality_gate", label
+        assert final.content == generation_failure_message("english"), label
+        assert result.content == generation_failure_message("english"), label
+
+    def test_language_mismatch_behaviour_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        result = self._generate("**Answer:** यह पूरी तरह हिंदी में लिखा गया उत्तर है।")
+        final = result.final_answer
+        assert final is not None
+        assert final.quality_status == "failed_quality_gate"
+        assert final.content == generation_failure_message("english")
+
+    def test_accepted_content_is_passed_through_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        body = "**Answer:** Canberra is the capital of Australia."
+        result = self._generate(body)
+        final = result.final_answer
+        assert final is not None
+        assert final.quality_status == "passed_quality_gate"
+        assert final.content == body
+        assert final.content != generation_failure_message("english")
+
+    def test_validation_disabled_leaves_content_untouched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "false")
+        cfg_module._settings = None
+        body = "\n".join(f"{i}. item {i}" for i in range(1, 12))
+        result = self._generate(body)
+        final = result.final_answer
+        assert final is not None
+        assert final.quality_status == "checked"
+        assert final.content == body
+
+    @pytest.mark.parametrize(
+        ("label", "body"),
+        (
+            ("raw_html_script", "**Answer:** ok <script>alert(1)</script>"),
+            ("raw_html_tag", "**Answer:** ok <div>markup</div>"),
+        ),
+    )
+    def test_unsafe_markup_is_neutralised_rather_than_delivered_raw(
+        self, monkeypatch: pytest.MonkeyPatch, label: str, body: str
+    ) -> None:
+        """Unsafe HTML never reaches the final gate as-is; the sanitizer escapes it.
+
+        Recorded so the substitution above is not mistaken for the only guard against
+        markup — these bodies are repaired and legitimately accepted.
+        """
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        result = self._generate(body)
+        final = result.final_answer
+        assert final is not None, label
+        assert "<script>" not in final.content, label
+        assert "<div>" not in final.content, label
+        assert final.quality_status == "passed_quality_gate", label

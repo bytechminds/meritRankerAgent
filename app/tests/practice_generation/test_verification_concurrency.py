@@ -279,7 +279,7 @@ def test_completion_order_does_not_determine_identity() -> None:
     assert verifier.completion_order[-1] == "slot-001"
     for index in range(1, 6):
         slot_id = f"slot-{index:03d}"
-        result = outcomes[slot_id]
+        result, _usage = outcomes[slot_id]
         assert isinstance(result, VerificationResult)
         assert result.slot_id == slot_id
         # Item ids are derived from the slot, so identity survives completion order.
@@ -294,9 +294,9 @@ def test_verifier_exception_is_isolated_to_its_own_question() -> None:
         context=_context(orchestrator, 3), units=_units(3)
     )
 
-    assert isinstance(outcomes["slot-002"], RuntimeError)
-    assert isinstance(outcomes["slot-001"], VerificationResult)
-    assert isinstance(outcomes["slot-003"], VerificationResult)
+    assert isinstance(outcomes["slot-002"][0], RuntimeError)
+    assert isinstance(outcomes["slot-001"][0], VerificationResult)
+    assert isinstance(outcomes["slot-003"][0], VerificationResult)
 
 
 def test_provider_execution_error_is_returned_not_raised() -> None:
@@ -308,8 +308,8 @@ def test_provider_execution_error_is_returned_not_raised() -> None:
         context=_context(orchestrator, 2), units=_units(2)
     )
 
-    assert outcomes["slot-001"] is failure
-    assert isinstance(outcomes["slot-002"], VerificationResult)
+    assert outcomes["slot-001"][0] is failure
+    assert isinstance(outcomes["slot-002"][0], VerificationResult)
 
 
 def test_rejection_and_approval_coexist_without_cross_contamination() -> None:
@@ -320,9 +320,9 @@ def test_rejection_and_approval_coexist_without_cross_contamination() -> None:
         context=_context(orchestrator, 3), units=_units(3)
     )
 
-    assert outcomes["slot-002"].decision is VerificationDecision.REGENERATE
-    assert outcomes["slot-001"].decision is VerificationDecision.ACCEPT
-    assert outcomes["slot-003"].decision is VerificationDecision.ACCEPT
+    assert outcomes["slot-002"][0].decision is VerificationDecision.REGENERATE
+    assert outcomes["slot-001"][0].decision is VerificationDecision.ACCEPT
+    assert outcomes["slot-003"][0].decision is VerificationDecision.ACCEPT
 
 
 def test_empty_unit_list_performs_no_verifier_call() -> None:

@@ -424,6 +424,10 @@ def _planner_validation_reason(
         return "PLANNER_INVALID_TOTAL", actual_slot_count
     # Contract invariants that previously collapsed into the catch-all, which made a
     # production planner failure impossible to identify from logs alone.
+    if "topic_evidence_ungrounded" in message:
+        return "PLANNER_TOPIC_EVIDENCE_UNGROUNDED", actual_slot_count
+    if "topic_evidence_duplicate" in message:
+        return "PLANNER_TOPIC_EVIDENCE_DUPLICATE", actual_slot_count
     if "intentionally distinct" in message:
         return "PLANNER_SLOTS_NOT_DISTINCT", actual_slot_count
     if "planner_family" in message:
@@ -1115,11 +1119,13 @@ def apply_system_bucket_policy(
             # erase the student's composition. Grounded evidence is what replaces it:
             # when every planned topic is tied to words the student actually wrote,
             # that composition is authoritative and the broad label is context only.
-            grounded = _grounded_topic_ids(blueprint, request)
-            if not requested_topics.issubset(planned_topics) and not (
-                grounded and grounded == planned_topics
-            ):
-                raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
+            # Grounding only decides this when the requested topics are not already
+            # covered. Evaluating it first made an invalid evidence span fatal for
+            # plans whose coverage was complete, where its result is never read.
+            if not requested_topics.issubset(planned_topics):
+                grounded = _grounded_topic_ids(blueprint, request)
+                if not (grounded and grounded == planned_topics):
+                    raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
         elif not planned_topics.issubset(requested_topics):
             raise ValueError("PLANNER_SLOT_TOPIC_COVERAGE_INVALID")
         for slot in blueprint.slots:

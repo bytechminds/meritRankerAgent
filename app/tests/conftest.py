@@ -56,6 +56,9 @@ def pytest_configure(config: pytest.Config) -> None:  # noqa: ARG001
     os.environ.setdefault("PATTERN_INTELLIGENCE_REUSE_ENABLED", "false")
     os.environ.setdefault("PRACTICE_GENERATION_ENABLED", "false")
     os.environ.setdefault("IMAGE_CLASSIFIER_ENABLED", "false")
+    # main.py builds the credit runtime at import time, so this must be set
+    # before collection or that import reads the live student wallet.
+    os.environ.setdefault("STUDENT_CREDIT_ENFORCEMENT_ENABLED", "false")
     os.environ.setdefault("LLM_ROLE_CONFIG_JSON", "{}")
 
 
@@ -84,6 +87,9 @@ def _unit_test_env_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATTERN_INTELLIGENCE_REUSE_ENABLED", "false")
     monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "false")
     monkeypatch.setenv("IMAGE_CLASSIFIER_ENABLED", "false")
+    # Keeps unit tests off the real student wallet: without this, an ambient
+    # .env.local that enables enforcement makes admission read live DynamoDB.
+    monkeypatch.setenv("STUDENT_CREDIT_ENFORCEMENT_ENABLED", "false")
     # Empty role map so get_llm_role_config() returns the safe mock default
     # for any role, rather than the real provider config from .env.local.
     monkeypatch.setenv("LLM_ROLE_CONFIG_JSON", "{}")

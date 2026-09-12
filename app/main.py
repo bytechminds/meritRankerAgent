@@ -113,6 +113,12 @@ from services.llm.billing import (
     validate_billing_configuration,
 )
 from services.llm.runtime_factory import build_model_executor
+from services.student_credits.bootstrap import build_student_credit_runtime
+from services.student_credits.errors import (
+    InsufficientStudentCreditsError,
+    StudentCreditError,
+)
+from services.student_credits.runtime import doubt_reference_id
 
 # ---------------------------------------------------------------------------
 # Bootstrap — runs once when the module is imported
@@ -159,6 +165,10 @@ conversation_understanding = (
     if conversation_persistence is not None
     else None
 )
+
+# None when STUDENT_CREDIT_ENFORCEMENT_ENABLED=false: no wallet read, no
+# settlement, and no behaviour change anywhere in Doubt Solver.
+student_credit_runtime = build_student_credit_runtime()
 
 runtime_identity = configure_runtime_identity(
     environment=settings.app_env,
@@ -246,6 +256,7 @@ if settings.enable_orchestrated_doubt_solver:
     practice_async_launcher = build_practice_async_launcher(
         task_tracker=app,
         llm_orchestrator=_orchestrator,
+        student_credits=student_credit_runtime,
     )
     # Bypassed on the Practice path: the >20 deterministic router hands large requests
     # straight to the existing intelligence planner, so no separate interpretation call
@@ -339,6 +350,45 @@ def _replay_response(turn: CompletedConversationTurn, request_id: str) -> dict:
         response["responseType"] = turn.response_type
         response["practiceTestId"] = turn.practice_test_id
     return response
+
+
+def _student_credit_refusal(
+    *,
+    request_id: str,
+    reason_code: str,
+    stream: bool,
+):
+    """Refuse chargeable generation before any provider call is made."""
+    if stream:
+        cancellation = StreamCancellation()
+        return StreamingResponse(
+            stream_events_as_sse(
+                iter(
+                    (
+                        DoubtSolverStreamEvent(
+                            type="error",
+                            request_id=request_id,
+                            stage="failed",
+                            label="Unable to complete",
+                            metadata={"retryable": False, "code": reason_code},
+                        ),
+                    )
+                ),
+                request_id=request_id,
+                cancellation=cancellation,
+                heartbeat_interval_seconds=(
+                    settings.answer_stream_heartbeat_interval_seconds
+                ),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return {
+        "success": False,
+        "request_id": request_id,
+        "mode": "doubt_solver",
+        "error": reason_code,
+    }
 
 
 def _stream_replayed_turn(
@@ -549,6 +599,7 @@ def invoke(payload: dict) -> dict | Response:
 
         # --- Doubt Solver path --------------------------------------------
         if mode == "doubt_solver":
+            entrypoint_started_at = time.monotonic()
             ds_request = DoubtSolverRequest.model_validate(payload)
             initial_request_type = "image" if ds_request.image is not None else "unknown"
             update_request_type(initial_request_type)
@@ -595,6 +646,38 @@ def invoke(payload: dict) -> dict | Response:
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                     )
                 return _replay_response(replay, request_id)
+            # Admission runs after idempotent replay (which is never chargeable)
+            # and before every LLM call, including image extraction below.
+            credit_admission: str | None = None
+            credit_mode: str | None = None
+            credit_balance: int | None = None
+            if student_credit_runtime is not None:
+                try:
+                    admitted_wallet = student_credit_runtime.ensure_can_start(actor_id)
+                except StudentCreditError as exc:
+                    return _student_credit_refusal(
+                        request_id=request_id,
+                        reason_code=exc.reason_code,
+                        stream=ds_request.stream,
+                    )
+                else:
+                    # Reuses the wallet's own rule; None means the balance was
+                    # unreadable during dry run, never "check passed".
+                    credit_admission = (
+                        "unavailable"
+                        if admitted_wallet is None
+                        else "allowed"
+                        if admitted_wallet.can_start_chargeable_work
+                        else "blocked"
+                    )
+                    credit_mode = (
+                        "dry_run"
+                        if student_credit_runtime.policy.dry_run
+                        else "enforcing"
+                    )
+                    credit_balance = (
+                        admitted_wallet.credits_balance if admitted_wallet else None
+                    )
             logger.debug(
                 "request_id=%s  actor_id_present=%s  mode=doubt_solver  query_len=%d "
                 "has_image=%s  exam_id=%s  language=%s  legacy_language_defaulted=%s "
@@ -769,6 +852,10 @@ def invoke(payload: dict) -> dict | Response:
                         defer_practice_start_until_committed=True,
                         initial_llm_usage_records=snapshot_llm_usage_records(),
                         operation_accumulator=current_operation_accumulator(),
+                        credit_admission=credit_admission,
+                        credit_mode=credit_mode,
+                        credit_balance=credit_balance,
+                        entrypoint_started_at=entrypoint_started_at,
                     )
                     stream_kwargs = {
                         "adapter": orchestrated_adapter,
@@ -778,6 +865,10 @@ def invoke(payload: dict) -> dict | Response:
                         "practice_launcher": (practice_async_launcher),
                         "practice_request_interpreter": practice_request_interpreter,
                     }
+                    # Omitted entirely when enforcement is off, so the streaming
+                    # call is byte-identical to the pre-credit contract.
+                    if student_credit_runtime is not None:
+                        stream_kwargs["student_credits"] = student_credit_runtime
                     events = stream_doubt_solver(
                         stream_input,
                         **stream_kwargs,
@@ -966,6 +1057,38 @@ def invoke(payload: dict) -> dict | Response:
                             "error": "PRACTICE_CONVERSATION_LINKAGE_FAILED",
                         }
                     practice_async_launcher.start(practice_test_id, request_id)
+                if (
+                    student_credit_runtime is not None
+                    and accepted
+                    and response_type != "practice_generation"
+                ):
+                    try:
+                        student_credit_runtime.settle(
+                            user_id=actor_id,
+                            reference_id=doubt_reference_id(
+                                user_id=actor_id, turn_id=ds_request.turn_id
+                            ),
+                            feature="doubt",
+                            operation_status="completed",
+                        )
+                    except InsufficientStudentCreditsError as exc:
+                        return _student_credit_refusal(
+                            request_id=request_id,
+                            reason_code=exc.reason_code,
+                            stream=False,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # An accepted answer is never retracted by a credit
+                        # failure. Nothing is charged and the reason is logged.
+                        logger.error(
+                            "student_credit_settlement_unavailable request_id=%s "
+                            "reason_code=%s error_type=%s",
+                            request_id,
+                            getattr(
+                                exc, "reason_code", "STUDENT_CREDIT_UNEXPECTED_ERROR"
+                            ),
+                            type(exc).__name__,
+                        )
                 response = {
                     "schema_version": "1",
                     "status": "completed" if accepted else "failed",

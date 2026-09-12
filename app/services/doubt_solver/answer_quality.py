@@ -142,6 +142,54 @@ def count_final_answer_sections(content: str) -> int:
     return len(_ANSWER_HEADING_LINE.findall(content))
 
 
+# A compact scalar answer: an option letter, or a number with an optional short unit.
+# Anything longer is prose.  The distinction matters because an "Answer:" heading is
+# routinely used for explanation or an intermediate elimination step
+# ("**Answer:** Eliminate options A and B."), and comparing prose against a final value
+# is exactly what produced the historical false positives this module guards against.
+_SCALAR_ANSWER_VALUE = re.compile(
+    r"^\s*(?:option\s+)?"
+    r"(?:(?P<option>[A-D])(?![A-Za-z0-9])"
+    r"|(?P<number>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?P<unit>%|percent|[A-Za-z/]{1,12})?)"
+    r"\s*[.\u2014-]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _scalar_answer(value: str) -> tuple[str, str] | None:
+    """Reduce an answer heading to its comparable scalar, or None when it is prose."""
+    cleaned = re.sub(r"[*\\()$]", "", value).strip()
+    match = _SCALAR_ANSWER_VALUE.match(cleaned)
+    if match is None:
+        return None
+    if match.group("option"):
+        return ("option", match.group("option").upper())
+    return ("number", match.group("number").replace(",", ""))
+
+
+def _contradicting_answer_surfaces(content: str) -> bool:
+    """Does a scalar "Answer:" headline disagree with the scalar "Final Answer:"?
+
+    Only compact scalars are compared, and the unit is deliberately ignored so that
+    "12 s" and "12 seconds", or "20%" and "20 percent", stay consistent.
+    """
+    headline: tuple[str, str] | None = None
+    final: tuple[str, str] | None = None
+    for match in _ANSWER_HEADING_LINE.finditer(content):
+        value = match.group("value").strip()
+        if not value:
+            continue
+        scalar = _scalar_answer(value)
+        if scalar is None:
+            continue
+        if match.group("label").casefold().startswith("final"):
+            final = final or scalar
+        else:
+            headline = headline or scalar
+    return headline is not None and final is not None and headline != final
+
+
 def _explicit_final_answer_values(content: str) -> list[str]:
     values: list[str] = []
     lines = content.splitlines()
@@ -325,6 +373,10 @@ def validate_answer_quality(
         answer_values = set(explicit_final_values)
         if len(answer_values) > 1:
             _flag("conflicting_answer_values", "rewrite_required")
+    if _contradicting_answer_surfaces(content):
+        # The visible headline states one scalar while the final answer states another.
+        # The student reads the headline, so the response must be repaired or refused.
+        _flag("conflicting_answer_values", "rewrite_required")
 
     spacing_content = _mask_spacing_protected_regions(check_content)
     if _JOINED_MONTH_DATE.search(spacing_content):

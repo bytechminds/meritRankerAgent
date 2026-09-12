@@ -205,3 +205,53 @@ def test_replay_does_not_split_unicode_grapheme_cluster() -> None:
     assert "".join(chunks) == content
     assert family in chunks
     assert flag in chunks
+
+
+def test_scalar_headline_contradicting_the_final_answer_is_rejected(
+    policy: AnswerQualityPolicy,
+) -> None:
+    """The student reads the headline, so 3 seconds over a 12-second solution is unsafe."""
+    result = _validate(
+        "**Answer:** 3 seconds\n\n**Solution:**\n\nSpeed = 36 km/h = 10 m/s\n\n"
+        "Time = 120/10 = 12 seconds\n\n**Final Answer:** 12 seconds\n<ANSWER_DONE>",
+        policy,
+    )
+
+    assert not result.is_valid
+    assert "conflicting_answer_values" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "**Answer:** C\n\nthe working derives B\n\n**Final Answer:** B\n<ANSWER_DONE>",
+        "**Answer:** 40\n\nthe sum is 64\n\n**Final Answer:** 24\n<ANSWER_DONE>",
+        r"**Answer:** \(15\)" "\n\n" r"**Final Answer:** \(12\)" "\n<ANSWER_DONE>",
+    ],
+)
+def test_option_numeric_and_latex_headline_conflicts_are_rejected(
+    content: str, policy: AnswerQualityPolicy
+) -> None:
+    result = _validate(content, policy)
+
+    assert "conflicting_answer_values" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # the same value written two ways
+        "**Answer:** 12 s\n\n**Final Answer:** 12 seconds\n<ANSWER_DONE>",
+        "**Answer:** 20%\n\n**Final Answer:** 20 percent\n<ANSWER_DONE>",
+        "**Answer:** B\n\n**Final Answer:** Option B\n<ANSWER_DONE>",
+        "**Answer:** B\n\n**Final Answer:** Option B — New Delhi\n<ANSWER_DONE>",
+        # a single heading has nothing to disagree with
+        "**Answer:** 70%\n<ANSWER_DONE>",
+    ],
+)
+def test_equivalent_or_single_answer_surfaces_stay_clean(
+    content: str, policy: AnswerQualityPolicy
+) -> None:
+    result = _validate(content, policy)
+
+    assert "conflicting_answer_values" not in result.reason_codes

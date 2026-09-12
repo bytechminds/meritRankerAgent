@@ -29,7 +29,24 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-08-10
+**Last updated:** 2026-09-03
+
+---
+
+## Latest Changes - Passive Canonical Taxonomy Carrier (2026-09-03)
+
+- `DoubtSolverRequest` now accepts the optional atomic snake-case pair
+  `canonical_subject_id` and `canonical_topic_id` as passive request context. Incomplete or malformed
+  values are dropped at the Pydantic boundary; the authenticated Next.js proxy is the only component
+  that may retain a pair after exact GLOBAL taxonomy validation.
+- The carrier stops at the request boundary. It does not enter graph state, prompts, classification,
+  route/model selection, retrieval, planning, practice generation, verification, persistence, usage
+  accounting, or SSE output. Existing raw Practice subject/topic fields remain behaviorally
+  authoritative.
+- The proxy performs one bounded existing `getStudentGlobalTaxonomy` read only for a complete,
+  structurally canonical candidate pair; absent, partial, invalid, unavailable, or unknown metadata
+  preserves the old request flow. No data model, table, queue, cache, provider, model, GraphQL
+  schema operation, or public response contract changed.
 
 ---
 

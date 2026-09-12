@@ -202,6 +202,22 @@ export class AgentCoreStack extends Stack {
           '/meritranker/agent-runtime/v1/practice/attempt/user-activity-index-name'
         )
       : '';
+    // Student runtime credits. Gated so a deployment with enforcement disabled
+    // never requires the credit parameters to exist.
+    const studentCreditEnforcementEnabled =
+      runtimeEnvironment.STUDENT_CREDIT_ENFORCEMENT_ENABLED?.toLowerCase() === 'true';
+    const userCreditsTableName = studentCreditEnforcementEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/credits/user-credits/table-name')
+      : '';
+    const userCreditsTableArn = studentCreditEnforcementEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/credits/user-credits/table-arn')
+      : '';
+    const creditLedgerTableName = studentCreditEnforcementEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/credits/credit-ledger/table-name')
+      : '';
+    const creditLedgerTableArn = studentCreditEnforcementEnabled
+      ? StringParameter.valueForStringParameter(this, '/meritranker/agent-runtime/v1/credits/credit-ledger/table-arn')
+      : '';
     const ssmParameterArns = [
       'conversation-history/table-name',
       'conversation-history/table-arn',
@@ -274,6 +290,16 @@ export class AgentCoreStack extends Stack {
         runtimeResource.addPropertyOverride(
           'EnvironmentVariables.DYNAMODB_PRACTICE_ATTEMPT_USER_INDEX',
           practiceAttemptUserActivityIndex
+        );
+      }
+      if (studentCreditEnforcementEnabled) {
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_USER_CREDITS_TABLE',
+          userCreditsTableName
+        );
+        runtimeResource.addPropertyOverride(
+          'EnvironmentVariables.DYNAMODB_CREDIT_LEDGER_TABLE',
+          creditLedgerTableName
         );
       }
       removeDefaultMemoryGrant(environment.runtime.role);
@@ -374,6 +400,19 @@ export class AgentCoreStack extends Stack {
           resources: [examProfileTableArn],
         })
       );
+      if (studentCreditEnforcementEnabled) {
+        // GetItem reads the authoritative balance for admission and recovers an
+        // existing settlement. TransactWriteItems performs the only write: the
+        // conditional ledger insert plus wallet decrement, together or not at
+        // all. The runtime never creates a wallet, so no PutItem is granted,
+        // and the non-transactional UpdateItem path is deliberately excluded.
+        environment.runtime.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ['dynamodb:GetItem', 'dynamodb:TransactWriteItems'],
+            resources: [userCreditsTableArn, creditLedgerTableArn],
+          })
+        );
+      }
       environment.runtime.addToPolicy(
         new iam.PolicyStatement({
           actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query'],

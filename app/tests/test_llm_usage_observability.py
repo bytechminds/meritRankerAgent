@@ -165,7 +165,8 @@ def test_reviewed_active_model_pricing_is_loaded_exactly(
     assert pricing.effective_from == "2026-07-27"
 
 
-def test_unverified_azure_deployment_price_is_not_guessed() -> None:
+def test_reviewed_azure_deployment_price_matches_the_pricing_sheet() -> None:
+    """Azure rates come from the owner's pricing sheet, never inferred from OpenAI."""
     pricing = find_model_pricing(
         load_pricing_config(),
         provider="azure_openai",
@@ -173,7 +174,11 @@ def test_unverified_azure_deployment_price_is_not_guessed() -> None:
         deployment="gpt-4.1-mini",
     )
 
-    assert pricing is None
+    assert pricing is not None
+    assert pricing.input_cost_per_million_tokens == 0.40
+    assert pricing.output_cost_per_million_tokens == 1.60
+    # Azure gpt-4.1-mini output is deliberately NOT the OpenAI public rate.
+    assert pricing.effective_from == "2026-09-11"
 
 
 def test_gemini_reviewed_price_calculates_reported_usage() -> None:

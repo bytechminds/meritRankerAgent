@@ -195,6 +195,28 @@ _LOCAL_NOUN_ANTECEDENT = re.compile(
     r"\b(?:a|an|the|this|that)\s+[a-z\u0900-\u097f]{3,}\b",
     re.IGNORECASE,
 )
+# A deictic pointing at a container the student writes in ("this sentence", "that
+# equation") names material supplied in the same turn.  The nouns are deliberately
+# metalinguistic: "this method" or "that formula" are ordinary follow-up wording and
+# must keep pointing at the conversation.
+_SUPPLIED_CONTAINER = re.compile(
+    r"\b(?:this|that|these|those|the)\s+"
+    r"(?:sentence|statement|equation|calculation|option|line|phrase|sum|"
+    r"paragraph|passage|expression)s?\b",
+    re.IGNORECASE,
+)
+# The student wrote something, ended it, and then asked about it — "He don't like tea.
+# What is wrong in this sentence?" or "…is incorrect: 20% of 500 = 50".  Substantive
+# text on the far side of the boundary is the supplied material.
+# "?" is excluded on purpose: two consecutive questions ("How many wives he had? Where
+# did he stay?") are a follow-up, not supplied material.
+_SUPPLIED_BLOCK = re.compile(r"[.!:]\s*\S+(?:\s+\S+){2,}", re.DOTALL)
+# Two coordinated questions where only the second carries the pronoun — "what is GDP
+# and how is it calculated".  The subject sits in the first half of the same turn.
+_COORDINATED_QUESTIONS = re.compile(
+    r"\S+(?:\s+\S+){2,}\s+(?:and|aur|और)\s+\S+(?:\s+\S+){2,}",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -249,6 +271,17 @@ def _has_local_antecedent(query: str, terms: tuple[str, ...]) -> bool:
     if not terms:
         return False
     if _SENTENCE_REFERENCE.search(query):
+        return True
+    # The antecedent is not always to the left of the pronoun: a student who supplies a
+    # sentence and then asks about it, or who coordinates two questions, resolves the
+    # reference inside this turn.  An ordinal or recency reference ("the previous one")
+    # points at the conversation by definition and can never be satisfied locally, so it
+    # is excluded before the structural evidence is considered.
+    if _SUPPLIED_CONTAINER.search(query):
+        return True
+    if not _ORDINAL_REFERENCE.search(query) and (
+        _SUPPLIED_BLOCK.search(query) or _COORDINATED_QUESTIONS.search(query)
+    ):
         return True
     words = _WORD.findall(query)
     lowered = [word.casefold() for word in words]

@@ -119,6 +119,7 @@ def observe_invocation(function: _F) -> _F:
                             ),
                         )
                     update_request_summary(
+                        wall_clock_duration_ms=duration_ms,
                         terminal_status=terminal_status,
                         terminal_reason=(
                             "clarification_required" if clarification else terminal_status

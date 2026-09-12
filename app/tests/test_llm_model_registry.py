@@ -122,8 +122,14 @@ class TestModelRegistryEnvOverrides:
         assert "math_intermediate_generator" in active
         reg.validate_real_mode_deployments()
 
-    def test_active_blank_gpt54_route_would_fail_validation(self):
-        """If a route pointed at openai_gpt_5_4 with blank deployment, preflight fails."""
+    def test_active_blank_gpt54_route_would_fail_validation(self, monkeypatch):
+        """If a route pointed at openai_gpt_5_4 with blank deployment, preflight fails.
+
+        The deployment is blanked explicitly so this safety property holds
+        regardless of what the ambient environment configures.
+        """
+        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_4", "")
+        reset_registry()
         reg = LlmConfigRegistry()
         from schemas.llm_routing import ResolvedRouteEntry
 

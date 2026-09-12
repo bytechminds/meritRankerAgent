@@ -1632,6 +1632,7 @@ class ProviderAdapterExecutor:
                 streaming=False,
                 status="failed",
                 error_type=type(exc).__name__,
+                failure_kind=getattr(exc, "failure_kind", None),
             )
             raise
         self._record_usage(
@@ -1649,6 +1650,7 @@ class ProviderAdapterExecutor:
         usage = ProviderTokenUsage()
         status: UsageStatus = "succeeded"
         error_type: str | None = None
+        failure_kind: str | None = None
         clear_stream_usage()
         try:
             profile = request.model_resolution.provider_profile
@@ -1686,6 +1688,7 @@ class ProviderAdapterExecutor:
         except Exception as exc:
             status = "failed"
             error_type = type(exc).__name__
+            failure_kind = getattr(exc, "failure_kind", None)
             raise
         finally:
             provider_usage = consume_stream_usage()
@@ -1698,6 +1701,7 @@ class ProviderAdapterExecutor:
                 streaming=True,
                 status=status,
                 error_type=error_type,
+                failure_kind=failure_kind,
             )
 
     @staticmethod
@@ -1719,6 +1723,7 @@ class ProviderAdapterExecutor:
         streaming: bool,
         status: UsageStatus,
         error_type: str | None = None,
+        failure_kind: str | None = None,
     ) -> None:
         resolution = request.model_resolution
         config = resolution.model_config
@@ -1743,4 +1748,5 @@ class ProviderAdapterExecutor:
             duration_ms=max(int((time.monotonic() - started_at) * 1000), 0),
             status=status,
             error_type=error_type,
+            failure_kind=failure_kind,
         )

@@ -35,10 +35,20 @@ _EXPLICIT_REFERENCE_FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        # "explain this" points outward only while the object stays unresolved.  When
+        # the turn goes on to supply the material ("explain this sentence - He does
+        # not go"), the demonstrative is satisfied locally and the existing
+        # _LOCAL_DEMONSTRATIVE_TASK / local-antecedent checks below settle it.  So the
+        # unresolved shape is spelled out in full: the demonstrative, optionally a bare
+        # conversational placeholder, optionally a delivery modifier, then end of turn.
         "selected_object_reference",
         re.compile(
-            r"\b(?:explain|check|verify|rethink)\s+"
-            r"(?:this|that|it|the last step|the answer)\b|"
+            r"\b(?:explain|check|verify|rethink)\s+(?:this|that|it)"
+            r"(?:\s+(?:answer|solution|question|result|step|one|part|option))?"
+            r"(?:\s+(?:again|once more|simpler|simply|properly|briefly|clearly|"
+            r"step by step|in (?:hindi|english)|dobara|phir se))?"
+            r"\s*[?.!]?$|"
+            r"\b(?:explain|check|verify|rethink)\s+(?:the last step|the answer)\b|"
             r"\bhighlight\s+the\s+[\w-]+(?:\s+[\w-]+){0,4}\s+solution\b|"
             r"\bwhat was the pattern\b|"
             r"\b(?:ye|yeh|woh|इसे|यह)\s+(?:kaise|kyu|कैसे|क्यों)\b|"
@@ -66,11 +76,28 @@ _EXPLICIT_REFERENCE_FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        # Every qualifier used to be optional, so the pattern degenerated to the bare
+        # word "wrong" and captured students asking about material they supplied
+        # themselves ("which part is wrong").  A correction reference now needs the
+        # conversational object it corrects — the assistant, or its answer/solution —
+        # to be named alongside the correction word.
         "correction_reference",
         re.compile(
-            r"\b(?:your|ur|the|this)?\s*(?:answer|solution)?\s*"
-            r"(?:is\s+)?(?:wrong|worng|incorrect|galat)\b|"
-            r"\b(?:answer|solution)\s+गलत\b"
+            r"\b(?:your|ur|the|this|that)\s+"
+            r"(?:previous\s+|last\s+|earlier\s+)?"
+            r"(?:answer|solution|response|result|reply|working)"
+            # The stated value may sit between the object and the copula:
+            # "the answer 57 is incorrect".
+            r"(?:\s+[\w.,%₹$-]+){0,2}\s+"
+            r"(?:is|was)\s+(?:wrong|worng|incorrect|galat)\b|"
+            r"\bwhy\s+(?:is|was)\s+(?:your|ur|the|this|that)\s+"
+            r"(?:previous\s+|last\s+|earlier\s+)?"
+            r"(?:answer|solution|response|result|reply)\s+"
+            r"(?:wrong|worng|incorrect|galat)\b|"
+            r"\b(?:you|u)\s+(?:are|were|r)\s+(?:wrong|worng|incorrect|galat)\b|"
+            # Hinglish and Hindi place the correction word straight after the object
+            # with no copula: "answer galat hai", "solution गलत hai".
+            r"\b(?:answer|solution|jawab|jawaab)\s+(?:galat|गलत)\b"
         ),
     ),
     (
@@ -183,6 +210,22 @@ _NAMED_STANDALONE_TOPIC = re.compile(
     r"history|polity|science)\s+(?:question|problem|practice|quiz)\b",
     re.IGNORECASE,
 )
+# "explain <object>" carries its own subject; "explain <modifier>" only restates how a
+# previous answer should be delivered and names nothing to work on.  The remainder after
+# the verb must be a modifier IN FULL — "explain photosynthesis in detail" still supplies
+# an object and stays self-contained.  Matching here only withholds CONTEXT_NOT_NEEDED, so
+# the gate falls through to UNCERTAIN and the existing classifier makes the final call.
+_MODIFIER_ONLY_REMAINDER = re.compile(
+    r"^\w+\s+(?:"
+    r"again|once more|simpler|simply|differently|briefly|slowly|clearly|more|better|"
+    r"another way|in (?:a )?(?:simpler|easier|short|detail|brief) ?(?:way|form)?|"
+    r"in (?:hindi|english)|step by step|step \d+|"
+    r"dobara|phir se|aur (?:simple|easy|aasan|asaan)|"
+    r"(?:hindi|english|aasan|asaan|simple) (?:me|mein)"
+    r")\s*[?.!]?$",
+    re.IGNORECASE,
+)
+
 _LOCAL_SOURCE_INTRODUCER = re.compile(
     r"\b(?:here (?:is|are)|consider|take|given)\s+"
     r"(?:the |this |my |a |an )?"
@@ -252,7 +295,7 @@ def _is_clearly_self_contained(normalized: str) -> bool:
                 "prove ",
             )
         ):
-            return len(words) >= 2
+            return len(words) >= 2 and not _MODIFIER_ONLY_REMAINDER.match(normalized)
         return len(words) >= 5 and bool(
             _PROBLEM_STRUCTURE.search(normalized)
             or _NUMERIC_PROBLEM.search(normalized)

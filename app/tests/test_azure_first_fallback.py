@@ -819,12 +819,8 @@ class TestModelExecutionFallback:
         fake_executor = _AliasedFakeProviderExecutor(
             raise_for={
                 "reasoning_advanced_generator": exhausted,
-                "openai_o3": LlmProviderExecutionError(
-                    "fallback unavailable",
-                    failure_kind="provider_unavailable",
-                ),
             },
-            return_for={"deepseek_v4pro": manifest},
+            return_for={"openai_o3": manifest},
         )
         executor = RegistryBackedModelExecutor(provider_executor=fake_executor)
         decision = resolve_route(
@@ -846,9 +842,8 @@ class TestModelExecutionFallback:
         assert fake_executor.call_log == [
             "reasoning_advanced_generator",
             "openai_o3",
-            "deepseek_v4pro",
         ]
-        assert result.model == "deepseek_v4pro"
+        assert result.model == "openai_o3"
         assert result.fallback_used is True
         assert len(json.loads(result.content)["questions"]) == 5
 

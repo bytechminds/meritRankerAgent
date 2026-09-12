@@ -995,7 +995,8 @@ class TestSubjectDifficultyRouteAliases:
         model_cfg = reg.model_map["reasoning_advanced_generator"]
         assert model_cfg.provider == "azure_openai"
         assert model_cfg.deployment == "o4-mini"
-        assert model_cfg.fallback_models == ["openai_o3", "deepseek_v4pro"]
+        # deepseek_v4pro removed 2026-09-11 (retired model, not a working path).
+        assert model_cfg.fallback_models == ["openai_o3"]
         deepseek_cfg = reg.model_map.get("reasoning_advanced_generator_deepseek")
         assert deepseek_cfg is not None
         assert deepseek_cfg.provider == "deepseek"

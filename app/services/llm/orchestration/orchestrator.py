@@ -453,7 +453,14 @@ class LlmOrchestrator:
             language=route_request.language,
             policy=quality_policy,
         )
-        if not final_quality.language_compliant:
+        if not final_quality.is_valid:
+            # A rejected answer must never travel on as the authoritative content.
+            # Language non-compliance already substituted here; every other final
+            # rejection reason used to keep the model text, so callers that read
+            # .content (the non-streaming response body and the buffered stream
+            # replay) delivered output this gate had just refused.  is_valid is a
+            # strict superset of the old condition: language_mismatch is flagged
+            # rewrite_required, and with validation disabled is_valid == compliance.
             final_content = generation_failure_message(route_request.language)
         return build_final_answer_result(
             content=final_content,

@@ -36,6 +36,7 @@ _LANGUAGE_ALIASES: dict[str, CanonicalLanguage] = {
     "हिन्दी": "hindi",
     "hinglish": "hinglish",
 }
+_CANONICAL_TAXONOMY_IDENTIFIER = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
 
 
 def normalize_question_language(value: Any) -> CanonicalLanguage:
@@ -129,6 +130,18 @@ class DoubtSolverRequest(BaseModel):
         max_length=64,
         description="Optional selected exam stage used only for answer presentation.",
     )
+    canonical_subject_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$",
+        description="Optional proxy-validated GLOBAL subject identifier; passive request context.",
+    )
+    canonical_topic_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$",
+        description="Optional proxy-validated GLOBAL topic identifier; passive request context.",
+    )
     stream: bool = Field(
         default=False,
         description="Request a streaming response with student-friendly status "
@@ -142,6 +155,28 @@ class DoubtSolverRequest(BaseModel):
     @classmethod
     def _normalize_language(cls, value: Any) -> CanonicalLanguage:
         return normalize_question_language(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_incomplete_or_malformed_canonical_taxonomy(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        subject_id = value.get("canonical_subject_id")
+        topic_id = value.get("canonical_topic_id")
+        if (
+            not isinstance(subject_id, str)
+            or not isinstance(topic_id, str)
+            or len(subject_id) > 128
+            or len(topic_id) > 128
+            or not _CANONICAL_TAXONOMY_IDENTIFIER.fullmatch(subject_id)
+            or not _CANONICAL_TAXONOMY_IDENTIFIER.fullmatch(topic_id)
+        ):
+            return {
+                **value,
+                "canonical_subject_id": None,
+                "canonical_topic_id": None,
+            }
+        return value
 
     @model_validator(mode="after")
     def _require_query_or_image(self) -> DoubtSolverRequest:

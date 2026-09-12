@@ -48,9 +48,18 @@ class RequestExecutionSummary:
     history_write_status: str | None = None
     session_write_status: str | None = None
     memory_write_status: str | None = None
+    credit_mode: str | None = None
+    credit_admission: str | None = None
+    credit_balance: int | None = None
+    credit_calculated: int | None = None
+    credit_settlement: str | None = None
+    credits_debited: int | None = None
     terminal_status: Literal["completed", "clarification", "failed", "cancelled"] | None = None
     terminal_reason: str | None = None
     total_duration_ms: int | None = None
+    # Orchestration-only timing stays in total_duration_ms for existing
+    # consumers; this is the full request wall clock, measured at the entrypoint.
+    wall_clock_duration_ms: int | None = None
 
 
 _summary: ContextVar[RequestExecutionSummary | None] = ContextVar(

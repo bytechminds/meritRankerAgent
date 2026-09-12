@@ -1178,6 +1178,34 @@ def format_request_block(
                 _line(f"Rejected turns: {previews['rejected_turn_ids']}"),
             ]
         )
+    # Omitted entirely when no credit runtime ran, so the section can never
+    # imply a wallet lookup that did not happen.
+    if any(
+        value is not None
+        for value in (
+            summary.credit_mode,
+            summary.credit_admission,
+            summary.credit_settlement,
+            summary.credit_calculated,
+        )
+    ):
+        lines.append("CREDITS")
+        lines.append(_line(f"Mode: {summary.credit_mode or 'unknown'}"))
+        lines.append(_line(f"Admission: {summary.credit_admission or 'not_applicable'}"))
+        if summary.credit_balance is not None:
+            lines.append(_line(f"Balance: {summary.credit_balance}"))
+        lines.append(
+            _line(
+                "Calculated: "
+                + (
+                    "unavailable"
+                    if summary.credit_calculated is None
+                    else str(summary.credit_calculated)
+                )
+            )
+        )
+        lines.append(_line(f"Settlement: {summary.credit_settlement or 'not_applicable'}"))
+        lines.append(_line(f"Debit: {summary.credits_debited or 0}"))
     lines.append("PERSISTENCE")
     for event in events:
         if not str(event.get("event") or "").startswith("conversation_persistence_"):

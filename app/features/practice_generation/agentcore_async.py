@@ -74,6 +74,7 @@ from services.llm.billing import (
     hand_off_current_operation,
 )
 from services.llm.orchestration.orchestrator import LlmOrchestrator
+from services.student_credits import StudentCreditRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +358,10 @@ class AgentCorePracticeAsyncLauncher:
             )
             if incoming is None:
                 return
+            # The launching request's own accepted usage (its classifier call) is
+            # already in this accumulator, so it needs no second transport to be
+            # chargeable — it is admitted once, here, where the handover happens.
+            incoming.seed_inherited_chargeable()
             with self._active_lock:
                 existing = self._billing_operations.get(test_id)
                 if existing is None:
@@ -904,6 +909,7 @@ def build_practice_async_launcher(
     *,
     task_tracker: AgentCoreTaskTracker,
     llm_orchestrator: LlmOrchestrator,
+    student_credits: StudentCreditRuntime | None = None,
 ) -> AgentCorePracticeAsyncLauncher | None:
     """Build the production practice graph from existing runtime integrations."""
     config = get_practice_config()
@@ -1002,6 +1008,7 @@ def build_practice_async_launcher(
             top_k=config.question_semantic_top_k,
             hydrate=questions.get_reuse_candidates,
         ),
+        student_credits=student_credits,
     )
     return AgentCorePracticeAsyncLauncher(
         task_tracker=task_tracker,

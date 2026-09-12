@@ -85,6 +85,11 @@ class RetrievalTrace(BaseModel):
     rerank_used: bool = Field(default=False, alias="rerankUsed")
     graph_gate_passed: bool = Field(default=False, alias="graphGatePassed")
     fallback_reason: str | None = Field(default=None, alias="fallbackReason", max_length=128)
+    # Sub-operation timings so a slow retrieval names its own bottleneck.
+    embedding_ms: int = Field(default=0, alias="embeddingMs", ge=0)
+    runtime_query_ms: int = Field(default=0, alias="runtimeQueryMs", ge=0)
+    pattern_query_ms: int = Field(default=0, alias="patternQueryMs", ge=0)
+    rerank_ms: int = Field(default=0, alias="rerankMs", ge=0)
 
 
 class StudentRetrievalContext(BaseModel):

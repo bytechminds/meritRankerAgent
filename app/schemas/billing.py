@@ -116,3 +116,9 @@ class OperationBillingSummary(BaseModel):
     cost_complete: bool
     missing_cost_profiles: tuple[str, ...] = ()
     missing_usage_call_count: int = Field(ge=0)
+    # Cached input was reported but the resolved model has no verified cached
+    # rate. Authoritative billing never falls back to the normal input rate.
+    missing_cached_rate_profiles: tuple[str, ...] = ()
+    # Provider usage violated an invariant (e.g. cached > input). Never clamped
+    # in authoritative billing; the operation is marked incomplete instead.
+    invalid_usage_call_count: int = Field(default=0, ge=0)

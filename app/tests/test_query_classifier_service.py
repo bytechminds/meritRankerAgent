@@ -1502,3 +1502,71 @@ def test_classifier_contract_gives_guidance_a_positive_intent_home() -> None:
 
     assert "`general_doubt`: a valid learning doubt not covered above, including asking" in prompt
     assert "how to study or practise, and preparation, planning, or strategy advice" in prompt
+
+
+# ---------------------------------------------------------------------------
+# VERIFY_AND_CORRECT relation normalisation
+# ---------------------------------------------------------------------------
+
+
+def test_resolved_verification_follow_up_is_relabelled_as_correction() -> None:
+    classification = QueryClassification(
+        intent="general_doubt",
+        subject="general",
+        confidence=0.95,
+        relation="FOLLOW_UP",
+        selected_turn_id="latest-turn",
+        requested_action="VERIFY_AND_CORRECT",
+    )
+
+    result = classifier_service._normalize_verification_relation(classification)
+
+    assert result.relation == "CORRECTION"
+    assert result.requested_action == "VERIFY_AND_CORRECT"
+    assert result.selected_turn_id == "latest-turn"
+
+
+def test_unresolved_verification_follow_up_is_left_alone() -> None:
+    classification = QueryClassification(
+        intent="general_doubt",
+        subject="general",
+        confidence=0.95,
+        relation="FOLLOW_UP",
+        selected_turn_id=None,
+        requested_action="VERIFY_AND_CORRECT",
+    )
+
+    assert (
+        classifier_service._normalize_verification_relation(classification).relation
+        == "FOLLOW_UP"
+    )
+
+
+@pytest.mark.parametrize(
+    ("relation", "action"),
+    (
+        ("FOLLOW_UP", "EXPLAIN_PREVIOUS"),
+        ("FOLLOW_UP", "GENERATE_SIMILAR"),
+        ("FOLLOW_UP", "TRANSFORM_PREVIOUS"),
+        ("FOLLOW_UP", "ANSWER_WITH_CONTEXT"),
+        ("CORRECTION", "VERIFY_AND_CORRECT"),
+        ("RESOLVE_AGAIN", "RESOLVE_FROM_SCRATCH"),
+        ("AMBIGUOUS", "ASK_CLARIFICATION"),
+    ),
+)
+def test_normalisation_leaves_every_already_legal_pair_unchanged(
+    relation: str, action: str
+) -> None:
+    classification = QueryClassification(
+        intent="solve_question",
+        subject="math",
+        confidence=0.95,
+        relation=relation,
+        selected_turn_id=None if relation == "AMBIGUOUS" else "latest-turn",
+        requested_action=action,
+    )
+
+    result = classifier_service._normalize_verification_relation(classification)
+
+    assert result.relation == relation
+    assert result.requested_action == action

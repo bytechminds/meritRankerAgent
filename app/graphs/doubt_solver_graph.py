@@ -887,6 +887,16 @@ def _orchestrated_classify_node(state: OrchestratedDoubtSolverState) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _trace_field(result: object, name: str) -> object | None:
+    """Read one safe retrieval-trace field.
+
+    The trace hangs off ``result.retrieval_context.retrieval_trace``; every
+    lookup is attribute-safe so test doubles without a trace stay valid.
+    """
+    context = getattr(result, "retrieval_context", None)
+    return getattr(getattr(context, "retrieval_trace", None), name, None)
+
+
 def _orchestrated_collect_context_node(
     state: OrchestratedDoubtSolverState,
     *,
@@ -985,7 +995,17 @@ def _orchestrated_collect_context_node(
             stage="retrieve",
             status="completed",
             duration_ms=duration_ms,
-            details={"source": retrieval_source, "item_count": result.item_count},
+            details={
+                "source": retrieval_source,
+                "item_count": result.item_count,
+                # Already computed by the retrieval service; previously dropped
+                # here, which made a slow zero-item retrieval undiagnosable.
+                "fallback_reason": _trace_field(result, "fallback_reason"),
+                "embedding_ms": _trace_field(result, "embedding_ms"),
+                "runtime_query_ms": _trace_field(result, "runtime_query_ms"),
+                "pattern_query_ms": _trace_field(result, "pattern_query_ms"),
+                "rerank_ms": _trace_field(result, "rerank_ms"),
+            },
         )
         fresh_evidence = result.fresh_evidence
         if freshness_requirement.requires_fresh_evidence:
