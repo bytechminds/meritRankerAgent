@@ -50,6 +50,10 @@ function runtimeEnvironment(target: AwsDeploymentTarget): Record<string, string>
       'PATTERN_INTELLIGENCE_REUSE_ENABLED',
       false
     ),
+    PRACTICE_PATTERN_CONTEXT_ENABLED: booleanEnvironment(
+      'PRACTICE_PATTERN_CONTEXT_ENABLED',
+      false
+    ),
     ENABLE_ORCHESTRATED_DOUBT_SOLVER: booleanEnvironment(
       'ENABLE_ORCHESTRATED_DOUBT_SOLVER',
       true

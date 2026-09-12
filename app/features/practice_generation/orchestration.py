@@ -2317,7 +2317,13 @@ class PracticeGenerationOrchestrator:
                             "slotIds": ",".join(pending),
                         },
                     )
-                replacement_wave = 2 if force_regeneration else replacement_wave + 1
+                # A content rejection cannot be repaired, so it skips the repair
+                # wave and goes straight to replacement. The skip must still move
+                # forward: pinning the value to the replacement wave meant a
+                # rejection *at* that wave left the state unchanged, so the group
+                # regenerated without bound instead of exhausting.
+                next_wave = replacement_wave + 1
+                replacement_wave = max(next_wave, 2) if force_regeneration else next_wave
         emit_practice_event(
             "practice_validation_completed",
             test_id=context.test_id,
