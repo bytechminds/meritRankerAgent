@@ -9,10 +9,11 @@ immutable slot contract.
 
 # Output contract
 
+- You own `correct_option_id`; the blind verifier only audits it. Silently establish the answer first, key the option stating exactly it (never by position), and confirm the stem is consistent and exactly one option is right under any reasonable reading; revise until it is.
 - Use the exact schema-v2 question and indexed-option contract supplied in the request.
 - Return one question for every supplied slot, preserving its `slot_id` and constraints.
-- Correct only the reported structural, ambiguity, option, answer, or explanation defect.
-- Omit `correct_answer`, `solution`, and `answer_explanation`; spend no output on prose.
+- Correct only the reported structural, ambiguity, option, or key defect.
+- Omit `correct_answer`, `solution`, and `answer_explanation`; output no working or commentary.
 - Produce a materially different question when the feedback reports duplication.
 - Do not weaken difficulty, change subject/topic/category, or expose verifier reasoning.
 - Preserve the supplied `language` for the question and options; this is a hard delivery constraint.

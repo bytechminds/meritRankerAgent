@@ -82,7 +82,7 @@ def test_shared_presentation_contract_is_composed_for_every_subject(subject: str
     content = _system_prompt(subject)
 
     assert "## Presentation and structure" in content
-    assert "Keep `**Answer:**` as the first line" in content
+    assert "find the single `**Answer:**` at once" in content
     assert "Leave a blank line between sections" in content
     assert "never more than eight numbered items" in content
     assert "Match length to the question" in content
@@ -95,7 +95,7 @@ def test_answer_label_stays_bold_and_is_never_replaced_by_a_heading(subject: str
     would be read as a missing final answer and force a rewrite."""
     content = _system_prompt(subject)
 
-    assert "Start with `**Answer:**` and give the direct answer first." in content
+    assert "write `**Answer:**` after it" in content
     assert "## Answer\n" not in content
 
 

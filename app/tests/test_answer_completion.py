@@ -555,10 +555,25 @@ class TestFailedQualityContentSubstitution:
             query="list the items",
         )
 
+    def test_presentation_only_rejection_keeps_its_text_but_stays_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After the rewrite, a presentation-only rejection keeps its text for a caller
+        that runs the correctness verifier; it is never marked as passed, and those
+        callers fail it unless the verifier approves (see
+        test_presentation_only_quality_recovery.py)."""
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        body = "\n".join(f"{i}. item {i}" for i in range(1, 12))
+        final = self._generate(body).final_answer
+        assert final is not None
+        assert final.quality_status == "failed_quality_gate"
+        assert final.content == body
+
     @pytest.mark.parametrize(
         ("label", "body"),
         (
-            ("too_many_visible_steps", "\n".join(f"{i}. item {i}" for i in range(1, 12))),
             ("incomplete_ending", "**Answer:** the value is. Therefore"),
             ("markdown_unclosed_fence", "**Answer:** see below\n\n```python\nx = 1\n"),
             ("math_unbalanced_display", "**Answer:** value \\[ x = 1 "),
@@ -639,3 +654,71 @@ class TestFailedQualityContentSubstitution:
         assert "<script>" not in final.content, label
         assert "<div>" not in final.content, label
         assert final.quality_status == "passed_quality_gate", label
+
+
+class TestConflictingAnswerSurfacesUseTheExistingRewrite:
+    """A draft whose plain `**Answer:**` surfaces disagree gets the one bounded rewrite."""
+
+    _REQUEST = RouteRequest(
+        request_id="conflict",
+        subject="math",
+        task_role="generator",
+        difficulty="intermediate",
+        intent="solve",
+    )
+
+    @staticmethod
+    def _orchestrator(monkeypatch: pytest.MonkeyPatch, *contents: str):
+        monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
+        monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+        cfg_module._settings = None
+        calls: list[int] = []
+
+        class _Sequenced:
+            last_stream_finish_reason = "stop"
+
+            def execute(self, *, route_decision, messages):
+                calls.append(len(messages))
+                content = contents[min(len(calls), len(contents)) - 1]
+                return MockModelExecutor(content=content, finish_reason="stop").execute(
+                    route_decision=route_decision, messages=messages
+                )
+
+        return LlmOrchestrator(model_executor=_Sequenced()), calls
+
+    def test_contradictory_draft_is_rewritten_once_to_one_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        orchestrator, calls = self._orchestrator(
+            monkeypatch,
+            (
+                "**Answer:** 89\n\nGiven numbers leave remainders 22, 23 and 24.\n\n"
+                "Subtract: 400 - 22 = 378, 536 - 23 = 513, 645 - 24 = 621.\n\n"
+                "The HCF of 378, 513 and 621 is 27.\n\n**Answer:** 27\n<ANSWER_DONE>"
+            ),
+            (
+                "Subtract: 400 - 22 = 378, 536 - 23 = 513, 645 - 24 = 621.\n\n"
+                "The HCF of 378, 513 and 621 is 27.\n\n**Answer:** 27\n<ANSWER_DONE>"
+            ),
+        )
+
+        result = orchestrator.generate(route_request=self._REQUEST, query="greatest N")
+
+        assert len(calls) == 2  # the draft and exactly one bounded rewrite
+        assert "**Answer:** 89" not in result.content
+        assert result.content.count("**Answer:**") == 1
+
+    def test_a_single_consistent_answer_costs_no_extra_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        orchestrator, calls = self._orchestrator(
+            monkeypatch,
+            (
+                "Subtract: 400 - 22 = 378, 536 - 23 = 513, 645 - 24 = 621.\n\n"
+                "The HCF of 378, 513 and 621 is 27.\n\n**Answer:** 27\n<ANSWER_DONE>"
+            ),
+        )
+
+        orchestrator.generate(route_request=self._REQUEST, query="greatest N")
+
+        assert len(calls) == 1

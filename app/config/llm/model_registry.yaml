@@ -62,7 +62,9 @@ models:
   openai_gpt_5_6_terra:
     description: >-
       Azure GPT-5.6 Terra. Deployment from AZURE_OPENAI_DEPLOYMENT_5.6_TERRA
-      (gpt-5.6-terra). Wired for the later Advanced qualification; not yet routed.
+      (gpt-5.6-terra). Replaces retired o3/o4-mini as primary on the reasoning
+      intermediate/advanced generators and the Doubt Solver verifier. Infrastructure
+      fallback is Azure DeepSeek-V4-Pro only.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     deployment: gpt-5.6-terra
@@ -73,6 +75,8 @@ models:
     token_budget_param: max_completion_tokens
     model_hard_max_output_tokens: 8000
     timeout_seconds: 60
+    fallback_models:
+      - azure_deepseek_v4_pro
 
   openai_gpt_5_mini:
     description: >-
@@ -176,15 +180,21 @@ models:
 
   deepseek_v4pro:
     description: >-
-      DeepSeek v4pro for hardest advanced math/reasoning. Model from
-      DEEPSEEK_V4PRO_MODEL (default deepseek-reasoner). Optional — falls back to o3.
-    provider: deepseek
-    provider_profile: deepseek_primary
-    model_id: deepseek-reasoner
+      DeepSeek V4-Pro. Corrected from the retired direct deepseek-reasoner identity to
+      the Azure Foundry DeepSeek-V4-Pro deployment (same metadata as
+      azure_deepseek_v4_pro). Callers are dormant o3 routes only.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    allowed_task_roles: [generator, verifier]
+    deployment: DeepSeek-V4-Pro
     supports_streaming: true
-    supports_thinking: true
+    supports_thinking: false
     supports_reasoning: true
-    reasoning_effort: high
+    reasoning_effort: medium
+    supported_reasoning_efforts: [low, medium, high]
+    token_budget_param: max_completion_tokens
+    supports_temperature: true
+    model_hard_max_output_tokens: 8000
     timeout_seconds: 90
     fallback_models:
       - openai_gpt_5_4
@@ -205,12 +215,16 @@ models:
     reasoning_effort: none
     timeout_seconds: 30
     fallback_models:
-      - openai_o4_mini
+      - openai_gpt_5_6_terra
+      # Same Azure DeepSeek-V4-Pro deployment as azure_deepseek_v4_pro. The registry
+      # rejects one alias appearing twice in a transitive fallback graph, and Terra
+      # already falls back to azure_deepseek_v4_pro, so this chain uses deepseek_v4pro.
+      - deepseek_v4pro
       - math_basic_generator_openai_native
 
   math_intermediate_generator:
     description: >-
-      Intermediate math — GPT-4.1-mini primary; o4-mini then o3 fallback.
+      Intermediate math — GPT-4.1-mini primary; Terra then Azure DeepSeek-V4-Pro fallback.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     deployment: gpt-4.1-mini
@@ -220,12 +234,15 @@ models:
     reasoning_effort: none
     timeout_seconds: 30
     fallback_models:
-      - openai_o4_mini
-      - openai_o3
+      - openai_gpt_5_6_terra
+      # Same Azure DeepSeek-V4-Pro deployment as azure_deepseek_v4_pro. The registry
+      # rejects one alias appearing twice in a transitive fallback graph, and Terra
+      # already falls back to azure_deepseek_v4_pro, so this chain uses deepseek_v4pro.
+      - deepseek_v4pro
 
   math_advanced_generator:
     description: >-
-      Advanced math — DeepSeek v4pro primary; o3 fallback.
+      Advanced math — DeepSeek reasoner (unrouted); Terra then Azure DeepSeek-V4-Pro fallback.
     provider: deepseek
     provider_profile: deepseek_primary
     model_id: deepseek-reasoner
@@ -236,7 +253,11 @@ models:
     timeout_seconds: 90
     structured_output_reasoning_reserve_tokens: 2600
     fallback_models:
-      - openai_o3
+      - openai_gpt_5_6_terra
+      # Same Azure DeepSeek-V4-Pro deployment as azure_deepseek_v4_pro. The registry
+      # rejects one alias appearing twice in a transitive fallback graph, and Terra
+      # already falls back to azure_deepseek_v4_pro, so this chain uses deepseek_v4pro.
+      - deepseek_v4pro
 
   math_cat_advanced_generator:
     description: >-
@@ -278,7 +299,7 @@ models:
 
   reasoning_basic_generator:
     description: >-
-      Basic reasoning — GPT-4.1-mini primary; o4-mini fallback.
+      Basic reasoning — GPT-4.1-mini primary; Terra then Azure DeepSeek-V4-Pro fallback.
     provider: azure_openai
     provider_profile: azure_foundry_v1
     deployment: gpt-4.1-mini
@@ -288,7 +309,11 @@ models:
     reasoning_effort: none
     timeout_seconds: 30
     fallback_models:
-      - openai_o4_mini
+      - openai_gpt_5_6_terra
+      # Same Azure DeepSeek-V4-Pro deployment as azure_deepseek_v4_pro. The registry
+      # rejects one alias appearing twice in a transitive fallback graph, and Terra
+      # already falls back to azure_deepseek_v4_pro, so this chain uses deepseek_v4pro.
+      - deepseek_v4pro
       - reasoning_basic_generator_openai_native
 
   reasoning_intermediate_generator:
@@ -586,7 +611,11 @@ models:
     reasoning_effort: none
     timeout_seconds: 90
     fallback_models:
-      - reasoning_advanced_generator
+      - openai_gpt_5_6_terra
+      # Same Azure DeepSeek-V4-Pro deployment as azure_deepseek_v4_pro. The registry
+      # rejects one alias appearing twice in a transitive fallback graph, and Terra
+      # already falls back to azure_deepseek_v4_pro, so this chain uses deepseek_v4pro.
+      - deepseek_v4pro
 
   deepseek_azure_standard_generator:
     description: >-

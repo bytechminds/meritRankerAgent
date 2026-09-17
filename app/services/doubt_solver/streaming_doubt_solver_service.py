@@ -42,6 +42,7 @@ from observability import (
     emit_request_summary,
     log_event,
     record_local_preview,
+    snapshot_llm_usage_records,
     stage_span,
     update_request_summary,
     update_request_type,
@@ -76,13 +77,31 @@ from services.doubt_solver.answer_delivery_policy import (
     AnswerDeliveryPolicy,
     AnswerDeliverySignals,
 )
+from services.doubt_solver.answer_diagnosis import diagnose_verification_failure
 from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
 from services.doubt_solver.answer_quality import (
     AnswerQualityPolicy,
+    is_presentation_only_failure,
     validate_answer_quality,
 )
 from services.doubt_solver.final_answer import build_final_answer_result
 from services.doubt_solver.markdown_replay import iter_markdown_replay_chunks
+from services.doubt_solver.question_integrity import (
+    QUESTION_NEEDS_CLARIFICATION,
+    ambiguous_question_message,
+)
+from services.doubt_solver.recovery_policy import (
+    CANDIDATE_RECOVERY_INSTRUCTION,
+    SERVICE_TEMPORARILY_UNAVAILABLE,
+    RecoveryBudget,
+    decide_verification_recovery,
+    log_recovery_decision,
+    recovery_failure_source,
+    recovery_reason_code,
+    shadow_generation_failure,
+    shadow_quality_recovery,
+    shadow_verification_recovery,
+)
 from services.doubt_solver.stream_labels import (
     LABEL_ANSWER_CONTINUATION,
     LABEL_CAREFUL_CLASSIFICATION,
@@ -107,6 +126,20 @@ from tools.web_search.models import FreshEvidenceBundle
 
 logger = logging.getLogger(__name__)
 __all__ = ["orchestrated_classify_query_with_delivery_signals"]
+
+# `retryable` is the system's automatic retry/fallback semantics; `user_retryable`
+# says whether the student may explicitly start a new attempt. Codes outside this
+# set omit the field so clients keep deciding from `retryable` as before.
+_USER_RETRYABLE_CODES = frozenset(
+    {
+        "ANSWER_VERIFICATION_FAILED",
+        "ANSWER_QUALITY_FAILED",
+        "ANSWER_PROVIDER_FAILED",
+        # An outage is the terminal a student should retry soonest, and it says nothing
+        # about their question or the answer.
+        SERVICE_TEMPORARILY_UNAVAILABLE,
+    }
+)
 
 
 def _stream_doubt_pattern_context(payload: object) -> DoubtPatternContext | None:
@@ -230,13 +263,45 @@ def _error_event(
     *,
     code: str,
     retryable: bool,
+    label: str | None = None,
+    user_retryable: bool | None = None,
 ) -> DoubtSolverStreamEvent:
+    metadata: dict[str, object] = {"retryable": retryable, "code": code}
+    if user_retryable is not None:
+        metadata["user_retryable"] = user_retryable
+    elif code in _USER_RETRYABLE_CODES:
+        metadata["user_retryable"] = True
     return DoubtSolverStreamEvent(
         type="error",
         request_id=request_id,
         stage="failed",
-        label="Unable to complete",
-        metadata={"retryable": retryable, "code": code},
+        label=label or "Unable to complete",
+        metadata=metadata,
+    )
+
+
+def _record_recovery(
+    decision: object,
+    budget: RecoveryBudget,
+    correctness: object,
+    attempt: int,
+    subject: str,
+    difficulty: str,
+    *,
+    node: str,
+    outcome: str,
+) -> None:
+    """Log one recovery the controller carried out, with its budget at that moment."""
+    log_recovery_decision(
+        decision,  # type: ignore[arg-type]
+        applied=True,
+        budget=budget.snapshot(),
+        verifier_status=str(getattr(correctness, "status", "")),
+        attempt_number=attempt,
+        node=node,  # type: ignore[arg-type]
+        subject=subject,
+        difficulty=difficulty,
+        outcome=outcome,
     )
 
 
@@ -363,8 +428,10 @@ def _iter_stream_doubt_solver(
             classifier_fallback = input.classifier_fallback
 
     if raw_classification is not None and conversation_preparation is not None:
+        # The working query is the student's text, or that text plus its repaired
+        # formatting when the request boundary normalized a malformed question.
         selected_context = build_selected_generation_context(
-            current_query=input.original_query or query,
+            current_query=query,
             classification=raw_classification,
             preparation=conversation_preparation,
         )
@@ -775,11 +842,17 @@ def _iter_stream_doubt_solver(
         if raw_classification is not None
         else str(classification_dict.get("requested_action") or "ANSWER_CURRENT")
     )
+    context_need = (
+        conversation_preparation.gate.decision
+        if conversation_preparation is not None
+        else None
+    )
     correctness_verification_required = requires_independent_correctness_verification(
         subject=subject,
         difficulty=difficulty,
         intent=intent,
         requested_action=requested_action,
+        context_need=context_need,
     )
     context_text = str(state.get("context_text") or "")
     web_verified = required_web_context_verified(classification_dict, state)
@@ -823,6 +896,7 @@ def _iter_stream_doubt_solver(
     answer = ""
     verification = None
     repair_attempted = False
+    presentation_only_continued = False
     generation_started = time.monotonic()
     if not web_verified:
         answer = verification_limited_response(input.language)
@@ -929,11 +1003,15 @@ def _iter_stream_doubt_solver(
             if doubt_pattern_context is not None:
                 generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
             draft = adapter.generate(**generation_kwargs)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "answer_delivery request_id=%s stage=private_generate terminal_reason=%s",
                 request_id,
                 "provider_failed_before_content",
+            )
+            shadow_generation_failure(
+                exc,
+                actual_terminal_code="ANSWER_PROVIDER_FAILED",
             )
             yield _error_event(
                 request_id,
@@ -975,6 +1053,7 @@ def _iter_stream_doubt_solver(
         )
         if _cancelled(input):
             return
+        correctness_verifier = getattr(adapter, "correctness_verifier", None)
         if settings.answer_verifier_enabled and not verification.is_valid:
             if settings.answer_verifier_max_repair_attempts == 1 and count_generator_calls() < 2:
                 repair_attempted = True
@@ -984,11 +1063,15 @@ def _iter_stream_doubt_solver(
                 try:
                     with bind_llm_attempt_type("repair"):
                         draft = adapter.generate(**generation_kwargs)
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "answer_delivery request_id=%s stage=repair terminal_reason=%s",
                         request_id,
                         "repair_failed",
+                    )
+                    shadow_generation_failure(
+                        exc,
+                        actual_terminal_code="ANSWER_REPAIR_FAILED",
                     )
                     yield _error_event(
                         request_id,
@@ -1019,7 +1102,28 @@ def _iter_stream_doubt_solver(
                 logger.debug("repair_completed request_id=%s stage=verifying", request_id)
                 if _cancelled(input):
                     return
-            if not verification.is_valid:
+            # After the single rewrite, an answer rejected only for presentation is
+            # still judged on correctness when the verifier runs for this request;
+            # without that verifier it fails exactly as before.
+            presentation_only_continued = (
+                not verification.is_valid
+                and is_presentation_only_failure(verification)
+                and correctness_verification_required
+                and correctness_verifier is not None
+                and any(
+                    record.attempt_type == "rewrite"
+                    for record in snapshot_llm_usage_records()
+                )
+            )
+            if presentation_only_continued:
+                log_event(
+                    "QUALITY_PRESENTATION_ONLY_CONTINUED",
+                    component="doubt_solver.quality",
+                    stage="validate_quality",
+                    status="continued",
+                    details={"reason_codes": ",".join(sorted(set(verification.reason_codes)))},
+                )
+            elif not verification.is_valid:
                 logger.warning(
                     "answer_delivery request_id=%s stage=verification approved=false "
                     "repair=%s generator_calls=%d",
@@ -1029,6 +1133,10 @@ def _iter_stream_doubt_solver(
                 )
                 # The correctness verifier runs only after this block, so naming it
                 # here blamed a stage that never executed.
+                shadow_quality_recovery(
+                    verification,
+                    actual_terminal_code="ANSWER_QUALITY_FAILED",
+                )
                 yield _error_event(
                     request_id,
                     code="ANSWER_QUALITY_FAILED",
@@ -1037,27 +1145,206 @@ def _iter_stream_doubt_solver(
                 return
         if _cancelled(input):
             return
-        correctness_verifier = getattr(adapter, "correctness_verifier", None)
         if correctness_verification_required and correctness_verifier is not None:
-            correctness = correctness_verifier.verify(
-                request_id=request_id,
-                query=query,
-                candidate_answer=verification.sanitized_text or draft,
-                subject=subject,
-                difficulty=difficulty,
-                language=input.language,
-            )
-            if not correctness.approved or not verification.is_valid:
+            budget = RecoveryBudget()
+            approved_for_delivery = False
+            regenerated = False
+            # Each recovery is single-use in the ledger, so at most three verifications can
+            # run: the first, one verifier-local retry, and one after a regenerated
+            # candidate. The range is a backstop, never the real bound.
+            for attempt in range(1, 4):
+                correctness = correctness_verifier.verify(
+                    request_id=request_id,
+                    query=query,
+                    candidate_answer=verification.sanitized_text or draft,
+                    subject=subject,
+                    difficulty=difficulty,
+                    language=input.language,
+                )
+                if _cancelled(input):
+                    return
+                if correctness.approved and (verification.is_valid or presentation_only_continued):
+                    approved_for_delivery = True
+                    break
+                verification_error_code = (
+                    "ANSWER_VERIFICATION_UNAVAILABLE"
+                    if correctness.status == "unavailable"
+                    else "ANSWER_VERIFICATION_FAILED"
+                )
+                if correctness.approved:
+                    # The verifier approved text the quality gate rejected: a quality
+                    # question, not a verification one, and already bounded elsewhere.
+                    shadow_quality_recovery(
+                        verification,
+                        actual_terminal_code=verification_error_code,
+                    )
+                    yield _error_event(request_id, code=verification_error_code, retryable=False)
+                    return
+                # After a regeneration the outcome is settled either way: exactly one
+                # verification follows it and no second candidate may be generated, so the
+                # paid diagnosis is skipped. The verdict's own reason still decides, which
+                # keeps an outage an outage and a technical failure retryable once.
+                diagnosis = None if regenerated else diagnose_verification_failure(
+                    adapter,
+                    request_id=request_id,
+                    query=query,
+                    candidate_answer=verification.sanitized_text or draft,
+                    verdict=correctness.status,
+                    verification=correctness,
+                    method=correctness.method,
+                    language=input.language,
+                )
+                if not settings.answer_recovery_enabled:
+                    shadow_verification_recovery(
+                        correctness,
+                        actual_terminal_code=verification_error_code,
+                        diagnosis=diagnosis,
+                    )
+                    yield _error_event(request_id, code=verification_error_code, retryable=False)
+                    return
+                recovery_decision = decide_verification_recovery(
+                    approved=False,
+                    reason_code=recovery_reason_code(correctness, diagnosis),
+                    budget=budget.snapshot(),
+                    failure_source=recovery_failure_source(correctness, diagnosis),
+                )
+
+                # The slot is claimed before the work starts, so an exception on the way
+                # can never hand the same recovery back to this request.
+                if (
+                    recovery_decision.action == "RETRY_SAME_NODE"
+                    and budget.take_verifier_technical_retry()
+                ):
+                    # Same candidate, same upstream results: only verification runs again.
+                    _record_recovery(
+                        recovery_decision,
+                        budget,
+                        correctness,
+                        attempt,
+                        subject,
+                        difficulty,
+                        node="verifier",
+                        outcome="verifier_retried",
+                    )
+                    continue
+                if (
+                    recovery_decision.action == "REGENERATE_CANDIDATE"
+                    and budget.take_candidate_recovery()
+                ):
+                    _record_recovery(
+                        recovery_decision,
+                        budget,
+                        correctness,
+                        attempt,
+                        subject,
+                        difficulty,
+                        node="generator",
+                        outcome="candidate_regenerated",
+                    )
+                    try:
+                        with bind_llm_attempt_type("repair"):
+                            draft = adapter.generate(
+                                **generation_kwargs,
+                                recovery_instruction=CANDIDATE_RECOVERY_INSTRUCTION,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        shadow_generation_failure(exc, actual_terminal_code="ANSWER_REPAIR_FAILED")
+                        yield _error_event(request_id, code="ANSWER_REPAIR_FAILED", retryable=True)
+                        return
+                    if _cancelled(input):
+                        return
+                    verification = validate_answer_quality(
+                        draft,
+                        subject=subject,
+                        intent=intent,
+                        difficulty=difficulty,
+                        query=query,
+                        language=input.language,
+                        policy=AnswerQualityPolicy.from_settings(settings),
+                    )
+                    # The frozen presentation-only rule applies to this candidate too: a
+                    # rewrite has already run for this request, the verifier is about to
+                    # judge it, and layout alone never becomes a correctness failure.
+                    regenerated = True
+                    presentation_only_continued = not verification.is_valid and (
+                        is_presentation_only_failure(verification)
+                        and any(
+                            record.attempt_type.startswith("rewrite")
+                            for record in snapshot_llm_usage_records()
+                        )
+                    )
+                    if not verification.is_valid and not presentation_only_continued:
+                        # A fresh candidate earns no trust: it faces the same gate, and its
+                        # own recovery capacity is already spent.
+                        shadow_quality_recovery(
+                            verification, actual_terminal_code="ANSWER_QUALITY_FAILED"
+                        )
+                        yield _error_event(
+                            request_id, code="ANSWER_QUALITY_FAILED", retryable=False
+                        )
+                        return
+                    continue
+                _record_recovery(
+                    recovery_decision,
+                    budget,
+                    correctness,
+                    attempt,
+                    subject,
+                    difficulty,
+                    node="verifier",
+                    outcome="terminal",
+                )
+                if recovery_decision.action == "ASK_CLARIFICATION":
+                    yield _error_event(
+                        request_id,
+                        code=QUESTION_NEEDS_CLARIFICATION,
+                        retryable=False,
+                        user_retryable=False,
+                        label=ambiguous_question_message(
+                            input.language,
+                            multiple_answers=recovery_decision.reason_code
+                            == "MULTIPLE_DEFENSIBLE_ANSWERS",
+                        ),
+                    )
+                    return
+                if recovery_decision.terminal_code == SERVICE_TEMPORARILY_UNAVAILABLE:
+                    # The executor already walked the configured provider chain; this is
+                    # an outage, not a wrong answer.
+                    yield _error_event(
+                        request_id, code=SERVICE_TEMPORARILY_UNAVAILABLE, retryable=True
+                    )
+                    return
                 yield _error_event(
                     request_id,
-                    code=(
-                        "ANSWER_VERIFICATION_UNAVAILABLE"
-                        if correctness.status == "unavailable"
-                        else "ANSWER_VERIFICATION_FAILED"
-                    ),
+                    code=recovery_decision.terminal_code or verification_error_code,
                     retryable=False,
                 )
                 return
+            if not approved_for_delivery:
+                # Unreachable while every budget is single-use, and it fails closed if that
+                # ever stops being true: an unapproved answer must never be delivered.
+                logger.error(
+                    "answer_delivery request_id=%s stage=verification terminal_reason=%s",
+                    request_id,
+                    "recovery_attempts_exhausted",
+                )
+                yield _error_event(
+                    request_id, code="ANSWER_VERIFICATION_FAILED", retryable=False
+                )
+                return
+        if (
+            not presentation_only_continued
+            and not verification.is_valid
+            and is_presentation_only_failure(verification)
+        ):
+            # Reached only when the quality block above is disabled: text the gate
+            # rejected is kept solely for the correctness verifier and is never replayed.
+            yield _error_event(
+                request_id,
+                code="ANSWER_QUALITY_FAILED",
+                retryable=False,
+            )
+            return
         answer = verification.sanitized_text or draft
         grounded_answer = sanitize_required_web_answer(
             classification_dict,
@@ -1174,7 +1461,9 @@ def _iter_stream_doubt_solver(
                 language=input.language,
                 policy=final_quality_policy,
             )
-    if not final_quality_policy.validation_enabled:
+    if not final_quality_policy.validation_enabled or presentation_only_continued:
+        # A presentation-only answer reaches here only after the correctness
+        # verifier approved it; "checked" is the existing accepted, non-passed status.
         quality_status = "checked"
     elif verification.is_valid:
         quality_status = "passed_quality_gate"

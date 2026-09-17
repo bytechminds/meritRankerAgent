@@ -53,7 +53,7 @@ def _system_prompt(
 def test_shared_policy_requires_direct_answer_and_dynamic_sections() -> None:
     content = _system_prompt(subject="math", prompt="subjects/math_generator.md")
 
-    assert 'Start with `**Answer:**` and give the direct answer first.' in content
+    assert "Settle the result before you commit to it." in content
     assert "Choose the smallest useful set of Markdown sections" in content
     assert "Do not force a universal template" in content
     assert "Omit empty headings" in content
@@ -117,7 +117,7 @@ def test_subject_overlays_define_optional_exam_relevant_sections(
 ) -> None:
     content = _system_prompt(subject=subject, prompt=prompt)
 
-    assert "`**Answer:**` is mandatory and comes first." in content
+    assert "`**Answer:**` is mandatory and appears once" in content
     for heading in headings:
         assert heading in content
 
@@ -164,3 +164,90 @@ def test_subject_generator_routes_remain_bound_to_existing_overlays() -> None:
         "subjects/general_generator.md",
     ):
         assert prompt in routes
+
+
+# ---------------------------------------------------------------------------
+# Derive-first, commit-once contract on the routes actually configured
+# ---------------------------------------------------------------------------
+
+_LIVE_GENERATOR_ROUTES = (
+    ("math", "basic", "solve"),
+    ("math", "intermediate", "solve"),
+    ("math", "advanced", "solve"),
+    ("reasoning", "intermediate", "solve"),
+    ("english", "intermediate", "explain"),
+    ("general", "default", "explain"),
+    ("factual", "default", "explain"),
+)
+
+
+def _assembled_generator_prompt(subject: str, difficulty: str, intent: str) -> str:
+    from schemas.llm_routing import RouteRequest
+    from services.llm.orchestration.route_resolver import resolve_route
+
+    route = resolve_route(
+        RouteRequest(
+            request_id="contract",
+            subject=subject,
+            task_role="generator",
+            difficulty=difficulty,
+            intent=intent,
+            language="english",
+        )
+    )
+    return PromptResolver(prompt_root=_PROMPT_ROOT).resolve(route, query="Q")[0].content
+
+
+@pytest.mark.parametrize(("subject", "difficulty", "intent"), _LIVE_GENERATOR_ROUTES)
+def test_generator_settles_the_result_before_committing_to_one_answer(
+    subject: str, difficulty: str, intent: str
+) -> None:
+    """A non-reasoning generator's first token is its first commitment.
+
+    Requiring `**Answer:**` before any working made it state a guess and then derive
+    something else; the shared contract must ask for the result to be settled first.
+    """
+    content = _assembled_generator_prompt(subject, difficulty, intent)
+
+    assert "Settle the result before you commit to it." in content
+    assert "Keep this checking to yourself" in content
+    assert "give the concise working first and write `**Answer:**` after it" in content
+    assert "Write exactly one `**Answer:**` for a single-answer question" in content
+    assert 'never include phrases such as "Wait", "Actually", or "Let\'s recheck"' in content
+
+
+@pytest.mark.parametrize(("subject", "difficulty", "intent"), _LIVE_GENERATOR_ROUTES)
+def test_no_prompt_layer_still_demands_a_premature_or_second_answer(
+    subject: str, difficulty: str, intent: str
+) -> None:
+    content = _assembled_generator_prompt(subject, difficulty, intent)
+
+    for conflicting in (
+        "comes first",
+        "on the first line",
+        "as the first line",
+        "Start with `**Answer:**`",
+        "Restate the result as `**Final Answer:**`",
+        "restart silently",
+    ):
+        assert conflicting not in content, conflicting
+
+
+@pytest.mark.parametrize(
+    ("subject", "difficulty", "intent"),
+    [route for route in _LIVE_GENERATOR_ROUTES if route[0] != "math"],
+)
+def test_math_answer_placement_does_not_leak_into_other_subjects(
+    subject: str, difficulty: str, intent: str
+) -> None:
+    content = _assembled_generator_prompt(subject, difficulty, intent)
+
+    assert "Give the working first, then `**Answer:**`" not in content
+    # A direct fact or definition still may lead with its answer.
+    assert "`**Answer:**` may open the response" in content
+
+
+def test_multi_part_questions_get_part_labelled_answers() -> None:
+    content = _assembled_generator_prompt("math", "intermediate", "solve")
+
+    assert "`**Answer (a):**` and `**Answer (b):**`" in content

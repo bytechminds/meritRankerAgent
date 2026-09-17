@@ -74,3 +74,35 @@ def test_replacement_waves_keep_their_evidence_and_language_rules(prompt: str) -
     assert "fresh_evidence" in body
     assert "evidence_by_slot" in body
     assert "supplied `language`" in body
+
+
+# The factual Author keeps its own pinned contract; these cover the generic authoring waves.
+_FACTUAL_AUTHOR = "practice_generation/question_generator_factual.md"
+_AUTHOR_WAVE_PROMPTS = [prompt for prompt in WAVE_PROMPTS if prompt != _FACTUAL_AUTHOR]
+
+
+@pytest.mark.parametrize("prompt", _AUTHOR_WAVE_PROMPTS)
+def test_every_authoring_wave_makes_the_author_own_the_key(prompt: str) -> None:
+    """The verifier is a safety audit; no wave may hand it the job of finding the answer."""
+    body = _text(prompt)
+    assert "You own" in body and "`correct_option_id`" in body
+    assert "the blind verifier only audits it" in body
+    for delegation in (
+        "PENDING_VERIFICATION",
+        "spend your effort",
+        "solves the item independently",
+        "Spend no output on prose",
+    ):
+        assert delegation not in body, f"{prompt} still delegates correctness: {delegation}"
+
+
+@pytest.mark.parametrize("prompt", _AUTHOR_WAVE_PROMPTS)
+def test_every_authoring_wave_self_checks_silently_and_emits_no_working(prompt: str) -> None:
+    body = _text(prompt)
+    lowered = body.lower()
+    assert "by position" in body, f"{prompt} does not forbid keying by option position"
+    assert "exactly one" in lowered
+    assert "no working or commentary" in body
+    for visible in ("show your", "show the working", "explain your", "step-by-step",
+                    '"working"', '"reasoning"', '"analysis"'):
+        assert visible not in lowered, f"{prompt} asks for visible reasoning: {visible}"

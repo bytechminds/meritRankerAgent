@@ -965,7 +965,7 @@ class TestSubjectDifficultyRouteAliases:
         reg = LlmConfigRegistry()
         route = reg.get_route("reasoning", "generator", "intermediate")
         assert route is not None
-        assert route.model == "reasoning_intermediate_generator"
+        assert route.model == "openai_gpt_5_6_terra"
 
     def test_math_intermediate_uses_gpt_41_mini(self) -> None:
         reg = LlmConfigRegistry()
@@ -991,7 +991,11 @@ class TestSubjectDifficultyRouteAliases:
                 assert bad not in deployment, f"{alias} uses forbidden deployment fragment {bad!r}"
         route = reg.get_route("reasoning", "generator", "advanced")
         assert route is not None
-        assert route.model == "reasoning_advanced_generator"
+        assert route.model == "openai_gpt_5_6_terra"
+        terra = reg.model_map["openai_gpt_5_6_terra"]
+        assert terra.deployment == "gpt-5.6-terra"
+        assert terra.fallback_models == ["azure_deepseek_v4_pro"]
+        # The retired o-series alias stays registered for history only.
         model_cfg = reg.model_map["reasoning_advanced_generator"]
         assert model_cfg.provider == "azure_openai"
         assert model_cfg.deployment == "o4-mini"

@@ -51,7 +51,9 @@ class TestSubjectAwareAuthorityRouting:
     ) -> None:
         route = registry.get_route("general", "verifier", "default")
         assert route is not None
-        assert route.model == "openai_o4_mini"
+        # Retired o4-mini replaced by Terra; prompt and budget stay the Doubt Solver's own.
+        assert route.model == "openai_gpt_5_6_terra"
+        assert route.prompt == "answer_correctness_verifier.md"
 
     def test_no_topic_level_verifier_routes_exist(
         self, registry: LlmConfigRegistry
@@ -68,10 +70,12 @@ class TestSubjectAwareAuthorityRouting:
         self, registry: LlmConfigRegistry
     ) -> None:
         retired = {"openai_gpt_5_6_terra", "glm5_bedrock"}
+        # Terra's retirement is for the Practice Answer Authority; ``general`` is the
+        # Doubt Solver answer-correctness verifier, a different contract.
         serving = {
             entry.model
-            for (_s, task_role, _d), entry in registry.route_map.items()
-            if task_role == "verifier"
+            for (subject, task_role, _d), entry in registry.route_map.items()
+            if task_role == "verifier" and subject != "general"
         }
         assert serving.isdisjoint(retired)
 

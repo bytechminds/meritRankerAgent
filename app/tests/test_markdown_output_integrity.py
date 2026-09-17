@@ -255,3 +255,65 @@ def test_equivalent_or_single_answer_surfaces_stay_clean(
     result = _validate(content, policy)
 
     assert "conflicting_answer_values" not in result.reason_codes
+
+
+# ---------------------------------------------------------------------------
+# Plain `**Answer:**` surfaces disagreeing with each other
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "**Answer:** 45 km/h\n\nRelative speed = 45 km/h\n\n**Answer:** 50 km/h\n<ANSWER_DONE>",
+        "**Answer:** B\n\nOption C fails the second condition.\n\n**Answer:** C\n<ANSWER_DONE>",
+        # The captured generator shape: a guessed headline, working, a recheck, and
+        # a third value. No label says "final", which is how it passed as clean.
+        (
+            "**Answer:** 4\n\n2^3 = 8 = 1 mod 7, so 2^2004 = 1 mod 7.\n\n**Answer:** 1\n\n"
+            "22004 = 7 x 3143 + 3\n\n**Answer:** 3\n<ANSWER_DONE>"
+        ),
+    ],
+)
+def test_disagreeing_plain_answer_surfaces_are_rejected(
+    content: str, policy: AnswerQualityPolicy
+) -> None:
+    result = _validate(content, policy)
+
+    assert not result.is_valid
+    assert "conflicting_answer_values" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Speed = 100 / 2 = 50\n\n**Answer:** 50 km/h\n<ANSWER_DONE>",
+        # the same value restated is not a conflict, and the existing duplicate policy
+        # (which counts only repeated Final Answer blocks) is unchanged
+        "**Answer:** 50 km/h\n\nSpeed = 100 / 2 = 50\n\n**Answer:** 50 km/h\n<ANSWER_DONE>",
+        # a genuinely multi-part question answers each part on its own labelled line
+        "(a) 3 x 4 = 12\n**Answer (a):** 12\n\n(b) 3 x 5 = 15\n**Answer (b):** 15\n<ANSWER_DONE>",
+    ],
+)
+def test_single_equivalent_and_part_labelled_answers_stay_clean(
+    content: str, policy: AnswerQualityPolicy
+) -> None:
+    result = _validate(content, policy)
+
+    assert "conflicting_answer_values" not in result.reason_codes
+    assert "duplicate_final_answer" not in result.reason_codes
+
+
+def test_prose_answer_surfaces_are_not_compared(policy: AnswerQualityPolicy) -> None:
+    """The scalar parser deliberately treats prose as uncomparable.
+
+    Comparing prose surfaces is what produced the historical false positives this
+    module guards against, so "Article 19" versus "Article 21" is not reported here.
+    This pins that limit rather than silently widening the parser.
+    """
+    result = _validate(
+        "**Answer:** Article 19\n\nIt protects liberty.\n\n**Answer:** Article 21\n<ANSWER_DONE>",
+        policy,
+    )
+
+    assert "conflicting_answer_values" not in result.reason_codes

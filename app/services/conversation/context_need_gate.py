@@ -243,6 +243,109 @@ _LOCAL_DEMONSTRATIVE_TASK = re.compile(
     re.IGNORECASE,
 )
 
+# Grammar, not subject vocabulary: an anaphor points backwards, so a turn that offers no
+# content word before it is pointing outside itself.
+_FUNCTION_WORD = frozenset(
+    "a an the of in on at to for from by with and or but is are was were be been being "
+    "do does did can could would should will shall may might must what which who whom "
+    "whose when where why how if then than that this these those there here it its "
+    "they them their he she his her not no nor yes all any both each more most some "
+    "such as so too very just only also about into over under again only".split()
+)
+_ANAPHOR = re.compile(
+    r"\b(?:it|its|they|them|their|theirs|these|those|he|him|his|she|her|hers)\b"
+)
+# "is it true that ...", "is it safe to ..." — the clause the pronoun stands for follows it
+# in the same turn, so nothing points outside.  The linking verb may sit on either side of
+# the pronoun, since a question inverts it.
+_LINK_VERB = frozenset(
+    "is was are were be been seems seem appears appear takes take matters matter "
+    "helps help means mean follows follow".split()
+)
+_EXPLETIVE_CLAUSE = re.compile(r"[^?.!]{0,64}?\b(?:that|to|whether)\b")
+# A bare label — "F", "H", "G1" — names something the turn must have introduced, or that
+# an earlier turn did.  "A" and "I" are excluded: they are an article and a pronoun.
+_SYMBOLIC_ENTITY = re.compile(r"(?<![A-Za-z0-9])[B-HJ-Z](?:\d{1,2})?(?![A-Za-z0-9])")
+_SYMBOL_BINDING = re.compile(r"[=<>+\-*/^]|\d")
+# "Q1." or "b)" at the start of a line numbers the question; it names nothing.
+_ENUMERATION_LABEL = re.compile(r"(?:^|\n)\s*[A-Za-z]?\d{0,2}\s*[.):]")
+# "Class B", "Theory X", "Hepatitis B" — a capitalised noun in front makes the letter part
+# of a name, not a label standing on its own.
+_NAMED_BY_PRECEDING_NOUN = re.compile(r"[A-Z][a-z]+\s+$")
+_REFERENCED_LABELS = 2
+# A turn this long is stating its own material; a turn leaning on an earlier one is short.
+_SELF_SUPPLYING_WORDS = 40
+_CONDITIONAL_SELF_SUPPLYING_WORDS = 20
+
+
+def _is_expletive(normalized: str, match: re.Match[str]) -> bool:
+    """Does this "it" stand for a clause the same turn goes on to state?"""
+    if not _EXPLETIVE_CLAUSE.match(normalized, match.end()):
+        return False
+    before = _WORD.findall(normalized[: match.start()])
+    after = _WORD.findall(normalized[match.end() :])
+    return bool(before and before[-1] in _LINK_VERB) or bool(after and after[0] in _LINK_VERB)
+
+
+def _has_unresolved_anaphor(normalized: str) -> bool:
+    for match in _ANAPHOR.finditer(normalized):
+        if match.group(0) == "it" and _is_expletive(normalized, match):
+            continue
+        preceding = _WORD.findall(normalized[: match.start()])
+        if not any(word not in _FUNCTION_WORD for word in preceding):
+            return True
+    return False
+
+
+def _is_named_by_preceding_noun(before: str) -> bool:
+    """Is the letter part of a name, as in "Class B"? A sentence-initial word is not one."""
+    match = _NAMED_BY_PRECEDING_NOUN.search(before)
+    return match is not None and match.start() > 0
+
+
+def _has_unbound_symbolic_entity(query: str, normalized: str) -> bool:
+    # Cheapest test first: a turn long enough to state its own material carries the labels
+    # it uses, whatever they are, so the per-label work below would be discarded anyway.
+    words = len(_WORD.findall(normalized))
+    if words >= _SELF_SUPPLYING_WORDS or (
+        words >= _CONDITIONAL_SELF_SUPPLYING_WORDS and _COMPLETE_CONDITION.search(normalized)
+    ):
+        return False
+    matches = [
+        match
+        for match in _SYMBOLIC_ENTITY.finditer(query)
+        if not _ENUMERATION_LABEL.match(query, max(0, match.start() - 1))
+        and not _is_named_by_preceding_noun(query[: match.start()])
+    ]
+    # One letter on its own is usually ordinary content ("vitamin C", "the X chromosome").
+    # A turn that leans on an earlier turn's cast names more than one of its members, and a
+    # short single-label turn is already short of standalone evidence without this signal.
+    if len({match.group(0) for match in matches}) < _REFERENCED_LABELS:
+        return False
+    return any(
+        not _SYMBOL_BINDING.search(
+            _SYMBOLIC_ENTITY.sub(" ", query[max(0, match.start() - 12) : match.end() + 12])
+        )
+        for match in matches
+    )
+
+
+def _unresolved_reference_signals(query: str, normalized: str) -> tuple[str, ...]:
+    """Name the material this turn leans on but never supplies.
+
+    Surface completeness is not semantic completeness: a turn can be a well-formed
+    question of any length and still be unanswerable without the entities or rules the
+    previous turn established.  Naming a signal here only withholds the standalone
+    certification, so the gate falls through to UNCERTAIN and the existing candidate
+    loading and compatibility checks decide whether any history is actually relevant.
+    """
+    signals = []
+    if _has_unbound_symbolic_entity(query, normalized):
+        signals.append("unbound_symbolic_entity")
+    if _has_unresolved_anaphor(normalized):
+        signals.append("unresolved_anaphor")
+    return tuple(signals)
+
 
 def normalize_context_query(query: str) -> str:
     normalized = unicodedata.normalize("NFKC", query).casefold()
@@ -335,6 +438,22 @@ class ContextNeedGate:
 
     def evaluate(self, query: str) -> ContextNeedAssessment:
         started = time.monotonic()
+        assessment = self._decide(query, started)
+        if assessment.decision != "CONTEXT_NOT_NEEDED":
+            return assessment
+        signals = _unresolved_reference_signals(query, normalize_context_query(query))
+        if not signals:
+            return assessment
+        # The turn looked complete but points at material it never supplies.  Checking
+        # recent context is cheaper than answering without the rules it depends on.
+        return ContextNeedAssessment(
+            decision="UNCERTAIN",
+            reason_codes=("unresolved_local_reference", *assessment.reason_codes),
+            matched_signals=(*signals, *assessment.matched_signals)[:8],
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    def _decide(self, query: str, started: float) -> ContextNeedAssessment:
         normalized = normalize_context_query(query)
         local_antecedent = _has_local_antecedent(normalized)
         for reason, pattern in _EXPLICIT_REFERENCE_FAMILIES:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import services.doubt_solver.answer_correctness as verifier_module
+import services.llm.structured_output as structured_output_module
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_correctness import AnswerCorrectnessVerifier
 from services.llm.orchestration.route_resolver import resolve_route
@@ -78,8 +79,11 @@ def test_empty_or_malformed_response_becomes_typed_unavailable(content: str) -> 
 def test_none_parsed_output_becomes_typed_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The syntax parser now lives behind the shared structured-output boundary,
+    # so the seam moved with it. The guarded behaviour is unchanged: a payload
+    # that is not an object must still fail closed as typed unavailable.
     monkeypatch.setattr(
-        verifier_module,
+        structured_output_module,
         "parse_classifier_json_strict",
         lambda _content: (None, ""),
     )
@@ -148,10 +152,9 @@ def test_verifier_route_has_reasoning_and_json_output_budget() -> None:
         )
     )
 
-    # Doubt Solver keeps its own verifier model. Practice's Answer Authority now has
-    # a dedicated route, so Terra — qualified only for that contract — does not reach
-    # this caller.
-    assert route.model == "openai_o4_mini"
+    # Doubt Solver keeps its own verifier route; retired o4-mini is replaced by Terra
+    # with the same prompt, budget and reasoning effort.
+    assert route.model == "openai_gpt_5_6_terra"
     assert route.max_tokens == 5000
     assert route.provider_options == {"reasoning_effort": "medium"}
     assert route.fallback_attempts == []
@@ -260,3 +263,269 @@ def test_percentage_answers_compare_on_their_numeric_value() -> None:
     )
 
     assert verification.approved is True
+
+
+# ---------------------------------------------------------------------------
+# Shared structured-output boundary adoption
+# ---------------------------------------------------------------------------
+
+
+def _verify_generic(content: str, candidate_answer: str, query: str = "Resolve the item."):
+    return AnswerCorrectnessVerifier(orchestrator=_FakeOrchestrator(content)).verify(  # type: ignore[arg-type]
+        request_id="verifier-boundary",
+        query=query,
+        candidate_answer=candidate_answer,
+        subject="math",
+        difficulty="intermediate",
+        language="english",
+    )
+
+
+def test_numeric_independent_answer_completes_normal_verification() -> None:
+    """Regression for the proven incident: a numeric verdict must not be discarded.
+
+    One fixture only. The behaviour it proves is representation handling, not
+    anything about counting digits, so the architecture is exercised by the
+    non-numeric cases below in exactly the same way.
+    """
+    verification = _verify_generic(
+        '{"status":"MATCH","independent_answer":55,'
+        '"single_defensible_answer":true,"reason":"independently derived"}',
+        "**Answer:** 55",
+    )
+
+    assert verification.status == "match"
+    assert verification.approved is True
+    assert verification.independent_answer == "55"
+    assert verification.method == "model"
+
+
+@pytest.mark.parametrize(
+    ("independent", "candidate"),
+    [
+        ("Option B", "**Answer:** Option B"),
+        ("noun", "**Answer:** noun"),
+        ("50 km/h", "**Answer:** 50 km/h"),
+        ("Article 21", "**Answer:** Article 21"),
+        ("photosynthesis", "**Answer:** photosynthesis"),
+        ("1991", "**Answer:** 1991"),
+    ],
+)
+def test_non_numeric_answers_pass_through_the_same_architecture(
+    independent: str, candidate: str
+) -> None:
+    verification = _verify_generic(
+        f'{{"status":"MATCH","independent_answer":"{independent}",'
+        '"single_defensible_answer":true,"reason":"independently derived"}',
+        candidate,
+    )
+
+    assert verification.status == "match"
+    assert verification.approved is True
+    assert verification.independent_answer == independent
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("12.5", "12.5"), ("55.0", "55"), ("-4", "-4")])
+def test_decimal_and_signed_numeric_verdicts_canonicalize(raw: str, expected: str) -> None:
+    verification = _verify_generic(
+        f'{{"status":"MATCH","independent_answer":{raw},'
+        '"single_defensible_answer":true,"reason":"independently derived"}',
+        f"**Answer:** {expected}",
+    )
+
+    assert verification.approved is True
+    assert verification.independent_answer == expected
+
+
+def test_self_consistency_guard_still_rejects_a_numeric_false_match() -> None:
+    """The guard caught a real o4-mini false positive; normalization must not blunt it."""
+    verification = _verify_generic(
+        '{"status":"MATCH","independent_answer":50,'
+        '"single_defensible_answer":true,"reason":"independently derived"}',
+        "**Answer:** 45 km/h",
+    )
+
+    assert verification.status == "mismatch"
+    assert verification.approved is False
+    assert verification.reason == "verifier_self_contradiction"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["true", "false", "null", "[]", "{}", '["55"]'],
+)
+def test_non_scalar_independent_answer_is_still_rejected(raw: str) -> None:
+    verification = _verify_generic(
+        f'{{"status":"MATCH","independent_answer":{raw},'
+        '"single_defensible_answer":true,"reason":"r"}',
+        "**Answer:** 55",
+    )
+
+    assert verification.status == "unavailable"
+    assert verification.approved is False
+    assert verification.reason == "ANSWER_VERIFICATION_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("content", "error", "expected_kind", "expected_stage"),
+    [
+        (_VALID_OUTPUT, RuntimeError("down"), "provider_failure", None),
+        ("not json", None, "structured_output_parse_failure", "parse"),
+        (
+            '{"status":"NOPE","independent_answer":"A",'
+            '"single_defensible_answer":true,"reason":"r"}',
+            None,
+            "structured_output_schema_failure",
+            "schema",
+        ),
+    ],
+)
+def test_failure_kind_is_recorded_without_changing_the_client_reason_code(
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    error: Exception | None,
+    expected_kind: str,
+    expected_stage: str | None,
+) -> None:
+    captured: dict = {}
+
+    def _capture(_name: str, **kwargs: object) -> None:
+        captured.update(kwargs.get("details") or {})  # type: ignore[arg-type]
+
+    monkeypatch.setattr(verifier_module, "log_event", _capture)
+    verification = AnswerCorrectnessVerifier(
+        orchestrator=_FakeOrchestrator(content=content, error=error)  # type: ignore[arg-type]
+    ).verify(
+        request_id="verifier-taxonomy",
+        query="Resolve the item.",
+        candidate_answer="**Answer:** 55",
+        subject="math",
+        difficulty="intermediate",
+        language="english",
+    )
+
+    # External contract unchanged for every internal cause.
+    assert verification.status == "unavailable"
+    assert verification.reason == "ANSWER_VERIFICATION_UNAVAILABLE"
+    # Internally the cause is now distinguishable.
+    assert captured["failureKind"] == expected_kind
+    if expected_stage is not None:
+        assert captured["validationStage"] == expected_stage
+        assert captured["schemaName"] == "_VerifierOutput"
+
+
+# ---------------------------------------------------------------------------
+# Candidate extraction reads the declared answer, never an unrelated number
+# ---------------------------------------------------------------------------
+
+_BASE_QUERY = "The number 2006! is written in base 22. How many zeroes are there at the end?"
+_REMAINDER_QUERY = (
+    "The numbers 400, 536 and 645, when divided by a number N, give the remainders "
+    "of 22, 23 and 24 respectively. Find the greatest such number N."
+)
+
+
+@pytest.mark.parametrize(
+    ("answer_line", "query", "expected"),
+    [
+        ("**Answer:** 199 zeroes at the end when written in base 22.", _BASE_QUERY, 199.0),
+        (
+            "**Answer:** 27 is the greatest number that leaves remainders 22, 23 and 24.",
+            _REMAINDER_QUERY,
+            27.0,
+        ),
+        ("**Answer:** The remainder when 22004 is divided by 7 is 3.",
+         "What is the remainder when 22004 is divided by 7?", 3.0),
+        ("**Answer:** 50 km/h", "", 50.0),
+        # an answer expression declares the result after its last "="
+        (r"**Answer:** 30% of 300 = \(\frac{30}{100} \times 300 = 90\)",
+         "What is 30% of 300?", 90.0),
+        ("**Answer:** 12.5", "", 12.5),
+        ("**Answer:** -4", "", -4.0),
+        ("**Answer:** 15%", "", 15.0),
+        (r"**Answer:** \(1,250\)", "", 1250.0),
+        # a single stated number is declared even when the question also contains it
+        ("**Answer:** The greatest such number is 24.", _REMAINDER_QUERY, 24.0),
+    ],
+)
+def test_candidate_number_is_the_declared_answer(
+    answer_line: str, query: str, expected: float
+) -> None:
+    assert verifier_module._candidate_number(answer_line, query=query) == expected
+
+
+@pytest.mark.parametrize(
+    ("answer_line", "query"),
+    [
+        ("**Answer:** photosynthesis", ""),
+        ("**Answer:** Option C", ""),
+        # two candidate numbers and no question to set either aside
+        ("**Answer:** 199 zeroes at the end when written in base 22.", ""),
+        # every number left over is still ambiguous
+        (r"**Answer:** \(\frac{3}{8}\)", ""),
+        ("**Answer:** 1 (since 2^2004 mod 7 cycles)", "What is 22004 divided by 7?"),
+        ("No answer heading here: 42", ""),
+    ],
+)
+def test_candidate_number_is_none_when_not_provable(answer_line: str, query: str) -> None:
+    assert verifier_module._candidate_number(answer_line, query=query) is None
+
+
+def _guard(candidate: str, independent: str, query: str):
+    return AnswerCorrectnessVerifier(
+        orchestrator=_FakeOrchestrator(
+            f'{{"status":"MATCH","independent_answer":"{independent}",'
+            '"single_defensible_answer":true,"reason":"checked"}'
+        )  # type: ignore[arg-type]
+    ).verify(
+        request_id="verifier-extraction",
+        query=query,
+        candidate_answer=candidate,
+        subject="math",
+        difficulty="advanced",
+        language="english",
+    )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "independent", "query"),
+    [
+        ("**Answer:** 199 zeroes at the end when written in base 22.", "199", _BASE_QUERY),
+        (
+            "**Answer:** 27 is the greatest number that leaves remainders 22, 23 and 24.",
+            "27",
+            _REMAINDER_QUERY,
+        ),
+    ],
+)
+def test_correct_answer_is_no_longer_rejected_for_a_trailing_context_number(
+    candidate: str, independent: str, query: str
+) -> None:
+    verification = _guard(candidate, independent, query)
+
+    assert verification.status == "match"
+    assert verification.approved is True
+
+
+@pytest.mark.parametrize(
+    ("candidate", "independent", "query"),
+    [
+        # captured live: the generator stated 90; the verifier matched against 199
+        (
+            "**Answer:** 2006! has **90 zeroes** at the end when written in base 22.",
+            "199",
+            _BASE_QUERY,
+        ),
+        # a wrong single number that also appears in the question must still be caught
+        ("**Answer:** The greatest such number is 24.", "27", _REMAINDER_QUERY),
+        ("**Answer:** 89", "27", _REMAINDER_QUERY),
+    ],
+)
+def test_self_consistency_guard_still_rejects_wrong_candidates(
+    candidate: str, independent: str, query: str
+) -> None:
+    verification = _guard(candidate, independent, query)
+
+    assert verification.status == "mismatch"
+    assert verification.reason == "verifier_self_contradiction"
+    assert verification.approved is False

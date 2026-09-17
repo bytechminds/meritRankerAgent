@@ -70,7 +70,10 @@ def test_advanced_reasoning_ceilings_are_untouched() -> None:
     # This patch removes a wasted call; it does not buy more capacity.
     assert capacity.product_hard_max_output_tokens == 5600
     assert capacity.model_hard_max_output_tokens == 8000
-    assert capacity.reasoning_effort == "medium"
+    # capacity.reasoning_effort mirrors the alias default (Terra declares "high") and is
+    # not sent; the payload effort is the route's provider option, which stays "medium".
+    route = LlmConfigRegistry().get_route("reasoning", "generator", "advanced")
+    assert route.provider_options["reasoning_effort"] == "medium"
 
 
 def test_math_advanced_capacity_is_unchanged() -> None:

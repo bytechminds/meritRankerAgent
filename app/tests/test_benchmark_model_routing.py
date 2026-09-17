@@ -45,8 +45,11 @@ class TestBenchmarkModelAliases:
     def test_deepseek_v4pro_reasoning_metadata(self):
         reg = LlmConfigRegistry()
         cfg = reg.model_map["deepseek_v4pro"]
+        # Corrected from direct deepseek-reasoner to the Azure DeepSeek-V4-Pro deployment.
+        assert cfg.provider == "azure_openai"
+        assert cfg.deployment == "DeepSeek-V4-Pro"
         assert cfg.supports_reasoning is True
-        assert cfg.reasoning_effort == "high"
+        assert cfg.reasoning_effort == "medium"
         assert cfg.fallback_models == ["openai_gpt_5_4"]
 
     def test_exam_specific_generators_exist(self):
@@ -61,20 +64,20 @@ class TestBenchmarkGeneratorMappings:
         reg = LlmConfigRegistry()
         cfg = reg.model_map["math_basic_generator"]
         assert cfg.deployment == "gpt-4.1-mini"
-        assert cfg.fallback_models[0] == "openai_o4_mini"
+        assert cfg.fallback_models[:2] == ["openai_gpt_5_6_terra", "deepseek_v4pro"]
 
     def test_math_intermediate_uses_gpt_41_mini(self):
         reg = LlmConfigRegistry()
         cfg = reg.model_map["math_intermediate_generator"]
         assert cfg.deployment == "gpt-4.1-mini"
-        assert "openai_o4_mini" in cfg.fallback_models
+        assert cfg.fallback_models == ["openai_gpt_5_6_terra", "deepseek_v4pro"]
 
     def test_math_advanced_uses_deepseek_v4pro(self):
         reg = LlmConfigRegistry()
         cfg = reg.model_map["math_advanced_generator"]
         assert cfg.provider == "deepseek"
         assert cfg.model_id == "deepseek-reasoner"
-        assert cfg.fallback_models == ["openai_o3"]
+        assert cfg.fallback_models == ["openai_gpt_5_6_terra", "deepseek_v4pro"]
         assert cfg.structured_output_reasoning_reserve_tokens == 2600
 
     def test_reasoning_basic_uses_gpt_41_mini(self):
@@ -124,10 +127,10 @@ class TestBenchmarkRouteResolution:
         assert self._route_model("reasoning", "basic") == "openai_gpt_5_4_mini"
 
     def test_reasoning_intermediate_route(self):
-        assert self._route_model("reasoning", "intermediate") == "reasoning_intermediate_generator"
+        assert self._route_model("reasoning", "intermediate") == "openai_gpt_5_6_terra"
 
     def test_reasoning_advanced_route(self):
-        assert self._route_model("reasoning", "advanced") == "reasoning_advanced_generator"
+        assert self._route_model("reasoning", "advanced") == "openai_gpt_5_6_terra"
 
     def test_general_default_route(self):
         assert self._route_model("general", "default") == "general_fast_generator"
@@ -185,7 +188,9 @@ class TestBenchmarkEnvOverrides:
         monkeypatch.setenv("DEEPSEEK_V4PRO_MODEL", "deepseek-custom-v4")
         reset_registry()
         reg = LlmConfigRegistry()
-        assert reg.model_map["deepseek_v4pro"].model_id == "deepseek-custom-v4"
+        # deepseek_v4pro is now the Azure deployment; the direct-provider env var
+        # no longer moves it.
+        assert reg.model_map["deepseek_v4pro"].deployment == "DeepSeek-V4-Pro"
         assert reg.model_map["math_advanced_generator"].model_id == "deepseek-custom-v4"
 
     def test_production_preflight_passes_with_defaults(self):

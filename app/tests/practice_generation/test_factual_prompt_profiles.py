@@ -186,4 +186,6 @@ class TestFactualPromptSemanticInvariants:
         text = (DEFAULT_PROMPT_ROOT / "practice_generation/question_generator_v2.md").read_text()
         assert "Use supplied `language` for every student-visible value." in text
         assert "Omit `correct_answer`, `solution`, and `answer_explanation`" in text
-        assert len(text) == 1617
+        # Re-pinned for the Practice reliability contract (author owns the key,
+        # silent self-check); the factual prompt still must not move this file.
+        assert len(text) == 1675

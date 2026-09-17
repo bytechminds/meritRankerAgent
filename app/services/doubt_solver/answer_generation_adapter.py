@@ -30,6 +30,7 @@ from schemas.doubt_solver import CanonicalLanguage, FinalAnswerResult
 from schemas.llm_routing import RouteRequest
 from services.doubt_solver.answer_completion import resolve_generator_route_subject
 from services.doubt_solver.answer_correctness import AnswerCorrectnessVerifier
+from services.doubt_solver.answer_diagnosis import AnswerDiagnoser
 from services.doubt_solver.final_answer import build_final_answer_result
 from services.llm.orchestration.orchestrator import LlmOrchestrator
 
@@ -44,10 +45,15 @@ class AnswerGenerationAdapter:
             raise TypeError("orchestrator is required.")
         self._orchestrator = orchestrator
         self._correctness_verifier = AnswerCorrectnessVerifier(orchestrator=orchestrator)
+        self._semantic_diagnoser = AnswerDiagnoser(orchestrator=orchestrator)
 
     @property
     def correctness_verifier(self) -> AnswerCorrectnessVerifier:
         return self._correctness_verifier
+
+    @property
+    def semantic_diagnoser(self) -> AnswerDiagnoser:
+        return self._semantic_diagnoser
 
     def generate(
         self,
@@ -65,6 +71,7 @@ class AnswerGenerationAdapter:
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
         doubt_pattern_context: DoubtPatternContext | None = None,
+        recovery_instruction: str | None = None,
     ) -> str:
         """Return the authoritative answer content for compatibility callers."""
         return self.generate_final(
@@ -81,6 +88,7 @@ class AnswerGenerationAdapter:
             language=language,
             conversation_context=conversation_context,
             doubt_pattern_context=doubt_pattern_context,
+            recovery_instruction=recovery_instruction,
         ).content
 
     def generate_final(
@@ -99,6 +107,7 @@ class AnswerGenerationAdapter:
         language: CanonicalLanguage = "english",
         conversation_context: str | None = None,
         doubt_pattern_context: DoubtPatternContext | None = None,
+        recovery_instruction: str | None = None,
     ) -> FinalAnswerResult:
         """Build a RouteRequest and call the orchestrator."""
         route_subject = resolve_generator_route_subject(
@@ -126,6 +135,8 @@ class AnswerGenerationAdapter:
         }
         if doubt_pattern_context is not None:
             generation_kwargs["doubt_pattern_context"] = doubt_pattern_context
+        if recovery_instruction:
+            generation_kwargs["recovery_instruction"] = recovery_instruction
         result = self._orchestrator.generate(**generation_kwargs)
 
         logger.debug(

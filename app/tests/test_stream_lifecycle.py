@@ -188,6 +188,7 @@ def test_provider_error_before_content_is_controlled_and_retryable() -> None:
     assert events[-1].metadata == {
         "retryable": True,
         "code": "ANSWER_PROVIDER_FAILED",
+        "user_retryable": True,
     }
     assert not any(event.type == "complete" for event in events)
 

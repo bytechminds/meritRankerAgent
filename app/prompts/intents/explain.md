@@ -13,7 +13,7 @@ The student's intent is to understand a concept, rule, or reasoning.
 
 ## Presentation by question shape
 
-Keep `**Answer:**` on the first line in every case, then use the shape that fits what was asked.
+Use the shape that fits what was asked, with one `**Answer:**` placed as the Generator Answer Contract directs.
 
 - **Define / what is** — direct definition, then two or three key points as bullets, then one short example only if it clarifies.
 - **Explain** — direct answer, then the concept, then the explanation as short labelled sections, then one example and a one-line takeaway.

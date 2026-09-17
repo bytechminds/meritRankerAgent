@@ -332,3 +332,33 @@ def test_an_exhausted_group_fails_the_assessment_instead_of_staying_generating()
 
     assert proceed is False, "an exhausted group must not let generation continue"
     assert committed["reason"] == "GENERATION_DEFICIT_EXHAUSTED"
+
+
+class _AmbiguityVerifier:
+    """Names the author's own key yet rejects: right under one reading only."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def verify_slot(self, *, request, bucket, slot, question):  # noqa: ANN001
+        del request, bucket
+        self.calls += 1
+        return VerificationResult(
+            schema_version="2",
+            generation_item_id=question.generation_item_id,
+            slot_id=slot.slot_id,
+            decision=VerificationDecision.REGENERATE,
+            valid_option_ids=[question.correct_option_id],
+            reason_codes=["AMBIGUOUS"],
+        )
+
+
+def test_an_ambiguous_verdict_matching_the_author_key_is_never_accepted() -> None:
+    """Id agreement alone is not approval: the authority's decision must be ACCEPT."""
+    generator, verifier = _DistinctGenerator(), _AmbiguityVerifier()
+
+    outcome = _run(generator, verifier)
+
+    assert outcome.accepted == ()
+    assert outcome.unresolved_slot_ids == ("slot-001",)
+    assert generator.waves == [0, 2]

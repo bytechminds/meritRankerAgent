@@ -82,7 +82,8 @@ routes:
           - general_default
           - safe_mock
 
-      # Optional CAT-level math route — inactive unless explicitly selected.
+      # DORMANT — unreachable (normalize_difficulty never yields this key) and still
+      # resolves to retired o3. Kept for history only; do not select.
       cat_advanced:
         inherits: default
         model: math_cat_advanced_generator
@@ -168,7 +169,8 @@ routes:
 
       intermediate:
         inherits: default
-        model: reasoning_intermediate_generator
+        # Retired o4-mini replaced by Terra (fallback Azure DeepSeek-V4-Pro).
+        model: openai_gpt_5_6_terra
         overlays:
           - levels/intermediate.md
         max_tokens: 1800
@@ -182,7 +184,8 @@ routes:
 
       advanced:
         inherits: default
-        model: reasoning_advanced_generator
+        # Retired o4-mini/o3 replaced by Terra (fallback Azure DeepSeek-V4-Pro).
+        model: openai_gpt_5_6_terra
         overlays:
           - levels/advanced.md
         max_tokens: 3200
@@ -195,7 +198,8 @@ routes:
           - general_default
           - safe_mock
 
-      # Optional SBI PO complex route — inactive unless explicitly selected.
+      # DORMANT — unreachable (normalize_difficulty never yields this key) and still
+      # resolves to retired o3. Kept for history only; do not select.
       sbi_po_complex:
         inherits: default
         model: reasoning_sbi_po_complex_generator
@@ -210,7 +214,8 @@ routes:
           - general_default
           - safe_mock
 
-      # Optional CAT LRDI route — inactive unless explicitly selected.
+      # DORMANT — unreachable (normalize_difficulty never yields this key) and still
+      # resolves to retired o3. Kept for history only; do not select.
       cat_lrdi:
         inherits: default
         model: reasoning_cat_lrdi_generator
@@ -465,10 +470,10 @@ routes:
 
     verifier:
       default:
-        # Doubt Solver's answer-correctness verifier. Terra is qualified for the
-        # Practice Answer Authority contract only, so it is NOT applied here — this
-        # route keeps its previously qualified model until separately qualified.
-        model: openai_o4_mini
+        # Doubt Solver's answer-correctness verifier. Retired o4-mini replaced by
+        # Terra (fallback Azure DeepSeek-V4-Pro via the alias's fallback_models).
+        # Prompt, schema, guards, budget and reasoning effort are unchanged.
+        model: openai_gpt_5_6_terra
         prompt: answer_correctness_verifier.md
         temperature: 0.0
         max_tokens: 5000

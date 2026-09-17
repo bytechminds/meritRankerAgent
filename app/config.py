@@ -180,6 +180,8 @@ class Settings:
     answer_live_stream_max_difficulty: str
     answer_verifier_enabled: bool
     answer_verifier_max_repair_attempts: int
+    answer_diagnosis_shadow_enabled: bool
+    answer_recovery_enabled: bool
     answer_replay_max_chunk_chars: int
     answer_stream_heartbeat_interval_seconds: float
     answer_allow_always_live_in_production: bool
@@ -568,6 +570,9 @@ def get_settings() -> Settings:
             raise ConfigurationError(
                 "ANSWER_LIVE_STREAM_MAX_DIFFICULTY must be a supported route difficulty."
             )
+        # Recovery acts on a diagnosis, so it can never run without one: enabling
+        # recovery enables diagnosis rather than failing at startup.
+        answer_recovery_enabled = os.getenv("ANSWER_RECOVERY_ENABLED", "false").lower() == "true"
         answer_verifier_max_repair_attempts = int(
             os.getenv("ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS", "1")
         )
@@ -849,6 +854,11 @@ def get_settings() -> Settings:
                 os.getenv("ANSWER_VERIFIER_ENABLED", "true").lower() == "true"
             ),
             answer_verifier_max_repair_attempts=answer_verifier_max_repair_attempts,
+            answer_diagnosis_shadow_enabled=(
+                os.getenv("ANSWER_DIAGNOSIS_SHADOW_ENABLED", "false").lower() == "true"
+                or answer_recovery_enabled
+            ),
+            answer_recovery_enabled=answer_recovery_enabled,
             answer_replay_max_chunk_chars=answer_replay_max_chunk_chars,
             answer_stream_heartbeat_interval_seconds=(
                 answer_stream_heartbeat_interval_seconds

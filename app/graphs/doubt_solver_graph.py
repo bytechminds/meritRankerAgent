@@ -53,7 +53,7 @@ from features.practice_generation.schemas import (
     PracticeGenerationRequest,
     PracticeLaunchResult,
 )
-from observability import log_event, update_request_summary
+from observability import log_event, snapshot_llm_usage_records, update_request_summary
 from schemas.conversation import ConversationCandidateCard, ConversationPreparation
 from schemas.doubt_solver import (
     CanonicalLanguage,
@@ -79,8 +79,18 @@ from services.conversation.selected_context_builder import (
 from services.doubt_solver.answer_correctness import (
     requires_independent_correctness_verification,
 )
-from services.doubt_solver.answer_quality import generation_failure_message
+from services.doubt_solver.answer_diagnosis import diagnose_verification_failure
+from services.doubt_solver.answer_quality import (
+    generation_failure_message,
+    is_presentation_only_failure,
+    validate_answer_quality,
+)
 from services.doubt_solver.final_answer import build_final_answer_result
+from services.doubt_solver.recovery_policy import (
+    shadow_generation_failure,
+    shadow_quality_recovery,
+    shadow_verification_recovery,
+)
 from services.dynamodb_service import DynamoDbConfigurationError, DynamoDbServiceError
 from services.query_classifier_service import classify_query
 from services.question_record_service import fetch_question_records_by_ids
@@ -1149,8 +1159,10 @@ def build_orchestrated_doubt_solver_graph(
         if preparation_payload and raw_payload:
             preparation = ConversationPreparation.model_validate(preparation_payload)
             raw = QueryClassification.model_validate(raw_payload)
+            # The working query is the student's text, or that text plus its repaired
+            # formatting when the request boundary normalized a malformed question.
             selected = build_selected_generation_context(
-                current_query=state["original_query"],
+                current_query=state["query"],
                 classification=raw,
                 preparation=preparation,
             )
@@ -1302,17 +1314,67 @@ def build_orchestrated_doubt_solver_graph(
                 final_answer = generate_final(**generation_kwargs)
                 answer = final_answer.content
                 relation = state.get("conversation_relation") or {}
+                preparation_payload = state.get("conversation_preparation") or {}
                 verification_required = requires_independent_correctness_verification(
                     subject=subject,
                     difficulty=difficulty,
                     intent=intent,
                     requested_action=str(relation.get("requested_action") or "ANSWER_CURRENT"),
+                    context_need=(preparation_payload.get("gate") or {}).get("decision"),
                 )
                 correctness_verifier = getattr(adapter, "correctness_verifier", None)
+                presentation_only_continued = False
+                if final_answer.quality_status == "failed_quality_gate":
+                    # Same rule as the streaming path: after the single rewrite, an
+                    # answer rejected only for presentation is judged on correctness
+                    # when the verifier runs; any other rejection never travels on.
+                    rejected_quality = validate_answer_quality(
+                        answer,
+                        subject=subject,
+                        difficulty=difficulty,
+                        intent=intent,
+                        query=state["query"],
+                        language=language,
+                    )
+                    presentation_only_continued = (
+                        verification_required
+                        and correctness_verifier is not None
+                        and is_presentation_only_failure(rejected_quality)
+                        and any(
+                            record.attempt_type == "rewrite"
+                            for record in snapshot_llm_usage_records()
+                        )
+                    )
+                    if presentation_only_continued:
+                        log_event(
+                            "QUALITY_PRESENTATION_ONLY_CONTINUED",
+                            component="doubt_solver.quality",
+                            stage="validate_quality",
+                            status="continued",
+                            details={
+                                "reason_codes": ",".join(
+                                    sorted(set(rejected_quality.reason_codes))
+                                ),
+                            },
+                        )
+                    else:
+                        shadow_quality_recovery(
+                            rejected_quality,
+                            actual_terminal_code="failed_quality_gate",
+                        )
+                        answer = generation_failure_message(language)
+                        final_answer = build_final_answer_result(
+                            content=answer,
+                            language=language,
+                            quality_status="failed_quality_gate",
+                        )
                 if (
                     verification_required
                     and correctness_verifier is not None
-                    and final_answer.quality_status != "failed_quality_gate"
+                    and (
+                        final_answer.quality_status != "failed_quality_gate"
+                        or presentation_only_continued
+                    )
                 ):
                     correctness = correctness_verifier.verify(
                         request_id=state["request_id"],
@@ -1323,11 +1385,31 @@ def build_orchestrated_doubt_solver_graph(
                         language=language,
                     )
                     if not correctness.approved:
+                        shadow_verification_recovery(
+                            correctness,
+                            actual_terminal_code="failed_quality_gate",
+                            diagnosis=diagnose_verification_failure(
+                                adapter,
+                                request_id=state["request_id"],
+                                query=state["query"],
+                                candidate_answer=answer,
+                                verdict=correctness.status,
+                                verification=correctness,
+                                method=correctness.method,
+                                language=language,
+                            ),
+                        )
                         answer = generation_failure_message(language)
                         final_answer = build_final_answer_result(
                             content=answer,
                             language=language,
                             quality_status="failed_quality_gate",
+                        )
+                    elif presentation_only_continued:
+                        final_answer = build_final_answer_result(
+                            content=answer,
+                            language=language,
+                            quality_status="checked",
                         )
             else:
                 answer = adapter.generate(**generation_kwargs)
@@ -1353,6 +1435,10 @@ def build_orchestrated_doubt_solver_graph(
                 error_code="PROVIDER_EXECUTION_FAILED",
                 details={"error_type": type(exc).__name__},
                 level=logging.ERROR,
+            )
+            shadow_generation_failure(
+                exc,
+                actual_terminal_code="PROVIDER_EXECUTION_FAILED",
             )
             answer = generation_failure_message(language)
             final_answer = build_final_answer_result(

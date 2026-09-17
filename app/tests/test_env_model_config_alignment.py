@@ -81,8 +81,8 @@ class TestOrchestratedIgnoresRoleJson:
         reg = LlmConfigRegistry()
         route = reg.get_route("reasoning", "generator", "advanced")
         assert route is not None
-        assert route.model == "reasoning_advanced_generator"
-        assert reg.model_map["reasoning_advanced_generator"].deployment == "o4-mini"
+        assert route.model == "openai_gpt_5_6_terra"
+        assert reg.model_map["openai_gpt_5_6_terra"].deployment == "gpt-5.6-terra"
 
 
 class TestRegistryEnvMapping:
@@ -102,7 +102,8 @@ class TestRegistryEnvMapping:
         monkeypatch.setenv("DEEPSEEK_V4PRO_MODEL", "deepseek-v4pro-custom")
         reset_registry()
         reg = LlmConfigRegistry()
-        assert reg.model_map["deepseek_v4pro"].model_id == "deepseek-v4pro-custom"
+        # deepseek_v4pro is now the Azure deployment; only the direct-provider alias reads this var.
+        assert reg.model_map["deepseek_v4pro"].deployment == "DeepSeek-V4-Pro"
         assert reg.model_map["math_advanced_generator"].model_id == "deepseek-v4pro-custom"
 
 
@@ -180,7 +181,7 @@ class TestLegacyRoleJsonAliasFormat:
         monkeypatch.setenv("ENABLE_REAL_LLM", "true")
         monkeypatch.setenv(
             "LLM_ROLE_CONFIG_JSON",
-            json.dumps({"math.advanced": "deepseek_v4pro"}),
+            json.dumps({"math.advanced": "math_advanced_generator"}),
         )
         _reset_settings()
         reset_registry()

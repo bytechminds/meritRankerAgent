@@ -349,3 +349,36 @@ class TestEnglishSoftSemanticGate:
     def test_single_defensible_option_is_the_only_ready_shape(self) -> None:
         result = _result(["0"], decision="ACCEPT")
         assert result.valid_option_ids == ["0"]
+
+
+class TestAuthorityChallengesEveryReasonableReading:
+    """An item that is right under one reading and wrong under another reached READY."""
+
+    @staticmethod
+    def _prompt() -> str:
+        from services.llm.orchestration.prompt_resolver import DEFAULT_PROMPT_ROOT
+
+        return (DEFAULT_PROMPT_ROOT / "practice_generation/question_verifier_v2.md").read_text()
+
+    def test_the_authority_stays_blind_to_the_author(self) -> None:
+        text = self._prompt()
+        assert "never see the author's answer" in text
+        assert "never guess its intent" in text
+
+    def test_every_option_is_judged_under_every_reasonable_reading(self) -> None:
+        text = self._prompt()
+        assert "Judge EVERY option under every reasonable reading" in text
+        assert "`ACCEPT` only when exactly one id is valid under every reading" in text
+
+    @pytest.mark.parametrize(
+        "code",
+        ["NO_VALID_OPTION", "MULTIPLE_VALID_OPTIONS", "CONTRADICTORY_DATA",
+         "INSUFFICIENT_INFORMATION", "AMBIGUOUS"],
+    )
+    def test_each_rejection_reason_is_named(self, code: str) -> None:
+        assert f"`{code}`" in self._prompt()
+
+    def test_an_ambiguous_verdict_is_expressible_without_a_schema_change(self) -> None:
+        """A reading-dependent answer may name the one option it found and still reject."""
+        result = _result(["0"], decision="REGENERATE")
+        assert result.is_approved is False

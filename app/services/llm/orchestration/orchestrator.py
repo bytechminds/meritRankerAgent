@@ -71,10 +71,12 @@ from services.doubt_solver.answer_quality import (
     build_rewrite_messages,
     detect_final_answer,
     generation_failure_message,
+    is_presentation_only_failure,
     log_answer_quality_rewrite,
     log_answer_quality_validation,
     parse_rewrite_output,
     plain_text_fallback,
+    preserves_answer_surface,
     rewrite_max_tokens,
     strip_duplicate_final_answer_section,
     validate_answer_quality,
@@ -402,10 +404,19 @@ class LlmOrchestrator:
                         language=route_request.language,
                         policy=quality_policy,
                     )
-                    accepted = candidate_quality.severity in ("clean", "minor")
-                    working = candidate
-                    quality = candidate_quality
-                    finish_reason = rewrite_result.finish_reason
+                    preserved = preserves_answer_surface(working, candidate)
+                    accepted = (
+                        candidate_quality.severity in ("clean", "minor") and preserved
+                    )
+                    if accepted:
+                        # A repair replaces the draft only when it is both clean and still
+                        # states the draft's answer. A rejected rewrite used to overwrite
+                        # the draft anyway, so a usable answer could be lost to a failed
+                        # reformat, and a rewrite that changed the answer was indistinguishable
+                        # from one that only changed the formatting.
+                        working = candidate
+                        quality = candidate_quality
+                        finish_reason = rewrite_result.finish_reason
                     was_regenerated = accepted
                     log_answer_quality_rewrite(
                         request_id=request_id,
@@ -414,7 +425,13 @@ class LlmOrchestrator:
                         success=accepted,
                         final_output_chars=len(candidate),
                         outcome=(
-                            parse_outcome if accepted else "quality_still_failed"
+                            parse_outcome
+                            if accepted
+                            else (
+                                "quality_still_failed"
+                                if preserved
+                                else "answer_surface_changed"
+                            )
                         ),
                     )
         elif quality.sanitized_text is not None:
@@ -453,7 +470,9 @@ class LlmOrchestrator:
             language=route_request.language,
             policy=quality_policy,
         )
-        if not final_quality.is_valid:
+        if not final_quality.is_valid and not (
+            rewrite_used and is_presentation_only_failure(final_quality)
+        ):
             # A rejected answer must never travel on as the authoritative content.
             # Language non-compliance already substituted here; every other final
             # rejection reason used to keep the model text, so callers that read
@@ -461,6 +480,10 @@ class LlmOrchestrator:
             # replay) delivered output this gate had just refused.  is_valid is a
             # strict superset of the old condition: language_mismatch is flagged
             # rewrite_required, and with validation disabled is_valid == compliance.
+            #
+            # The one exception keeps the text of an answer that still fails only
+            # on presentation after its rewrite. It stays failed_quality_gate, so
+            # only a caller that runs the correctness verifier may continue it.
             final_content = generation_failure_message(route_request.language)
         return build_final_answer_result(
             content=final_content,
@@ -829,6 +852,7 @@ class LlmOrchestrator:
         context: str | None = None,
         conversation_context: str | None = None,
         doubt_pattern_context: DoubtPatternContext | None = None,
+        recovery_instruction: str | None = None,
     ) -> OrchestrationResult:
         """Run the full orchestration pipeline and return a safe result.
 
@@ -878,6 +902,10 @@ class LlmOrchestrator:
                 doubt_pattern_context=doubt_pattern_context,
             )
         )
+        if recovery_instruction:
+            # One extra turn for a regenerated candidate. The route, prompt and every other
+            # input stay exactly as resolved above, so this is the same generator role.
+            messages = [*messages, LlmMessage(role="user", content=recovery_instruction)]
 
         context_chars = len(context) if context else 0
         is_generator = is_answer_generation_route(
@@ -1263,7 +1291,10 @@ class LlmOrchestrator:
                     continuation_attempts=continuation_attempts,
                 )
                 if buffer_for_quality:
-                    if final_answer.content.strip():
+                    if (
+                        final_answer.quality_status != "failed_quality_gate"
+                        and final_answer.content.strip()
+                    ):
                         yield final_answer.content
                     else:
                         yield generation_failure_message(route_request.language)

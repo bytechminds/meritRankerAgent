@@ -253,13 +253,13 @@ class TestNewModelAliases:
         reg = LlmConfigRegistry()
         route = reg.get_route("reasoning", "generator", "intermediate")
         assert route is not None
-        assert route.model == "reasoning_intermediate_generator"
+        assert route.model == "openai_gpt_5_6_terra"
 
     def test_reasoning_advanced_uses_reasoning_advanced_generator(self) -> None:
         reg = LlmConfigRegistry()
         route = reg.get_route("reasoning", "generator", "advanced")
         assert route is not None
-        assert route.model == "reasoning_advanced_generator"
+        assert route.model == "openai_gpt_5_6_terra"
 
     def test_no_active_route_uses_reasoning_advanced_complex_generator(self) -> None:
         reg = LlmConfigRegistry()

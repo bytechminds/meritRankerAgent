@@ -30,7 +30,7 @@ REWRITE_USER_PROMPT = (
     "number, unit, punctuation mark, and math, statistics, or chemistry symbol. Do not "
     "show failed attempts. Follow every original system instruction, including the "
     "requested response language and script. Use valid Markdown. Use \\(...\\) and "
-    "\\[...\\] only for math. Do not use $ or $$. Keep it concise. "
+    "\\[...\\] only for math. Do not use $ or $$. "
     "End with <ANSWER_DONE>."
 )
 
@@ -131,6 +131,24 @@ class AnswerQualityResult:
     language_compliant: bool = True
 
 
+# Findings about how an answer is laid out, not whether its markup, structure,
+# language, or safety is sound. After the single rewrite, an answer failing only on
+# these may continue to the correctness verifier instead of failing terminally.
+PRESENTATION_ONLY_REASON_CODES = frozenset(
+    {"too_many_display_math_blocks", "too_many_visible_steps"}
+)
+
+
+def is_presentation_only_failure(result: AnswerQualityResult) -> bool:
+    """True when a rejected answer's every reason code is presentation-only."""
+    return (
+        not result.is_valid
+        and result.language_compliant
+        and bool(result.reason_codes)
+        and set(result.reason_codes) <= PRESENTATION_ONLY_REASON_CODES
+    )
+
+
 def detect_final_answer(content: str) -> bool:
     """Return True when an Answer or Final Answer section is present."""
     if not content or not content.strip():
@@ -168,26 +186,131 @@ def _scalar_answer(value: str) -> tuple[str, str] | None:
     return ("number", match.group("number").replace(",", ""))
 
 
-def _contradicting_answer_surfaces(content: str) -> bool:
-    """Does a scalar "Answer:" headline disagree with the scalar "Final Answer:"?
+# A LaTeX command, or a sub/superscript that is braced or digit-led. A letter-led one is
+# excluded because "price_limit" and "_the rate_" are ordinary prose, not math.
+_LATEX_COMMAND = re.compile(r"\\[a-zA-Z]|[\^_][{0-9]")
 
-    Only compact scalars are compared, and the unit is deliberately ignored so that
-    "12 s" and "12 seconds", or "20%" and "20 percent", stay consistent.
+
+def _has_single_dollar_math(content: str) -> bool:
+    """Is there a bare `$...$` span the renderer would actually treat as math?
+
+    Currency prose is not math. The renderer requires the opening `$` to be followed by a
+    non-space and the closing `$` to be preceded by one, on the same line and unescaped, so
+    "The cost is $5 and the price is $12." carries no math span while "$x+1$" does. Asking
+    the renderer's own matcher keeps this rule and the renderer from disagreeing.
     """
-    headline: tuple[str, str] | None = None
-    final: tuple[str, str] | None = None
+    for line in content.splitlines():
+        dollars = [
+            index
+            for index, char in enumerate(line)
+            if char == "$"
+            and not _is_escaped(line, index)
+            and not line.startswith("$$", index)
+            and not (index and line.startswith("$$", index - 1))
+        ]
+        if len(dollars) < 2:
+            continue
+        # A span exists when some opener has some closer after it. The earliest valid
+        # opener sees every candidate closer, so one pass settles the line.
+        opener = next(
+            (i for i in dollars if i + 1 < len(line) and not line[i + 1].isspace()), None
+        )
+        if opener is not None and any(
+            j > opener and not line[j - 1].isspace() for j in dollars
+        ):
+            return True
+        # "$ \frac{d}{t} $" is padded, so the renderer prints it literally rather than
+        # typesetting it. The student still sees raw LaTeX, so it is still a defect. Both
+        # ends must be padded: a currency amount always binds to its sign ("$5"), so a
+        # LaTeX command merely sitting between two prices is not a delimiter pair.
+        if any(
+            line[first + 1].isspace()
+            and line[second - 1].isspace()
+            and _LATEX_COMMAND.search(line[first + 1 : second])
+            for first, second in zip(dollars, dollars[1:], strict=False)
+            if first + 1 < len(line) and second > first + 1
+        ):
+            return True
+    return False
+
+
+# A repair that returns half the answer is not a reformat. The floor is deliberately loose:
+# reflowing math and dropping a duplicated answer section trim a little, not most, of a draft.
+_MIN_REPAIR_LENGTH_RATIO = 0.5
+
+
+def _normalized_answer_value(value: str) -> str:
+    """The answer as the student reads it, free of the markup a reformat may change."""
+    cleaned = html.unescape(value)
+    cleaned = re.sub(r"\\[()\[\]]|[*`$\\]", " ", cleaned)
+    cleaned = cleaned.replace("%", " percent ")
+    cleaned = re.sub(r"[\s,]+", " ", cleaned).strip()
+    # Only trailing punctuation is decoration; a leading "-" is the sign of the answer.
+    return cleaned.rstrip(" .;:\u2014-").casefold()
+
+
+def _answer_values(content: str) -> set[str]:
+    values = {
+        _normalized_answer_value(match.group("value"))
+        for match in _ANSWER_HEADING_LINE.finditer(content)
+    }
+    return {value for value in values if value}
+
+
+def preserves_answer_surface(draft: str, candidate: str) -> bool:
+    """Does a repaired answer still state the same answer, and still show its work?
+
+    Presentation repair must return the same solution in different formatting, never a
+    different one, so every answer the draft states must survive verbatim once markup is
+    normalized away — a unit, an option, a ratio or a prose conclusion included, and a
+    draft that states two conflicting answers is not resolved here because choosing
+    between them is a semantic decision this gate cannot make. The length floor catches
+    the rest: a repair that discards most of the draft has stopped reformatting it, even
+    when the final answer happens to survive.
+    """
+    draft_values = _answer_values(draft)
+    candidate_values = _answer_values(candidate)
+    if _contradicting_answer_surfaces(draft):
+        # A draft whose scalar answers disagree is the one case the existing gate asks the
+        # rewrite to resolve. It may drop a surface but never introduce a new one. A
+        # genuinely multi-part answer is not this shape, and must keep every part.
+        if not candidate_values or not candidate_values <= draft_values:
+            return False
+    elif draft_values and candidate_values != draft_values:
+        return False
+    stripped_draft = draft.strip()
+    if not stripped_draft:
+        return True
+    return len(candidate.strip()) >= _MIN_REPAIR_LENGTH_RATIO * len(stripped_draft)
+
+
+def _answer_scalars(content: str) -> set[tuple[str, str]]:
+    scalars: set[tuple[str, str]] = set()
     for match in _ANSWER_HEADING_LINE.finditer(content):
         value = match.group("value").strip()
         if not value:
             continue
         scalar = _scalar_answer(value)
-        if scalar is None:
-            continue
-        if match.group("label").casefold().startswith("final"):
-            final = final or scalar
-        else:
-            headline = headline or scalar
-    return headline is not None and final is not None and headline != final
+        if scalar is not None:
+            scalars.add(scalar)
+    return scalars
+
+
+def _contradicting_answer_surfaces(content: str) -> bool:
+    """Do two scalar answer surfaces state different values?
+
+    Every answer heading counts, whatever its label. The generator contract writes a
+    plain `**Answer:**`, so two of those that disagree are as visible to the student as
+    one that disagrees with `**Final Answer:**`; requiring a "final" label let exactly
+    that shape pass as clean. Neither surface is treated as the true one: the conflict
+    itself is the defect.
+
+    Only compact scalars are compared, and the unit is deliberately ignored so that
+    "12 s" and "12 seconds", or "20%" and "20 percent", stay consistent. A part-labelled
+    surface such as `**Answer (a):**` is not a compact scalar, so the answers to a
+    genuinely multi-part question are never compared with each other.
+    """
+    return len(_answer_scalars(content)) > 1
 
 
 def _explicit_final_answer_values(content: str) -> list[str]:
@@ -328,7 +451,7 @@ def validate_answer_quality(
         _flag("math_quad_dollar", "rewrite_required")
     if _DOLLAR_DISPLAY.search(content):
         _flag("math_double_dollar", "rewrite_required")
-    if _DOLLAR_INLINE.search(content):
+    if _has_single_dollar_math(content):
         _flag("math_single_dollar", "rewrite_required")
 
     if _count_unbalanced(content, r"\(", r"\)"):

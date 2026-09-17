@@ -162,6 +162,8 @@ def _cost_usd(
     [
         ("gemini", "gemini-3.7-flash", Decimal("0.75"), Decimal("3.75")),
         ("openai", "gpt-4o-mini", Decimal("0.15"), Decimal("0.60")),
+        ("azure_openai", "gpt-5.6-terra", Decimal("2.00"), Decimal("12.00")),
+        ("azure_openai", "DeepSeek-V4-Pro", Decimal("1.74"), Decimal("3.48")),
     ],
 )
 def test_newly_priced_model_costs_match_the_configured_rates(
@@ -180,6 +182,35 @@ def test_newly_priced_model_costs_match_the_configured_rates(
         Decimal("250000") * input_rate + Decimal("100000") * output_rate
     ) / Decimal("1000000")
     assert mixed == expected
+
+
+@pytest.mark.parametrize(
+    ("alias", "deployment", "input_rate", "output_rate", "cached_rate"),
+    [
+        ("openai_gpt_5_6_terra", "gpt-5.6-terra", "2.00", "12.00", "0.20"),
+        ("azure_deepseek_v4_pro", "DeepSeek-V4-Pro", "1.74", "3.48", "0.145"),
+        ("deepseek_v4pro", "DeepSeek-V4-Pro", "1.74", "3.48", "0.145"),
+    ],
+)
+def test_o_series_replacement_aliases_resolve_to_reviewed_azure_rates(
+    alias: str, deployment: str, input_rate: str, output_rate: str, cached_rate: str
+) -> None:
+    """Terra and DeepSeek-V4-Pro are reachable, so the compiled registry must price them."""
+    registry = get_registry()
+    assert alias in reachable_billable_aliases()
+    model_config = registry.model_map[alias]
+    assert (model_config.provider, model_config.deployment) == ("azure_openai", deployment)
+
+    rate = _find_rate(
+        load_billing_config(),
+        provider=model_config.provider,
+        model=model_config.model_id or model_config.deployment or alias,
+        deployment=model_config.deployment,
+    )
+    assert rate is not None
+    assert rate.input_cost_per_million_tokens == Decimal(input_rate)
+    assert rate.output_cost_per_million_tokens == Decimal(output_rate)
+    assert rate.cached_input_cost_per_million_tokens == Decimal(cached_rate)
 
 
 def test_newly_priced_models_do_not_disturb_existing_rates() -> None:

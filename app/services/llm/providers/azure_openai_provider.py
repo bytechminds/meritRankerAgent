@@ -302,12 +302,17 @@ class AzureOpenAIProviderAdapter:
     # Client builders — one per Azure API mode
     # ------------------------------------------------------------------
 
-    def _build_client_classic(self, credentials: ProviderCredentials) -> Any:
+    def _build_client_classic(
+        self, credentials: ProviderCredentials, timeout_seconds: int
+    ) -> Any:
         """Build an AzureOpenAI client for azure_deployment_chat_completions mode.
 
         Uses AzureOpenAI(azure_endpoint=..., api_version=..., api_key=...).
         The SDK appends /openai/deployments/<deployment>/chat/completions?api-version=...
         to the endpoint automatically.
+
+        ``timeout_seconds`` is the resolved model timeout; without it the SDK default
+        (600 s read) applies and a stalled call outlives the configured bound.
 
         Preconditions (validated before calling):
         - credentials.endpoint does NOT end with /openai/v1
@@ -322,13 +327,17 @@ class AzureOpenAIProviderAdapter:
             azure_endpoint=credentials.endpoint,
             api_version=credentials.api_version,
             max_retries=0,
+            timeout=float(timeout_seconds),
         )
 
-    def _build_client_v1(self, credentials: ProviderCredentials) -> Any:
+    def _build_client_v1(self, credentials: ProviderCredentials, timeout_seconds: int) -> Any:
         """Build an OpenAI client for azure_openai_v1 mode.
 
         Uses OpenAI(base_url=<normalised /openai/v1/>, api_key=...).
         The SDK appends /chat/completions to base_url — no deployment path.
+
+        ``timeout_seconds`` is the resolved model timeout; without it the SDK default
+        (600 s read) applies and a stalled call outlives the configured bound.
 
         Preconditions (validated before calling):
         - credentials.endpoint ends with /openai/v1 (or /openai/v1/)
@@ -342,6 +351,7 @@ class AzureOpenAIProviderAdapter:
             api_key=credentials.api_key,
             base_url=base_url,
             max_retries=0,
+            timeout=float(timeout_seconds),
         )
 
     # ------------------------------------------------------------------
@@ -380,11 +390,12 @@ class AzureOpenAIProviderAdapter:
             )
 
         azure_api_mode = credentials.azure_api_mode or "azure_deployment_chat_completions"
+        timeout_seconds = request.model_resolution.timeout_seconds
 
         if azure_api_mode == "azure_openai_v1":
-            client = self._validate_and_build_v1(credentials)
+            client = self._validate_and_build_v1(credentials, timeout_seconds)
         else:
-            client = self._validate_and_build_classic(credentials)
+            client = self._validate_and_build_classic(credentials, timeout_seconds)
 
         deployment = request.model_resolution.model_config.deployment
         if not deployment:
@@ -492,11 +503,12 @@ class AzureOpenAIProviderAdapter:
             )
 
         azure_api_mode = credentials.azure_api_mode or "azure_deployment_chat_completions"
+        timeout_seconds = request.model_resolution.timeout_seconds
 
         if azure_api_mode == "azure_openai_v1":
-            client = self._validate_and_build_v1(credentials)
+            client = self._validate_and_build_v1(credentials, timeout_seconds)
         else:
-            client = self._validate_and_build_classic(credentials)
+            client = self._validate_and_build_classic(credentials, timeout_seconds)
 
         deployment = request.model_resolution.model_config.deployment
         if not deployment:
@@ -601,7 +613,9 @@ class AzureOpenAIProviderAdapter:
     # Mode-specific credential validation helpers
     # ------------------------------------------------------------------
 
-    def _validate_and_build_classic(self, credentials: ProviderCredentials) -> Any:
+    def _validate_and_build_classic(
+        self, credentials: ProviderCredentials, timeout_seconds: int
+    ) -> Any:
         """Validate credentials for azure_deployment_chat_completions mode and build client.
 
         Raises:
@@ -634,9 +648,11 @@ class AzureOpenAIProviderAdapter:
                 "AzureOpenAIProviderAdapter (azure_deployment_chat_completions) "
                 "requires credentials.api_version."
             )
-        return self._build_client_classic(credentials)
+        return self._build_client_classic(credentials, timeout_seconds)
 
-    def _validate_and_build_v1(self, credentials: ProviderCredentials) -> Any:
+    def _validate_and_build_v1(
+        self, credentials: ProviderCredentials, timeout_seconds: int
+    ) -> Any:
         """Validate credentials for azure_openai_v1 mode and build client.
 
         Raises:
@@ -656,7 +672,7 @@ class AzureOpenAIProviderAdapter:
                 "with '/openai/v1' but the configured endpoint does not. "
                 "Expected https://<resource>.openai.azure.com/openai/v1"
             )
-        return self._build_client_v1(credentials)
+        return self._build_client_v1(credentials, timeout_seconds)
 
     @staticmethod
     def _extract_content(completion: Any, request: ProviderExecutionRequest) -> str:

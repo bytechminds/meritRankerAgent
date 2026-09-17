@@ -79,7 +79,17 @@ class TestDeepSeekV4ProProviderPath:
         assert "deepseek-reasoner" not in (config.model_id or "")
         assert "deepseek-reasoner" not in (config.deployment or "")
 
-    @pytest.mark.parametrize("alias", ["deepseek_v4pro", "math_advanced_generator"])
+    def test_the_v4pro_legacy_alias_now_resolves_to_the_azure_deployment(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        """deepseek_v4pro claimed V4-Pro but served deepseek-reasoner; it is corrected."""
+        config = registry.model_map["deepseek_v4pro"]
+        assert config.provider == "azure_openai"
+        assert config.provider_profile == "azure_foundry_v1"
+        assert config.deployment == "DeepSeek-V4-Pro"
+        assert config.model_id is None
+
+    @pytest.mark.parametrize("alias", ["math_advanced_generator"])
     def test_legacy_direct_aliases_are_behaviourally_unchanged(
         self, registry: LlmConfigRegistry, alias: str
     ) -> None:
@@ -113,7 +123,7 @@ class TestAuthorityRoute:
         serving = [
             f"{s}.{r}.{d}"
             for (s, r, d), entry in registry.route_map.items()
-            if r == "verifier" and entry.model == "openai_gpt_5_6_terra"
+            if r == "verifier" and entry.model == "openai_gpt_5_6_terra" and s != "general"
         ]
         assert serving == []
         assert "openai_gpt_5_6_terra" in registry.model_map
@@ -134,7 +144,7 @@ class TestAuthorityRoute:
         assert ("general", "verifier", "default") in registry.route_map
         general = registry.get_route("general", "verifier", "default")
         assert general is not None
-        assert general.model == "openai_o4_mini"
+        assert general.model == "openai_gpt_5_6_terra"
 
 
 class TestGeminiIntegration:

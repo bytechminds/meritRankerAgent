@@ -29,7 +29,284 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-09-03
+**Last updated:** 2026-09-17
+
+---
+
+## Latest Changes - Presentation Repair Keeps the Answer (2026-09-17)
+
+A formatting repair now returns the same solution in different formatting, and ordinary currency
+prose is no longer mistaken for malformed math.
+
+- **Why**: `math_single_dollar` matched any two non-`$$` dollar signs anywhere in an answer, so
+  "the cost is $5 and the price is $12" read as an inline math span. A correct Quant answer was
+  sent for an LLM rewrite and could fail closed before correctness verification ran at all
+  (production request 45e227c7). Separately, the rewritten candidate replaced the draft whether or
+  not it was accepted, so a failed reformat discarded a usable answer and a reformat that changed
+  the answer was indistinguishable from one that changed the layout.
+- **Currency is not math.** The detector asks the same question the renderer does: a bare `$...$`
+  span counts only when the opening `$` is followed by a non-space and the closing one preceded by
+  a non-space, on the same line and unescaped. A padded span is still a defect when it carries a
+  LaTeX command or a braced or digit-led script (`$ \frac{d}{t} $`, `$ x^2 $`), because the
+  renderer prints those literally. The scan is per line and linear.
+- **A repair may not change the answer.** Before a rewritten candidate replaces the draft it must
+  state the same answer — compared as normalized text, so a unit, an option, a ratio, a currency
+  amount, a sign or a prose conclusion all count — and retain at least half the draft's characters.
+  A draft the gate itself calls contradictory may be reduced to one of its own answers, never to a
+  new one; a genuinely multi-part answer must keep every part.
+- **A failed repair no longer costs the draft.** A rejected rewrite leaves the draft in place,
+  still `failed_quality_gate`, so only a caller that runs the correctness verifier may continue it.
+  A draft that is itself unsafe to render is still replaced by the failure message.
+- Known bound: a repair that keeps the answer and stays above the length floor can still restate
+  the derivation. Detecting substitution is not possible deterministically here, and the
+  correctness verifier remains the check for it.
+
+---
+
+## Latest Changes - Dependent Follow-up Context + Verification Safety (2026-09-17)
+
+A follow-up whose entities or rules live in the previous turn is no longer certified as a
+standalone request, and `default` difficulty no longer disables correctness verification
+for such a turn.
+
+- **Why**: a request asking for a team size "that includes both F and H" arrived one turn
+  after the constraint set that defines F, H and the selection rules. The gate certified it
+  `complete_self_contained_request` on surface shape alone, so no history was read, the
+  classifier was forced to `NEW_QUESTION`, difficulty landed on `default`, and `default`
+  excluded the answer from verification. A provably wrong answer was delivered and persisted.
+- **Semantic completeness is now separate from syntactic completeness.** Before returning
+  `CONTEXT_NOT_NEEDED`, `ContextNeedGate` checks whether the turn leans on material it never
+  supplies: two or more bare labels ("F and H", "A, B, C and D") that the turn does not bind
+  in an expression, or an anaphor with no content word before it. Both are structural, not
+  subject vocabulary. Excluded, because they are ordinary content rather than references:
+  question numbering ("Q1."), a letter named by the noun in front of it ("Class B",
+  "Theory X"), a single letter on its own ("vitamin C", "the X chromosome"), a turn long
+  enough to state its own conditions, and an expletive "it" whose clause follows it in the
+  same turn ("is it true that…", "is it safe to…").
+- **A signal only withholds the certification.** The decision becomes `UNCERTAIN`
+  (`unresolved_local_reference`, with the signal in `matched_signals`), which is the existing
+  context-check path: candidates are loaded, and the existing compatibility and classifier
+  selection still decide whether any of them is used. Fetching context and using context stay
+  separate decisions.
+- **`default` difficulty is no longer read as low risk.** The classifier emits `default` when
+  evidence is insufficient — including when the premises are missing. A `math`/`reasoning`
+  solve at `default` is now verified unless the gate certified the turn as standalone.
+  `intermediate`/`advanced` verification, other subjects, and `explain` intent are unchanged,
+  so an ordinary standalone question keeps the existing low-cost path.
+- Verification and recovery semantics, routing, models, quality rules, persistence and credit
+  behaviour are unchanged.
+- Known bounds, each a deliberate trade against false positives on ordinary questions:
+  a turn that omits its premises without any label or anaphor — "who could win with only
+  five upsets in the tournament" (production request 4e43a732) — is still certified
+  standalone; a generic unresolved-definite-reference signal was attempted and rejected
+  because grammatical position alone cannot separate "in the tournament" from "in the
+  atmosphere". A follow-up naming only one
+  label ("can F be selected in a larger arrangement?") is caught only when it is short
+  enough to fall short of the gate's own standalone evidence; and the anaphor list is
+  Latin-script, so a Devanagari pronoun is covered only by the existing explicit-reference
+  families; and a follow-up that writes its labels as named things ("can Person B and
+  Person D be selected together?") is exempted with "Class B" and stays certified.
+
+---
+
+## Latest Changes - Verifier Input Contract (2026-09-16)
+
+The correctness verifier now composes its input through a deterministic builder that can never
+exceed the orchestrator's `MAX_QUERY_CHARS` (4,000) query contract. The limit itself is
+unchanged.
+
+- **Why**: the verifier previously composed up to ~12,100 characters (question 4,000 +
+  candidate 8,000 + framing). `LlmOrchestrator.generate` rejects a longer query before route
+  resolution, so a long-but-valid candidate — typically a regenerated Advanced answer — failed
+  verification with zero provider calls, was misread as a provider failure, spent the verifier
+  retry on an identical call that could not succeed, and ended
+  `ANSWER_VERIFICATION_UNAVAILABLE`.
+- **Short inputs are byte-for-byte unchanged.** Compaction only engages once the composed
+  input exceeds the limit.
+- **Compaction keeps head and tail**, never a plain prefix: the question is served first from
+  the budget, and the candidate keeps its opening and — with the larger share — its ending,
+  where a solution states its result. The elided middle is marked. It is deterministic, has no
+  model call, and never touches the student-facing answer text: only the verifier's copy is
+  compacted. The guarantee is the candidate's ending, not the `**Answer:**` line by name: a
+  very long question shrinks the candidate to a 600-character floor, so an answer followed by
+  a long appendix can still fall outside the kept tail. A question longer than ~3,300
+  characters is itself compacted head+tail.
+- **`INPUT_TOO_LARGE`** is a verification reason code diagnosed STRUCTURAL / VERIFIER and
+  listed as unretryable, so an input that somehow cannot be brought under the limit fails
+  deterministically instead of being retried identically or blamed on the provider.
+- Verdict semantics, the verifier prompt, diagnosis, recovery policy, routing and models are
+  unchanged.
+- Known issue (not fixed here): the `verification_calls` field of the LLM usage summary counts
+  any `.verifier.` role, so the shadow semantic diagnosis — which shares that route — inflates
+  it. Log-only; it does not affect billing, credits or recovery budgets.
+
+---
+
+## Latest Changes - Verification Recovery Phase 1: Bounded Local Recovery (2026-09-16)
+
+A failed verification now repairs the responsibility that failed and reuses every upstream
+node that already succeeded. Off by default (`ANSWER_RECOVERY_ENABLED=false`); enabling it
+also enables diagnosis, so recovery can never run without one.
+
+- **Candidate fault** (verdict not MATCH, diagnosis CANDIDATE, reason `WRONG_FINAL_ANSWER` or
+  `CANDIDATE_CONFLICT`): one fresh generation on the same subject, difficulty and route, told
+  only that an independent check rejected the previous answer — never the verifier's answer,
+  reasoning, or a correction. Classification, retrieval, context and normalization are reused,
+  not repeated. The fresh candidate faces the same quality gate (including the frozen
+  presentation-only rule) and then exactly one more verification. Anything but MATCH is
+  terminal: no second regeneration, no further semantic verification.
+- **Question fault** (AMBIGUOUS with diagnosis QUESTION and reason `INCOMPLETE_QUESTION` or
+  `MULTIPLE_DEFENSIBLE_ANSWERS`): terminal `QUESTION_NEEDS_CLARIFICATION`, `retryable=false`,
+  `user_retryable=false`, no generation, no persistence, no credit. The localized message asks
+  for the missing values, conditions or options and never names an internal code.
+- **Verifier technical failure** (`PARSE_FAILURE`, `SCHEMA_FAILURE`, technical unclassified):
+  one verifier-local retry with the identical candidate and no generator call.
+  `CONFIGURATION_FAILURE` and `OUTPUT_TOKEN_EXHAUSTED` are never retried, since the identical
+  call cannot clear them.
+- **Provider exhaustion**: the executor still owns the fallback chain and nothing wraps it.
+  When it is exhausted the request ends `SERVICE_TEMPORARILY_UNAVAILABLE`, `retryable=true`,
+  `user_retryable=true`, with copy that blames neither the question nor the answer.
+- **MATCH stays authoritative.** Diagnosis can never overrule approval: a MATCH completes even
+  when the diagnosis says the question was incomplete, and a healthy answer never pays for a
+  diagnosis call.
+- **Budgets** are request-local, independent and single-use: continuation, presentation
+  rewrite, the candidate slot (structural repair, truncation regeneration, or verifier-driven
+  regeneration), and the verifier retry. Each is claimed before the work starts, so an
+  exception cannot hand one back; provider fallback inside the executor spends none of them.
+- **Observability**: `RECOVERY_DECISION` records the verdict, kind, source, reason, action,
+  attempt number, node, subject/difficulty and every budget flag — codes and counts only.
+  With recovery disabled the decision is still recorded as `RECOVERY_DECISION_SHADOW`.
+- Applies to the streamed verified path. The non-streaming graph keeps its Phase 0 behavior
+  (diagnosis and shadow decision, no recovery).
+- Known bound: the fresh candidate cannot spend a presentation rewrite the request already
+  used, so a presentation-heavy regeneration fails closed with `ANSWER_QUALITY_FAILED`.
+
+---
+
+## Latest Changes - Verification Recovery Phase 0b: Separate Shadow Diagnosis (2026-09-16)
+
+The primary verifier is untouched — same prompt, same schema, same authority over
+MATCH / MISMATCH / AMBIGUOUS and approval. A separate bounded call labels a verdict it can
+never change. Shadow only: no recovery action, no wire-code change, nothing student-visible.
+
+- `prompts/answer_diagnosis.md` (new) receives the question, the candidate and the decided
+  verdict, and returns only `failure_source` (NONE/QUESTION/CANDIDATE/VERIFIER) and
+  `reason_code` (NONE, WRONG_FINAL_ANSWER, CANDIDATE_CONFLICT, INCOMPLETE_QUESTION,
+  MULTIPLE_DEFENSIBLE_ANSWERS, VERIFIER_LOW_CONFIDENCE). It runs on the existing verifier route
+  (`general.verifier.default`), so no routing or model choice changed.
+- `services/doubt_solver/answer_diagnosis.py` (new) validates the pair: each reason belongs to
+  exactly one source, and a disagreeing, unknown, non-string or missing value becomes
+  `SEMANTIC_UNCLASSIFIED` / `UNKNOWN`. A provider or parse failure is swallowed the same way.
+  Event: `SEMANTIC_DIAGNOSIS_COMPLETED` (codes only).
+- **Status and source are orthogonal.** `MATCH + QUESTION + INCOMPLETE_QUESTION` is valid when
+  the candidate correctly explains that the question cannot be answered uniquely, and an approved
+  verdict still completes, whatever the diagnosis says.
+- The diagnosis may only speak for a semantic failure a model judged. A verifier timeout or parse
+  failure keeps its own technical reason, and a technical verdict is never sent for diagnosis at
+  all, so no paid call happens during a provider outage. Deterministic recomputation and the
+  self-contradiction guard are this system's own findings and are never reopened.
+- Off by default (`ANSWER_DIAGNOSIS_SHADOW_ENABLED=false`), so no extra call, cost or latency
+  reaches a student request. The earlier approach of asking the primary verifier for a code was
+  rejected after it shifted real verdicts.
+- Budget: the single candidate slot is shared by a hard structural repair, a truncation
+  regeneration, and a verifier-driven regeneration; the presentation rewrite does not consume it,
+  and an attempt that fell back to another model still counts.
+
+---
+
+## Latest Changes - Verification Recovery Phase 0a: Diagnosis + Shadow Decisions (2026-09-16)
+
+No request ends differently. This phase only makes failures diagnosable.
+
+- `CorrectnessVerification` carries a runtime `reason_code`; `failure_kind` and
+  `failure_source` are derived from it (`services/doubt_solver/recovery_policy.py`) and never
+  read from the model. The verifier prompt and schema are unchanged, so a model-written code
+  is still a schema failure.
+  - Technical: `TIMEOUT` and `PROVIDER_FAILURE` only for transient provider failure kinds
+    (timeout, rate limit, quota, unavailable, empty output); `CONFIGURATION_FAILURE` for
+    route/prompt/model misconfiguration; `PARSE_FAILURE`, `SCHEMA_FAILURE`; everything else,
+    including executor-wrapped code errors, is `TECHNICAL_UNCLASSIFIED`.
+  - Semantic: `NONE`, `WRONG_FINAL_ANSWER` (deterministic recomputation only),
+    `VERIFIER_SELF_CONTRADICTION` (existing guard), and `SEMANTIC_UNCLASSIFIED` for every model
+    rejection until the verifier states a cause (Phase 0b, separately approved).
+- `correctness_verification_completed` adds `diagnosis_reason_code`,
+  `diagnosis_failure_kind`, `diagnosis_failure_source`; the free-text reason is never logged.
+- A pure controller maps diagnosis plus request budget use to one action (`COMPLETE`,
+  `RETRY_SAME_NODE`, `REPAIR_CANDIDATE`, `REGENERATE_CANDIDATE`, `ASK_CLARIFICATION`,
+  `FAIL_TEMPORARY`, `FAIL_SAFE`). Budgets: continuation 1, generation recovery 1 in total
+  (rewrite, repair, and regeneration together), verifier technical retry 1, no generator
+  retry; semantic or invalid-code unknowns fail safe, technical verifier unknowns retry once;
+  infrastructure failures do not retry beyond the executor fallback. No model or difficulty change is ever chosen.
+- `RECOVERY_DECISION_SHADOW` records that action, the would-be terminal code, the actual
+  terminal code and budget use at each verified-path failure (streaming buffered path and the
+  graph). It runs inside a guard so a shadow error cannot change the request.
+- Not yet: any recovery action, `SERVICE_TEMPORARILY_UNAVAILABLE` on the wire, verifier
+  routing changes.
+
+---
+
+## Latest Changes - Launch Reliability Patch (2026-09-15)
+
+- **Manual Retry contract.** Terminal `error` events keep `metadata.retryable` as system
+  semantics (automatic retry/fallback) and add `metadata.user_retryable` (the student may start
+  a new attempt) for `ANSWER_VERIFICATION_FAILED` (false/true), `ANSWER_QUALITY_FAILED`
+  (false/true) and `ANSWER_PROVIDER_FAILED` (true/true). Other codes omit the field and clients
+  decide from `retryable`. Retry is only ever a student tap; nothing resubmits automatically.
+- **Presentation-only quality recovery.** After the single bounded rewrite, an answer whose
+  remaining quality reasons are all in `PRESENTATION_ONLY_REASON_CODES`
+  (`too_many_display_math_blocks`, `too_many_visible_steps`) continues to the existing
+  correctness verifier instead of failing, but only when that verifier runs for the request.
+  The orchestrator keeps such text marked `failed_quality_gate`; the streaming and
+  non-streaming paths deliver it only after verifier approval (final status `checked`) and
+  never replay it otherwise. Every other reason keeps `ANSWER_QUALITY_FAILED`. Event:
+  `QUALITY_PRESENTATION_ONLY_CONTINUED` with reason codes only.
+- **Conditional question normalization** (`services/doubt_solver/question_integrity.py`, text
+  input on the orchestrated path, at the request boundary in `main.py`). A deterministic gate
+  flags only high-confidence formatting damage (formula bracket-piece/encoding debris,
+  unbalanced `\(`/`\[`, operator-line fragments, long runs of isolated tokens with operators);
+  clean questions make no extra call. A flagged question gets one `generate_structured` call on
+  the existing `general.classifier_strong` route (`prompts/question_normalizer.md`) and a
+  deterministic guard that rejects any repair that is not representation-only: after NFC
+  normalization the characters, compared case-sensitively and in order, may differ only by
+  curly-brace pieces (`⎧`–`⎭`) and LaTeX `\(`/`\[` delimiters; only `×`/`*`, `÷`/`/`,
+  `−`/`-` are treated as equal. Between characters only the break may change: a space may
+  vanish (not beside a value's `.`/`,`, so `Rs .50` stays) or become a line break; a space
+  may be added only beside an operator and never inside `!=`/`<=`-style compounds; a line
+  break (any Unicode line terminator) or a phrase-ending `. , ;` may change form but not
+  vanish, and nothing may become punctuation; a line break may not be inserted inside `3x`
+  and may be dropped only after an operator, `(` or option label, before `= ≤ ≥ ≠ ^ / )`, or
+  before `+ - * < >` alone on their line (a line starting `-x`, `* y` or `> y` stays
+  separate). The repair may add a lead-in colon (`equations:`) before a line that starts
+  with a digit, sign or `(`; a colon in the student's text is always kept.
+  The ordered word/number sequence (numbers keep their `.`/`,` separators) and operator
+  sequence must also match and no placeholder (`?`, `...`, `___`) may be added. This rejects
+  reassociated quantities, swapped option values, changes of direction, multiplicity,
+  ordering, comparison or negation words, Hindi vowel-sign changes, letter-case changes,
+  dropped or added brackets, `√`, `!`, `|`, `'`, ratio `:` or set/geometry symbols, a
+  dropped/added leading decimal point (`.5`), split digit grouping (`1,500`), a comma that
+  turns an expression into a list or back (`5 - 3` ↔ `5, -3`, `3, x` ↔ `3 x`), and a deleted
+  separator that chains equations (`x = 2, y = 3` → `x = 2y = 3`). A repair that still has
+  dangling structure (a line ending on an operator, an operator followed by another binary
+  operator or `=`, a relation followed by a placeholder, an option label without text, a bare
+  "find") is treated as missing information. Only a guard-passed, complete repair continues, as the original text
+  followed by the repaired reading; `original_query` stays untouched for replay and history,
+  and conversation context is built from the working query so the repair reaches generation
+  and verification. `AMBIGUOUS`, `MISSING_INFORMATION`, a guard rejection, or an unavailable
+  normalizer end the request before any answer call with `QUESTION_NEEDS_CLARIFICATION`
+  (`retryable=false`, `user_retryable=false`, localized re-type/re-upload message; no
+  persistence, no credit settlement). Event: `QUESTION_NORMALIZATION_DECISION`.
+- Known limits: the guard is intentionally strict, so a genuine repair that also rewrites a
+  superscript (`x²` → `x^2`) or a word, turns bracket/fraction debris (`⎛ ⎞`, `⎯`) into
+  symbols, drops a replacement or private-use character, adds a comma between equations, or
+  deletes a line break between two values (including unwrapping a hard-wrapped sentence or
+  joining `(a) 21\n(b) 27` onto one line), or re-spaces Hindi OCR splits, is refused with a
+  clarification rather than solved; a repair with a bare `Solve:`/`Find:` line is caught by
+  the dangling-structure check. Conversely, turning a space into a line break is accepted as layout, so where a
+  run-together system (`= 4 x + 2 y`) splits into equations is the normalizer's reading;
+  generation and Terra verification still see the original text alongside it. A few
+  rare clean shapes (very long spaced arithmetic, code containing `\(`) still flag and cost one
+  normalizer call. Historical failed questions were not retained
+  (`HISTORICAL_CASE_NOT_REPRODUCIBLE`).
 
 ---
 
@@ -259,7 +536,7 @@ The four V1 planning documents are complete and implementation is done:
   Intermediate values, relationship terms, rejected options, formulas, and ordinary explanatory
   `Answer` headings do not become competing conclusions.
 - Rewrite parsing records provider-empty, parse-failed, marker-missing-but-complete,
-  quality-still-failed, and accepted outcomes. A complete markerless rewrite still passes the normal
+  quality-still-failed, answer-surface-changed, and accepted outcomes. A complete markerless rewrite still passes the normal
   final-answer and quality checks; empty or malformed output remains rejected. One rewrite maximum is
   unchanged.
 - Read-only Dev smoke confirms the fixed SSM parameters, both DynamoDB tables, both conversation

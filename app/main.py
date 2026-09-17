@@ -66,6 +66,7 @@ from observability import (
 from observability.summary import reset_request_summary
 from schemas.conversation import CompletedConversationTurn
 from schemas.doubt_solver import (
+    CanonicalLanguage,
     DoubtSolverFinalResponse,
     DoubtSolverRequest,
     DoubtSolverStreamEvent,
@@ -95,6 +96,13 @@ from services.doubt_solver.exam_profile_cache import get_exam_profile_runtime
 from services.doubt_solver.exam_response_profile import (
     ExamResponseProfileConfigError,
     get_exam_response_profile_resolver,
+)
+from services.doubt_solver.question_integrity import (
+    QUESTION_NEEDS_CLARIFICATION,
+    QuestionNormalizer,
+    assess_question_integrity,
+    clarification_message,
+    compose_normalized_query,
 )
 from services.doubt_solver.stream_transport import (
     StreamCancellation,
@@ -215,6 +223,7 @@ if settings.image_classifier_enabled:
 orchestrated_doubt_solver_graph = None
 orchestrated_adapter: AnswerGenerationAdapter | None = None
 follow_up_resolver = None
+question_normalizer: QuestionNormalizer | None = None
 practice_async_launcher = None
 practice_request_interpreter = None
 if settings.enable_orchestrated_doubt_solver:
@@ -251,6 +260,7 @@ if settings.enable_orchestrated_doubt_solver:
     )
 
     follow_up_resolver = FollowUpQueryResolver(orchestrator=_orchestrator)
+    question_normalizer = QuestionNormalizer(orchestrator=_orchestrator)
     _adapter = AnswerGenerationAdapter(orchestrator=_orchestrator)
     orchestrated_adapter = _adapter
     practice_async_launcher = build_practice_async_launcher(
@@ -388,6 +398,50 @@ def _student_credit_refusal(
         "request_id": request_id,
         "mode": "doubt_solver",
         "error": reason_code,
+    }
+
+
+def _question_clarification_refusal(
+    *,
+    request_id: str,
+    language: CanonicalLanguage,
+    stream: bool,
+):
+    """Stop before any answer call when the question cannot be read reliably."""
+    message = clarification_message(language)
+    if stream:
+        return StreamingResponse(
+            stream_events_as_sse(
+                iter(
+                    (
+                        DoubtSolverStreamEvent(
+                            type="error",
+                            request_id=request_id,
+                            stage="failed",
+                            label=message,
+                            metadata={
+                                "retryable": False,
+                                "user_retryable": False,
+                                "code": QUESTION_NEEDS_CLARIFICATION,
+                            },
+                        ),
+                    )
+                ),
+                request_id=request_id,
+                cancellation=StreamCancellation(),
+                heartbeat_interval_seconds=(
+                    settings.answer_stream_heartbeat_interval_seconds
+                ),
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return {
+        "success": False,
+        "request_id": request_id,
+        "mode": "doubt_solver",
+        "error": QUESTION_NEEDS_CLARIFICATION,
+        "answer": message,
     }
 
 
@@ -797,6 +851,30 @@ def invoke(payload: dict) -> dict | Response:
                 get_settings().enable_orchestrated_doubt_solver
                 and orchestrated_doubt_solver_graph is not None
             ):
+                if source_modality == "text" and query and question_normalizer is not None:
+                    integrity_signals = assess_question_integrity(query)
+                    if integrity_signals:
+                        normalization = question_normalizer.normalize(
+                            request_id=request_id,
+                            query=query,
+                            language=ds_request.language,
+                            signals=integrity_signals,
+                        )
+                        # A flagged question is solved only from a repair that passed the
+                        # fact guard. Solving the damaged text instead let a misread reach
+                        # a verifier that reads the same damaged text.
+                        if (
+                            normalization.outcome != "normalized"
+                            or not normalization.normalized_question
+                        ):
+                            return _question_clarification_refusal(
+                                request_id=request_id,
+                                language=ds_request.language,
+                                stream=ds_request.stream,
+                            )
+                        query = compose_normalized_query(
+                            original_query, normalization.normalized_question
+                        )
                 if ds_request.stream:
                     if orchestrated_adapter is None:
                         return {
