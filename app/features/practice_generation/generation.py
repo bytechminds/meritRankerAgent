@@ -18,6 +18,10 @@ from features.practice_generation.metadata_normalization import (
     normalize_subject,
     normalize_topic,
 )
+from features.practice_generation.planning import (
+    _structural_error_bucket,
+    practice_generator_route_subject,
+)
 from features.practice_generation.question_contract import (
     SemanticBasis,
     classify_semantic_basis,
@@ -45,6 +49,7 @@ from services.llm.orchestration.practice_generation_capacity import (
     PracticeGenerationCapacityPolicy,
 )
 from services.llm.orchestration.route_resolver import resolve_route
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 
 
 @dataclass(frozen=True)
@@ -58,10 +63,45 @@ class RouteOutputCapacity:
 TokenBudgetResolver = Callable[[str, str], int | RouteOutputCapacity]
 
 
+# Bucket → generator-prefixed reason code, mirroring the planner's identical mapping
+# (features.practice_generation.planning._PLANNER_STRUCTURAL_REASON_CODES) with its
+# own prefix. Consulted only after the more specific SCHEMA_V2_*_CONTRACT_INVALID
+# location-based codes below have had a chance to match, so a field-specific code is
+# never coarsened just because this set also covers it.
+_GENERATOR_STRUCTURAL_REASON_CODES = {
+    "parse_failure": "GENERATOR_PARSE_FAILURE",
+    "missing": "GENERATOR_MISSING_FIELD",
+    "constraint": "GENERATOR_SCHEMA_CONSTRAINT_INVALID",
+    "type": "GENERATOR_SCHEMA_TYPE_INVALID",
+}
+
+# Every technical/structural rejection code parse_partial_generation can emit — the
+# location-based SCHEMA_V2_*_CONTRACT_INVALID codes plus every value
+# _GENERATOR_STRUCTURAL_REASON_CODES can produce, plus the envelope/truncation/
+# fallback codes emitted directly. A semantic rejection (e.g. from
+# validate_playable_question, or GENERATION_BUCKET_CONTRACT_MISMATCH) is never a
+# member: the caller uses this set to tell "the output was structurally wrong" apart
+# from "the output was well-formed but rejected", which decide different terminal
+# reason codes.
+STRUCTURAL_GENERATOR_REASON_CODES = frozenset(
+    {
+        "SCHEMA_V2_IDENTITY_CONTRACT_INVALID",
+        "SCHEMA_V2_SLOT_CONTRACT_INVALID",
+        "SCHEMA_V2_OPTION_CONTRACT_INVALID",
+        "SCHEMA_V2_ANSWER_CONTRACT_INVALID",
+        "GENERATOR_CONTRACT_INVALID",
+        "GENERATOR_OUTPUT_TRUNCATED",
+        "GENERATOR_BATCH_COUNT_MISMATCH",
+        "GENERATOR_OUTPUT_INVALID",
+        *_GENERATOR_STRUCTURAL_REASON_CODES.values(),
+    }
+)
+
+
 def _structured_parse_rejection_code(error: ValidationError | TypeError) -> str:
     """Map schema failures to safe, stable diagnostics without exposing model output."""
     if isinstance(error, TypeError):
-        return "STRUCTURED_PARSE_INVALID"
+        return "GENERATOR_OUTPUT_INVALID"
 
     locations = {
         str(location[0])
@@ -76,7 +116,8 @@ def _structured_parse_rejection_code(error: ValidationError | TypeError) -> str:
         return "SCHEMA_V2_OPTION_CONTRACT_INVALID"
     if locations & {"correct_option_id", "correct_answer", "answer_explanation", "solution"}:
         return "SCHEMA_V2_ANSWER_CONTRACT_INVALID"
-    return "STRUCTURED_PARSE_INVALID"
+    bucket = _structural_error_bucket(error)
+    return _GENERATOR_STRUCTURAL_REASON_CODES.get(bucket, "GENERATOR_OUTPUT_INVALID")
 
 
 def _route_output_token_budget(subject: str, difficulty: str) -> RouteOutputCapacity:
@@ -85,7 +126,7 @@ def _route_output_token_budget(subject: str, difficulty: str) -> RouteOutputCapa
         route = resolve_route(
             RouteRequest(
                 request_id="practice-generation-batch-capacity",
-                subject=subject,
+                subject=practice_generator_route_subject(subject, difficulty),
                 task_role="generator",
                 difficulty=difficulty,
                 intent="practice",
@@ -116,7 +157,10 @@ def _practice_capacity_for_slot(
         route = resolve_route(
             RouteRequest(
                 request_id="practice-generation-capacity",
-                subject=slot.subject_id,
+                subject=practice_generator_route_subject(
+                    slot.subject_id,
+                    slot.difficulty,
+                ),
                 task_role="generator",
                 difficulty=slot.difficulty.value,
                 intent="practice",
@@ -148,7 +192,10 @@ def _practice_capacity_for_bucket(
         route = resolve_route(
             RouteRequest(
                 request_id="practice-generation-capacity",
-                subject=bucket.subject,
+                subject=practice_generator_route_subject(
+                    bucket.subject,
+                    bucket.difficulty,
+                ),
                 task_role="generator",
                 difficulty=bucket.difficulty.value,
                 intent="practice",
@@ -459,21 +506,31 @@ def parse_partial_generation(
     existing_normalized_texts: set[str],
     slots: tuple[PlannerSlot, ...] = (),
     requested_language: str | None = None,
+    finish_reason: str | None = None,
 ) -> ParsedGeneration:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
+        # A truncated completion (finish_reason=length) is a bounded-recovery signal,
+        # not a malformed-output one: the model was cut off mid-JSON, so the existing
+        # replacement wave should run, not be told the shape itself was wrong.
+        truncated = (
+            finish_reason is not None
+            and normalize_completion_outcome(finish_reason) == "output_token_exhausted"
+        )
         return ParsedGeneration(
             accepted=(),
             rejected_count=group.required_count,
-            rejection_reason_codes=("STRUCTURED_PARSE_INVALID",),
+            rejection_reason_codes=(
+                "GENERATOR_OUTPUT_TRUNCATED" if truncated else "GENERATOR_PARSE_FAILURE",
+            ),
         )
     raw_questions = payload.get("questions", []) if isinstance(payload, dict) else []
     if not isinstance(raw_questions, list):
         return ParsedGeneration(
             accepted=(),
             rejected_count=group.required_count,
-            rejection_reason_codes=("STRUCTURED_PARSE_INVALID",),
+            rejection_reason_codes=("GENERATOR_CONTRACT_INVALID",),
         )
 
     accepted: list[GeneratedQuestion] = []
@@ -556,7 +613,12 @@ def parse_partial_generation(
         if question.slot_id:
             seen_ids.add(question.slot_id)
         existing_normalized_texts.add(normalized)
-    rejected += max(0, group.required_count - len(accepted) - rejected)
+    # The model returned fewer items than required_count: slots with no corresponding
+    # item at all, distinct from an item that was present and rejected — each such gap
+    # previously counted toward rejected_count with no reason code attached.
+    missing = max(0, group.required_count - len(accepted) - rejected)
+    rejected += missing
+    rejection_reason_codes.extend(["GENERATOR_BATCH_COUNT_MISMATCH"] * missing)
     return ParsedGeneration(
         accepted=tuple(accepted),
         rejected_count=rejected,
@@ -612,10 +674,10 @@ def deterministic_question_id(
 def _is_persisted_schema_v2(practice_meta: object) -> bool:
     """True when a persisted question was authored under the schema-v2 contract.
 
-    The v2 Author deliberately emits no `solution`; the in-batch check already exempts
-    it (see the solution_required expression in parse_partial_generation). Persisted
-    validation has to apply the same exemption or every verified v2 item is rejected
-    at the final gate. v1/legacy/reused items keep the original requirement.
+    The v2 Author deliberately emits no `solution`, but a verified persisted v2 item
+    carries the mandatory Authority-derived explanation in both answer snapshots.
+    The existing v2 answer-contract validator enforces that requirement independently
+    of the legacy solution flag.
     """
     return (
         isinstance(practice_meta, dict)

@@ -62,6 +62,12 @@ material routing conflict.
 
 Do **not** invent obscure keys.
 
+`pattern_family_candidate` names the broad exam family, separate from `pattern_topic_candidate`,
+only when the request obviously belongs to one of these exact values: `HISTORY`, `GEOGRAPHY`,
+`POLITY`, `ECONOMICS`, `SCIENCE`, `PHYSICS`, `CHEMISTRY`, `BIOLOGY`, `COMPUTER_SCIENCE`. Use one of
+these exact values only when obvious; otherwise leave it null. Never use a value outside this set,
+and never let it change `subject`.
+
 ## Conversation relation and action
 
 ### Pronoun and contextual reference resolution

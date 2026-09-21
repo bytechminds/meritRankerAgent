@@ -9,9 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from practice_limits import (
     MAX_PRACTICE_QUESTIONS,
+    MAX_REQUESTED_PRACTICE_QUESTIONS,
     PRACTICE_SLOT_ID_PATTERN,
+    effective_practice_question_count,
 )
 from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
+from schemas.practice_limit import PracticeLimitation
 from services.llm.orchestration.prompt_budget import PromptInputBudget
 from tools.web_search.models import FreshEvidenceBundle
 
@@ -86,8 +89,9 @@ class PracticeGenerationRequest(BaseModel):
     turn_id: str = Field(min_length=1, max_length=128)
     original_query: str = Field(min_length=1, max_length=5000)
     practice_type: PracticeType
-    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    requested_count: int = Field(ge=1, le=MAX_REQUESTED_PRACTICE_QUESTIONS)
     accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    limitation: PracticeLimitation | None = None
     subject: str = Field(min_length=1, max_length=64)
     topic: str | None = Field(default=None, max_length=128)
     topics: list[str] | None = Field(default=None, max_length=12)
@@ -116,8 +120,22 @@ class PracticeGenerationRequest(BaseModel):
 
     @model_validator(mode="after")
     def _accepted_count_matches_requested_count(self) -> PracticeGenerationRequest:
-        if self.accepted_count != self.requested_count:
-            raise ValueError("accepted_count must equal requested_count")
+        effective_count = effective_practice_question_count(self.requested_count)
+        if self.accepted_count != effective_count:
+            raise ValueError("accepted_count must equal the effective requested count")
+        if self.requested_count == self.accepted_count and self.limitation is not None:
+            raise ValueError("unlimited request must not carry a limitation")
+        if self.requested_count != self.accepted_count:
+            if self.limitation is None:
+                raise ValueError("limited request must carry a limitation")
+            if (
+                self.limitation.type != "QUESTION_COUNT_LIMIT"
+                or self.limitation.requested_value != self.requested_count
+                or self.limitation.effective_value != self.accepted_count
+                or self.limitation.maximum_value != MAX_PRACTICE_QUESTIONS
+                or self.limitation.message_key != "PRACTICE_MAX_QUESTIONS_LIMITED"
+            ):
+                raise ValueError("limitation does not match the question-count contract")
         if self.difficulty_distribution is not None:
             counts = self.difficulty_distribution.values()
             if any(count < 0 for count in counts):
@@ -134,6 +152,11 @@ class PracticeGenerationRequest(BaseModel):
         elif self.fresh_evidence is not None:
             raise ValueError("static practice must not retain fresh evidence")
         return self
+
+    @property
+    def effective_count(self) -> int:
+        """The count supplied to the planner and all downstream lifecycle stages."""
+        return self.accepted_count
 
 
 class DemandBucket(BaseModel):
@@ -272,12 +295,16 @@ class PlannerSlot(BaseModel):
 
 
 class TopicEvidence(BaseModel):
-    """One requested topic, tied to the exact words the student used for it.
+    """One requested topic, grounded by a short exact span the student actually wrote.
 
-    ``source_text`` is the student's own span, copied from the original query; the
-    planner supplies the semantic normalization in ``topic_id``. Deterministic code
-    verifies only the source, which is what stops an invented topic from entering a
-    blueprint: a topic with no span in the query is never treated as user-requested.
+    ``source_text`` is a short exact substring of the original query, own script,
+    sufficient for ``_grounded_topic_ids`` to confirm the topic was actually requested;
+    the planner supplies the semantic normalization in ``topic_id``. It is deliberately
+    NOT required to reproduce the full source question or the complete relevant phrase —
+    grounding (``planning.py:_grounded_topic_ids``) only ever tests literal substring
+    membership, so the shortest span that still uniquely names the topic satisfies it.
+    Audited: the only production consumer of this field is that substring check; no
+    caller needs the complete original question here.
     """
 
     model_config = ConfigDict(
@@ -289,7 +316,9 @@ class TopicEvidence(BaseModel):
 
 
 class PracticeBlueprint(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
+    model_config = ConfigDict(
+        str_strip_whitespace=True, frozen=True, populate_by_name=True
+    )
 
     schema_version: Literal["1", "2"] = "1"
     practice_type: PracticeType
@@ -401,6 +430,189 @@ class PracticeBlueprint(BaseModel):
         return self
 
 
+# ---------------------------------------------------------------------------------
+# Provider-native structured-output generation schema (schema-v2 planner wire shape).
+#
+# This is NOT ``PlannerSlot``/``TopicEvidence``.model_json_schema(): that compiles
+# optional fields to ``anyOf``/``$ref``/``$defs``, which strict-mode providers reject
+# (see the identical constraint documented next to the Gemini verifier schema). This
+# is the smallest JSON-Schema subset that constrains SHAPE only — type, enum,
+# required, additionalProperties — for a provider's own strict/constrained-decoding
+# mode. Business rules a provider schema cannot express (``max_length``, item-count
+# bounds, uniqueness, grounding, cross-field invariants) stay enforced locally by
+# ``PracticeBlueprint``/``PlannerSlot``/``TopicEvidence`` after parsing, unchanged by
+# whichever path produced the JSON. Shared by every schema-v2 planner family
+# (quant_reasoning, english, factual): their wire shape is identical; only the prompt
+# guidance differs per family.
+# ---------------------------------------------------------------------------------
+
+
+def planner_generation_schema() -> dict[str, Any]:
+    """Return the schema-v2 planner output shape as a strict-mode JSON Schema.
+
+    Every property is listed in ``required`` per provider strict-mode semantics
+    (required means "present in the object", not "non-null"); a field that is
+    optional in ``PlannerSlot``/``TopicEvidence`` is typed nullable here instead.
+    """
+    nullable_string = {"type": ["string", "null"]}
+    slot = {
+        "type": "object",
+        "properties": {
+            "slot_id": {"type": "string"},
+            "subject_id": {"type": "string"},
+            "topic_id": {"type": "string"},
+            "category_id": {"type": "string"},
+            "difficulty": {"type": "string", "enum": [value.value for value in Difficulty]},
+            "complexity": {"type": "string", "enum": [value.value for value in Complexity]},
+            "exam_ids": {"type": "array", "items": {"type": "string"}},
+            "question_type": {"type": "string", "enum": [QuestionType.MCQ.value]},
+            "target_skill": {"type": "string"},
+            "variation_hint": {"type": "string"},
+            "pattern_family_id": nullable_string,
+            "generator_route_hint": {"type": "string"},
+            "reasoning_target": nullable_string,
+            "trap_type": nullable_string,
+            "not_same_when": {"type": "array", "items": {"type": "string"}},
+            "generation_group_hint": {"type": ["integer", "null"]},
+        },
+        "required": [
+            "slot_id",
+            "subject_id",
+            "topic_id",
+            "category_id",
+            "difficulty",
+            "complexity",
+            "exam_ids",
+            "question_type",
+            "target_skill",
+            "variation_hint",
+            "pattern_family_id",
+            "generator_route_hint",
+            "reasoning_target",
+            "trap_type",
+            "not_same_when",
+            "generation_group_hint",
+        ],
+        "additionalProperties": False,
+    }
+    evidence = {
+        "type": "object",
+        "properties": {
+            "sourceText": {"type": "string"},
+            "topicId": {"type": "string"},
+        },
+        "required": ["sourceText", "topicId"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "slots": {"type": "array", "items": slot},
+            "requestedTopicEvidence": {"type": "array", "items": evidence},
+        },
+        "required": ["slots", "requestedTopicEvidence"],
+        "additionalProperties": False,
+    }
+
+
+def practice_generator_generation_schema() -> dict[str, Any]:
+    """Return the schema-v2 question-generator output shape as a strict-mode JSON Schema.
+
+    Shared by every generator route (math/reasoning/english/factual/general) and every
+    replacement wave: ``question_generator_v2.md``, ``question_generator_factual.md``,
+    ``question_repair.md``, and ``question_regenerator.md`` all specify this identical
+    wire shape, so one schema covers initial generation and both replacement waves.
+    Constrains structure only; ``GeneratedQuestion`` stays the authority for
+    ``max_length``, option-count, and cross-field invariants after parsing.
+    """
+    option = {
+        "type": "object",
+        "properties": {
+            "option_id": {"type": "string", "enum": ["0", "1", "2", "3"]},
+            "value": {"type": "string"},
+        },
+        "required": ["option_id", "value"],
+        "additionalProperties": False,
+    }
+    question = {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["2"]},
+            "bucket_id": {"type": "string"},
+            "slot_id": {"type": "string"},
+            "question": {"type": "string"},
+            "question_type": {"type": "string", "enum": [QuestionType.MCQ.value]},
+            "options": {"type": "array", "items": option},
+            "correct_option_id": {"type": "string", "enum": ["0", "1", "2", "3"]},
+            "subject": {"type": "string"},
+            "topic": {"type": "string"},
+            "difficulty": {"type": "string", "enum": [value.value for value in Difficulty]},
+        },
+        "required": [
+            "schema_version",
+            "bucket_id",
+            "slot_id",
+            "question",
+            "question_type",
+            "options",
+            "correct_option_id",
+            "subject",
+            "topic",
+            "difficulty",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {"questions": {"type": "array", "items": question}},
+        "required": ["questions"],
+        "additionalProperties": False,
+    }
+
+
+def practice_verifier_generation_schema() -> dict[str, Any]:
+    """Return the schema-v2 Answer Authority output shape as a strict-mode JSON Schema.
+
+    Shared by every Practice verifier route (math/reasoning/english/factual) regardless
+    of provider: ``question_verifier_v2.md`` specifies this identical wire shape.
+    Includes ``evidence_urls`` — present on ``VerificationResult`` and required by
+    ``_enforce_evidence_citations`` for fresh-evidence questions, but absent from the
+    Gemini adapter's previous hand-written copy of this schema; adapters should build
+    their native response format from this one function rather than duplicating it, so
+    the two cannot drift apart again. Constrains structure only; ``VerificationResult``
+    stays the authority for ``max_length``, item-count bounds, and cross-field
+    invariants after parsing.
+    """
+    option_id = {"type": "string", "enum": ["0", "1", "2", "3"]}
+    return {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["2"]},
+            "generation_item_id": {"type": "string"},
+            "slot_id": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["ACCEPT", "REPAIRABLE", "REGENERATE", "TERMINAL_REJECTION"],
+            },
+            "valid_option_ids": {"type": "array", "items": option_id},
+            "answer_explanation": {"type": "string"},
+            "reason_codes": {"type": "array", "items": {"type": "string"}},
+            "evidence_urls": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "schema_version",
+            "generation_item_id",
+            "slot_id",
+            "decision",
+            "valid_option_ids",
+            "answer_explanation",
+            "reason_codes",
+            "evidence_urls",
+        ],
+        "additionalProperties": False,
+    }
+
+
 class GenerationGroup(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -439,10 +651,9 @@ class GeneratedQuestion(BaseModel):
     correct_option_id: Literal["0", "1", "2", "3"] | None = None
     # Derived from ``correct_option_id`` for schema v2 — not authored, not compared.
     correct_answer: str = Field(min_length=1, max_length=1000)
-    # Optional for schema v2. A playable, scorable question needs a stem, options and
-    # a verified canonical option id — nothing else. Authors no longer spend output
-    # tokens on prose that the authority does not read and scoring never consults.
-    # Existing explanations (reuse, QuestionBank, PYQ, educator-authored) are preserved.
+    # Schema-v2 authors omit prose. The blind Answer Authority supplies this only after
+    # independently selecting one canonical option; persistence then writes that exact
+    # value to both canonical explanation snapshots.
     answer_explanation: str = Field(default="", max_length=5000)
     solution: str = Field(default="", max_length=5000)
     subject: str = Field(min_length=1, max_length=64)
@@ -511,7 +722,7 @@ class GeneratedQuestion(BaseModel):
 class AssessmentProgress(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    requested_count: int = Field(ge=1, le=MAX_REQUESTED_PRACTICE_QUESTIONS)
     accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     reused_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
     generated_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
@@ -540,9 +751,10 @@ class PracticeLaunchResult(BaseModel):
 
     test_id: str = Field(min_length=1, max_length=128)
     status: Literal["GENERATING", "READY", "FAILED"]
-    requested_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
+    requested_count: int = Field(ge=1, le=MAX_REQUESTED_PRACTICE_QUESTIONS)
     accepted_count: int = Field(ge=1, le=MAX_PRACTICE_QUESTIONS)
     count_clamped: bool
+    limitation: PracticeLimitation | None = None
     progress_percent: int = Field(ge=0, le=100)
     playable: bool
     duplicate_request: bool = False
@@ -569,7 +781,7 @@ class PracticeControlResult(BaseModel):
     execution_id: str | None = Field(default=None, max_length=128)
     already_active: bool = False
     ready_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
-    requested_count: int = Field(default=0, ge=0, le=MAX_PRACTICE_QUESTIONS)
+    requested_count: int = Field(default=0, ge=0, le=MAX_REQUESTED_PRACTICE_QUESTIONS)
 
 
 class PracticeLaunchDecision(BaseModel):
@@ -596,6 +808,10 @@ class GeneratedBatch(BaseModel):
     route_id: str = Field(min_length=1, max_length=160)
     model: str = Field(min_length=1, max_length=160)
     prompt_input_budget: PromptInputBudget | None = None
+    # The provider's own stop reason ("stop", "length", ...), carried through so a
+    # truncated response can be told apart from a malformed one before either is
+    # treated as a schema failure. None for callers/executors that do not report it.
+    finish_reason: str | None = None
 
 
 class PlannerEnvelope(BaseModel):
@@ -622,6 +838,9 @@ class VerificationResult(BaseModel):
     valid_option_ids: list[Literal["0", "1", "2", "3"]] = Field(
         default_factory=list, max_length=4
     )
+    # Required by the strict schema-v2 provider response for ACCEPT. It is produced by
+    # the independent Answer Authority, never copied from the author.
+    answer_explanation: str = Field(default="", max_length=5000)
     reason_codes: list[str] = Field(default_factory=list, max_length=8)
     evidence_urls: list[str] = Field(default_factory=list, max_length=4)
     approved: bool | None = None
@@ -638,6 +857,10 @@ class VerificationResult(BaseModel):
                 if len(self.valid_option_ids) != 1:
                     raise ValueError(
                         "accepted verification requires exactly one valid option id"
+                    )
+                if not self.answer_explanation:
+                    raise ValueError(
+                        "accepted verification requires an answer explanation"
                     )
                 if self.independently_solved_option_id is None:
                     object.__setattr__(

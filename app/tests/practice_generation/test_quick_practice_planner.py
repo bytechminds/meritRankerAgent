@@ -47,12 +47,12 @@ class _ExplodingPlanner:
 # --- A. single subject / single topic, exact totals ---------------------------
 
 @pytest.mark.parametrize("count", [1, 2, 3, 5, 6, 10, 20, 50, 100])
-def test_slot_count_always_equals_requested_count(count: int) -> None:
+def test_slot_count_always_equals_effective_requested_count(count: int) -> None:
     blueprint = deterministic_blueprint(request_for(f"Create {count} questions on Time and Work"))
 
-    assert len(blueprint.slots) == count
-    assert blueprint.accepted_count == count
-    assert sum(bucket.required_count for bucket in blueprint.buckets) == count
+    assert len(blueprint.slots) == min(count, 50)
+    assert blueprint.accepted_count == min(count, 50)
+    assert sum(bucket.required_count for bucket in blueprint.buckets) == min(count, 50)
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -87,7 +87,7 @@ def test_mixed_difficulty_request_distributes_and_still_totals_exactly(count: in
         request_for(f"Create {count} mixed difficulty questions on Time and Work")
     )
 
-    assert len(blueprint.slots) == count
+    assert len(blueprint.slots) == min(count, 50)
     bands = {slot.difficulty for slot in blueprint.slots}
     assert bands <= {Difficulty.BASIC, Difficulty.INTERMEDIATE, Difficulty.ADVANCED}
     if count >= 3:
@@ -112,9 +112,9 @@ def test_multiple_topics_allocate_without_losing_the_total(
         request_for(f"Create {count} questions", topic=topic)
     )
 
-    assert len(blueprint.slots) == count
+    assert len(blueprint.slots) == min(count, 50)
     distinct = {slot.topic_id for slot in blueprint.slots}
-    assert len(distinct) == min(count, expected_topics)
+    assert len(distinct) == min(count, 50, expected_topics)
     # Equal apportionment: no topic may exceed another by more than one slot.
     per_topic = [sum(1 for s in blueprint.slots if s.topic_id == t) for t in distinct]
     assert max(per_topic) - min(per_topic) <= 1
@@ -256,7 +256,7 @@ def test_balanced_allocation_when_every_topic_fits(count: int) -> None:
         for t in {s.topic_id for s in blueprint.slots}
     ]
 
-    assert sum(per_topic) == count
+    assert sum(per_topic) == min(count, 50)
     assert len(per_topic) == 3
     assert max(per_topic) - min(per_topic) <= 1
 
@@ -478,5 +478,5 @@ def test_grouping_is_stable_for_identical_input() -> None:
 def test_group_cap_holds_at_every_supported_count(count: int) -> None:
     _blueprint, deficits, groups = _groups_for(count, "percentage, ratio, average", [])
 
-    assert sum(g.required_count for g in groups) == len(deficits) == count
+    assert sum(g.required_count for g in groups) == len(deficits) == min(count, 50)
     assert all(g.required_count <= 5 for g in groups)

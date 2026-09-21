@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 _SUBJECT_ALIASES: dict[str, str] = {
     "math": "math",
+    # Internal Practice-only Math authoring route. No classifier or student-facing
+    # subject may emit this value; Practice derives it from a Math slot and route
+    # difficulty so the promotion cannot alter Doubt Solver Math routing.
+    "practice_math": "practice_math",
     "maths": "math",
     "mathematics": "math",
     "quantitative_aptitude": "math",

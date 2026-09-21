@@ -82,6 +82,7 @@ class _RecordingVerifier:
                 slot_id=slot.slot_id,
                 decision=VerificationDecision.ACCEPT,
                 valid_option_ids=[question.correct_option_id],
+                answer_explanation="The independently selected option is correct.",
                 reason_codes=["MATCH"],
             )
         finally:

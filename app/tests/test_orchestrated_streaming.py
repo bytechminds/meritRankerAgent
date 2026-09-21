@@ -148,6 +148,63 @@ def test_practice_start_can_be_deferred_until_terminal_frame_commit(
     assert ordering == ["persisted"]
 
 
+def test_practice_launch_narrows_a_general_subject_through_the_shared_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming practice-launch path must use the same canonical subject
+    resolution as the graph path, not the raw classifier subject. Regression for
+    a defect where streaming passed subject="general" straight through, causing
+    Practice's Authority guard to fail closed for classified factual families."""
+    monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "true")
+    captured: dict[str, object] = {}
+
+    class Launcher:
+        def launch(self, request):
+            captured["subject"] = request.subject
+            return PracticeLaunchResult(
+                test_id="practice-456",
+                status="GENERATING",
+                requested_count=5,
+                accepted_count=5,
+                count_clamped=False,
+                progress_percent=0,
+                playable=False,
+                message="Your practice test is being prepared.",
+            )
+
+    class Persistence:
+        def persist_completed_turn(self, *_args, **_kwargs):
+            return SimpleNamespace(history_write_status="succeeded")
+
+    list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                actor_id="user-1",
+                conversation_id="conversation-1",
+                turn_id="turn-1",
+                query="create indian polity question of 5 questions test",
+                original_query="create indian polity question of 5 questions test",
+                language="english",
+                classification={
+                    "subject": "general",
+                    "topic": "Indian Polity",
+                    "pattern_family_candidate": "POLITY",
+                    "intent": "practice",
+                    "difficulty": "default",
+                    "retrieval_required": False,
+                },
+                classifier_confidence=0.99,
+            ),
+            adapter=_make_adapter(),
+            conversation_persistence=Persistence(),
+            practice_launcher=Launcher(),
+        )
+    )
+
+    assert captured["subject"] == "polity"
+
+
 class TestStreamEventSchema:
     def test_status_validates(self) -> None:
         event = DoubtSolverStreamEvent(

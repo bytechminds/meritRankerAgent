@@ -57,6 +57,11 @@ def _result(valid_option_ids: list[str], decision: str = "ACCEPT") -> Verificati
         slot_id="slot-001",
         decision=decision,
         valid_option_ids=valid_option_ids,
+        answer_explanation=(
+            "The independently selected option follows from the stated premises."
+            if decision == "ACCEPT"
+            else ""
+        ),
         reason_codes=["SINGLE_VALID_OPTION"],
     )
 
@@ -76,8 +81,8 @@ class TestAuthorOutputIsMinimal:
         """Backward compatibility: a caller supplying the old field is not broken."""
         assert _question(correct_answer="4").correct_answer == "4"
 
-    def test_a_question_is_complete_without_an_explanation(self) -> None:
-        """Stem, options and a verified option id are all a playable question needs."""
+    def test_an_author_candidate_can_omit_its_explanation(self) -> None:
+        """Only the post-verification persisted contract requires authority prose."""
         question = _question(answer_explanation="")
         assert question.answer_explanation == ""
         assert question.solution == ""
@@ -90,7 +95,7 @@ class TestAuthorOutputIsMinimal:
         assert question.answer_explanation == "Two plus two is four."
 
 
-class TestExplanationIsOptionalForReady:
+class TestExplanationIsRequiredForReady:
     @staticmethod
     def _item(*, explanation: str, contract_explanation: str) -> dict[str, object]:
         return {
@@ -118,14 +123,20 @@ class TestExplanationIsOptionalForReady:
             "_practiceMeta": {"questionType": "mcq", "language": "english"},
         }
 
-    def test_persisted_v2_contract_accepts_an_absent_explanation(self) -> None:
+    def test_persisted_v2_contract_rejects_a_missing_answer_snapshot(self) -> None:
         validation = validate_persisted_playable_question(
-            self._item(explanation="", contract_explanation=""),
+            self._item(
+                explanation="Two plus two equals four.",
+                contract_explanation="",
+            ),
             expected_question_type="mcq",
             expected_language="english",
             solution_required=False,
         )
-        assert (validation.valid, validation.reason_code) == (True, "PLAYABLE")
+        assert (validation.valid, validation.reason_code) == (
+            False,
+            "ANSWER_CONTRACT_MISMATCH",
+        )
 
     def test_persisted_v2_contract_keeps_an_existing_explanation_valid(self) -> None:
         validation = validate_persisted_playable_question(
@@ -139,9 +150,11 @@ class TestExplanationIsOptionalForReady:
         )
         assert (validation.valid, validation.reason_code) == (True, "PLAYABLE")
 
-    def test_persisted_v2_contract_accepts_a_wholly_absent_explanation_key(self) -> None:
-        """The production shape: _put_question omits the attribute when it is empty."""
-        item = self._item(explanation="", contract_explanation="")
+    def test_persisted_v2_contract_rejects_a_missing_root_snapshot(self) -> None:
+        item = self._item(
+            explanation="",
+            contract_explanation="Two plus two equals four.",
+        )
         del item["explanation"]
 
         validation = validate_persisted_playable_question(
@@ -150,7 +163,10 @@ class TestExplanationIsOptionalForReady:
             expected_language="english",
             solution_required=False,
         )
-        assert (validation.valid, validation.reason_code) == (True, "PLAYABLE")
+        assert (validation.valid, validation.reason_code) == (
+            False,
+            "ANSWER_CONTRACT_MISMATCH",
+        )
 
     def test_persisted_v2_contract_rejects_disagreeing_explanations(self) -> None:
         """Optional, but the item and its answer contract must not diverge."""
@@ -186,6 +202,17 @@ class TestAuthorityOutputContract:
 
     def test_independent_answer_is_derived_from_the_single_valid_option(self) -> None:
         assert _result(["3"]).independently_solved_option_id == "3"
+
+    def test_accept_without_an_authority_explanation_is_rejected_by_the_schema(self) -> None:
+        with pytest.raises(ValidationError, match="answer explanation"):
+            VerificationResult(
+                schema_version="2",
+                generation_item_id="item-1",
+                slot_id="slot-001",
+                decision="ACCEPT",
+                valid_option_ids=["3"],
+                reason_codes=["SINGLE_VALID_OPTION"],
+            )
 
     def test_accept_with_no_valid_option_is_rejected_by_the_schema(self) -> None:
         with pytest.raises(ValidationError, match="exactly one valid option"):

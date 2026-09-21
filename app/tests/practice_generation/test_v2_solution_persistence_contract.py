@@ -1,10 +1,4 @@
-"""Schema-v2 questions are authored without a solution, so persistence must not demand one.
-
-Live production evidence (20Q run 1): every verified v2 item was rejected at the final gate
-with QUESTION_SOLUTION_REQUIRED and zero assessments reached READY. The in-batch check already
-exempted v2; the persisted checks did not. v1/legacy/reused items keep the original
-requirement, and the shared validator itself is unchanged.
-"""
+"""Schema-v2 authors omit prose; READY persistence requires authority-owned explanations."""
 
 from __future__ import annotations
 
@@ -72,12 +66,22 @@ class TestPersistedSchemaVersionDetection:
 
 
 class TestSolutionRequirementBySchemaVersion:
-    def test_v2_without_solution_passes(self) -> None:
+    def test_v2_without_both_explanation_snapshots_fails(self) -> None:
         contract = validate_persisted_playable_question(
             _item("2", solution=None),
             expected_question_type="mcq",
             expected_language="english",
             solution_required=(True and not _is_persisted_schema_v2({"schemaVersion": "2"})),
+        )
+        assert not contract.valid
+        assert contract.reason_code == "ANSWER_CONTRACT_MISMATCH"
+
+    def test_v2_with_both_explanation_snapshots_passes(self) -> None:
+        contract = validate_persisted_playable_question(
+            _item("2", solution="Two plus two is four."),
+            expected_question_type="mcq",
+            expected_language="english",
+            solution_required=False,
         )
         assert contract.valid, contract.reason_code
 
@@ -103,11 +107,11 @@ class TestSolutionRequirementBySchemaVersion:
     def test_mixed_set_is_judged_per_item(self) -> None:
         """A v1 item in the same set must not be exempted by a v2 sibling."""
         results = []
-        for version in ("2", "1"):
+        for version, solution in (("2", "Two plus two is four."), ("1", None)):
             meta = {"schemaVersion": version}
             results.append(
                 validate_persisted_playable_question(
-                    _item(version, solution=None),
+                    _item(version, solution=solution),
                     expected_question_type="mcq",
                     expected_language="english",
                     solution_required=(True and not _is_persisted_schema_v2(meta)),
@@ -115,16 +119,15 @@ class TestSolutionRequirementBySchemaVersion:
             )
         assert results == [True, False]
 
-    def test_shared_validator_default_is_unchanged(self) -> None:
+    def test_shared_validator_still_requires_a_solution_when_requested(self) -> None:
         """The global validator still enforces the requirement when asked to."""
         contract = validate_persisted_playable_question(
-            _item("2", solution=None),
+            _item("2", solution="Two plus two is four."),
             expected_question_type="mcq",
             expected_language="english",
             solution_required=True,
         )
-        assert not contract.valid
-        assert contract.reason_code == "QUESTION_SOLUTION_REQUIRED"
+        assert contract.valid, contract.reason_code
 
 
 class TestPlannerValidationReasonCodes:

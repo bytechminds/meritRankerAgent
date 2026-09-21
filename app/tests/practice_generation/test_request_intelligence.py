@@ -593,9 +593,9 @@ class TestUnusableInterpretations:
     def test_out_of_bounds_count_is_rejected(self) -> None:
         with pytest.raises(RequestIntelligenceError) as exc_info:
             parse_request_intelligence(
-                _response(count=900, status="BROAD"),
-                query="Create 900 questions",
-                explicit_count=900,
+                _response(count=1000, status="BROAD"),
+                query="Create 1000 questions",
+                explicit_count=1000,
             )
 
         assert exc_info.value.reason_code == "PRACTICE_INTELLIGENCE_COUNT_OUT_OF_BOUNDS"
@@ -1087,18 +1087,23 @@ class TestCustomDistributionTotals:
         assert request.accepted_count == 50
         assert counts == {"basic": 10, "intermediate": 30, "advanced": 10}
 
-    def test_implied_total_beyond_the_supported_bound_is_rejected(self) -> None:
-        with pytest.raises(RequestIntelligenceError) as exc_info:
-            parse_request_intelligence(
-                _response(
-                    count=None, status="BROAD", mode="CUSTOM",
-                    distribution={"basic": 100, "intermediate": 100, "advanced": 100},
-                ),
-                query="Give me 100 easy, 100 medium and 100 hard questions",
-                explicit_count=None,
+    def test_implied_total_above_the_v1_cap_is_proportionally_preserved(self) -> None:
+        query = "Give me a practice set: 100 easy, 100 medium and 100 hard"
+        interpreter = _RecordingInterpreter(
+            _response(
+                count=None,
+                status="BROAD",
+                mode="CUSTOM",
+                distribution={"basic": 100, "intermediate": 100, "advanced": 100},
             )
+        )
 
-        assert exc_info.value.reason_code == "PRACTICE_INTELLIGENCE_COUNT_OUT_OF_BOUNDS"
+        request = _resolve(query, interpreter)
+        counts = Counter(slot.difficulty.value for slot in deterministic_blueprint(request).slots)
+
+        assert request.requested_count == 300
+        assert request.accepted_count == 50
+        assert counts == {"basic": 17, "intermediate": 17, "advanced": 16}
 
 
 class TestHardeningPreservesExistingBehaviour:

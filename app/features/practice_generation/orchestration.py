@@ -10,6 +10,7 @@ from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from features.practice_generation.config import PracticeGenerationConfig
@@ -19,6 +20,7 @@ from features.practice_generation.execution_control import (
     current_practice_execution_id,
 )
 from features.practice_generation.generation import (
+    STRUCTURAL_GENERATOR_REASON_CODES,
     QuestionGenerator,
     QuestionVerifier,
     bucket_for_slot,
@@ -54,6 +56,8 @@ from features.practice_generation.planning import (
     select_planner_family,
 )
 from features.practice_generation.progress import AppSyncAssessmentProgressRepository
+from features.practice_generation.providers import PracticeAuthorityUnavailableError
+from features.practice_generation.question_contract import validate_playable_question
 from features.practice_generation.question_semantic_reuse import (
     QuestionSemanticReuseResolver,
     group_semantic_demands,
@@ -156,6 +160,94 @@ class _SlotGenerationOutcome:
     cancelled: bool = False
 
 
+class _RecoveryDisposition(StrEnum):
+    """Bounded next-step classification for a rejected schema-v2 candidate."""
+
+    REPAIRABLE_EXISTING_CANDIDATE = "REPAIRABLE_EXISTING_CANDIDATE"
+    REPLACE_CANDIDATE = "REPLACE_CANDIDATE"
+    TECHNICAL_FAILURE = "TECHNICAL_FAILURE"
+    TERMINAL = "TERMINAL"
+
+
+def _classify_recovery_disposition(
+    *,
+    verification: VerificationResult | None,
+    binding_valid: bool,
+    gate_reason: str | None,
+) -> _RecoveryDisposition:
+    """Choose the existing bounded recovery path without accepting untrusted output.
+
+    Provider and authority failures are classified by their existing exception branches
+    before this function is reached. The one safe semantic correction is a verifier
+    ``ACCEPT`` that establishes exactly one valid option while disagreeing with the
+    author's declared option id. Every other semantic rejection needs a fresh item
+    or an existing terminal failure path.
+    """
+    if verification is None:
+        return _RecoveryDisposition.TECHNICAL_FAILURE
+    if verification.decision is VerificationDecision.TERMINAL_REJECTION:
+        return _RecoveryDisposition.TERMINAL
+    if (
+        binding_valid
+        and verification.decision is VerificationDecision.ACCEPT
+        and gate_reason == "AUTHOR_AUTHORITY_MISMATCH"
+        and len(verification.valid_option_ids) == 1
+    ):
+        return _RecoveryDisposition.REPAIRABLE_EXISTING_CANDIDATE
+    if (
+        binding_valid
+        and gate_reason is None
+        and verification.decision is VerificationDecision.REPAIRABLE
+    ):
+        return _RecoveryDisposition.REPAIRABLE_EXISTING_CANDIDATE
+    return _RecoveryDisposition.REPLACE_CANDIDATE
+
+
+def _materialize_authority_answer_contract(
+    *,
+    question: GeneratedQuestion,
+    verification: VerificationResult,
+) -> GeneratedQuestion | None:
+    """Build the complete schema-v2 answer contract from the blind Authority result."""
+    if (
+        question.schema_version != "2"
+        or verification.schema_version != "2"
+        or verification.decision is not VerificationDecision.ACCEPT
+        or len(verification.valid_option_ids) != 1
+        or not verification.answer_explanation
+    ):
+        return None
+    authoritative_option_id = verification.valid_option_ids[0]
+    matching_options = [
+        option
+        for option in question.canonical_options
+        if option.option_id == authoritative_option_id
+    ]
+    if len(matching_options) != 1:
+        return None
+    try:
+        corrected = GeneratedQuestion.model_validate(
+            {
+                **question.model_dump(mode="json"),
+                "correct_option_id": authoritative_option_id,
+                "correct_answer": matching_options[0].value,
+                "answer_explanation": verification.answer_explanation,
+                "solution": verification.answer_explanation,
+            }
+        )
+    except (TypeError, ValueError):
+        return None
+    contract = validate_playable_question(
+        question_type=corrected.question_type,
+        question=corrected.question,
+        options=corrected.options,
+        correct_answer=corrected.correct_answer,
+        solution=corrected.solution,
+        solution_required=True,
+    )
+    return corrected if contract.valid else None
+
+
 def _meta(assessment: dict[str, Any]) -> dict[str, Any]:
     value = assessment.get("meta")
     if isinstance(value, dict):
@@ -200,6 +292,7 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "practice_type": value.get("practiceType"),
             "requested_count": value.get("requestedCount"),
             "accepted_count": value.get("acceptedCount"),
+            "limitation": value.get("limitation"),
             "subject": value.get("subject"),
             "topic": value.get("topic"),
             "topics": value.get("topics"),
@@ -453,6 +546,14 @@ class PracticeGenerationOrchestrator:
                 request,
             )
         else:
+            self._progress_updates.update(
+                test_id,
+                meta_updates={
+                    "phase": InternalPhase.PLANNING.value,
+                    "progressMessageKey": "PRACTICE_GENERATION_PLANNING",
+                },
+                live=False,
+            )
             emit_practice_event(
                 "BLUEPRINT_STARTED",
                 test_id=test_id,
@@ -566,6 +667,14 @@ class PracticeGenerationOrchestrator:
                     },
                 )
 
+        self._progress_updates.update(
+            test_id,
+            meta_updates={
+                "phase": InternalPhase.MATCHING_EXISTING.value,
+                "progressMessageKey": "PRACTICE_GENERATION_MATCHING",
+            },
+            live=False,
+        )
         emit_practice_event(
             "EXISTING_MATCH_STARTED",
             test_id=test_id,
@@ -1321,6 +1430,7 @@ class PracticeGenerationOrchestrator:
                 bucket=bucket,
                 existing_normalized_texts=existing_texts,
                 requested_language=request.language,
+                finish_reason=getattr(batch, "finish_reason", None),
             )
         except PracticeExecutionStopped:
             raise
@@ -1429,6 +1539,21 @@ class PracticeGenerationOrchestrator:
                         )
                     except PracticeExecutionStopped:
                         raise
+                    except PracticeAuthorityUnavailableError as exc:
+                        # A deterministic routing/config failure (no qualified Authority
+                        # for this subject), never a provider outage — must stay
+                        # distinguishable from VERIFIER_UNAVAILABLE in telemetry.
+                        verifier_error_class = type(exc).__name__
+                        result = VerificationResult(
+                            generation_item_id=question.generation_item_id,
+                            approved=False,
+                            reason_code="PRACTICE_AUTHORITY_UNAVAILABLE",
+                        )
+                        logger.warning(
+                            "practice authority unavailable test_id=%s group_id=%s",
+                            test_id,
+                            group_id,
+                        )
                     except Exception as exc:  # noqa: BLE001
                         # Exception class only: the slot path already records this and
                         # without it here VERIFIER_UNAVAILABLE stays undiagnosable.
@@ -1888,6 +2013,7 @@ class PracticeGenerationOrchestrator:
         accepted: dict[str, _VerifiedSlotQuestion] = {}
         repair_candidates: dict[str, GeneratedQuestion] = {}
         repair_reasons: dict[str, tuple[str, ...]] = {}
+        replacement_slot_ids: set[str] = set()
         reasons: list[str] = []
         excluded = set(context.excluded_texts)
         route_id = ""
@@ -1907,8 +2033,18 @@ class PracticeGenerationOrchestrator:
                 cancelled = True
                 break
             completed_wave = replacement_wave
-            force_regeneration = False
-            wave_slots = tuple(pending.values())
+            wave_slots = (
+                tuple(
+                    slot
+                    for slot_id, slot in pending.items()
+                    if slot_id not in replacement_slot_ids
+                )
+                if replacement_wave == 1
+                else tuple(pending.values())
+            )
+            if not wave_slots:
+                replacement_wave += 1
+                continue
             wave_group = context.group.model_copy(
                 update={
                     "required_count": len(wave_slots),
@@ -1917,6 +2053,13 @@ class PracticeGenerationOrchestrator:
                 }
             )
             if replacement_wave == 1:
+                self._update_progress(
+                    context.test_id,
+                    context.request,
+                    meta_updates={
+                        "progressMessageKey": "PRACTICE_GENERATION_REFINING",
+                    },
+                )
                 emit_practice_event(
                     "question_repair_started",
                     test_id=context.test_id,
@@ -1928,6 +2071,13 @@ class PracticeGenerationOrchestrator:
                     },
                 )
             elif replacement_wave == 2:
+                self._update_progress(
+                    context.test_id,
+                    context.request,
+                    meta_updates={
+                        "progressMessageKey": "PRACTICE_GENERATION_REFINING",
+                    },
+                )
                 emit_practice_event(
                     "question_replacement_started",
                     test_id=context.test_id,
@@ -1988,6 +2138,7 @@ class PracticeGenerationOrchestrator:
                     existing_normalized_texts=wave_excluded,
                     slots=wave_slots,
                     requested_language=context.request.language,
+                    finish_reason=getattr(batch, "finish_reason", None),
                 )
             except PracticeExecutionStopped:
                 cancelled = True
@@ -2126,6 +2277,33 @@ class PracticeGenerationOrchestrator:
                         level=logging.WARNING,
                     )
                     break
+                if isinstance(outcome, PracticeAuthorityUnavailableError):
+                    logger.warning(
+                        "slot practice authority unavailable test_id=%s group_id=%s",
+                        context.test_id,
+                        context.group.group_id,
+                    )
+                    reasons.append("PRACTICE_AUTHORITY_UNAVAILABLE")
+                    emit_practice_event(
+                        "QUESTION_VERIFICATION_RESULT",
+                        test_id=context.test_id,
+                        status="rejected",
+                        details={
+                            "groupId": context.group.group_id,
+                            "bucketId": context.bucket.bucket_id,
+                            "slotId": slot.slot_id,
+                            "replacementWave": replacement_wave,
+                            "reasonCode": "PRACTICE_AUTHORITY_UNAVAILABLE",
+                            "errorClass": type(outcome).__name__,
+                        },
+                    )
+                    # A deterministic routing/config failure (no qualified Authority for
+                    # this subject), never a provider outage: never retried, and left
+                    # non-recoverable for the same reasons as VERIFIER_UNAVAILABLE below.
+                    provider_failure_recoverable = False
+                    provider_failure_stage = "VERIFIER"
+                    terminal = False
+                    break
                 if isinstance(outcome, BaseException) or outcome is None:
                     logger.warning(
                         "slot verifier unavailable test_id=%s group_id=%s error_type=%s",
@@ -2183,6 +2361,25 @@ class PracticeGenerationOrchestrator:
                     gate_reason = "AUTHOR_AUTHORITY_MISMATCH"
                 else:
                     gate_reason = None
+                corrected_authority_key = False
+                if (
+                    binding_valid
+                    and verification.decision is VerificationDecision.ACCEPT
+                    and len(valid_option_ids) == 1
+                ):
+                    authority_question = _materialize_authority_answer_contract(
+                        question=question,
+                        verification=verification,
+                    )
+                    if authority_question is None:
+                        gate_reason = "ANSWER_EXPLANATION_MISSING"
+                    else:
+                        corrected_authority_key = (
+                            authority_question.correct_option_id
+                            != question.correct_option_id
+                        )
+                        question = authority_question
+                        gate_reason = None
                 answer_valid = gate_reason is None
                 if (
                     binding_valid
@@ -2237,7 +2434,11 @@ class PracticeGenerationOrchestrator:
                             "bucketId": context.bucket.bucket_id,
                             "slotId": slot.slot_id,
                             "replacementWave": replacement_wave,
-                            "reasonCode": "VERIFIER_APPROVED",
+                            "reasonCode": (
+                                "AUTHOR_AUTHORITY_KEY_CORRECTED"
+                                if corrected_authority_key
+                                else "VERIFIER_APPROVED"
+                            ),
                         },
                     )
                     continue
@@ -2275,55 +2476,73 @@ class PracticeGenerationOrchestrator:
                         ),
                     },
                 )
-                if verification.decision is VerificationDecision.TERMINAL_REJECTION:
+                recovery_disposition = _classify_recovery_disposition(
+                    verification=verification,
+                    binding_valid=binding_valid,
+                    gate_reason=gate_reason,
+                )
+                if recovery_disposition is _RecoveryDisposition.TERMINAL:
                     terminal = True
                     break
-                if (
-                    verification.decision is VerificationDecision.REGENERATE
-                    or gate_reason is not None
-                ):
-                    force_regeneration = True
+                if recovery_disposition is _RecoveryDisposition.REPLACE_CANDIDATE:
+                    replacement_slot_ids.add(slot.slot_id)
             if provider_failure_stage is not None:
                 break
             if cancelled:
                 break
             if pending and not terminal:
-                if force_regeneration:
+                if replacement_wave == 0:
                     excluded.update(
                         normalize_question_identity(
                             repair_candidates[slot_id].question,
                             repair_candidates[slot_id].options,
                         )
-                        for slot_id in pending
+                        for slot_id in replacement_slot_ids
                         if slot_id in repair_candidates
                     )
                 if replacement_wave == 1:
+                    failed_repair_slot_ids = {
+                        slot.slot_id for slot in wave_slots if slot.slot_id in pending
+                    }
                     excluded.update(
                         normalize_question_identity(
                             repair_candidates[slot_id].question,
                             repair_candidates[slot_id].options,
                         )
-                        for slot_id in pending
+                        for slot_id in failed_repair_slot_ids
                         if slot_id in repair_candidates
                     )
-                    emit_practice_event(
-                        "question_repair_failed",
-                        test_id=context.test_id,
-                        status="failed",
-                        details={
-                            "groupId": context.group.group_id,
-                            "repairAttempt": 1,
-                            "reasonCode": reasons[-1] if reasons else "REPAIR_REJECTED",
-                            "slotIds": ",".join(pending),
-                        },
+                    replacement_slot_ids.update(failed_repair_slot_ids)
+                    if failed_repair_slot_ids:
+                        emit_practice_event(
+                            "question_repair_failed",
+                            test_id=context.test_id,
+                            status="failed",
+                            details={
+                                "groupId": context.group.group_id,
+                                "repairAttempt": 1,
+                                "reasonCode": (
+                                    reasons[-1] if reasons else "REPAIR_REJECTED"
+                                ),
+                                "slotIds": ",".join(sorted(failed_repair_slot_ids)),
+                            },
+                        )
+                # Only an authority-approved single-option key mismatch can repair the
+                # existing candidate. All other semantic rejections advance directly
+                # to the final fresh replacement. Either path must move forward:
+                # pinning a rejected replacement at wave two previously looped
+                # indefinitely instead of exhausting the bounded budget.
+                if replacement_wave == 0:
+                    replacement_wave = (
+                        1
+                        if any(
+                            slot_id not in replacement_slot_ids
+                            for slot_id in pending
+                        )
+                        else 2
                     )
-                # A content rejection cannot be repaired, so it skips the repair
-                # wave and goes straight to replacement. The skip must still move
-                # forward: pinning the value to the replacement wave meant a
-                # rejection *at* that wave left the state unchanged, so the group
-                # regenerated without bound instead of exhausting.
-                next_wave = replacement_wave + 1
-                replacement_wave = max(next_wave, 2) if force_regeneration else next_wave
+                else:
+                    replacement_wave += 1
         emit_practice_event(
             "practice_validation_completed",
             test_id=context.test_id,
@@ -2643,7 +2862,7 @@ class PracticeGenerationOrchestrator:
                 # Verification never completed; the questions themselves were
                 # never shown to be deficient.
                 terminal_reason_code = "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED"
-            elif "STRUCTURED_PARSE_INVALID" in outcome.reason_codes:
+            elif STRUCTURAL_GENERATOR_REASON_CODES.intersection(outcome.reason_codes):
                 terminal_reason_code = "PRACTICE_GENERATOR_OUTPUT_INVALID"
             else:
                 terminal_reason_code = "GENERATION_DEFICIT_EXHAUSTED"
@@ -3077,20 +3296,25 @@ class PracticeGenerationOrchestrator:
         if assessment is None:
             raise PracticeRepositoryError("ASSESSMENT_NOT_FOUND")
         meta = _meta(assessment)
-        ready_count = int(meta.get("readyQuestionCount") or 0)
-        manifest_count = int(meta.get("readyCount") or 0)
-        progress = self._progress(ready_count, request.accepted_count)
-        self._progress_updates.update(
+        updated = self._progress_updates.update(
             test_id,
             meta_updates={
+                "progressMessageKey": "PRACTICE_GENERATION_CREATING",
                 **(meta_updates or {}),
                 "phase": InternalPhase.GENERATING.value,
-                "progressPercent": progress,
+                "progressPercent": self._progress(
+                    int(meta.get("readyQuestionCount") or 0),
+                    request.accepted_count,
+                ),
             },
             live=False,
             recalculate_manifest=True,
             authoritative_question_ids=authoritative_question_ids,
         )
+        updated_meta = _meta(updated) if isinstance(updated, dict) else meta
+        ready_count = int(updated_meta.get("readyQuestionCount") or 0)
+        manifest_count = int(updated_meta.get("readyCount") or 0)
+        progress = self._progress(ready_count, request.accepted_count)
         emit_practice_event(
             "practice_manifest_updated",
             test_id=test_id,

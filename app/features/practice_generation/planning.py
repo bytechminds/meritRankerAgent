@@ -16,6 +16,9 @@ from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
+from features.practice_generation.metadata_normalization import (
+    normalize_subject as normalize_practice_subject,
+)
 from features.practice_generation.request_intelligence import (
     PracticeRequestInterpreter,
     interpret_practice_request,
@@ -35,8 +38,12 @@ from features.practice_generation.schemas import (
     VerificationPolicy,
 )
 from observability.events import log_event
-from practice_limits import MAX_PRACTICE_QUESTIONS
+from practice_limits import (
+    MAX_REQUESTED_PRACTICE_QUESTIONS,
+    effective_practice_question_count,
+)
 from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
+from schemas.practice_limit import PracticeLimitation
 from schemas.practice_request_intelligence import (
     CustomDifficulty,
     MixedDifficulty,
@@ -45,6 +52,7 @@ from schemas.practice_request_intelligence import (
 )
 from services.classification.web_search_demand import is_freshness_sensitive_query
 from services.llm.orchestration.errors import ProviderExecutionError
+from services.llm.providers.finish_reasons import normalize_completion_outcome
 from tools.web_search.models import FreshEvidenceBundle
 
 _GENERATION_TARGET = (
@@ -337,6 +345,10 @@ class PlannerValidationDiagnostic:
     validation_stage: str = "schema"
     actual_slot_count: int | None = None
     duration_ms: int | None = None
+    # A safe, bounded summary of the violated constraint ("max_length=160,
+    # actual_length=213") built only from Pydantic's own ``ctx`` and a length computed
+    # from (never retaining) the offending value. Empty when the error carries none.
+    constraint: str = ""
     # Verbatim text of the failing invariant, populated ONLY when the message is one
     # of our own literals. Model and student text can never appear here.
     owned_message: str = ""
@@ -391,12 +403,154 @@ def _owned_error_message(error: Exception) -> str:
     return message if message in _owned_value_error_messages() else ""
 
 
+# Pydantic's own machine-readable ``errors()[i]["type"]``, grouped into the same small
+# stable category set the business-rule checks below already return. Consulted only as
+# a fallback, after every specific PLANNER_* message pattern has had a chance to match,
+# so a named business-rule code is never coarsened just because this set also covers it.
+_STRUCTURAL_MISSING_TYPES = frozenset({"missing"})
+_STRUCTURAL_TYPE_ERROR_TYPES = frozenset(
+    {
+        "int_parsing",
+        "int_type",
+        "float_parsing",
+        "float_type",
+        "string_type",
+        "bool_parsing",
+        "bool_type",
+        "list_type",
+        "dict_type",
+        "enum",
+        "literal_error",
+        "uuid_parsing",
+        "date_parsing",
+        "datetime_parsing",
+        "json_type",
+    }
+)
+_STRUCTURAL_CONSTRAINT_TYPES = frozenset(
+    {
+        "string_too_long",
+        "string_too_short",
+        "too_long",
+        "too_short",
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "string_pattern_mismatch",
+        "multiple_of",
+    }
+)
+# A raise site that names its own invariant (e.g. ``raise ValueError("PLANNER_SLOT_
+# SUBJECT_MISMATCH")``) already IS a reason code; recognizing the shape generalizes to
+# every such constant without hardcoding each one here, current or future.
+_CONSTANT_SHAPED_MESSAGE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
+def _structural_error_bucket(error: Exception) -> str | None:
+    """Classify by Pydantic's/the parser's own typed error, not a free-text guess.
+
+    Returns one of ``"parse_failure"``/``"missing"``/``"constraint"``/``"type"``, or
+    None when the error carries no machine-readable type this module knows how to
+    bucket. Generic across every schema-v2 boundary (planner, generator, ...): each
+    caller maps these buckets to its own prefixed reason codes, so the classification
+    logic — and the Pydantic error-type sets it reads — is written once and reused,
+    never re-derived per boundary.
+    """
+    if isinstance(error, json.JSONDecodeError):
+        return "parse_failure"
+    if not isinstance(error, ValidationError):
+        return None
+    errors = error.errors(include_url=False)
+    if not errors:
+        return None
+    # One response can fail several fields at once; the first is the same one
+    # ``field_paths``/``error_types`` already lead with, so the reason code and the
+    # diagnostic stay describing the same failure.
+    error_type = str(errors[0].get("type") or "")
+    if error_type in _STRUCTURAL_MISSING_TYPES:
+        return "missing"
+    if error_type in _STRUCTURAL_CONSTRAINT_TYPES:
+        return "constraint"
+    if error_type in _STRUCTURAL_TYPE_ERROR_TYPES:
+        return "type"
+    return None
+
+
+_PLANNER_STRUCTURAL_REASON_CODES = {
+    "parse_failure": "PLANNER_PARSE_FAILURE",
+    "missing": "PLANNER_MISSING_FIELD",
+    "constraint": "PLANNER_SCHEMA_CONSTRAINT_INVALID",
+    "type": "PLANNER_SCHEMA_TYPE_INVALID",
+}
+
+
+def _structural_reason_from_pydantic_type(error: Exception) -> str | None:
+    """Map the generic structural-error bucket to a planner-prefixed reason code."""
+    bucket = _structural_error_bucket(error)
+    return _PLANNER_STRUCTURAL_REASON_CODES.get(bucket) if bucket else None
+
+
+# Bound metadata Pydantic attaches to a constraint failure — never the value itself.
+_SAFE_CONSTRAINT_CTX_KEYS = (
+    "max_length",
+    "min_length",
+    "le",
+    "ge",
+    "lt",
+    "gt",
+    "max_items",
+    "min_items",
+    "multiple_of",
+)
+
+
+def _constraint_hint(error: Exception) -> str:
+    """A safe, bounded ``bound=N,actual_length=M`` summary for a repair attempt.
+
+    Built only from Pydantic's own ``ctx`` (which carries the rule, never the value
+    that broke it) plus a length computed from ``input`` without ever retaining that
+    input. Empty when the error is not a constraint-shaped ValidationError.
+    """
+    if not isinstance(error, ValidationError):
+        return ""
+    errors = error.errors(include_url=False)
+    if not errors:
+        return ""
+    first = errors[0]
+    ctx = first.get("ctx") or {}
+    parts = [
+        f"{key}={ctx[key]}"
+        for key in _SAFE_CONSTRAINT_CTX_KEYS
+        if key in ctx and isinstance(ctx[key], (int, float))
+    ]
+    if not parts:
+        return ""
+    actual_length = ctx.get("actual_length")
+    if not isinstance(actual_length, (int, float)):
+        raw_input = first.get("input")
+        if isinstance(raw_input, (str, list, tuple, set, dict)):
+            actual_length = len(raw_input)
+    if isinstance(actual_length, (int, float)):
+        parts.append(f"actual_length={actual_length}")
+    return ",".join(parts)
+
+
 def _planner_validation_reason(
     error: Exception,
     *,
     raw: str,
+    finish_reason: str | None = None,
 ) -> tuple[str, int | None]:
     """Return a stable validation reason without retaining planner content."""
+    # A truncated response is a token-budget/provider outcome, not a schema defect —
+    # the model may have been about to produce a perfectly valid blueprint. Checked
+    # first, and only for a parse failure, since a truncated response's own defect IS
+    # an incomplete JSON parse; a validation error on an otherwise complete, parseable
+    # response is a real schema/content issue whatever the finish reason was.
+    if isinstance(error, json.JSONDecodeError) and finish_reason is not None:
+        if normalize_completion_outcome(finish_reason) == "output_token_exhausted":
+            return "PLANNER_OUTPUT_TRUNCATED", None
     actual_slot_count: int | None = None
     try:
         payload = json.loads(raw)
@@ -444,6 +598,11 @@ def _planner_validation_reason(
         return "PLANNER_BUCKETS_MISSING", actual_slot_count
     if "bucket ids must be unique" in message:
         return "PLANNER_DUPLICATE_BUCKET", actual_slot_count
+    if _CONSTANT_SHAPED_MESSAGE.match(str(error)):
+        return str(error), actual_slot_count
+    structural_reason = _structural_reason_from_pydantic_type(error)
+    if structural_reason is not None:
+        return structural_reason, actual_slot_count
     return "PLANNER_SCHEMA_INVALID", actual_slot_count
 
 
@@ -454,9 +613,12 @@ def _planner_validation_diagnostic(
     attempt: int,
     phase: str,
     duration_ms: int,
+    finish_reason: str | None = None,
 ) -> PlannerValidationDiagnostic:
     """Extract allowlisted validation metadata without retaining model content."""
-    reason_code, actual_slot_count = _planner_validation_reason(error, raw=raw)
+    reason_code, actual_slot_count = _planner_validation_reason(
+        error, raw=raw, finish_reason=finish_reason
+    )
     schema_name = "PracticeBlueprint"
     field_paths: tuple[str, ...] = ()
     error_types: tuple[str, ...] = ()
@@ -493,6 +655,7 @@ def _planner_validation_diagnostic(
         phase=phase,
         schema_name=schema_name,
         validation_stage=validation_stage,
+        constraint=_constraint_hint(error),
         owned_message=_owned_error_message(error),
         owned_origin=_owned_error_origin(error),
         error_count=error_count,
@@ -508,10 +671,16 @@ def _planner_repair_feedback(diagnostic: PlannerValidationDiagnostic) -> str:
     """Provide bounded, non-sensitive correction data to the sole repair attempt."""
     fields = ",".join(diagnostic.field_paths) or "$"
     error_types = ",".join(diagnostic.error_types) or "validation_error"
-    return (
+    feedback = (
         f"reason={diagnostic.reason_code};fields={fields};"
         f"types={error_types};schema={diagnostic.schema_name}"
     )
+    if diagnostic.constraint:
+        # e.g. "max_length=160,actual_length=213" — the numeric bound and how far the
+        # previous attempt was from it, so the one repair attempt has an actual target
+        # instead of only the field name and error class.
+        feedback += f";constraint={diagnostic.constraint}"
+    return feedback
 
 
 _DIFFICULTY_ORDER: tuple[Difficulty, ...] = (
@@ -605,25 +774,28 @@ def resolve_requested_count(query: str, practice_type: PracticeType) -> int:
 
 
 def required_fresh_evidence_count(query: str) -> int:
-    """Return the exact number of independently grounded fresh facts required."""
+    """Return the bounded number of independently grounded fresh facts required."""
     practice_type = resolve_practice_type(query)
-    return resolve_requested_count(query, practice_type)
+    return effective_practice_question_count(
+        _validated_practice_count(resolve_requested_count(query, practice_type))
+    )
 
 
 def is_fresh_evidence_request_supported(query: str) -> bool:
     """Only a valid Practice count may enter a freshness-required retrieval path."""
     practice_type = resolve_practice_type(query)
-    count = resolve_requested_count(query, practice_type)
-    return 1 <= count <= MAX_PRACTICE_QUESTIONS
+    try:
+        _validated_practice_count(resolve_requested_count(query, practice_type))
+    except PracticeRequestCountError:
+        return False
+    return True
 
 
 def validate_practice_requested_count(query: str) -> int:
-    """Resolve and validate the single user-requested Practice count authority."""
+    """Resolve, validate, and normalize the server-owned Practice count contract."""
     practice_type = resolve_practice_type(query)
-    requested_count = resolve_requested_count(query, practice_type)
-    if not 1 <= requested_count <= MAX_PRACTICE_QUESTIONS:
-        raise PracticeRequestCountError(PracticeRequestCountError.reason_code)
-    return requested_count
+    requested_count = _validated_practice_count(resolve_requested_count(query, practice_type))
+    return effective_practice_question_count(requested_count)
 
 
 # Closed set of factual families Practice may adopt from the classifier's
@@ -633,6 +805,9 @@ def validate_practice_requested_count(query: str) -> int:
 # model-authored and unconstrained in its own schema, so Practice validates it against
 # this allowlist before trusting it and otherwise keeps the existing fail-closed path.
 # Scoped to the Practice routing boundary: the shared classifier contract is unchanged.
+# This exact value set is also the only vocabulary the classifier prompt
+# (prompts/classification_semantics.md, "Retrieval hints") is told it may use for
+# `pattern_family_candidate` — keep both lists identical.
 _FACTUAL_FAMILY_CANDIDATES: frozenset[str] = frozenset(
     {
         "HISTORY",
@@ -723,12 +898,24 @@ def resolve_practice_request(
             explicit_count=explicit_count,
         )
     )
-    accepted_count = _resolve_practice_count(
+    requested_count = _resolve_practice_count(
         practice_type,
         structured_count=requested_count,
         explicit_count=explicit_count,
         intelligence=intelligence,
         freshness_required=freshness_requirement.requires_fresh_evidence,
+    )
+    accepted_count = effective_practice_question_count(requested_count)
+    limitation = (
+        PracticeLimitation(
+            type="QUESTION_COUNT_LIMIT",
+            requested_value=requested_count,
+            effective_value=accepted_count,
+            maximum_value=accepted_count,
+            message_key="PRACTICE_MAX_QUESTIONS_LIMITED",
+        )
+        if requested_count != accepted_count
+        else None
     )
     mixed_difficulty_requested = bool(_MIXED_DIFFICULTY_SIGNAL.search(query))
     explicit_difficulty_requested = bool(_EXPLICIT_DIFFICULTY_SIGNAL.search(query))
@@ -743,10 +930,14 @@ def resolve_practice_request(
             normalized_difficulty = Difficulty(difficulty_spec.level.lower())
         elif isinstance(difficulty_spec, CustomDifficulty):
             candidate = _interpreted_distribution(difficulty_spec)
-            # A breakdown is only usable when it still adds up to the count that
-            # was actually resolved; anything else is dropped rather than reconciled.
-            if sum(candidate.values()) == accepted_count:
-                difficulty_distribution = candidate
+            # Preserve an explicit distribution through the V1 count cap. The
+            # total is deterministic and must still match the raw request; scale
+            # proportionally only after that authority check.
+            if sum(candidate.values()) == requested_count:
+                difficulty_distribution = _scale_distribution(
+                    candidate,
+                    target_count=accepted_count,
+                )
     display_topic = topic or subject.replace("_", " ").title()
     title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
     return PracticeGenerationRequest(
@@ -756,8 +947,9 @@ def resolve_practice_request(
         turn_id=turn_id,
         original_query=query,
         practice_type=practice_type,
-        requested_count=accepted_count,
+        requested_count=requested_count,
         accepted_count=accepted_count,
+        limitation=limitation,
         subject=subject,
         topic=topic,
         topics=topics,
@@ -806,7 +998,7 @@ def _resolve_practice_count(
 
 
 def _validated_practice_count(count: int) -> int:
-    if not 1 <= count <= MAX_PRACTICE_QUESTIONS:
+    if not 1 <= count <= MAX_REQUESTED_PRACTICE_QUESTIONS:
         raise PracticeRequestCountError(PracticeRequestCountError.reason_code)
     return count
 
@@ -829,6 +1021,35 @@ def _interpreted_distribution(
         Difficulty.INTERMEDIATE: distribution.intermediate,
         Difficulty.ADVANCED: distribution.advanced,
     }
+
+
+def _scale_distribution(
+    distribution: dict[Difficulty, int],
+    *,
+    target_count: int,
+) -> dict[Difficulty, int]:
+    """Proportionally fit an explicit distribution into the effective count.
+
+    Integer quotas use the largest-remainder method with the stable canonical
+    difficulty order as the sole tie-breaker. No semantic interpretation or model
+    call is introduced by the count cap.
+    """
+    source_total = sum(distribution.values())
+    if source_total == target_count:
+        return distribution
+
+    quotas: dict[Difficulty, int] = {}
+    remainders: list[tuple[int, int, Difficulty]] = []
+    for index, difficulty in enumerate(_DIFFICULTY_ORDER):
+        quota, remainder = divmod(distribution.get(difficulty, 0) * target_count, source_total)
+        quotas[difficulty] = quota
+        remainders.append((remainder, index, difficulty))
+
+    for _, _, difficulty in sorted(remainders, key=lambda item: (-item[0], item[1]))[
+        : target_count - sum(quotas.values())
+    ]:
+        quotas[difficulty] += 1
+    return quotas
 
 
 def resolve_practice_delivery_language(
@@ -898,9 +1119,26 @@ def select_planner_family(request: PracticeGenerationRequest) -> PlannerFamily:
     return PlannerFamily.FACTUAL
 
 
+def practice_generator_route_subject(subject: str, difficulty: Difficulty | str) -> str:
+    """Project a Practice slot onto its scoped generator route subject.
+
+    ``practice_math`` is an internal route distinction, not a student-facing
+    subject. It confines the qualified Terra promotion to Practice Math's
+    default/intermediate authoring path while preserving the shared Math routes
+    used by Doubt Solver, basic Practice, and advanced Practice.
+    """
+    normalized = normalize_practice_subject(subject) or "general"
+    difficulty_value = difficulty.value if isinstance(difficulty, Difficulty) else difficulty
+    if normalized == "math" and difficulty_value in {"default", "intermediate"}:
+        return "practice_math"
+    # All non-promoted subjects stay on the existing resolver path. In particular,
+    # Science/Polity/etc. must reach the resolver's factual-family aliases rather
+    # than silently collapsing to general.
+    return normalized
+
+
 def _generator_route_hint(subject: str, difficulty: Difficulty) -> str:
-    normalized = subject.casefold().replace("-", "_").replace(" ", "_")
-    route_subject = normalized if normalized in {"math", "reasoning", "english"} else "general"
+    route_subject = practice_generator_route_subject(subject, difficulty)
     return f"{route_subject}.generator.{difficulty.value}"
 
 
@@ -1097,6 +1335,25 @@ def apply_system_bucket_policy(
     blueprint: PracticeBlueprint,
     request: PracticeGenerationRequest,
 ) -> PracticeBlueprint:
+    if blueprint.schema_version == "2":
+        # Route hints are server-owned execution metadata. Recompute them from the
+        # immutable slot subject/difficulty rather than trusting a planner response
+        # or a persisted blueprint created before a route-only promotion.
+        canonical_slots = [
+            slot.model_copy(
+                update={
+                    "generator_route_hint": _generator_route_hint(
+                        slot.subject_id,
+                        slot.difficulty,
+                    )
+                }
+            )
+            for slot in blueprint.slots
+        ]
+        if canonical_slots != blueprint.slots:
+            payload = blueprint.model_dump(mode="json")
+            payload["slots"] = [slot.model_dump(mode="json") for slot in canonical_slots]
+            blueprint = PracticeBlueprint.model_validate(payload)
     if any(bucket.question_type is not QuestionType.MCQ for bucket in blueprint.buckets):
         raise ValueError("PLAYER_UNSUPPORTED_QUESTION_TYPE")
     if blueprint.schema_version == "2":
@@ -1138,11 +1395,6 @@ def apply_system_bucket_policy(
                 raise ValueError("PLANNER_SLOT_SUBJECT_MISMATCH")
             if requested_exam and slot.exam_ids != [requested_exam]:
                 raise ValueError("PLANNER_SLOT_EXAM_MISMATCH")
-            if slot.generator_route_hint != _generator_route_hint(
-                slot.subject_id,
-                slot.difficulty,
-            ):
-                raise ValueError("PLANNER_SLOT_ROUTE_HINT_INVALID")
     return blueprint.model_copy(
         update={
             "buckets": [
@@ -1390,6 +1642,11 @@ class BlueprintManager:
                     attempt=calls,
                     phase="initial" if attempt == 0 else "repair",
                     duration_ms=int((time.monotonic() - started_at) * 1000),
+                    # Optional: only RoutedPlannerProvider sets this (see its
+                    # last_finish_reason docstring); a Protocol implementer that does
+                    # not is unaffected and this is simply None for it, exactly as
+                    # before this attribute existed.
+                    finish_reason=getattr(self._planner, "last_finish_reason", None),
                 )
                 diagnostics.append(diagnostic)
                 feedback = _planner_repair_feedback(diagnostic)

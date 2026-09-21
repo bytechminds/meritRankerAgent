@@ -40,6 +40,7 @@ from features.practice_generation.planning import (
     deterministic_blueprint,
     parse_blueprint,
     planner_tier,
+    practice_generator_route_subject,
     resolve_practice_request,
     select_planner_family,
 )
@@ -73,6 +74,9 @@ def request(
     count_query: str | None = None,
     subject: str = "math",
     topic: str = "algebra",
+    topics: list[str] | None = None,
+    requested_count: int | None = None,
+    source_question_reference: str | None = None,
 ):
     return resolve_practice_request(
         request_id="request-1",
@@ -82,14 +86,17 @@ def request(
         query=count_query or query,
         subject=subject,
         topic=topic,
+        topics=topics,
+        requested_count=requested_count,
         difficulty="intermediate",
         language="english",
         exam_id="CAT",
         exam_stage=None,
+        source_question_reference=source_question_reference,
     )
 
 
-@pytest.mark.parametrize("count", [1, 5, 6, 10, 20, 50, 99, 100])
+@pytest.mark.parametrize("count", [1, 5, 6, 10, 20, 50])
 def test_valid_requested_count_is_preserved_exactly(count: int) -> None:
     resolved = request(
         f"Create {count} algebra questions",
@@ -97,26 +104,75 @@ def test_valid_requested_count_is_preserved_exactly(count: int) -> None:
     )
 
     assert (resolved.requested_count, resolved.accepted_count) == (count, count)
+    assert resolved.limitation is None
 
 
-@pytest.mark.parametrize("count", [0, -1, 101])
+@pytest.mark.parametrize("count", [51, 75, 100])
+def test_oversized_requested_count_is_capped_with_a_machine_readable_limitation(
+    count: int,
+) -> None:
+    resolved = request(
+        f"Create {count} algebra questions",
+        count_query=f"Create {count} algebra questions",
+    )
+
+    assert (resolved.requested_count, resolved.accepted_count) == (count, 50)
+    assert resolved.limitation is not None
+    assert resolved.limitation.model_dump(by_alias=True) == {
+        "applied": True,
+        "type": "QUESTION_COUNT_LIMIT",
+        "requestedValue": count,
+        "effectiveValue": 50,
+        "maximumValue": 50,
+        "messageKey": "PRACTICE_MAX_QUESTIONS_LIMITED",
+    }
+
+
+@pytest.mark.parametrize("count", [0, -1, 1000])
 def test_out_of_range_requested_count_is_rejected(count: int) -> None:
     with pytest.raises(PracticeRequestCountError) as exc_info:
         request(
             f"Create {count} algebra questions",
             count_query=f"Create {count} algebra questions",
+            requested_count=count,
         )
 
     assert exc_info.value.reason_code == "PRACTICE_REQUEST_COUNT_OUT_OF_RANGE"
 
 
 @pytest.mark.parametrize("count", [1, 5, 20, 50, 100])
-def test_hyphenated_requested_count_is_preserved_exactly(count: int) -> None:
+def test_hyphenated_requested_count_preserves_provenance_and_caps_effective_count(
+    count: int,
+) -> None:
     """A '<N>-question' compound must not fall through to the practice-type default."""
     query = f"Create a {count}-question Quick Practice on Algebra"
     resolved = request(query, count_query=query)
 
-    assert (resolved.requested_count, resolved.accepted_count) == (count, count)
+    assert resolved.requested_count == count
+    assert resolved.accepted_count == min(count, 50)
+
+
+def test_oversized_mixed_request_preserves_topics_and_source_reference_for_fifty_slots() -> None:
+    resolved = request(
+        "Create 100 questions from percentage, ratio, and average based on source Q-42",
+        count_query="Create 100 questions from percentage, ratio, and average based on source Q-42",
+        topic="percentage",
+        topics=["percentage", "ratio", "average"],
+        requested_count=100,
+        source_question_reference="Q-42",
+    )
+
+    blueprint = deterministic_blueprint(resolved)
+
+    assert resolved.accepted_count == 50
+    assert resolved.topics == ["percentage", "ratio", "average"]
+    assert resolved.source_question_reference == "Q-42"
+    assert len(blueprint.slots) == 50
+    assert {slot.topic_id for slot in blueprint.slots} == {
+        "percentage",
+        "ratio",
+        "average",
+    }
 
 
 def test_multi_topic_hyphenated_count_request_preserves_requested_total() -> None:
@@ -702,8 +758,38 @@ def test_mixed_deterministic_fallback_uses_slot_specific_routes() -> None:
         bucket = buckets[group.bucket_id]
         assert {slot.difficulty for slot in group_slots} == {bucket.difficulty}
         assert {slot.generator_route_hint for slot in group_slots} == {
-            f"math.generator.{bucket.difficulty.value}"
+            (
+                "practice_math.generator.intermediate"
+                if bucket.difficulty is Difficulty.INTERMEDIATE
+                else f"math.generator.{bucket.difficulty.value}"
+            )
         }
+
+
+def test_intermediate_math_route_hint_is_canonicalized_on_blueprint_reload() -> None:
+    resolved_request = request("Create one algebra question")
+    current = deterministic_blueprint(resolved_request)
+    legacy = current.model_copy(
+        update={
+            "slots": [
+                slot.model_copy(update={"generator_route_hint": "math.generator.intermediate"})
+                for slot in current.slots
+            ]
+        }
+    )
+
+    reloaded = apply_system_bucket_policy(legacy, resolved_request)
+
+    assert [slot.generator_route_hint for slot in reloaded.slots] == [
+        "practice_math.generator.intermediate"
+    ]
+
+
+def test_practice_math_route_projection_preserves_factual_subject_aliases() -> None:
+    assert practice_generator_route_subject("math", Difficulty.INTERMEDIATE) == "practice_math"
+    assert practice_generator_route_subject("math", Difficulty.ADVANCED) == "math"
+    assert practice_generator_route_subject("science", Difficulty.INTERMEDIATE) == "science"
+    assert practice_generator_route_subject("polity", Difficulty.INTERMEDIATE) == "polity"
 
 
 def test_mixed_difficulty_survives_safe_async_request_rehydration() -> None:
@@ -1046,7 +1132,7 @@ def test_reuse_rejects_wrong_difficulty_instead_of_only_downranking_it() -> None
     assert match_existing_questions(blueprint, [candidate])[0].deficit == 1
 
 
-def test_intermediate_generation_groups_are_capped_at_four() -> None:
+def test_terra_intermediate_generation_groups_are_capped_at_three() -> None:
     blueprint = deterministic_blueprint(request("Create twenty algebra questions"))
     groups = build_generation_groups(
         blueprint,
@@ -1054,7 +1140,7 @@ def test_intermediate_generation_groups_are_capped_at_four() -> None:
         group_size=5,
         group_max=5,
     )
-    assert [group.required_count for group in groups] == [4, 4, 4, 4, 4]
+    assert [group.required_count for group in groups] == [3, 3, 3, 3, 3, 3, 2]
     assert sum(group.required_count for group in groups) == 20
 
 
@@ -1171,7 +1257,7 @@ def test_practice_capacity_policy_keeps_simple_work_small_and_complex_reasoning_
     ("subject", "difficulty", "complexity", "expected"),
     [
         ("math", Difficulty.BASIC, Complexity.LOW, [5]),
-        ("math", Difficulty.INTERMEDIATE, Complexity.MEDIUM, [4, 1]),
+        ("math", Difficulty.INTERMEDIATE, Complexity.MEDIUM, [3, 2]),
         ("math", Difficulty.ADVANCED, Complexity.LOW, [2, 2, 1]),
         ("math", Difficulty.ADVANCED, Complexity.HIGH, [1, 1, 1, 1, 1]),
         ("reasoning", Difficulty.ADVANCED, Complexity.LOW, [2, 2, 1]),
@@ -1798,13 +1884,29 @@ def test_planner_cannot_emit_question_types_the_current_player_cannot_render() -
         apply_system_bucket_policy(unsupported, request("Create two algebra questions"))
 
 
-def test_final_ready_gate_rejects_a_persisted_unplayable_question() -> None:
+def test_final_ready_gate_requires_complete_schema_v2_explanation_snapshots() -> None:
     blueprint = deterministic_blueprint(request("Create one algebra question"))
     valid = {
         "questionId": "q1",
         "question": "What is two plus two?",
         "options": ["1", "2", "3", "4"],
-        "answers": json.dumps({"correctAnswer": "4", "options": ["1", "2", "3", "4"]}),
+        "answers": json.dumps(
+            {
+                "schemaVersion": "2",
+                "optionIdentity": "INDEX_V1",
+                "options": [
+                    {"optionId": 0, "value": "1"},
+                    {"optionId": 1, "value": "2"},
+                    {"optionId": 2, "value": "3"},
+                    {"optionId": 3, "value": "4"},
+                ],
+                "correctOptionId": 3,
+                "correctAnswer": "4",
+                "answerExplanation": "Two plus two equals four.",
+                "answerStatus": "VERIFIED",
+                "answerVersion": 1,
+            }
+        ),
         "correctAnswer": "4",
         "explanation": "Two plus two equals four.",
         "topic": blueprint.slots[0].topic_id,
@@ -1817,11 +1919,31 @@ def test_final_ready_gate_rejects_a_persisted_unplayable_question() -> None:
             "verificationMethod": "INDEPENDENT_MODEL_V2",
             "questionType": "mcq",
             "language": "english",
+            "schemaVersion": "2",
         },
     }
     assert validate_final_set(blueprint=blueprint, linked_questions=[valid]).ready is True
-    invalid = {**valid, "options": []}
-    assert validate_final_set(blueprint=blueprint, linked_questions=[invalid]).ready is False
+    missing_answer_snapshot = {
+        **valid,
+        "answers": valid["answers"].replace(
+            '"answerExplanation": "Two plus two equals four."',
+            '"answerExplanation": ""',
+        ),
+    }
+    missing_root_snapshot = dict(valid)
+    del missing_root_snapshot["explanation"]
+    mismatched_snapshots = {
+        **valid,
+        "explanation": "An unrelated explanation.",
+    }
+    for invalid in (
+        missing_answer_snapshot,
+        missing_root_snapshot,
+        mismatched_snapshots,
+    ):
+        validation = validate_final_set(blueprint=blueprint, linked_questions=[invalid])
+        assert validation.ready is False
+        assert validation.reason_code == "ANSWER_CONTRACT_MISMATCH"
 
 
 @pytest.mark.parametrize("count", [3, 5, 10, 20])
@@ -2004,18 +2126,18 @@ def test_final_slot_contract_still_rejects_topic_and_unverified_drift() -> None:
     assert validate_final_set(blueprint=blueprint, linked_questions=unverified).ready is False
 
 
-def test_one_hundred_reused_questions_pass_the_final_slot_contract() -> None:
-    blueprint = _slot_blueprint(100)
+def test_fifty_reused_questions_pass_the_final_slot_contract() -> None:
+    blueprint = _slot_blueprint(50)
     linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
 
     validation = validate_final_set(blueprint=blueprint, linked_questions=linked)
 
-    assert len(linked) == 100
+    assert len(linked) == 50
     assert validation.ready is True, validation.reason_code
 
 
-def test_one_incompatible_question_among_one_hundred_names_only_that_slot() -> None:
-    blueprint = _slot_blueprint(100)
+def test_one_incompatible_question_among_fifty_names_only_that_slot() -> None:
+    blueprint = _slot_blueprint(50)
     linked = [_linked_from_slot(slot, reused=True) for slot in blueprint.slots]
     linked[42]["topic"] = "an_unrelated_topic"
 

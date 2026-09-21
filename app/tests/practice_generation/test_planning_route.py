@@ -464,3 +464,87 @@ def test_repair_feedback_carries_the_named_invariant() -> None:
     assert "reason=PLANNER_TOPIC_EVIDENCE_UNGROUNDED" in _planner_repair_feedback(
         diagnostic
     )
+
+
+def test_truncated_output_is_distinguished_from_parse_failure() -> None:
+    """A JSON parse failure paired with token-exhaustion must not read as schema-invalid."""
+    from features.practice_generation.planning import _planner_validation_reason
+
+    try:
+        json.loads("{'slots': [")
+    except json.JSONDecodeError as exc:
+        parse_error = exc
+
+    truncated_reason, _ = _planner_validation_reason(
+        parse_error, raw="{'slots': [", finish_reason="length"
+    )
+    assert truncated_reason == "PLANNER_OUTPUT_TRUNCATED"
+
+    ordinary_reason, _ = _planner_validation_reason(
+        parse_error, raw="{'slots': [", finish_reason="stop"
+    )
+    assert ordinary_reason != "PLANNER_OUTPUT_TRUNCATED"
+
+    unknown_finish_reason, _ = _planner_validation_reason(
+        parse_error, raw="{'slots': [", finish_reason=None
+    )
+    assert unknown_finish_reason != "PLANNER_OUTPUT_TRUNCATED"
+
+
+def test_oversized_source_text_is_a_constraint_violation_not_generic_schema_invalid() -> (
+    None
+):
+    """Failure A's exact defect: string_too_long must classify as a constraint, not a catch-all."""
+    from features.practice_generation.planning import _planner_validation_reason
+    from features.practice_generation.schemas import TopicEvidence
+
+    try:
+        TopicEvidence(sourceText="x" * 213, topicId="t")
+    except Exception as exc:  # noqa: BLE001 - capturing the real ValidationError
+        error = exc
+
+    reason, _ = _planner_validation_reason(error, raw="")
+    assert reason == "PLANNER_SCHEMA_CONSTRAINT_INVALID"
+
+
+def test_missing_required_field_is_distinguished_from_type_error() -> None:
+    from features.practice_generation.planning import _planner_validation_reason
+    from features.practice_generation.schemas import TopicEvidence
+
+    try:
+        TopicEvidence(sourceText="topic text")  # missing topicId
+    except Exception as exc:  # noqa: BLE001 - capturing the real ValidationError
+        missing_error = exc
+
+    try:
+        TopicEvidence(sourceText=123, topicId="t")
+    except Exception as exc:  # noqa: BLE001 - capturing the real ValidationError
+        type_error = exc
+
+    missing_reason, _ = _planner_validation_reason(missing_error, raw="")
+    type_reason, _ = _planner_validation_reason(type_error, raw="")
+
+    assert missing_reason == "PLANNER_MISSING_FIELD"
+    assert type_reason == "PLANNER_SCHEMA_TYPE_INVALID"
+
+
+def test_constraint_hint_surfaces_bound_and_length_without_raw_text() -> None:
+    from features.practice_generation.planning import (
+        _planner_validation_diagnostic,
+    )
+    from features.practice_generation.schemas import TopicEvidence
+
+    long_text = "x" * 213
+    try:
+        TopicEvidence(sourceText=long_text, topicId="t")
+    except Exception as exc:  # noqa: BLE001 - capturing the real ValidationError
+        error = exc
+
+    diagnostic = _planner_validation_diagnostic(
+        error, raw="", attempt=1, phase="plan", duration_ms=1
+    )
+
+    assert diagnostic.reason_code == "PLANNER_SCHEMA_CONSTRAINT_INVALID"
+    assert "max_length=160" in diagnostic.constraint
+    assert "actual_length=213" in diagnostic.constraint
+    assert long_text not in diagnostic.constraint

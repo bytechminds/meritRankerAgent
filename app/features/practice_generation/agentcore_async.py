@@ -204,6 +204,7 @@ class AgentCorePracticeAsyncLauncher:
                 "actorRef": safe_user_ref(request.user_id),
                 "requestedCount": request.requested_count,
                 "acceptedCount": request.accepted_count,
+                "effectiveCount": request.effective_count,
                 "duplicateRequest": duplicate,
             },
         )
@@ -262,6 +263,7 @@ class AgentCorePracticeAsyncLauncher:
             requested_count=request.requested_count,
             accepted_count=request.accepted_count,
             count_clamped=request.requested_count != request.accepted_count,
+            limitation=request.limitation,
             progress_percent=max(0, min(progress, 100)),
             playable=status == "READY" and bool(meta.get("playable")),
             duplicate_request=duplicate,
@@ -288,7 +290,9 @@ class AgentCorePracticeAsyncLauncher:
             status="CANCEL_REQUESTED",
             execution_id=str(meta.get("activeExecutionId") or "") or None,
             ready_count=int(meta.get("readyCount") or 0),
-            requested_count=int(assessment.get("totalQuestions") or 0),
+            requested_count=int(
+                meta.get("requestedCount") or assessment.get("totalQuestions") or 0
+            ),
         )
 
     def resume(self, test_id: str, user_id: str) -> PracticeControlResult:
@@ -345,7 +349,9 @@ class AgentCorePracticeAsyncLauncher:
             ),
             already_active=claimed is None and assessment.get("status") == "GENERATING",
             ready_count=int(meta.get("readyCount") or 0),
-            requested_count=int(assessment.get("totalQuestions") or 0),
+            requested_count=int(
+                meta.get("requestedCount") or assessment.get("totalQuestions") or 0
+            ),
         )
 
     def _attach_billing_operation(self, test_id: str, practice_type: str) -> None:

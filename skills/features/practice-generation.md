@@ -8,6 +8,11 @@ tracked background execution, IAM-signed AppSync progress publication, and local
 validation are implemented; Sandbox live generation remains `[NOT VERIFIED]` until the controlled
 live gate completes.
 
+As of 2026-09-20, the workspace carries a **Dev-qualified, Practice-only** Terra route for default
+and intermediate Math authoring. It is not approved for production deployment or student-credit
+enablement: the completed 20-question lifecycle sample is below its launch reliability threshold;
+the current release state is **`PRACTICE_MATH_LAUNCH_BLOCKED_20Q_RELIABILITY`**.
+
 The existing classifier recognizes practice intent and a deterministic gate requires an explicit
 creation signal. Eligible requests create or recover the deterministic private assessment,
 register one AgentCore tracked task, persist the conversation linkage, start background execution,
@@ -15,6 +20,361 @@ and end the request stream with the typed `practice_generation_started` event co
 `responseType=practice_generation` and `practiceTestId`. Practice advice and strategy questions
 continue through DoubtSolverGraph. The controlled `PRACTICE_AGENTCORE_ASYNC_NOT_CONFIGURED` result
 remains only as a defensive injected-graph fallback when no launcher is supplied.
+
+## V1 50-question count and truthful-progress contract (2026-09-20)
+
+V1 accepts a student-requested count from 1 through 999 but creates at most **50** questions.
+The original `requested_count` remains durable provenance; `accepted_count` / `effective_count`
+is the server-owned count supplied to the planner, matcher, generator, verifier, finalizer, and
+student card. A request over 50 is not rejected merely for being oversized. Instead it carries the
+validated machine-readable limitation:
+
+```json
+{
+  "applied": true,
+  "type": "QUESTION_COUNT_LIMIT",
+  "requestedValue": 100,
+  "effectiveValue": 50,
+  "maximumValue": 50,
+  "messageKey": "PRACTICE_MAX_QUESTIONS_LIMITED"
+}
+```
+
+The normalization happens before planning and remains attached to the persisted parent metadata,
+the replay-safe `practiceRequest`, the launch result, and the typed
+`practice_generation_started` acknowledgement. It does not discard structured topics, source
+question references, subject, exam, section, difficulty, language, or other request constraints.
+Fresh-evidence demand is based on the effective count, so a current-affairs request for 100 uses
+50 bounded evidence items rather than being rejected or requesting 100 items. Existing historical
+slot identifiers remain readable, while a new request can never produce more than 50 slots.
+
+Progress continues to use the existing IAM-signed AppSync parent update and student subscription;
+there is no polling, second stream, fake percentage, raw model text, or chain-of-thought display.
+The server publishes only allowlisted message keys for queued, planning, matching, creating,
+refining, and finalizing phases. The student card maps those keys to localized copy and, only while
+the task remains non-terminal with no new persisted update, rotates a short safe “still working”
+heartbeat. Repair or replacement is described as “Improving a question.” Terminal states stop the
+heartbeat. The immediate acknowledgement displays the localized count limitation only for the
+known validated limitation key.
+
+### Deployed progress-contract coupling
+
+The AgentCore Practice producer, `practice-generation-progress` AppSync resolver, and frontend
+subscription/parser form one strict deployed metadata contract. The resolver admits only the
+explicitly allowlisted `effectiveCount`, `limitation`, and `progressMessageKey` additions alongside
+the established keys; it continues to reject every unknown field. Any shared progress-metadata
+change must be deployed resolver-first with the matching producer and verified by a ≤50 bootstrap
+smoke plus an over-limit contract smoke. The frontend continues to derive localized display from
+the structured limitation and approved message keys, never from free-form backend text.
+
+Focused offline verification completed after this change: **431 Python Practice tests** and
+**217 TypeScript Practice/Doubt Solver tests** passed. Targeted lint and filtered typecheck have no
+errors in the changed files. The repository-wide Python gate was also run after the count-contract
+corrections: Ruff passed; pytest reported **5,186 passed, 38 failed, and 1 skipped**. The remaining
+failures are recovery, stream, verifier, credit, cache, and lifecycle cases outside this count/progress
+scope; they remain a release concern and need their own triage. The repository-wide frontend typecheck
+remains **[NOT VERIFIED]** for this change because it currently reports 421 pre-existing errors across
+102 unrelated files; none are in the changed count/progress files.
+
+On 2026-09-21, the Dev `practice-generation-progress` resolver was deployed in parity with the
+already-running AgentCore producer. A no-LLM resolver smoke accepted a normal 30-question metadata
+update, while an unknown-key probe still returned `PRACTICE_PROGRESS_UNKNOWN_META_FIELD` before any
+persistence. Credit-disabled, real-LLM lifecycle gates then reached `READY 5/5` for the current
+route, `READY 30/30` for the historical Average/Profit-Loss regression, and `READY 50/50` for a
+structured 100-question mixed-Math request. The last record retained `requestedCount=100`,
+`effectiveCount=50`, and the validated `QUESTION_COUNT_LIMIT`; the planner and final manifest never
+exceeded 50 slots. Aggregate-only persistence checks confirmed non-empty explanations and schema-v2
+answer contracts for every final question. The known broader Practice Math release blocker remains
+unchanged; this contract repair does not promote a model, alter planner/model/verifier/recovery
+behavior, enable credits, or authorize production deployment.
+
+## Semantic recovery routing (2026-09-19)
+
+Schema-v2 verification remains fail-closed: no rejected candidate is accepted unless the bounded
+authority-key correction rules below prove it is safe, and every repaired or replaced item is
+parsed, validated, and independently reverified. The recovery budget remains exactly one initial
+generation, one repair, and one final fresh replacement per unresolved slot.
+
+A bound schema-v2 `AUTHOR_AUTHORITY_MISMATCH` with `ACCEPT` and exactly one valid indexed option
+is corrected locally only when the change is key-only: its canonical option ID occurs exactly once,
+the derived answer can be synchronized, and the candidate has no authored explanation or solution.
+The Author never receives the Authority's independently solved option ID. A mismatch with dependent
+authored prose, or any other semantic rejection, retains the existing bounded repair or replacement
+policy.
+
+`NO_VALID_OPTION`, `MULTIPLE_VALID_OPTIONS`, ambiguity, contradictory/insufficient data, binding
+failures, structural rejections, verifier/provider failures, and authority-unavailable outcomes are
+not key-repaired. Existing non-repairable semantic candidates advance directly to the one final
+fresh replacement; technical and authority failures retain their existing fail-closed behavior.
+Wave two now receives bounded per-slot reason codes through the existing `repair_context` shape,
+without the rejected candidate's raw wording, options, or answer material, so it can avoid the
+known defect class while authoring a new item. This path is covered by focused no-network routing
+and prompt-payload regressions. A live semantic recovery replay remains **[NOT VERIFIED]**.
+
+## Math reliability evidence and authority-key correction (2026-09-19)
+
+The final Average trace established that a verifier-approved schema-v2 slot is persisted before
+its group's unresolved siblings can terminally fail: the linked Question count advanced from four
+reused questions to five. The prior progress event reported the pre-update manifest count, which
+made this preserved work appear lost. Progress and manifest events now read the authoritative
+post-update metadata. An incomplete assessment is still never published; terminal failure keeps
+all internally valid linked work for recovery and audit only.
+
+For a bound schema-v2 `ACCEPT` where the blind qualified Authority reports exactly one valid
+indexed option and it differs from the author's key, the coordinator applies a local key-only
+correction instead of calling the repair Author. It synchronizes the derived `correct_answer`,
+revalidates the renderer contract, reuses the Authority verdict, and records
+`AUTHOR_AUTHORITY_KEY_CORRECTED` on the existing verification event. This is allowed only when
+the candidate has no authored explanation or solution; items with either field retain the bounded
+repair path because their dependent prose cannot be safely synchronized locally. Missing or
+duplicated option IDs, zero/multiple valid options, non-`ACCEPT` decisions, invalid bindings, and
+all provider or authority failures remain fail-closed and do not receive local correction.
+
+At the initial 2026-09-19 Average screen, the shared Math route was
+`math.generator.intermediate`, backed by GPT-4.1-mini with no reasoning support. A manual-only,
+no-persistence screen in
+`app/scripts/qualify_practice_math.py` compared that route with the already-configured
+`openai_gpt_5_6_terra` alias. It required an explicit run flag and disabled student-credit
+enforcement; it never launched an assessment, stored a Question, or emitted question content.
+
+On 2026-09-19, two paired runs across Average, percentage/P&L, ratio/proportion, simple interest,
+time and work, boats and streams, algebra, and geometry/mensuration produced 32 candidates per
+arm. The normal Math Authority agreed with 19/32 current-author keys (59.375%; 8 rejected, 5 key
+mismatches) and 30/32 Terra keys (93.75%; 1 rejected, 1 key mismatch). Both arms completed with
+provider finish reason `stop` and no observed fallback. Terra is materially better in this screen
+but fails the required 98% gate. The screen does not independently adjudicate mathematical truth,
+does not exercise repair/replacement recovery, and no live `READY` acceptance sampling was run.
+Therefore independent semantic adjudication, recovery-path qualification, and live readiness remain
+**[NOT VERIFIED]**; no production model, routing, prompt, capacity, fallback, verifier, or credit
+configuration was changed.
+
+### Independent Math qualification harness (2026-09-19)
+
+`app/scripts/qualify_practice_math.py` remains a manual, local-only qualification tool and has no
+student-facing runtime import. Its default screen is now 60 candidates: five per canonical family
+across Average, Percentage, Profit/Loss, Ratio/Proportion, Simple/Compound Interest, Time/Work,
+Time/Speed/Distance, Boats/Streams, Number System, Algebra, Geometry, and Mensuration. The slices
+cover `basic`, `intermediate`, and `advanced` route resolution while retaining the same production
+slot prompt, schema-v2 generated-question contract, normal subject-qualified Math Authority, and
+no recovery/persistence lifecycle. The only candidate variable is the generator alias override.
+
+The public report contains aggregates only: Authority outcomes by topic/difficulty, provider stop
+signals, fallback use, provider-reported token totals, local versioned-price cost estimates, and
+latency summaries. It cannot establish mathematical truth. An evaluator may request a private,
+mode-0600 review capture below `/private/tmp` only with the separate
+`ALLOW_PRIVATE_MATH_QUALIFICATION_REVIEW=true` gate. That capture is never logged or printed and
+contains only generated stems/options, the initial author key, and blind Authority verdict needed
+for independent review. A no-LLM post-processing mode accepts a complete manual adjudication of
+each review ID into exactly one of `VALID_CORRECT_KEY`, `VALID_WRONG_KEY_ONLY`,
+`NO_VALID_OPTION`, `MULTIPLE_VALID_OPTIONS`, `CONTRADICTORY_DATA`, `AMBIGUOUS`, `UNSOLVABLE`, or
+`STRUCTURAL_INVALID`. It separately reports semantic validity, initial key correctness, per-topic
+taxonomy, and Authority true/false approvals/rejections. It allows lifecycle qualification only at
+at least 98% observed candidate semantic validity with zero observed Authority false approvals;
+it never changes a route itself.
+
+An Authority provider/schema outage is a technical availability outcome, not a semantic candidate
+classification and not a verifier false rejection. The capture records `responded` or `unavailable`
+without exposing provider details. Aggregate adjudication excludes unavailable calls from the
+Authority confusion matrix, reports their count separately, and blocks advancement until every
+candidate has an Authority response. Borderline semantic screens (96–97.99% with complete,
+false-approval-free Authority evidence) require expanded qualification rather than lifecycle
+qualification. This reporting-only correction does not change the production verifier, fallback,
+recovery, or route behavior.
+
+The script still requires `RUN_PRACTICE_MATH_QUALIFICATION=true`,
+`STUDENT_CREDIT_ENFORCEMENT_ENABLED=false`, and `ENABLE_REAL_LLM=true` before any provider call.
+It never constructs an assessment, starts a launcher, invokes repositories, creates Question or
+link records, or debits student credits. The independent screen and lifecycle gates are separately
+qualified; neither changes production Math routing, bounded recovery, prompt contracts, Authority
+selection, or credits.
+
+On 2026-09-19, a controlled candidate-only screen independently adjudicated 60 GPT-5.6 Luna
+questions (five each across the twelve documented Math families). It used the normal Math
+Authority and no fallback; student-credit enforcement was explicitly disabled. The adjudication
+found 57 `VALID_CORRECT_KEY`, two `CONTRADICTORY_DATA`, and one `NO_VALID_OPTION`: **95.0%**
+semantic validity, zero key-only defects, and no observed Authority false approval. The Authority
+correctly rejected all three invalid candidates. Ratio/Proportion, Time/Work, and Boats/Streams
+were each 4/5 semantically valid. Luna therefore fails the 98% semantic-generation promotion
+threshold and is **not promoted**. The prior 32-candidate GPT-4.1-mini/Terra screen was
+Authority-agreement-only and cannot be used as semantic evidence. GPT-5.6 Terra and remaining
+already-integrated candidates require the same independent qualification before a global
+`MATH_GENERATOR_MODEL_QUALITY_BLOCKER` conclusion is valid. No lifecycle qualification, production
+route change, or credit enablement is authorized from this evidence.
+
+On 2026-09-19, the same controlled candidate-only screen independently adjudicated 60
+GPT-5.6 Terra questions: five in each documented Math family. All 60 were mathematically
+valid (**100.0%**): 58 were `VALID_CORRECT_KEY` and two were `VALID_WRONG_KEY_ONLY`
+(Ratio/Proportion and Time/Speed/Distance). Both key-only defects have one valid indexed
+answer and meet the existing P1 local-correction guard; no recovery Author invocation is
+needed for that defect class. The initial normal Math Authority result had 56 true approvals,
+zero false approvals, zero true rejections, one false rejection, and three unavailable provider
+responses. The three unavailable records were reverified through the unchanged qualified Math
+Authority route; all three agreed. The completed aggregate is therefore 59 true approvals, zero
+false approvals, zero true rejections, one false rejection, and zero unavailable results.
+Terra has passed the independent semantic screen
+(`TERRA_MATH_SEMANTIC_SCREEN_PASSED`) and advanced only to lifecycle qualification; it is not
+production-qualified. The original screen used 69 provider calls (12 generator and 57 verifier),
+no observed fallback, a local price estimate of USD 0.24950625, and explicitly disabled
+student-credit enforcement. No production model, routing, verifier, recovery, prompt, capacity,
+fallback, or credit configuration was changed.
+
+### Terra Average persistent lifecycle gate (2026-09-19)
+
+`app/scripts/qualify_practice_math_lifecycle.py` is a separately opt-in Dev-only gate. It requires
+`RUN_PRACTICE_MATH_LIFECYCLE_QUALIFICATION=true`, the designated Dev account ID,
+`PRACTICE_LIFECYCLE_QUALIFICATION_TARGET=dev`, real LLM enablement, and
+`STUDENT_CREDIT_ENFORCEMENT_ENABLED=false`; it rejects a production environment before creating a
+launcher. It resolves its Average request through the same `resolve_practice_request` path as the
+application. The exact 10-question query resolves to grounded `QUICK_PRACTICE` and the normal
+deterministic blueprint, rather than incorrectly forcing the separate `TOPIC_TEST` LLM-planner
+route. Only the Math generator alias is temporarily replaced with Terra; planner selection,
+normal Math Authority verification, DynamoDB persistence, AppSync progress, final validation, and
+the `READY` terminal contract are unchanged.
+
+The controlled Dev gate completed five independent Average 10-question assessments: all five
+reached `READY` within the 900-second bound, with five unique exact manifests of ten questions
+each (50/50 ready, generated/reused/verified counters coherent, and no partial publication).
+Four verified existing questions were reused and six Terra-authored questions were persisted per
+run. Three runs required the one permitted fresh replacement for `NO_VALID_OPTION`; one run used
+the existing safe P1 authority-key correction. There were no provider fallbacks. Aggregate elapsed
+time was 154,146 ms (mean 30,829.2 ms; max 36,102 ms); local estimated LLM cost was USD 0.13449445
+across the five runs. This qualifies only the Average fast gate:
+`TERRA_AVERAGE_PERSISTENT_LIFECYCLE_PASSED`. Cross-topic, 20-question, 50-question, 100-question,
+recovery/resume, and production-readiness gates remain **[NOT VERIFIED]**. Private raw review and
+adjudication captures are deleted after their aggregate report is produced; aggregate reports are
+retained. No production route, model binding, billing, or credit setting changed.
+
+### Terra expanded independent screen — blocked (2026-09-19)
+
+A second independent 60-candidate Terra screen used the same frozen candidate-only harness,
+prompt/schema/slot contract, and qualified Math Authority. It produced 57 valid candidates
+(**95.0%**): 57 `VALID_CORRECT_KEY`, one `UNSOLVABLE`, one `NO_VALID_OPTION`, and one
+`CONTRADICTORY_DATA`. Profit/Loss, Time/Work, and Geometry each had one invalid item in five. The
+Profit/Loss item omitted the marked price needed to calculate profit; the Time/Work item had a
+solvable result absent from the options; and the Geometry item gave side/diagonal data incompatible
+with its asserted cyclic quadrilateral. The normal Authority safely rejected the first two, but
+incorrectly accepted the contradictory Geometry candidate; it also falsely rejected one valid
+Time/Speed/Distance candidate. Its independent result is 56 true approvals, two true rejections,
+one false approval, one false rejection, and zero unavailable calls.
+
+Across the two independently adjudicated screens, Terra has 117 valid candidates out of 120
+(**97.5%**): 115 initially correct keys, two safe `VALID_WRONG_KEY_ONLY` cases, one
+`UNSOLVABLE`, one `NO_VALID_OPTION`, and one `CONTRADICTORY_DATA`. Completed Authority evidence is
+115 true approvals, two true rejections, **one false approval**, two false rejections, and zero
+unavailable results. The observed false approval is a release blocker; the combined result does not
+meet the zero-false-accept or approximately-98% expanded-quality gate. Therefore Terra is
+`DO_NOT_QUALIFY`: `TERRA_MATH_GENERATOR_QUALIFIED`,
+`TERRA_MATH_PRODUCTION_ROUTE_PROMOTED`, `MATH_GENERATOR_SEMANTIC_QUALITY_FIXED`,
+`PRACTICE_95_PLUS_RELIABILITY_VALIDATED`, and
+`PRACTICE_READY_FOR_STUDENT_CREDIT_ENABLEMENT` are **not earned**. The passing Average fast gate
+does not override this semantic safety result, and larger persistent lifecycle runs are not
+authorized. Under the final launch policy, Terra's 97.5% observed semantic validity is sufficient
+for generator qualification; no alternate Math model is to be qualified merely to raise that
+metric. Promotion remains blocked only on Authority safety and the remaining lifecycle gates.
+Private raw captures and manual adjudications were deleted after their aggregate reports were
+produced; only aggregate-only reports are retained. No production route, model binding, retry,
+credit, or infrastructure configuration changed.
+
+### Authority contradiction safety hardening (2026-09-19)
+
+The single expanded-screen false approval is confirmed as `VERIFIER_CONTRADICTION_MISSED`, not an
+adjudication, option-binding, answer-binding, or serialization error. The invalid Geometry stem
+asserted a cyclic quadrilateral whose supplied sides and diagonal cannot coexist; the Authority
+accepted an option derived from only a subset of those premises. The schema-v2 blind payload test
+proves that the Authority receives the complete stem and indexed options while author answer fields
+remain excluded. The v2 Authority prompt now requires it to establish joint consistency of every
+stated premise before applying any formula, and to emit `REGENERATE`/`CONTRADICTORY_DATA` when that
+fails. This is a subject-neutral precedence rule; it adds no special-case geometry code, model
+vote, additional healthy-question call, or recovery wave. `test_practice_prompts.py` pins that
+contract. A no-network route audit confirms `math.generator.default` and
+`math.generator.intermediate` currently resolve to Azure `gpt-4.1-mini` with no reasoning effort,
+while `math.generator.advanced` resolves to Azure `gpt-4.1`. Initial authoring, repair, and final
+replacement all issue the same canonical Math `generator` route request; only their prompt name
+varies. Thus a later promotion can be one central Math route/config change without touching the
+planner, P0, P1, recovery, or unrelated Doubt Solver routes. A fresh 30–60 candidate mixed-Math
+Authority sample with zero observed false approvals is still **[NOT VERIFIED]**; until it completes,
+`MATH_AUTHORITY_LAUNCH_SAFETY_VALIDATED` and every Terra production-promotion or full-lifecycle
+marker remain unearned. The live qualification and credit safeguards are unchanged.
+
+The same no-persistence harness now has `--authority-controls`: a fixed 30-item, independently
+adjudicated Authority-only sample. It contains 21 normal valid controls, one valid wrong-key-only
+control, five plausible contradictory-data controls, and one each of no-valid-option,
+multiple-valid-options, and ambiguous controls across the documented Math families. It sends only
+the normal blind subject-qualified verifier request; it never invokes an author, assessment
+launcher, repository, AppSync mutation, or student-credit path. Its aggregate-only report separates
+true/false approvals and rejections from technical unavailability, records expected reason-code
+coverage, requires all targeted contradiction controls to reject, and cannot earn
+`MATH_AUTHORITY_LAUNCH_SAFETY_VALIDATED` with a false approval, unavailable call, or more than 10%
+false rejections of valid controls. The mode retains the existing explicit real-LLM and
+credit-disabled gates and writes an optional aggregate report only below `/private/tmp`.
+
+### Authority requalification and narrow Terra Dev route (2026-09-20)
+
+The historical pending-status paragraphs above are superseded by the following fresh, independent
+Authority control run. The normal blind qualified Math Authority received all 30 fixed controls
+with student-credit enforcement disabled: **22 true approvals, 8 true rejections, 0 false
+approvals, 0 false rejections, and 0 technical-unavailable responses**. All five contradictory
+premise controls were rejected as `CONTRADICTORY_DATA`. This is the required fresh evidence for
+`MATH_AUTHORITY_LAUNCH_SAFETY_VALIDATED`; the generic contradiction-precedence instruction remains
+the only Authority remediation. No topic-specific code, extra verifier, route change, or recovery
+wave was added.
+
+`practice_generator_route_subject()` is the one server-owned Practice boundary that derives
+`practice_math` only for canonical Math `default`/`intermediate` slots. The new
+`practice_math.generator.default` and `.intermediate` entries select
+`openai_gpt_5_6_terra`; Basic and Advanced Practice Math retain the existing `math` routes, and
+Doubt Solver always requests the unchanged shared `math` routes. The helper is used for initial
+authoring, repair, replacement, and capacity resolution. Persisted schema-v2 planner hints are
+canonicalized from immutable slot subject/difficulty before routing, preventing stale planner
+metadata from selecting a shared Math route. `practice_math` maps back to the Math exam profile
+context, and capacity policy recognizes it as Math without any model-name branch.
+
+The Dev-only lifecycle harness now accepts a fully self-contained request plus classified
+subject/topic/difficulty/expected-count, resolves it through `resolve_practice_request`, and
+asserts the resolved count. With `--use-production-route`, it applies no generator override and
+records aggregate-only route/model event counts. It enforces the Terra binding only for the narrow
+Practice-Math slice, allowing it to perform route-leak regressions for other subjects with their
+own configured routes. It records no prompt or model output; optional final-question review is
+mode `0600` below `/private/tmp`.
+
+Five independent production-route Average 10Q runs passed (`READY 50/50`): 22 generator calls,
+52 verifier calls, two successful bounded replacements, one safe P1 key correction, no repair,
+no fallback, and no reuse. All generator runtime telemetry resolved to
+`practice_math.generator.intermediate → gpt-5.6-terra`; mean duration was 47,962.4 ms (max
+52,629 ms) and aggregate estimated cost was USD 0.22194635. The exact persisted similar-source
+request — “create similar 20 questions like The ages of A and B are in the ratio 5:7. Five years
+ago, their ages were in the ratio 5:8. The respective present ages (in years) are: practice test”
+— resolved as `SIMILAR_QUESTION` through `INTELLIGENCE` planning and passed `READY 20/20` in
+273,729 ms (20 generator and 20 verifier calls; USD 0.23654975). Independent review of all 20
+final persisted questions found zero invalid stems, inconsistent premises, duplicate valid
+options, missing keys, or incorrect published keys.
+
+The classifier typo regression was separately re-run against the real classifier. Correct spelling,
+`simialr`, and both alternative explicit similar-question phrasings all returned Math
+`practice_question`, `NEW_QUESTION`, `ANSWER_CURRENT`, and mapped `practice`; no classifier change
+was made. Dev lifecycle checks also reached full READY state without route leakage for Reasoning
+(its existing Terra route), English (gpt-5.4-mini), and Polity and Chemistry (their configured
+`factual.generator.default` Gemini route). Isolated Doubt Solver Math solve and persisted
+follow-up completed successfully;
+an earlier deliberately ambiguous multi-turn follow-up correctly returned clarification and is not
+a route regression.
+
+The 20-run 10Q representative Math sample completed with **18/20 READY (90.0%)**, meeting the
+minimum but not the 95% preferred rate. The two failed first attempts were safe semantic failures:
+only `NO_VALID_OPTION` rejections exhausted the unchanged bounded budget, no partial assessment
+was playable, and independent replays of the same Ages and Algebra controls reached `READY 10/10`.
+The failures remain counted and are not hidden by those replays.
+
+The larger 20Q gate is **not met**. Six of eight completed controls reached `READY 20/20`: the
+exact similar-source request, mixed query, Ratio/Proportion, Geometry, Simple Interest, and
+Compound Interest. Algebra and Number System failed, yielding **6/8 READY (75.0%)**. The two
+failures exposed only safe `NO_VALID_OPTION → GENERATION_DEFICIT_EXHAUSTED` behavior: Algebra
+finished with 17 approved questions and Number System with 2; neither published a partial student
+test, each emitted one terminal `FAILED`, and no provider fallback or retry expansion occurred. At
+two failures, a ten-run sample can achieve at most 8/10, below the required 9/10. Therefore 50Q
+and 100Q launch controls were intentionally not started, and the release remains blocked. This is
+a no-go evidence result, not authorization to add retries, change models, lower Authority
+standards, or deploy the route.
 
 ## Architecture
 
@@ -1143,3 +1503,18 @@ pins the count to the deterministic value on that path, so generation can never 
 the evidence actually gathered. That is a safety guard, **not** intended semantics: the
 real correction is to interpret before sizing retrieval, which is a graph-ordering change
 across two call sites and deliberately out of scope for this round.
+
+### Schema-v2 explanation integrity (2026-09-20)
+
+Schema-v2 authors continue to emit only the stem, indexed options, and proposed option ID. A
+candidate is now materialized for persistence only when the existing blind Answer Authority returns
+`ACCEPT`, exactly one valid option ID, and a non-empty self-contained `answer_explanation`. The
+Authority-derived option and explanation are written as the single source for both the root
+`Question.explanation` and `answers.answerExplanation` snapshots; no writer copies or fabricates
+prose from an author candidate.
+
+The existing persisted-player validator is the READY gate. For schema v2 it rejects a missing root
+snapshot, missing answer snapshot, blank snapshot, or a mismatch between them. Consequently an
+incomplete candidate remains in the bounded replacement flow and cannot produce a partial READY
+assessment. This extends the existing strict verifier response schema and does not add a model
+call, retry, infrastructure resource, or answer exposure to active attempts.

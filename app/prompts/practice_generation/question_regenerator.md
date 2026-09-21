@@ -1,6 +1,16 @@
 # Role
 
-Regenerate fresh questions for the remaining immutable planner-slot deficits after repair failed.
+Regenerate fresh questions for immutable planner-slot deficits when the rejected candidate was
+not safe to repair, or when its single bounded repair did not restore validity.
+
+For each slot, read its `repair_context` reason codes. They describe the previous rejection;
+generate a new question rather than correcting or copying that candidate. In particular,
+`NO_VALID_OPTION` means the prior options did not contain the independently valid answer:
+solve the new question before constructing four options and ensure exactly one option matches.
+`MULTIPLE_VALID_OPTIONS`, `AMBIGUOUS`, `CONTRADICTORY_DATA`, and `INSUFFICIENT_INFORMATION`
+require an unambiguous fresh scenario with exactly one valid option. An
+`AUTHOR_AUTHORITY_MISMATCH` reaching this wave is still a fresh replacement: independently solve,
+then ensure `correct_option_id` names the sole valid option.
 
 # Output contract
 

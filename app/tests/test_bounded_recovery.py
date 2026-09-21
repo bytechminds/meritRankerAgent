@@ -23,6 +23,7 @@ from observability.llm_usage import (
 from schemas.llm_usage import ProviderTokenUsage
 from services.doubt_solver.answer_correctness import CorrectnessVerification
 from services.doubt_solver.answer_diagnosis import SemanticDiagnosis
+from services.doubt_solver.question_integrity import ambiguous_question_message
 from services.doubt_solver.recovery_policy import (
     CANDIDATE_RECOVERY_INSTRUCTION,
     RecoveryBudget,
@@ -305,9 +306,16 @@ def test_c_a_self_contradicting_candidate_also_regenerates_once() -> None:
 def test_d_a_question_fault_asks_the_student_for_what_is_missing(
     diagnosis: SemanticDiagnosis,
 ) -> None:
-    verifier = _Verifier(_AMBIGUOUS)
+    """A question the deterministic gates admitted is blamed only after a fresh candidate.
+
+    The approved policy changed here: one ambiguous verdict is no longer enough to end the
+    request, because the same question family is answered successfully on other turns. The
+    single candidate slot is spent first, and a still-ambiguous second verdict is what asks
+    the student for what is missing.
+    """
+    verifier = _Verifier(_AMBIGUOUS, _AMBIGUOUS)
     diagnoser = _Diagnoser(diagnosis)
-    adapter = _Adapter(_ANSWER_A, verifier=verifier, diagnoser=diagnoser)
+    adapter = _Adapter(_ANSWER_A, _ANSWER_B, verifier=verifier, diagnoser=diagnoser)
 
     events = _stream(adapter)
 
@@ -317,9 +325,13 @@ def test_d_a_question_fault_asks_the_student_for_what_is_missing(
         "code": "QUESTION_NEEDS_CLARIFICATION",
         "user_retryable": False,
     }
-    assert len(adapter.generate_calls) == 1  # no regeneration
-    assert len(verifier.calls) == 1  # no second verification
-    assert diagnoser.calls == 1
+    assert len(adapter.generate_calls) == 2  # exactly one regeneration, never a second
+    assert len(verifier.calls) == 2
+    assert diagnoser.calls == 1  # the post-regeneration verdict pays for no diagnosis
+    # The wording still comes from the diagnosis, even though it was paid for once.
+    assert terminal.label == ambiguous_question_message(
+        "english", multiple_answers=diagnosis is _MULTIPLE
+    )
     # The student is told what to send, and never an internal code.
     assert terminal.label is not None and len(terminal.label) > 20
     for code in ("INCOMPLETE_QUESTION", "MULTIPLE_DEFENSIBLE_ANSWERS", "QUESTION"):

@@ -47,11 +47,13 @@ class _DistinctGenerator:
     def __init__(self, *, raise_on_wave: dict[int, BaseException] | None = None) -> None:
         self._raise_on_wave = raise_on_wave or {}
         self.waves: list[int] = []
+        self.slot_ids_by_wave: list[tuple[int, tuple[str, ...]]] = []
 
     def generate_slots(self, *, request, bucket, group, slots, **kwargs):  # noqa: ANN001
         del request, group
         wave = int(kwargs.get("replacement_wave", 0))
         self.waves.append(wave)
+        self.slot_ids_by_wave.append((wave, tuple(slot.slot_id for slot in slots)))
         if len(self.waves) > _ATTEMPT_PROBE_CAP:
             raise _LoopProbe(f"unbounded generation: waves={self.waves}")
         if wave in self._raise_on_wave:
@@ -117,6 +119,7 @@ class _Verifier:
             slot_id=slot.slot_id,
             decision=VerificationDecision.ACCEPT,
             valid_option_ids=[question.correct_option_id],
+            answer_explanation="The independently selected option is correct.",
             reason_codes=["MATCH"],
         )
 
@@ -241,6 +244,7 @@ def test_one_exhausting_slot_leaves_the_other_accepted_questions_intact() -> Non
                 slot_id=slot.slot_id,
                 decision=VerificationDecision.ACCEPT,
                 valid_option_ids=[question.correct_option_id],
+                answer_explanation="The independently selected option is correct.",
                 reason_codes=["MATCH"],
             )
 
@@ -252,6 +256,57 @@ def test_one_exhausting_slot_leaves_the_other_accepted_questions_intact() -> Non
     accepted_slots = sorted(item.slot.slot_id for item in outcome.accepted)
     assert accepted_slots == ["slot-001", "slot-003"], "accepted questions were lost"
     assert outcome.unresolved_slot_ids == ("slot-002",)
+
+
+def test_mixed_semantic_recovery_corrects_authority_key_and_replaces_rejection() -> None:
+    class _MixedRecoveryVerifier:
+        def __init__(self) -> None:
+            self.calls_by_slot: dict[str, int] = {}
+
+        def verify_slot(self, *, request, bucket, slot, question):  # noqa: ANN001
+            del request, bucket
+            calls = self.calls_by_slot.get(slot.slot_id, 0) + 1
+            self.calls_by_slot[slot.slot_id] = calls
+            if slot.slot_id == "slot-001" and calls == 1:
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision=VerificationDecision.ACCEPT,
+                    valid_option_ids=["0"],
+                    answer_explanation="Option 0 is the independently solved answer.",
+                    reason_codes=["SINGLE_VALID_OPTION"],
+                )
+            if slot.slot_id == "slot-002" and calls == 1:
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision=VerificationDecision.REGENERATE,
+                    valid_option_ids=[],
+                    reason_codes=["NO_VALID_OPTION"],
+                )
+            return VerificationResult(
+                schema_version="2",
+                generation_item_id=question.generation_item_id,
+                slot_id=slot.slot_id,
+                decision=VerificationDecision.ACCEPT,
+                valid_option_ids=[question.correct_option_id],
+                answer_explanation="The independently selected option is correct.",
+                reason_codes=["MATCH"],
+            )
+
+    generator = _DistinctGenerator()
+    outcome = _run(generator, _MixedRecoveryVerifier(), slot_count=2)
+
+    assert generator.slot_ids_by_wave == [
+        (0, ("slot-001", "slot-002")),
+        (2, ("slot-002",)),
+    ]
+    assert sorted(item.slot.slot_id for item in outcome.accepted) == [
+        "slot-001",
+        "slot-002",
+    ]
 
 
 # --- 6-7. provider failure and the attempt budget ----------------------------

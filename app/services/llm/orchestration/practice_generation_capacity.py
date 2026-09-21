@@ -51,7 +51,7 @@ class PracticeGenerationCapacityPolicy:
         difficulty = route_decision.difficulty
         if difficulty not in {"basic", "intermediate", "advanced"}:
             difficulty = "basic"
-        if route_decision.subject not in {"math", "reasoning"}:
+        if route_decision.subject not in {"math", "practice_math", "reasoning"}:
             difficulty = "basic"
         is_reasoning_model = model_config.supports_reasoning
         band = cls._BANDS[(difficulty, is_reasoning_model)]
@@ -88,7 +88,7 @@ class PracticeGenerationCapacityPolicy:
             cls._complexity_slot_cap(workload.complexity),
         )
         if (
-            route_decision.subject in {"math", "reasoning"}
+            route_decision.subject in {"math", "practice_math", "reasoning"}
             and difficulty == "advanced"
             and workload.complexity == "high"
         ):
@@ -140,6 +140,7 @@ class PracticeGenerationCapacityPolicy:
     def _visible_output_floor(*, subject: str, complexity: str, slot_count: int) -> int:
         base = {
             "math": 300,
+            "practice_math": 300,
             "reasoning": 310,
             "english": 280,
         }.get(subject, 260)

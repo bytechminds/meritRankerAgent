@@ -259,6 +259,7 @@ class AppSyncAssessmentProgressRepository:
                     "resumeReason": resume_reason,
                     "generationGroups": groups,
                     "phase": InternalPhase.GENERATING.value,
+                    "progressMessageKey": "PRACTICE_GENERATION_CREATING",
                     "playable": False,
                     "errorCode": None,
                     "lastCompletedStage": "EXECUTION_CLAIMED",
@@ -387,6 +388,7 @@ class AppSyncAssessmentProgressRepository:
             test_id,
             meta_updates={
                 "phase": InternalPhase.MATCHING_EXISTING.value,
+                "progressMessageKey": "PRACTICE_GENERATION_MATCHING",
                 "blueprint": blueprint.model_dump(mode="json"),
                 "plannerCalls": planner_calls,
                 "plannerTier": planner_tier,
@@ -448,6 +450,7 @@ class AppSyncAssessmentProgressRepository:
             meta_updates={
                 "generationGroups": groups,
                 "phase": InternalPhase.GENERATING.value,
+                "progressMessageKey": "PRACTICE_GENERATION_CREATING",
             },
             expected_updated_at=str(assessment.get("updatedAt") or ""),
             live=False,
@@ -475,6 +478,7 @@ class AppSyncAssessmentProgressRepository:
                     "recoveryAttemptCount": 1,
                     "lastCompletedStage": "RECOVERY_CLAIMED",
                     "phase": InternalPhase.GENERATING.value,
+                    "progressMessageKey": "PRACTICE_GENERATION_CREATING",
                 },
                 expected_updated_at=str(assessment.get("updatedAt") or ""),
                 live=False,
@@ -583,6 +587,7 @@ class AppSyncAssessmentProgressRepository:
             test_id,
             meta_updates={
                 "phase": InternalPhase.FINALIZING.value,
+                "progressMessageKey": "PRACTICE_GENERATION_FINALIZING",
                 "finalizationAttempt": next_attempt,
                 "finalizationReasonCode": reason_code,
             },

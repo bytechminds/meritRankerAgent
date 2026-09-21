@@ -66,44 +66,68 @@ def _classifier_response_schema() -> dict[str, Any]:
 def _verifier_response_schema() -> dict[str, Any]:
     """Return the schema-v2 Answer Authority wire shape.
 
-    Written out rather than derived from ``VerificationResult`` because that model
-    still carries the legacy v1 fields, and their optionality compiles to ``anyOf``
-    with ``$ref``/``$defs`` — constructs this API rejects. The fields below are exactly
-    the ones the v2 verifier prompt asks for, and the canonical model remains the
-    authority: it re-validates every response after parsing.
+    Delegates to the canonical, provider-agnostic schema function (shared with the
+    Azure adapter) instead of a private hand-written copy — the previous hand-written
+    copy here had drifted and was missing ``evidence_urls``, a real field on
+    ``VerificationResult`` used for fresh-evidence citation enforcement. The canonical
+    model remains the authority: it re-validates every response after parsing.
     """
-    option_id = {"type": "string", "enum": ["0", "1", "2", "3"]}
-    return {
-        "type": "object",
-        "properties": {
-            "schema_version": {"type": "string", "enum": ["2"]},
-            "generation_item_id": {"type": "string"},
-            "slot_id": {"type": "string"},
-            "decision": {
-                "type": "string",
-                "enum": ["ACCEPT", "REPAIRABLE", "REGENERATE", "TERMINAL_REJECTION"],
-            },
-            "valid_option_ids": {"type": "array", "items": option_id, "maxItems": 4},
-            "reason_codes": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-        },
-        "required": [
-            "schema_version",
-            "generation_item_id",
-            "slot_id",
-            "decision",
-            "valid_option_ids",
-            "reason_codes",
-        ],
-    }
+    from features.practice_generation.schemas import (  # noqa: PLC0415
+        practice_verifier_generation_schema,
+    )
+
+    return practice_verifier_generation_schema()
+
+
+def _generator_response_schema() -> dict[str, Any]:
+    """Return the schema-v2 question-generator wire shape (shared with Azure)."""
+    from features.practice_generation.schemas import (  # noqa: PLC0415
+        practice_generator_generation_schema,
+    )
+
+    return practice_generator_generation_schema()
 
 
 # Native response schemas keyed by execution role. A role absent from this map is
 # executed as an ordinary free-text call. Keyed by role, never by model, so no
-# model-specific branch exists.
+# model-specific branch exists. "classifier" has exactly one caller (the Doubt Solver
+# classifier) and needs no further gate. "generator" and "verifier" are also shared
+# with Doubt Solver's free-text answer generation and answer-correctness verifier
+# respectively — and, critically, "intent" cannot discriminate the two: the classifier
+# maps a practice_question intent to the literal string "practice"
+# (academic_classifier.ACADEMIC_INTENT_MAP) on requests that fall through to the
+# ordinary Doubt Solver "generate" node whenever Practice launch is ineligible or
+# disabled, so a naive intent=="practice" gate would wrongly fire for a Doubt Solver
+# free-text call. _NATIVE_SCHEMA_GENERATOR_PROMPTS/_NATIVE_SCHEMA_VERIFIER_PROMPTS
+# gate on the exact prompt path Practice's own _execute() passes instead —
+# provider-agnostic, and the only signal exact enough to also exclude the legacy
+# schema-v1 Practice generator/verifier prompts, which use a different wire shape.
 _NATIVE_RESPONSE_SCHEMAS: dict[str, Callable[[], dict[str, Any]]] = {
     "classifier": _classifier_response_schema,
     "verifier": _verifier_response_schema,
+    "generator": _generator_response_schema,
 }
+_NATIVE_SCHEMA_GENERATOR_PROMPTS = frozenset(
+    {
+        "practice_generation/question_generator_v2.md",
+        "practice_generation/question_generator_factual.md",
+        "practice_generation/question_repair.md",
+        "practice_generation/question_regenerator.md",
+    }
+)
+_NATIVE_SCHEMA_VERIFIER_PROMPTS = frozenset({"practice_generation/question_verifier_v2.md"})
+
+
+def _active_native_schema_builder(
+    request: ProviderExecutionRequest,
+) -> Callable[[], dict[str, Any]] | None:
+    task_role = request.route_decision.task_role
+    prompt = request.route_decision.prompt
+    if task_role == "generator" and prompt not in _NATIVE_SCHEMA_GENERATOR_PROMPTS:
+        return None
+    if task_role == "verifier" and prompt not in _NATIVE_SCHEMA_VERIFIER_PROMPTS:
+        return None
+    return _NATIVE_RESPONSE_SCHEMAS.get(task_role)
 
 
 class GeminiProviderAdapter:
@@ -201,9 +225,7 @@ class GeminiProviderAdapter:
             "temperature": request.temperature,
             "max_output_tokens": request.max_tokens,
         }
-        schema_builder = _NATIVE_RESPONSE_SCHEMAS.get(
-            request.route_decision.task_role
-        )
+        schema_builder = _active_native_schema_builder(request)
         if schema_builder is not None:
             values.update(
                 {
@@ -280,7 +302,7 @@ class GeminiProviderAdapter:
             metadata={
                 "model_label": request.model_resolution.model_config.model_label,
                 "native_structured_output": (
-                    request.route_decision.task_role in _NATIVE_RESPONSE_SCHEMAS
+                    _active_native_schema_builder(request) is not None
                 ),
             },
         )

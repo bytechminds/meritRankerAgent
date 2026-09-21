@@ -153,6 +153,16 @@ def test_composed_prompt_estimate_remains_compact() -> None:
         assert estimated_tokens < 625  # the 2_500-char bound expressed in tokens
 
 
+def test_v2_authority_rejects_inconsistent_premises_before_formula_application() -> None:
+    """Pin the false-accept fix without embedding a geometry-specific rule."""
+    prompt = (
+        PromptResolver()._prompt_root / "practice_generation/question_verifier_v2.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Reject incompatible stated premises" in prompt
+    assert "`CONTRADICTORY_DATA`" in prompt
+
+
 def test_generator_and_verifier_receive_only_their_role_prompt() -> None:
     request = resolve_practice_request(
         request_id="request-1",
@@ -180,6 +190,11 @@ def test_generator_and_verifier_receive_only_their_role_prompt() -> None:
         exclude_normalized_texts=(),
     )
     assert generator_executor.last_messages is not None
+    assert generator_executor.last_route_decision is not None
+    assert generator_executor.last_route_decision.route_id == (
+        "practice_math.generator.intermediate"
+    )
+    assert generator_executor.last_route_decision.model == "openai_gpt_5_6_terra"
     generator_system = generator_executor.last_messages[0].content
     assert "Generate only the assigned questions" in generator_system
     assert "shortest complete response" in generator_system
@@ -258,6 +273,11 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
     )
 
     assert generator_executor.last_messages is not None
+    assert generator_executor.last_route_decision is not None
+    assert generator_executor.last_route_decision.route_id == (
+        "practice_math.generator.intermediate"
+    )
+    assert generator_executor.last_route_decision.model == "openai_gpt_5_6_terra"
     assert "Generate one independently playable MCQ" in generator_executor.last_messages[0].content
     generator_payload = json.loads(generator_executor.last_messages[1].content)
     assert generator_payload["required_answer_contract"] == {
@@ -294,6 +314,7 @@ def test_slot_generator_and_verifier_exchange_the_canonical_answer_contract() ->
                 "slot_id": slot.slot_id,
                 "decision": "ACCEPT",
                 "valid_option_ids": ["3"],
+                "answer_explanation": "Two plus two equals four.",
                 "reason_codes": ["SINGLE_VALID_OPTION"],
             }
         )
@@ -368,6 +389,7 @@ def test_authority_payload_never_carries_the_author_answer() -> None:
                 "slot_id": slot.slot_id,
                 "decision": "ACCEPT",
                 "valid_option_ids": ["3"],
+                "answer_explanation": "Two plus two equals four.",
                 "reason_codes": ["SINGLE_VALID_OPTION"],
             }
         )
@@ -455,6 +477,9 @@ def test_repair_payload_is_slot_scoped_and_contains_only_the_rejected_candidate(
     )
 
     assert executor.last_messages is not None
+    assert executor.last_route_decision is not None
+    assert executor.last_route_decision.route_id == "practice_math.generator.intermediate"
+    assert executor.last_route_decision.model == "openai_gpt_5_6_terra"
     assert "read its `repair_context` entry" in executor.last_messages[0].content
     payload = json.loads(executor.last_messages[1].content)
     assert payload["repair_context"] == [
@@ -464,6 +489,75 @@ def test_repair_payload_is_slot_scoped_and_contains_only_the_rejected_candidate(
             "candidate": candidate.model_dump(mode="json"),
         }
     ]
+
+
+def test_replacement_payload_keeps_reason_context_without_rejected_content() -> None:
+    request = resolve_practice_request(
+        request_id="request-replacement-v2",
+        user_id="user-1",
+        conversation_id="conversation-1",
+        turn_id="turn-replacement-v2",
+        query="Create one algebra question",
+        subject="math",
+        topic="algebra",
+        difficulty="intermediate",
+        language="english",
+        exam_id="CAT",
+        exam_stage=None,
+    )
+    blueprint = deterministic_blueprint(request)
+    bucket = blueprint.buckets[0]
+    slot = blueprint.slots[0]
+    candidate = GeneratedQuestion(
+        schema_version="2",
+        generation_item_id="item-rejected",
+        bucket_id=bucket.bucket_id,
+        slot_id=slot.slot_id,
+        question="If x plus one equals two, what is x?",
+        question_type="mcq",
+        options=[
+            {"option_id": "0", "value": "0"},
+            {"option_id": "1", "value": "1"},
+            {"option_id": "2", "value": "2"},
+            {"option_id": "3", "value": "3"},
+        ],
+        correct_option_id="1",
+        correct_answer="1",
+        answer_explanation="The submitted explanation is intentionally incomplete.",
+        solution="Subtract one.",
+        subject=slot.subject_id,
+        topic=slot.topic_id,
+        difficulty=slot.difficulty,
+    )
+    executor = MockModelExecutor(content='{"questions":[]}')
+
+    RoutedQuestionGenerator(LlmOrchestrator(model_executor=executor)).generate_slots(
+        request=request,
+        bucket=bucket,
+        group=GenerationGroup(
+            group_id="replacement-group",
+            bucket_id=bucket.bucket_id,
+            required_count=1,
+            slot_ids=[slot.slot_id],
+        ),
+        slots=(slot,),
+        exclude_normalized_texts=(),
+        repair_feedback=("NO_VALID_OPTION",),
+        repair_candidates_by_slot={slot.slot_id: candidate},
+        repair_reason_codes_by_slot={slot.slot_id: ("NO_VALID_OPTION",)},
+        replacement_wave=2,
+    )
+
+    assert executor.last_messages is not None
+    assert executor.last_route_decision is not None
+    assert executor.last_route_decision.route_id == "practice_math.generator.intermediate"
+    assert executor.last_route_decision.model == "openai_gpt_5_6_terra"
+    assert "repair_context" in executor.last_messages[0].content
+    payload = json.loads(executor.last_messages[1].content)
+    assert payload["repair_context"] == [
+        {"slot_id": slot.slot_id, "reason_codes": ["NO_VALID_OPTION"]}
+    ]
+    assert candidate.question not in json.dumps(payload)
 
 
 def test_slot_generator_receives_one_answer_redacted_pattern_guidance_block() -> None:

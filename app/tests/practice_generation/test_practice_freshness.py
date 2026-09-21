@@ -11,6 +11,7 @@ import pytest
 from features.practice_generation.orchestration import _request
 from features.practice_generation.planning import (
     is_fresh_evidence_request_supported,
+    required_fresh_evidence_count,
     resolve_practice_freshness_requirement,
     resolve_practice_request,
 )
@@ -279,35 +280,11 @@ def test_static_practice_bypasses_fresh_evidence_collection(monkeypatch) -> None
     assert result["practice_test_id"] == "practice-fresh"
 
 
-def test_invalid_fresh_practice_count_does_not_search_or_launch(monkeypatch) -> None:
-    monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "true")
-    monkeypatch.setattr(
-        "services.context_retrieval.context_retrieval_service.ContextRequestBuilder.from_query_and_classification",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unexpected web search")
-        ),
-    )
-    launched: list[object] = []
+def test_capped_fresh_practice_uses_the_effective_evidence_count() -> None:
     query = "Create 101 current affairs questions for SSC GD"
 
-    result = build_orchestrated_doubt_solver_graph(
-        _NoAnswerAdapter(),
-        practice_launcher=lambda request: launched.append(request) or _launch_result(),
-    ).invoke(
-        _graph_state(
-            query,
-            {
-                "intent": "practice",
-                "subject": "general",
-                "need_web_search": True,
-                "web_search_reason": "current_affairs",
-            },
-        )
-    )
-
-    assert is_fresh_evidence_request_supported(query) is False
-    assert launched == []
-    assert "could not be started" in result["answer"]
+    assert is_fresh_evidence_request_supported(query) is True
+    assert required_fresh_evidence_count(query) == 50
 
 
 def test_historical_current_affairs_window_and_evidence_filter_are_preserved() -> None:
@@ -356,7 +333,7 @@ def test_historical_current_affairs_window_and_evidence_filter_are_preserved() -
     assert [item.url for item in bundle.items] == ["https://pib.gov.in/2024-event"]
 
 
-def test_hundred_current_affairs_slots_accept_a_complete_mock_evidence_bundle() -> None:
+def test_hundred_current_affairs_slots_use_a_complete_effective_evidence_bundle() -> None:
     query = "Create 100 latest current affairs questions for SSC GD"
     request = resolve_practice_request(
         request_id="request-fresh-100",
@@ -374,13 +351,14 @@ def test_hundred_current_affairs_slots_accept_a_complete_mock_evidence_bundle() 
             query,
             {"intent": "practice", "web_search_reason": "current_affairs"},
         ),
-        fresh_evidence=_evidence(100),
+        fresh_evidence=_evidence(50),
     )
 
     assert request.requested_count == 100
-    assert request.accepted_count == 100
+    assert request.accepted_count == 50
+    assert request.limitation is not None
     assert request.fresh_evidence is not None
-    assert len(request.fresh_evidence.items) == 100
+    assert len(request.fresh_evidence.items) == 50
 
 
 def test_fresh_evidence_survives_practice_request_reconstruction() -> None:
@@ -488,6 +466,7 @@ def test_verifier_rejects_a_fresh_fact_without_a_selected_evidence_url() -> None
                 "slot_id": "slot-001",
                 "decision": "ACCEPT",
                 "valid_option_ids": ["0"],
+                "answer_explanation": "The supplied evidence supports option A.",
                 "reason_codes": ["INDEPENDENT_SOLUTION_MATCH"],
             }
         )

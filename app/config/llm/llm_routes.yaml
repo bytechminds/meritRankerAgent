@@ -121,6 +121,34 @@ routes:
           - general_default
           - safe_mock
 
+  # Route-only Practice Math authoring distinction. `planning.py` is the sole
+  # producer and selects it only for default/intermediate Math slots; this keeps
+  # the shared Math routes used by Doubt Solver, basic Practice, and advanced
+  # Practice unchanged.
+  practice_math:
+    generator:
+      default:
+        model: openai_gpt_5_6_terra
+        prompt: subjects/math_generator.md
+        temperature: 0.2
+        max_tokens: 900
+        intent_overlays:
+          practice:
+            - intents/practice.md
+        fallback:
+          - general_default
+          - safe_mock
+
+      intermediate:
+        inherits: default
+        overlays:
+          - levels/intermediate.md
+        max_tokens: 2600
+        fallback:
+          - default
+          - general_default
+          - safe_mock
+
   reasoning:
     verifier:
       default:

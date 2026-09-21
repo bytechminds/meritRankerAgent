@@ -275,9 +275,16 @@ class AssessmentRepository:
             "practiceType": request.practice_type.value,
             "requestedCount": request.requested_count,
             "acceptedCount": request.accepted_count,
+            "effectiveCount": request.effective_count,
+            "limitation": (
+                request.limitation.model_dump(mode="json", by_alias=True)
+                if request.limitation is not None
+                else None
+            ),
             "examStage": request.exam_stage,
             "requestedLanguage": request.language,
             "phase": progress.phase.value,
+            "progressMessageKey": "PRACTICE_GENERATION_QUEUED",
             "playable": False,
             "progressPercent": 0,
             "readyQuestionCount": 0,
@@ -312,6 +319,12 @@ class AssessmentRepository:
                 "practiceType": request.practice_type.value,
                 "requestedCount": request.requested_count,
                 "acceptedCount": request.accepted_count,
+                "effectiveCount": request.effective_count,
+                "limitation": (
+                    request.limitation.model_dump(mode="json", by_alias=True)
+                    if request.limitation is not None
+                    else None
+                ),
                 "subject": request.subject,
                 "topic": request.topic,
                 "topics": request.topics,
@@ -1345,9 +1358,9 @@ class QuestionRepository:
             if not slot_id:
                 continue
             item["_practiceMeta"] = practice_meta
-            # Schema-v2 questions are authored without a solution by contract, so a
-            # resume must not invalidate slots that were already verified. v1/legacy
-            # items keep the original requirement.
+            # Schema-v2 authors omit a solution, but persistence requires the Answer
+            # Authority's non-empty canonical explanation snapshots. The shared v2
+            # contract validator enforces that independently of this legacy flag.
             item_schema_v2 = str(practice_meta.get("schemaVersion") or "") == "2"
             contract = validate_persisted_playable_question(
                 item,

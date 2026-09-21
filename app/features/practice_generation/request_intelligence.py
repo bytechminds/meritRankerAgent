@@ -26,7 +26,7 @@ from typing import NamedTuple, Protocol
 from pydantic import ValidationError
 
 from observability.events import log_event
-from practice_limits import MAX_PRACTICE_QUESTIONS
+from practice_limits import MAX_REQUESTED_PRACTICE_QUESTIONS
 from schemas.practice_request_intelligence import (
     CustomDifficulty,
     PracticeRequestIntelligence,
@@ -271,7 +271,7 @@ def _validate_difficulty(
         raise RequestIntelligenceError(
             "PRACTICE_INTELLIGENCE_DIFFICULTY_ARITHMETIC_INVALID"
         )
-    if target is None and not 1 <= total <= MAX_PRACTICE_QUESTIONS:
+    if target is None and not 1 <= total <= MAX_REQUESTED_PRACTICE_QUESTIONS:
         raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_COUNT_OUT_OF_BOUNDS")
 
 
@@ -300,7 +300,7 @@ def parse_request_intelligence(
     tokens = tokenize_query(query)
     intelligence = PracticeRequestIntelligence.model_validate(json.loads(raw))
     if intelligence.requested_count is not None:
-        if not 1 <= intelligence.requested_count <= MAX_PRACTICE_QUESTIONS:
+        if not 1 <= intelligence.requested_count <= MAX_REQUESTED_PRACTICE_QUESTIONS:
             raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_COUNT_OUT_OF_BOUNDS")
         if explicit_count is not None and intelligence.requested_count != explicit_count:
             raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_COUNT_MISMATCH")

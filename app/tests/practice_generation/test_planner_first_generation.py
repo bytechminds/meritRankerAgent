@@ -8,6 +8,7 @@ from copy import deepcopy
 
 import pytest
 
+from features.practice_generation import orchestration as orchestration_module
 from features.practice_generation.config import PracticeGenerationConfig
 from features.practice_generation.execution_control import (
     ActivePracticeExecutionRegistry,
@@ -19,6 +20,7 @@ from features.practice_generation.pattern_context import NoOpPatternContextProvi
 from features.practice_generation.planning import deterministic_blueprint
 from features.practice_generation.schemas import (
     GeneratedBatch,
+    GeneratedQuestion,
     PracticeGenerationRequest,
     VerificationResult,
 )
@@ -154,6 +156,8 @@ class Questions:
             "question": question.question,
             "topic": question.topic,
             "difficulty": question.difficulty.value,
+            "correctOptionId": question.correct_option_id,
+            "correctAnswer": question.correct_answer,
             "_practiceMeta": {
                 "bucketId": question.bucket_id,
                 "slotId": question.slot_id,
@@ -221,6 +225,7 @@ class Verifier:
             slot_id=slot.slot_id,
             decision="ACCEPT",
             valid_option_ids=[question.correct_option_id],
+            answer_explanation="The independently selected option is correct.",
             reason_codes=["SINGLE_VALID_OPTION"],
         )
 
@@ -262,15 +267,29 @@ def generated_question(*, bucket, slot) -> dict:
 
 
 class WaveGenerator:
-    def __init__(self, *, fail_provider: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_provider: bool = False,
+        include_dependent_text: bool = True,
+    ) -> None:
         self.fail_provider = fail_provider
+        self.include_dependent_text = include_dependent_text
         self.waves: list[int] = []
+        self.reason_codes_by_wave: list[dict[str, tuple[str, ...]] | None] = []
 
-    def generate_slots(self, *, bucket, slots, replacement_wave, **_kwargs):
+    def generate_slots(self, *, bucket, slots, replacement_wave, **kwargs):
         self.waves.append(replacement_wave)
+        reason_codes = kwargs.get("repair_reason_codes_by_slot")
+        self.reason_codes_by_wave.append(
+            dict(reason_codes) if reason_codes is not None else None
+        )
         if self.fail_provider:
             raise ProviderExecutionError("provider failed", failure_kind="timeout")
         question = generated_question(bucket=bucket, slot=slots[0])
+        if not self.include_dependent_text:
+            question["answer_explanation"] = ""
+            question["solution"] = ""
         if replacement_wave == 2:
             question["question"] = (
                 f"For {slots[0].slot_id}, in a fresh scenario, what is two plus two?"
@@ -373,6 +392,11 @@ class DecisionVerifier:
             valid_option_ids=(
                 [] if decision == "REGENERATE" else [question.correct_option_id]
             ),
+            answer_explanation=(
+                "The independently selected option is correct."
+                if decision == "ACCEPT"
+                else ""
+            ),
             reason_codes=[
                 "INDEPENDENT_SOLUTION_MATCH"
                 if decision == "ACCEPT"
@@ -401,6 +425,7 @@ class SelectiveProviderFailureVerifier:
             slot_id=slot.slot_id,
             decision="ACCEPT",
             valid_option_ids=[question.correct_option_id],
+            answer_explanation="The independently selected option is correct.",
             reason_codes=["SINGLE_VALID_OPTION"],
         )
 
@@ -719,6 +744,11 @@ class GateVerifier:
             slot_id=slot.slot_id,
             decision="ACCEPT" if len(valid) == 1 else "REGENERATE",
             valid_option_ids=valid,
+            answer_explanation=(
+                "The independently selected option is correct."
+                if len(valid) == 1
+                else ""
+            ),
             reason_codes=["SINGLE_VALID_OPTION" if len(valid) == 1 else "REPORTED"],
         )
 
@@ -749,16 +779,234 @@ def test_multiple_valid_options_is_rejected_and_forces_regeneration() -> None:
     assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
 
 
-def test_author_authority_mismatch_is_rejected_even_when_authority_accepts() -> None:
-    """One valid option, but not the author's: agreement fails, so the item cannot pass."""
-    generator = WaveGenerator()
+def test_author_authority_mismatch_is_corrected_without_a_repair_call() -> None:
+    """A blind Authority's single valid option corrects the key locally and once."""
+    generator = WaveGenerator(include_dependent_text=False)
+    verifier = GateVerifier(["1"])
     orchestrator, assessments = build_orchestrator(
         generator=generator,
         # The author keys "3"; the authority independently finds "1".
-        verifier=GateVerifier(["1"]),
+        verifier=verifier,
     )
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0]
+    assert verifier.calls == 1
+    assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
+    persisted = orchestrator._questions.linked["question-slot-001"]
+    assert persisted["correctOptionId"] == "1"
+    assert persisted["correctAnswer"] == "2"
+
+
+def test_authority_explanation_allows_a_key_correction_without_repair() -> None:
+    class MismatchThenRegenerateVerifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def verify_slot(self, *, slot, question, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision="ACCEPT",
+                    valid_option_ids=["1"],
+                    answer_explanation="Option 1 is the independently solved answer.",
+                    reason_codes=["SINGLE_VALID_OPTION"],
+                )
+            if self.calls == 2:
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision="REGENERATE",
+                    valid_option_ids=[],
+                    reason_codes=["NO_VALID_OPTION"],
+                )
+            return VerificationResult(
+                schema_version="2",
+                generation_item_id=question.generation_item_id,
+                slot_id=slot.slot_id,
+                decision="ACCEPT",
+                valid_option_ids=[question.correct_option_id],
+                answer_explanation="The independently selected option is correct.",
+                reason_codes=["SINGLE_VALID_OPTION"],
+            )
+
+    generator = WaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=MismatchThenRegenerateVerifier(),
+    )
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0]
+    assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
+
+
+def test_authority_key_correction_fails_closed_without_one_indexed_option() -> None:
+    assessment_request = request()
+    blueprint = deterministic_blueprint(assessment_request)
+    bucket = blueprint.buckets[0]
+    slot = blueprint.slots[0]
+    question = GeneratedQuestion.model_validate(generated_question(bucket=bucket, slot=slot))
+    question = question.model_copy(update={"answer_explanation": "", "solution": ""})
+    verification = VerificationResult(
+        schema_version="2",
+        generation_item_id=question.generation_item_id,
+        slot_id=slot.slot_id,
+        decision="ACCEPT",
+        valid_option_ids=["1"],
+        answer_explanation="Option 1 is the independently solved answer.",
+        reason_codes=["SINGLE_VALID_OPTION"],
+    )
+
+    missing = question.model_copy(update={"canonical_options": question.canonical_options[:1]})
+    duplicated = question.model_copy(
+        update={"canonical_options": [*question.canonical_options, question.canonical_options[1]]}
+    )
+
+    assert (
+        orchestration_module._materialize_authority_answer_contract(
+            question=missing,
+            verification=verification,
+        )
+        is None
+    )
+    assert (
+        orchestration_module._materialize_authority_answer_contract(
+            question=duplicated,
+            verification=verification,
+        )
+        is None
+    )
+
+
+class _ThreeSlotWaveGenerator:
+    def __init__(self) -> None:
+        self.waves: list[int] = []
+
+    def generate_slots(self, *, bucket, slots, replacement_wave, **_kwargs):
+        self.waves.append(replacement_wave)
+        questions = []
+        for slot in slots:
+            question = generated_question(bucket=bucket, slot=slot)
+            question["question"] = (
+                f"Wave {replacement_wave} question for {slot.slot_id}: what is two plus two?"
+            )
+            question["answer_explanation"] = ""
+            question["solution"] = ""
+            questions.append(question)
+        return GeneratedBatch(
+            content=json.dumps({"questions": questions}),
+            route_id=slots[0].generator_route_hint,
+            model="test-model",
+        )
+
+
+def _configure_three_slot_group(assessments: Assessments) -> None:
+    group = assessments.item["meta"]["generationGroups"]["g1"]
+    group["requiredCount"] = 3
+    group["slotIds"] = ["slot-001", "slot-002", "slot-003"]
+
+
+def test_approved_slot_is_preserved_when_group_siblings_exhaust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OneApprovedVerifier:
+        def verify_slot(self, *, slot, question, **_kwargs):
+            if slot.slot_id == "slot-001":
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision="ACCEPT",
+                    valid_option_ids=[question.correct_option_id],
+                    answer_explanation="The independently selected option is correct.",
+                    reason_codes=["SINGLE_VALID_OPTION"],
+                )
+            return VerificationResult(
+                schema_version="2",
+                generation_item_id=question.generation_item_id,
+                slot_id=slot.slot_id,
+                decision="REGENERATE",
+                valid_option_ids=[],
+                reason_codes=["NO_VALID_OPTION"],
+            )
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+    generator = _ThreeSlotWaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=OneApprovedVerifier(),
+    )
+    _configure_three_slot_group(assessments)
+
+    orchestrator.generate_wave("test-v2", ["g1"])
+
+    assert generator.waves == [0, 2]
+    assert set(orchestrator._questions.linked) == {"question-slot-001"}
+    assert assessments.item["meta"]["readyCount"] == 1
+    assert assessments.item["meta"]["readyQuestionCount"] == 1
+    manifest_events = [
+        details
+        for event, details in events
+        if event == "practice_manifest_updated"
+    ]
+    assert manifest_events[-1]["details"]["readyCount"] == 1
+
+
+def test_approved_siblings_remain_unchanged_when_only_one_slot_is_replaced() -> None:
+    class TwoApprovedThenReplacementVerifier:
+        def __init__(self) -> None:
+            self.calls_by_slot: dict[str, int] = {}
+
+        def verify_slot(self, *, slot, question, **_kwargs):
+            calls = self.calls_by_slot.get(slot.slot_id, 0) + 1
+            self.calls_by_slot[slot.slot_id] = calls
+            if slot.slot_id == "slot-003" and calls == 1:
+                return VerificationResult(
+                    schema_version="2",
+                    generation_item_id=question.generation_item_id,
+                    slot_id=slot.slot_id,
+                    decision="REGENERATE",
+                    valid_option_ids=[],
+                    reason_codes=["NO_VALID_OPTION"],
+                )
+            return VerificationResult(
+                schema_version="2",
+                generation_item_id=question.generation_item_id,
+                slot_id=slot.slot_id,
+                decision="ACCEPT",
+                valid_option_ids=[question.correct_option_id],
+                answer_explanation="The independently selected option is correct.",
+                reason_codes=["SINGLE_VALID_OPTION"],
+            )
+
+    generator = _ThreeSlotWaveGenerator()
+    orchestrator, assessments = build_orchestrator(
+        generator=generator,
+        verifier=TwoApprovedThenReplacementVerifier(),
+    )
+    _configure_three_slot_group(assessments)
 
     orchestrator.generate_wave("test-v2", ["g1"])
 
     assert generator.waves == [0, 2]
     assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
+    assert set(orchestrator._questions.linked) == {
+        "question-slot-001",
+        "question-slot-002",
+        "question-slot-003",
+    }
+    assert orchestrator._questions.linked["question-slot-001"]["question"].startswith("Wave 0")
+    assert orchestrator._questions.linked["question-slot-002"]["question"].startswith("Wave 0")
+    assert orchestrator._questions.linked["question-slot-003"]["question"].startswith("Wave 2")

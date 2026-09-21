@@ -29,7 +29,51 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-09-17
+**Last updated:** 2026-09-18
+
+---
+
+## Latest Changes - Bounded AMBIGUOUS Recovery (2026-09-18)
+
+A question the system has already admitted to solving gets one fresh candidate before an
+AMBIGUOUS verdict is allowed to blame the question.
+
+- **Why**: an AMBIGUOUS verdict whose diagnosis said QUESTION ended the request immediately, with
+  no regeneration. The same question family was answered successfully on other turns, so a single
+  ambiguous verdict — one model judging one candidate — was discarding questions the system can
+  demonstrably solve.
+- **Policy**: a first AMBIGUOUS verdict on a typed text question, with the candidate slot free →
+  one fresh candidate through the existing regeneration path and recovery instruction, the same
+  quality gate, then exactly one more verification. MATCH completes; MISMATCH ends
+  `ANSWER_VERIFICATION_FAILED`. A second AMBIGUOUS is read with the first verdict's diagnosis,
+  since no second diagnosis is paid for: a question fault clarifies with its own wording
+  (missing information, or more than one defensible answer), and a verifier fault ends
+  `ANSWER_VERIFICATION_FAILED` rather than blaming the question.
+- **The candidate slot is shared, not added.** Candidate recovery stays at most one per request,
+  whichever cause spent it — verifier-driven regeneration, structural repair or truncation
+  regeneration. A request that already spent it clarifies without generating again.
+- **Recovery authority is independent of usage and telemetry records.** The request ledger claims
+  the candidate slot directly when a structural repair runs, rather than inferring it from that
+  repair's usage record. Previously a usage record that failed to write read as an unspent slot and
+  allowed a second candidate recovery — a latent violation of the one-recovery invariant, now closed
+  for both MISMATCH and AMBIGUOUS. When the record is written, which is the normal case, behaviour
+  is unchanged; usage records remain the source for metering and observability only.
+- **Proven question faults are untouched.** A question the integrity normalizer marks as missing
+  information or ambiguous is refused before the solver runs, and a context-dependent turn with no
+  usable prior turn clarifies before any candidate exists, so neither can reach this policy. Image
+  questions skip those gates, so they keep clarifying on the first AMBIGUOUS verdict.
+- **What admission does not prove.** The deterministic gates catch damaged or context-less text,
+  not every missing fact, so a clean but genuinely incomplete question can still earn the fresh
+  candidate. Live runs on such questions produced either a second AMBIGUOUS (clarification) or a
+  correct "cannot be determined from the given information" answer that the verifier approved; no
+  run delivered an invented premise, but the sample was small.
+- **The existing mismatch recovery is unchanged**, including its terminal when the regenerated
+  candidate is then judged AMBIGUOUS.
+- **The diagnosis no longer ends a first AMBIGUOUS verdict on its own** for an admitted text
+  question. It still chooses the clarification wording, and still decides the terminal of a
+  repeated AMBIGUOUS verdict.
+- **Cost**: a MATCH adds nothing. A recovered ambiguity costs one generator call and one
+  verification; the existing diagnosis call is unchanged and is not repeated after regeneration.
 
 ---
 
@@ -157,8 +201,11 @@ also enables diagnosis, so recovery can never run without one.
   terminal: no second regeneration, no further semantic verification.
 - **Question fault** (AMBIGUOUS with diagnosis QUESTION and reason `INCOMPLETE_QUESTION` or
   `MULTIPLE_DEFENSIBLE_ANSWERS`): terminal `QUESTION_NEEDS_CLARIFICATION`, `retryable=false`,
-  `user_retryable=false`, no generation, no persistence, no credit. The localized message asks
-  for the missing values, conditions or options and never names an internal code.
+  `user_retryable=false`, no persistence, no credit. The localized message asks for the missing
+  values, conditions or options and never names an internal code. Since 2026-09-18 the first
+  AMBIGUOUS verdict on a question the deterministic gates admitted spends the single candidate
+  slot on one fresh candidate before this terminal is reached (see the section below); a
+  question the gates reject still clarifies before any generation.
 - **Verifier technical failure** (`PARSE_FAILURE`, `SCHEMA_FAILURE`, technical unclassified):
   one verifier-local retry with the identical candidate and no generator call.
   `CONFIGURATION_FAILURE` and `OUTPUT_TOKEN_EXHAUSTED` are never retried, since the identical

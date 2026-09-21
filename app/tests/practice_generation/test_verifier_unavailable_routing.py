@@ -18,6 +18,7 @@ from features.practice_generation.planning import (
     deterministic_blueprint,
     resolve_practice_request,
 )
+from features.practice_generation.providers import PracticeAuthorityUnavailableError
 from features.practice_generation.schemas import VerificationResult
 
 
@@ -72,6 +73,10 @@ class _Verifier:
         self.call_count += 1
         if self.outcome == "unavailable":
             raise RuntimeError("verifier provider unavailable")
+        if self.outcome == "authority_unavailable":
+            raise PracticeAuthorityUnavailableError(
+                f"PRACTICE_AUTHORITY_NOT_QUALIFIED subject={bucket.subject}"
+            )
         if self.outcome == "approved":
             return VerificationResult(
                 generation_item_id=question.generation_item_id,
@@ -230,3 +235,27 @@ def test_verifier_outage_schedules_no_provider_replacement_group() -> None:
     assert committed["failed_reason"] == "PRACTICE_VERIFIER_FALLBACK_EXHAUSTED", (
         committed["failed_reason"]
     )
+
+
+# --- PracticeAuthorityUnavailableError: distinct from a provider outage -----
+
+
+def test_authority_unavailable_is_not_labeled_verifier_unavailable() -> None:
+    """A deterministic routing/config failure (no qualified Authority for this
+    subject) must be distinguishable in telemetry from a genuine provider outage."""
+    generator, _verifier, outcome = _run("authority_unavailable")
+
+    assert generator.call_count == 1, f"waves generated: {generator.waves}"
+    assert outcome.accepted == ()
+    assert "PRACTICE_AUTHORITY_UNAVAILABLE" in outcome.reason_codes
+    assert "VERIFIER_UNAVAILABLE" not in outcome.reason_codes
+
+
+def test_authority_unavailable_is_not_marked_provider_recoverable() -> None:
+    """No retry: an authority-routing failure cannot be repaired by regenerating
+    the question or by falling back, so it must stay non-recoverable exactly like
+    a genuine verifier outage."""
+    _generator, _verifier, outcome = _run("authority_unavailable")
+
+    assert outcome.provider_failure_stage == "VERIFIER"
+    assert outcome.provider_failure_recoverable is False

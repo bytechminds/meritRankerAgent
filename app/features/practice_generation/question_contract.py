@@ -243,17 +243,13 @@ def validate_persisted_playable_question(
 
 
 def _explanation_consistent(*, item: dict[str, object], explanation: object) -> bool:
-    """A v2 explanation is optional, but the two copies must never disagree.
-
-    Scoring reads the canonical option id, never prose, so an absent explanation does
-    not make a question unplayable. What would be a defect is the item and its answer
-    contract carrying different explanations, so that stays enforced.
-    """
+    """Require the two schema-v2 explanation snapshots to be non-empty and identical."""
     stored = item.get("explanation")
-    written = "" if explanation is None else explanation
-    if not isinstance(written, str) or not isinstance(stored, (str, type(None))):
+    if not isinstance(explanation, str) or not isinstance(stored, str):
         return False
-    return (stored or "").strip() == written.strip()
+    written = explanation.strip()
+    persisted = stored.strip()
+    return bool(written) and persisted == written
 
 
 def _validate_v2_answer_contract(

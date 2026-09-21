@@ -82,6 +82,7 @@ DifficultyLevel = Literal["default", "basic", "intermediate", "advanced"]
 
 SubjectName = Literal[
     "math",
+    "practice_math",
     "reasoning",
     "english",
     "general",

@@ -41,6 +41,7 @@ from features.practice_generation.schemas import (
     PracticeType,
     VerificationResult,
 )
+from schemas.practice_limit import PracticeLimitation
 from services.llm.orchestration.errors import ProviderExecutionError
 
 
@@ -68,6 +69,12 @@ class FakeAssessments:
                         "practiceType": request.practice_type.value,
                         "requestedCount": request.requested_count,
                         "acceptedCount": request.accepted_count,
+                        "effectiveCount": request.effective_count,
+                        "limitation": (
+                            request.limitation.model_dump(mode="json", by_alias=True)
+                            if request.limitation is not None
+                            else None
+                        ),
                         "subject": request.subject,
                         "topic": request.topic,
                         "difficulty": request.difficulty.value,
@@ -785,7 +792,18 @@ def make_request(
         original_query=f"Create {count} questions",
         practice_type="FULL_MOCK" if full_mock else "QUIZ",
         requested_count=count,
-        accepted_count=min(count, 100),
+        accepted_count=min(count, 50),
+        limitation=(
+            PracticeLimitation(
+                type="QUESTION_COUNT_LIMIT",
+                requested_value=count,
+                effective_value=50,
+                maximum_value=50,
+                message_key="PRACTICE_MAX_QUESTIONS_LIMITED",
+            )
+            if count > 50
+            else None
+        ),
         subject="math",
         topic="algebra",
         difficulty="intermediate",
@@ -1556,7 +1574,7 @@ def test_repeated_fifty_question_reliability_10_runs() -> None:
         assert len(assessments.item["meta"].encode("utf-8")) < 50_000
 
 
-def test_repeated_hundred_question_reliability_3_runs() -> None:
+def test_repeated_hundred_question_request_reliability_uses_fifty_effective_slots() -> None:
     for _ in range(3):
         assessments, questions, _processed = run_job(
             100,
@@ -1566,7 +1584,7 @@ def test_repeated_hundred_question_reliability_3_runs() -> None:
             reject_once=True,
         )
         assert assessments.item["status"] == "READY"
-        assert len(questions.linked) == 100
+        assert len(questions.linked) == 50
         assert len(assessments.item["meta"].encode("utf-8")) < 100_000
 
 
@@ -1832,9 +1850,12 @@ def test_structured_parse_invalid_rejects_the_whole_model_response() -> None:
     # A per-question schema failure is localized: the valid sibling survives.
     assert len(mixed.accepted) == 1
     assert mixed.rejected_count == 1
-    # An unparseable response has no salvageable candidates at all.
+    # An unparseable response has no salvageable candidates at all. The catch-all
+    # code was later split into an actionable taxonomy (GENERATOR_PARSE_FAILURE,
+    # GENERATOR_OUTPUT_TRUNCATED, GENERATOR_MISSING_FIELD, ...); this case has no
+    # finish_reason evidence of truncation, so it is a genuine parse failure.
     assert malformed.accepted == ()
-    assert "STRUCTURED_PARSE_INVALID" in malformed.rejection_reason_codes
+    assert "GENERATOR_PARSE_FAILURE" in malformed.rejection_reason_codes
 
 
 def test_replacement_wave_preserves_language_exam_stage_and_group_identity() -> None:

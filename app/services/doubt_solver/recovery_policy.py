@@ -289,12 +289,18 @@ def decide_verification_recovery(
     reason_code: str,
     budget: RecoveryBudgetUse,
     failure_source: str | None = None,
+    verifier_status: str | None = None,
+    question_eligible_to_solve: bool = False,
 ) -> RecoveryDecision:
     """Map one verdict to one action.
 
     ``failure_source`` comes from the separate diagnostic call when it ran. It may only
     redirect an already-failing verdict; approval belongs to the verifier alone, so an
     approved verdict completes whatever the diagnosis says about the question.
+
+    ``question_eligible_to_solve`` says the deterministic question gates already admitted
+    this question to normal solving. It defaults to false so a caller that cannot vouch for
+    that keeps the previous behaviour.
     """
     kind, source = verification_diagnosis(reason_code)
     if failure_source is not None and failure_source in _DIAGNOSABLE_SOURCES:
@@ -315,6 +321,17 @@ def decide_verification_recovery(
         ):
             return decision("RETRY_SAME_NODE", None)
         return decision("FAIL_TEMPORARY", "ANSWER_VERIFICATION_UNAVAILABLE")
+    if (
+        verifier_status == "ambiguous"
+        and question_eligible_to_solve
+        and not budget.candidate_recovery_used
+    ):
+        # A question the deterministic gates admitted is one this system believes it can
+        # solve, so a single ambiguous verdict is not yet evidence that the question is at
+        # fault — the diagnosis that says so is one model reading one candidate. One fresh
+        # candidate is spent from the same single slot before the question is blamed. Once
+        # the slot is spent, whatever spent it, the verdict takes the branches below.
+        return decision("REGENERATE_CANDIDATE", None)
     if source == "QUESTION" and reason_code in CLARIFICATION_REASONS:
         return decision("ASK_CLARIFICATION", "QUESTION_NEEDS_CLARIFICATION")
     if (

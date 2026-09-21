@@ -13,8 +13,9 @@ Each slot must contain only:
 `generation_group_hint`.
 
 Also return `requestedTopicEvidence`: one per requested topic, not per slot.
-`sourceText` is an exact query span, own script, whole for compound names;
-`topicId` is your normalized English id. Invent neither.
+`sourceText` is a short exact query span naming the topic only, not the whole
+question — under 160 characters. `topicId` is your normalized English id.
+Invent neither.
 
 # Rules
 

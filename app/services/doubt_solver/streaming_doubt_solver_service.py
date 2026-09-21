@@ -15,6 +15,7 @@ from features.practice_generation.agentcore_async import PracticeLaunchError
 from features.practice_generation.planning import (
     PRACTICE_ASYNC_NOT_CONFIGURED,
     PracticeRequestCountError,
+    canonical_practice_subject,
     decide_practice_launch,
     practice_route_enabled,
     resolve_practice_freshness_requirement,
@@ -681,7 +682,10 @@ def _iter_stream_doubt_solver(
                 conversation_id=input.conversation_id,
                 turn_id=input.turn_id,
                 query=input.original_query or input.query,
-                subject=str(classification_dict.get("subject") or "general"),
+                subject=canonical_practice_subject(
+                    classification_dict.get("subject"),
+                    classification_dict.get("pattern_family_candidate"),
+                ),
                 topic=(
                     str(classification_dict["topic"]) if classification_dict.get("topic") else None
                 ),
@@ -792,6 +796,9 @@ def _iter_stream_doubt_solver(
             data=PracticeGenerationStartedData(
                 practice_test_id=launch.test_id,
                 message=launch.message,
+                requested_count=launch.requested_count,
+                effective_count=launch.accepted_count,
+                limitation=launch.limitation,
             ),
         )
         return
@@ -1147,8 +1154,18 @@ def _iter_stream_doubt_solver(
             return
         if correctness_verification_required and correctness_verifier is not None:
             budget = RecoveryBudget()
+            if repair_attempted:
+                # The structural repair above already spent the one candidate recovery. The
+                # ledger learns that here rather than from its usage record, so a telemetry
+                # record that fails to write cannot hand the slot back.
+                budget.take_candidate_recovery()
             approved_for_delivery = False
             regenerated = False
+            # The diagnosis of an ambiguous verdict that earned a fresh candidate. No second
+            # diagnosis is paid for after regeneration, so a verdict that is ambiguous again
+            # is read with this one: a question fault still clarifies with its own wording,
+            # and a verifier fault still fails safe rather than blaming the question.
+            ambiguous_diagnosis = None
             # Each recovery is single-use in the ledger, so at most three verifications can
             # run: the first, one verifier-local retry, and one after a regenerated
             # candidate. The range is a backstop, never the real bound.
@@ -1182,18 +1199,23 @@ def _iter_stream_doubt_solver(
                     return
                 # After a regeneration the outcome is settled either way: exactly one
                 # verification follows it and no second candidate may be generated, so the
-                # paid diagnosis is skipped. The verdict's own reason still decides, which
-                # keeps an outage an outage and a technical failure retryable once.
-                diagnosis = None if regenerated else diagnose_verification_failure(
-                    adapter,
-                    request_id=request_id,
-                    query=query,
-                    candidate_answer=verification.sanitized_text or draft,
-                    verdict=correctness.status,
-                    verification=correctness,
-                    method=correctness.method,
-                    language=input.language,
-                )
+                # paid diagnosis is skipped. The verdict's own reason decides, which keeps an
+                # outage an outage and a technical failure retryable once — except that a
+                # verdict ambiguous again is read with the diagnosis that earned the fresh
+                # candidate, since that is the only diagnosis this ambiguity ever had.
+                if regenerated:
+                    diagnosis = ambiguous_diagnosis if correctness.status == "ambiguous" else None
+                else:
+                    diagnosis = diagnose_verification_failure(
+                        adapter,
+                        request_id=request_id,
+                        query=query,
+                        candidate_answer=verification.sanitized_text or draft,
+                        verdict=correctness.status,
+                        verification=correctness,
+                        method=correctness.method,
+                        language=input.language,
+                    )
                 if not settings.answer_recovery_enabled:
                     shadow_verification_recovery(
                         correctness,
@@ -1207,6 +1229,17 @@ def _iter_stream_doubt_solver(
                     reason_code=recovery_reason_code(correctness, diagnosis),
                     budget=budget.snapshot(),
                     failure_source=recovery_failure_source(correctness, diagnosis),
+                    verifier_status=correctness.status,
+                    # Only a typed text question has been through the deterministic gates: a
+                    # question the integrity normalizer flagged is refused before the solver
+                    # runs, and a dependent turn with no usable prior turn clarifies before
+                    # any candidate exists. Those gates catch damaged or context-less text,
+                    # not every missing fact, so an admitted question can still be genuinely
+                    # incomplete; the second verification is what judges the fresh candidate.
+                    # An image question never passed those gates, so it keeps clarifying.
+                    question_eligible_to_solve=(
+                        input.source_modality == "text" and not input.image_uncertain
+                    ),
                 )
 
                 # The slot is claimed before the work starts, so an exception on the way
@@ -1231,6 +1264,8 @@ def _iter_stream_doubt_solver(
                     recovery_decision.action == "REGENERATE_CANDIDATE"
                     and budget.take_candidate_recovery()
                 ):
+                    if correctness.status == "ambiguous":
+                        ambiguous_diagnosis = diagnosis
                     _record_recovery(
                         recovery_decision,
                         budget,

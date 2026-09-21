@@ -195,6 +195,7 @@ class TestGeminiNativeVerifierSchema:
 
         assert "verifier" in _NATIVE_RESPONSE_SCHEMAS
         assert "classifier" in _NATIVE_RESPONSE_SCHEMAS
+        assert "generator" in _NATIVE_RESPONSE_SCHEMAS
 
     def test_schemas_are_keyed_by_role_never_by_model(self) -> None:
         """No model-specific repair branch may exist in the adapter."""
@@ -215,10 +216,17 @@ class TestGeminiNativeVerifierSchema:
             "decision",
             "valid_option_ids",
             "reason_codes",
+            # Present on VerificationResult and required by
+            # _enforce_evidence_citations for fresh-evidence questions; missing from
+            # this schema's previous hand-written copy before it started delegating
+            # to the canonical practice_verifier_generation_schema().
+            "evidence_urls",
         }
         options = schema["properties"]["valid_option_ids"]
         assert options["items"]["enum"] == ["0", "1", "2", "3"]
-        assert options["maxItems"] == 4
+        # Item-count bounds (maxItems) are no longer encoded in the provider schema —
+        # the canonical schema constrains shape only; VerificationResult's own
+        # max_length=4 stays the authority, unchanged after parsing.
 
     def test_the_verifier_schema_avoids_constructs_the_api_rejects(self) -> None:
         """Derived-from-model schemas emit anyOf/$ref, which this API refuses."""
@@ -246,3 +254,113 @@ class TestGeminiNativeVerifierSchema:
         )
         assert result.is_approved is True
         assert result.independently_solved_option_id == "2"
+
+
+class TestGeminiNativeGeneratorSchema:
+    def test_the_generator_schema_carries_the_v2_contract(self) -> None:
+        from services.llm.providers.gemini_provider import _generator_response_schema
+
+        schema = _generator_response_schema()
+        question_schema = schema["properties"]["questions"]["items"]
+        assert set(question_schema["required"]) == {
+            "schema_version", "bucket_id", "slot_id", "question", "question_type",
+            "options", "correct_option_id", "subject", "topic", "difficulty",
+        }
+
+    def test_the_generator_schema_validates_against_the_canonical_model(self) -> None:
+        from features.practice_generation.schemas import GeneratedQuestion
+
+        question = GeneratedQuestion.model_validate(
+            {
+                "schema_version": "2", "bucket_id": "b1", "slot_id": "slot-001",
+                "question": "What is 2+2?", "question_type": "mcq",
+                "options": [
+                    {"option_id": "0", "value": "3"}, {"option_id": "1", "value": "4"},
+                    {"option_id": "2", "value": "5"}, {"option_id": "3", "value": "6"},
+                ],
+                "correct_option_id": "1", "subject": "math", "topic": "addition",
+                "difficulty": "basic",
+            }
+        )
+        assert question.correct_answer == "4"
+
+
+class TestGeminiNativeSchemaDoubtSolverIsolation:
+    """generator/verifier are shared task_roles with Doubt Solver; the native schema
+    must fire only for Practice's own schema-v2 prompts, gated on the exact prompt
+    path rather than intent.
+
+    Gating on intent=="practice" alone is unsafe: the classifier maps a
+    practice_question intent to the literal string "practice"
+    (academic_classifier.ACADEMIC_INTENT_MAP) even for requests that fall through to
+    Doubt Solver's ordinary free-text "generate" node (Practice launch ineligible or
+    disabled), so a naive intent gate would force a free-text Doubt Solver answer into
+    the strict Practice MCQ JSON schema. Prompt-path gating also correctly excludes
+    the legacy schema-v1 Practice generator/verifier prompts, which use a different
+    wire shape than schema-v2.
+    """
+
+    @staticmethod
+    def _request(task_role: str, prompt: str, intent: str | None = None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            route_decision=SimpleNamespace(
+                task_role=task_role, prompt=prompt, intent=intent
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("task_role", "prompt"),
+        [
+            ("generator", "practice_generation/question_generator_v2.md"),
+            ("generator", "practice_generation/question_generator_factual.md"),
+            ("generator", "practice_generation/question_repair.md"),
+            ("generator", "practice_generation/question_regenerator.md"),
+            ("verifier", "practice_generation/question_verifier_v2.md"),
+        ],
+    )
+    def test_v2_practice_prompts_activate_the_native_schema(
+        self, task_role: str, prompt: str
+    ) -> None:
+        from services.llm.providers.gemini_provider import _active_native_schema_builder
+
+        assert _active_native_schema_builder(self._request(task_role, prompt)) is not None
+
+    @pytest.mark.parametrize(
+        ("task_role", "prompt"),
+        [
+            ("generator", "subjects/math_generator.md"),
+            ("generator", "subjects/general_generator.md"),
+            ("verifier", "answer_correctness_verifier.md"),
+        ],
+    )
+    def test_doubt_solver_prompts_never_activate_the_native_schema_even_with_intent_practice(
+        self, task_role: str, prompt: str
+    ) -> None:
+        from services.llm.providers.gemini_provider import _active_native_schema_builder
+
+        request = self._request(task_role, prompt, intent="practice")
+        assert _active_native_schema_builder(request) is None
+
+    @pytest.mark.parametrize(
+        ("task_role", "prompt"),
+        [
+            ("generator", "practice_generation/question_generator.md"),
+            ("verifier", "practice_generation/question_verifier.md"),
+        ],
+    )
+    def test_legacy_v1_practice_prompts_never_activate_the_native_schema(
+        self, task_role: str, prompt: str
+    ) -> None:
+        from services.llm.providers.gemini_provider import _active_native_schema_builder
+
+        request = self._request(task_role, prompt, intent="practice")
+        assert _active_native_schema_builder(request) is None
+
+    def test_classifier_is_unaffected_by_the_prompt_gate(self) -> None:
+        """classifier has exactly one caller and needs no prompt gate."""
+        from services.llm.providers.gemini_provider import _active_native_schema_builder
+
+        request = self._request("classifier", "classification_semantics.md")
+        assert _active_native_schema_builder(request) is not None

@@ -9,6 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from schemas.practice_limit import PracticeLimitation
+
 PRACTICE_PROGRESS_CONTRACT_VERSION = "practice-progress-meta-v1"
 
 
@@ -22,9 +24,16 @@ class PracticeProgressMeta(BaseModel):
     practice_type: str | None = Field(default=None, alias="practiceType")
     requested_count: int | None = Field(default=None, alias="requestedCount")
     accepted_count: int | None = Field(default=None, alias="acceptedCount")
+    effective_count: int | None = Field(default=None, alias="effectiveCount")
+    limitation: PracticeLimitation | None = None
     exam_stage: str | None = Field(default=None, alias="examStage")
     requested_language: str | None = Field(default=None, alias="requestedLanguage")
     phase: str | None = None
+    progress_message_key: str | None = Field(
+        default=None,
+        alias="progressMessageKey",
+        pattern=r"^PRACTICE_GENERATION_[A-Z_]{1,64}$",
+    )
     playable: bool | None = None
     progress_percent: int | None = Field(default=None, alias="progressPercent")
     ready_question_count: int | None = Field(default=None, alias="readyQuestionCount")

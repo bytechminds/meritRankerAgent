@@ -242,11 +242,15 @@ class PromptResolver:
             return system_content
 
         sections = [system_content]
+        # ``practice_math`` is a route-only boundary. Exam profiles remain keyed by
+        # the student-facing canonical subject, so it must project back to Math
+        # before selecting exam sections.
+        profile_subject = "math" if subject == "practice_math" else subject
         resolution = self._exam_profile_runtime.resolve(
             exam_profile_id=exam_profile_id,
             exam_id=exam_id,
             exam_stage=exam_stage,
-            subject=subject,
+            subject=profile_subject,
             full_mock=False,
         )
         if resolution.context is not None:

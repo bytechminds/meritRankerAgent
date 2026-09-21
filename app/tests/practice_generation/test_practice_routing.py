@@ -196,6 +196,8 @@ def test_stream_creation_request_returns_existing_practice_completion(
         "practiceTestId": "practice-123",
         "status": "GENERATING",
         "message": "Your practice test is being prepared.",
+        "requestedCount": 5,
+        "effectiveCount": 5,
     }
     assert "taskId" not in str(serialized)
 

@@ -10,7 +10,10 @@ from typing import Any
 from features.practice_generation.execution_control import (
     current_expensive_attempt_guard,
 )
-from features.practice_generation.planning import select_planner_family
+from features.practice_generation.planning import (
+    practice_generator_route_subject,
+    select_planner_family,
+)
 from features.practice_generation.request_intelligence import (
     token_id,
     tokenize_query,
@@ -102,6 +105,7 @@ def _execute(
         route_id=result.route_decision.route_id,
         model=result.model,
         prompt_input_budget=prompt_input_budget,
+        finish_reason=getattr(result, "finish_reason", None),
     )
 
 
@@ -286,6 +290,11 @@ class RoutedRequestIntelligenceProvider:
 class RoutedPlannerProvider:
     def __init__(self, orchestrator: LlmOrchestrator) -> None:
         self._orchestrator = orchestrator
+        # Set by the most recent plan() call. Read by BlueprintManager.build via
+        # getattr(..., None), so a PlannerProvider that does not set it (every test
+        # double implementing only the Protocol's plan() -> str) behaves exactly as
+        # before: the truncation check below simply finds nothing to classify by.
+        self.last_finish_reason: str | None = None
 
     def plan(
         self,
@@ -327,7 +336,7 @@ class RoutedPlannerProvider:
             payload["freshness_requirement"] = freshness
         if profile_resolution.context is not None:
             payload["exam_profile"] = profile_resolution.context.as_planner_payload()
-        return _execute(
+        batch = _execute(
             self._orchestrator,
             request_id=request.request_id,
             subject=family.value,
@@ -336,7 +345,9 @@ class RoutedPlannerProvider:
             language=request.language,
             prompt_name=f"practice_generation/planners/{family.value}",
             payload=payload,
-        ).content
+        )
+        self.last_finish_reason = batch.finish_reason
+        return batch.content
 
 
 class RoutedQuestionGenerator:
@@ -380,7 +391,10 @@ class RoutedQuestionGenerator:
         return _execute(
             self._orchestrator,
             request_id=request.request_id,
-            subject=bucket.subject,
+            subject=practice_generator_route_subject(
+                bucket.subject,
+                bucket.difficulty,
+            ),
             task_role="generator",
             difficulty=bucket.difficulty.value,
             language=request.language,
@@ -538,7 +552,7 @@ class RoutedQuestionGenerator:
                 "answer_version": 1,
             },
         }
-        if replacement_wave == 1:
+        if replacement_wave in {1, 2}:
             candidates = repair_candidates_by_slot or {}
             reasons_by_slot = repair_reason_codes_by_slot or {}
             payload["repair_context"] = [
@@ -547,7 +561,10 @@ class RoutedQuestionGenerator:
                     "reason_codes": list(reasons_by_slot.get(slot.slot_id, ()))[:4],
                     **(
                         {"candidate": candidates[slot.slot_id].model_dump(mode="json")}
-                        if slot.slot_id in candidates
+                        # Wave one repairs this exact candidate. Wave two receives only
+                        # bounded reason codes: it must author a fresh question without
+                        # receiving raw rejected wording, options, or answer material.
+                        if replacement_wave == 1 and slot.slot_id in candidates
                         else {}
                     ),
                 }
@@ -586,7 +603,10 @@ class RoutedQuestionGenerator:
         return self._orchestrator.measure_structured_input(
             route_request=RouteRequest(
                 request_id=request.request_id,
-                subject=bucket.subject,
+                subject=practice_generator_route_subject(
+                    bucket.subject,
+                    bucket.difficulty,
+                ),
                 task_role="generator",
                 difficulty=bucket.difficulty.value,
                 intent="practice",
@@ -631,7 +651,10 @@ class RoutedQuestionGenerator:
         return _execute(
             self._orchestrator,
             request_id=request.request_id,
-            subject=bucket.subject,
+            subject=practice_generator_route_subject(
+                bucket.subject,
+                bucket.difficulty,
+            ),
             task_role="generator",
             difficulty=bucket.difficulty.value,
             language=request.language,

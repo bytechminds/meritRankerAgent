@@ -510,7 +510,7 @@ class TestWebSearchToolProvider:
         assert result.fresh_evidence is not None
         assert result.fresh_evidence.requested_window.temporal_mode == "EXPLICIT_YEAR"
 
-    def test_hundred_slot_fresh_request_uses_one_bounded_search_and_fails_closed(
+    def test_capped_fresh_request_uses_one_bounded_search_and_fails_closed(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -547,7 +547,7 @@ class TestWebSearchToolProvider:
                 topic="current_affairs",
                 web_search_reason="current_affairs",
                 requires_fresh_evidence=True,
-                required_evidence_count=100,
+                required_evidence_count=50,
             )
         )
 

@@ -592,3 +592,238 @@ class TestAzureStreamNormalization:
         )
         list(adapter.generate_stream(request=_make_request(tmp_path), credentials=creds))
         assert adapter.last_stream_finish_reason == "stop"
+
+
+class TestPlannerNativeStructuredOutput:
+    """Practice's planner/generator/verifier roles get a native strict json_schema
+    response_format; Doubt Solver's calls through the same shared task_roles do not.
+
+    Gated on the exact prompt path (route_decision.prompt), not on intent: the
+    classifier maps a practice_question intent to the literal string "practice"
+    (academic_classifier.ACADEMIC_INTENT_MAP) even for requests that fall through to
+    Doubt Solver's ordinary free-text "generate" node (Practice launch ineligible or
+    disabled), so intent=="practice" cannot tell the two apart. The legacy schema-v1
+    Practice generator/verifier prompts also use a different wire shape than schema-v2
+    and must not get this schema either — prompt-path gating excludes those too.
+    """
+
+    def _with(self, request, **route_updates):
+        route = request.route_decision.model_copy(update=route_updates)
+        return request.model_copy(update={"route_decision": route})
+
+    def test_planner_role_gets_native_structured_output(self, tmp_path: Path) -> None:
+        request = self._with(
+            _make_request(tmp_path),
+            task_role="planner",
+            prompt="practice_generation/planners/factual.md",
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" in kwargs
+        response_format = kwargs["response_format"]
+        assert response_format["type"] == "json_schema"
+        assert response_format["json_schema"]["strict"] is True
+        schema = response_format["json_schema"]["schema"]
+        assert schema["type"] == "object"
+        assert set(schema["required"]) == {"slots", "requestedTopicEvidence"}
+        assert schema["additionalProperties"] is False
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "practice_generation/question_generator_v2.md",
+            "practice_generation/question_generator_factual.md",
+            "practice_generation/question_repair.md",
+            "practice_generation/question_regenerator.md",
+        ],
+    )
+    def test_generator_v2_prompts_get_native_structured_output(
+        self, tmp_path: Path, prompt: str
+    ) -> None:
+        """Every schema-v2 generator prompt — initial, factual, repair, regenerate —
+        shares the one wire shape and must all get the native schema alike."""
+        request = self._with(
+            _make_request(tmp_path), task_role="generator", prompt=prompt
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" in kwargs
+        schema = kwargs["response_format"]["json_schema"]["schema"]
+        assert schema["properties"]["questions"]["items"]["required"] == [
+            "schema_version", "bucket_id", "slot_id", "question", "question_type",
+            "options", "correct_option_id", "subject", "topic", "difficulty",
+        ]
+
+    def test_verifier_v2_prompt_gets_native_structured_output(
+        self, tmp_path: Path
+    ) -> None:
+        request = self._with(
+            _make_request(tmp_path),
+            task_role="verifier",
+            prompt="practice_generation/question_verifier_v2.md",
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" in kwargs
+        schema = kwargs["response_format"]["json_schema"]["schema"]
+        assert "evidence_urls" in schema["required"]
+
+    def test_other_roles_get_no_response_format(self, tmp_path: Path) -> None:
+        request = _make_request(tmp_path)  # task_role="generator", default test prompt
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        ("task_role", "prompt"),
+        [
+            ("generator", "subjects/math_generator.md"),
+            ("generator", "subjects/general_generator.md"),
+            ("verifier", "answer_correctness_verifier.md"),
+        ],
+    )
+    def test_doubt_solver_prompts_get_no_response_format_even_with_intent_practice(
+        self, tmp_path: Path, task_role: str, prompt: str
+    ) -> None:
+        """Regression for the found defect: the classifier maps practice_question to
+        intent="practice" even on requests that fall through to Doubt Solver's ordinary
+        free-text generate node. A naive intent=="practice" gate would wrongly force a
+        free-text Doubt Solver answer into the strict Practice MCQ JSON schema — the
+        prompt-path gate must reject it regardless of intent."""
+        request = self._with(
+            _make_request(tmp_path), task_role=task_role, prompt=prompt, intent="practice"
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        ("task_role", "prompt"),
+        [
+            ("generator", "practice_generation/question_generator.md"),
+            ("verifier", "practice_generation/question_verifier.md"),
+        ],
+    )
+    def test_legacy_v1_practice_prompts_get_no_response_format(
+        self, tmp_path: Path, task_role: str, prompt: str
+    ) -> None:
+        """Regression for the found defect: the legacy schema-v1 Practice
+        generator/verifier prompts use a different wire shape (plain-string options,
+        correct_answer/solution, no schema_version) than schema-v2 — forcing them into
+        the v2 strict schema would reject every legitimate v1 response."""
+        request = self._with(
+            _make_request(tmp_path), task_role=task_role, prompt=prompt, intent="practice"
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" not in kwargs
+
+    @pytest.mark.parametrize(
+        "schema_name",
+        ["planner_generation_schema", "practice_generator_generation_schema",
+         "practice_verifier_generation_schema"],
+    )
+    def test_generation_schema_never_encodes_length_or_count_constraints(
+        self, schema_name: str
+    ) -> None:
+        """maxLength/item-count bounds stay local (Pydantic); the provider only gets shape."""
+        import features.practice_generation.schemas as schemas_module
+
+        forbidden_keys = {
+            "maxLength", "minLength", "minItems", "maxItems", "pattern", "uniqueItems",
+        }
+
+        def check(obj: object) -> None:
+            if isinstance(obj, dict):
+                found = forbidden_keys & obj.keys()
+                assert not found, found
+                for value in obj.values():
+                    check(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    check(item)
+
+        check(getattr(schemas_module, schema_name)())
+
+    @pytest.mark.parametrize(
+        "schema_name",
+        ["planner_generation_schema", "practice_generator_generation_schema",
+         "practice_verifier_generation_schema"],
+    )
+    def test_generation_schema_is_strict_mode_self_consistent(
+        self, schema_name: str
+    ) -> None:
+        """Every property must be required and every object closed, or the provider rejects it."""
+        import features.practice_generation.schemas as schemas_module
+
+        def check(obj: dict) -> None:
+            if obj.get("type") == "object":
+                assert set(obj["properties"]) == set(obj["required"])
+                assert obj["additionalProperties"] is False
+                for value in obj["properties"].values():
+                    check(value)
+            if obj.get("type") == "array":
+                check(obj["items"])
+
+        check(getattr(schemas_module, schema_name)())
+
+    def test_planner_generation_schema_round_trips_through_real_pydantic_validation(
+        self,
+    ) -> None:
+        """The compiled schema's shape must actually match what PracticeBlueprint accepts."""
+        from features.practice_generation.schemas import (
+            PracticeBlueprint,
+            planner_generation_schema,
+        )
+
+        schema = planner_generation_schema()
+        slot_props = set(schema["properties"]["slots"]["items"]["properties"])
+        evidence_props = set(schema["properties"]["requestedTopicEvidence"]["items"]["properties"])
+        slot_model = PracticeBlueprint.model_fields["slots"].annotation.__args__[0]
+        assert slot_props == set(slot_model.model_fields)
+        assert evidence_props == {"source_text", "topic_id"} or evidence_props == {
+            "sourceText",
+            "topicId",
+        }
+
+    def test_generator_schema_round_trips_through_real_pydantic_validation(self) -> None:
+        """A schema-valid instance must be accepted by GeneratedQuestion unchanged."""
+        from features.practice_generation.schemas import (
+            GeneratedQuestion,
+            practice_generator_generation_schema,
+        )
+
+        schema = practice_generator_generation_schema()
+        question_props = set(schema["properties"]["questions"]["items"]["properties"])
+        assert question_props == {
+            "schema_version", "bucket_id", "slot_id", "question", "question_type",
+            "options", "correct_option_id", "subject", "topic", "difficulty",
+        }
+        sample = {
+            "schema_version": "2", "bucket_id": "b1", "slot_id": "slot-001",
+            "question": "What is 2+2?", "question_type": "mcq",
+            "options": [
+                {"option_id": "0", "value": "3"}, {"option_id": "1", "value": "4"},
+                {"option_id": "2", "value": "5"}, {"option_id": "3", "value": "6"},
+            ],
+            "correct_option_id": "1", "subject": "math", "topic": "addition",
+            "difficulty": "basic",
+        }
+        question = GeneratedQuestion.model_validate(sample)
+        assert question.correct_answer == "4"
+
+    def test_verifier_schema_round_trips_through_real_pydantic_validation(self) -> None:
+        """A schema-valid instance must be accepted by VerificationResult unchanged,
+        including evidence_urls — missing from the prior Gemini-only hand-written copy."""
+        from features.practice_generation.schemas import (
+            VerificationResult,
+            practice_verifier_generation_schema,
+        )
+
+        schema = practice_verifier_generation_schema()
+        assert set(schema["properties"]) == {
+            "schema_version", "generation_item_id", "slot_id", "decision",
+            "valid_option_ids", "answer_explanation", "reason_codes", "evidence_urls",
+        }
+        sample = {
+            "schema_version": "2", "generation_item_id": "item-slot-001",
+            "slot_id": "slot-001", "decision": "ACCEPT", "valid_option_ids": ["1"],
+            "answer_explanation": "Option 1 follows from the calculation.",
+            "reason_codes": ["SINGLE_VALID_OPTION"], "evidence_urls": [],
+        }
+        result = VerificationResult.model_validate(sample)
+        assert result.is_approved is True

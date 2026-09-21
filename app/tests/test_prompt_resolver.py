@@ -71,11 +71,12 @@ def _make_route(
     model: str = "gemini_flash_light",
     intent: str | None = None,
     exam: str | None = None,
+    subject: str = "math",
 ) -> RouteDecision:
     """Construct a minimal RouteDecision for testing."""
     return RouteDecision(
         route_id="math.generator.default",
-        subject="math",
+        subject=subject,
         task_role="generator",
         difficulty="default",
         intent=intent,
@@ -97,7 +98,11 @@ def _write(tmp_path: Path, rel_path: str, content: str) -> None:
 
 
 class _ExamProfileRuntime:
-    def resolve(self, **_: object) -> ExamProfileResolution:
+    def __init__(self) -> None:
+        self.subjects: list[object] = []
+
+    def resolve(self, **kwargs: object) -> ExamProfileResolution:
+        self.subjects.append(kwargs.get("subject"))
         return ExamProfileResolution(
             context=AgentExamContext(
                 exam_profile_id="CAT#2026",
@@ -180,6 +185,23 @@ def test_cached_exam_profile_precedes_the_legacy_exam_resolver(tmp_path: Path) -
 
     assert '"examProfileId":"CAT#2026"' in messages[0].content
     assert "Admin-managed context." in messages[0].content
+
+
+def test_practice_math_route_preserves_math_exam_profile_context(tmp_path: Path) -> None:
+    _write(tmp_path, "main.md", "# Main")
+    runtime = _ExamProfileRuntime()
+    route = _make_route("main.md", exam="CAT", subject="practice_math").model_copy(
+        update={"route_id": "practice_math.generator.intermediate"}
+    )
+    resolver = PromptResolver(
+        prompt_root=tmp_path,
+        exam_profile_runtime=runtime,
+        exam_profile_resolver=_LegacyExamProfileResolver(),  # type: ignore[arg-type]
+    )
+
+    resolver.resolve(route, query="Create a question", request_id="request-practice-math")
+
+    assert runtime.subjects == ["math"]
 
 
 def test_resolve_structured_uses_safe_cached_prompts_without_answer_contract(

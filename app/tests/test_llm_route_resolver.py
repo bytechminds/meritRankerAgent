@@ -74,6 +74,9 @@ class TestSubjectNormalization:
     def test_math_normalizes_to_math(self) -> None:
         assert normalize_subject("math") == "math"
 
+    def test_internal_practice_math_route_subject_is_preserved(self) -> None:
+        assert normalize_subject("practice_math") == "practice_math"
+
     def test_quant_normalizes_to_math(self) -> None:
         assert normalize_subject("quant") == "math"
 
@@ -167,6 +170,32 @@ class TestExactRouteResolution:
         decision = resolve_route(req, registry)
         assert decision.route_source == "exact"
         assert decision.difficulty == "default"
+
+    def test_practice_math_intermediate_resolves_to_terra(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        decision = resolve_route(
+            _request(
+                "practice_math",
+                "generator",
+                "intermediate",
+                intent="practice",
+            ),
+            registry,
+        )
+        assert decision.route_id == "practice_math.generator.intermediate"
+        assert decision.model == "openai_gpt_5_6_terra"
+        assert decision.provider_options == {}
+
+    def test_shared_math_intermediate_route_remains_unchanged(
+        self, registry: LlmConfigRegistry
+    ) -> None:
+        decision = resolve_route(
+            _request("math", "generator", "intermediate", intent="solve"),
+            registry,
+        )
+        assert decision.route_id == "math.generator.intermediate"
+        assert decision.model == "math_intermediate_generator"
 
     def test_reasoning_generator_default_resolves(
         self, registry: LlmConfigRegistry

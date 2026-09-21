@@ -76,6 +76,14 @@ def test_replacement_waves_keep_their_evidence_and_language_rules(prompt: str) -
     assert "supplied `language`" in body
 
 
+def test_final_replacement_uses_reason_only_recovery_context() -> None:
+    body = _text("practice_generation/question_regenerator.md")
+
+    assert "`repair_context` reason codes" in body
+    assert "not safe to repair" in body
+    assert "NO_VALID_OPTION" in body
+
+
 # The factual Author keeps its own pinned contract; these cover the generic authoring waves.
 _FACTUAL_AUTHOR = "practice_generation/question_generator_factual.md"
 _AUTHOR_WAVE_PROMPTS = [prompt for prompt in WAVE_PROMPTS if prompt != _FACTUAL_AUTHOR]

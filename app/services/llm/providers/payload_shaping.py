@@ -10,6 +10,7 @@ chat completion kwargs. Drops unsupported parameters and None values.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,93 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BLOCKED_THINKING_KEYS = frozenset({"thinking", "provider_options"})
+
+
+def _planner_schema_builder() -> dict[str, Any]:
+    from features.practice_generation.schemas import (  # noqa: PLC0415
+        planner_generation_schema,
+    )
+
+    return planner_generation_schema()
+
+
+def _generator_schema_builder() -> dict[str, Any]:
+    from features.practice_generation.schemas import (  # noqa: PLC0415
+        practice_generator_generation_schema,
+    )
+
+    return practice_generator_generation_schema()
+
+
+def _verifier_schema_builder() -> dict[str, Any]:
+    from features.practice_generation.schemas import (  # noqa: PLC0415
+        practice_verifier_generation_schema,
+    )
+
+    return practice_verifier_generation_schema()
+
+
+# Gated by the exact prompt path Practice's own _execute() passes, never by task_role
+# or intent alone. Both are shared with Doubt Solver: "generator"/"verifier" also serve
+# answer_generation_adapter.py's free-text answers and answer_correctness.py's/
+# answer_diagnosis.py's answer-correctness verifier, and — critically — the classifier
+# maps a practice_question intent to the literal string "intent=practice"
+# (academic_classifier.py's ACADEMIC_INTENT_MAP) on requests that fall through to the
+# ordinary Doubt Solver "generate" node whenever Practice launch is ineligible or
+# disabled, so "intent" cannot discriminate the two either. The legacy schema-v1
+# Practice generator/verifier prompts ("question_generator.md"/"question_verifier.md")
+# use a different wire shape than schema-v2 and must not get this schema. The prompt
+# path is the one signal that is exact for all of this: only real Practice schema-v2
+# calls ever send these paths, provider-agnostic, no model- or subject-specific branch.
+_NATIVE_SCHEMA_GENERATOR_PROMPTS = frozenset(
+    {
+        "practice_generation/question_generator_v2.md",
+        "practice_generation/question_generator_factual.md",
+        "practice_generation/question_repair.md",
+        "practice_generation/question_regenerator.md",
+    }
+)
+_NATIVE_SCHEMA_VERIFIER_PROMPTS = frozenset({"practice_generation/question_verifier_v2.md"})
+_PLANNER_PROMPT_PREFIX = "practice_generation/planners/"
+
+_NATIVE_RESPONSE_SCHEMA_BUILDERS: dict[str, Callable[[], dict[str, Any]]] = {
+    "planner": _planner_schema_builder,
+    "generator": _generator_schema_builder,
+    "verifier": _verifier_schema_builder,
+}
+
+
+def _native_schema_builder_for(
+    task_role: str, prompt: str
+) -> Callable[[], dict[str, Any]] | None:
+    if task_role == "planner" and prompt.startswith(_PLANNER_PROMPT_PREFIX):
+        return _NATIVE_RESPONSE_SCHEMA_BUILDERS["planner"]
+    if task_role == "generator" and prompt in _NATIVE_SCHEMA_GENERATOR_PROMPTS:
+        return _NATIVE_RESPONSE_SCHEMA_BUILDERS["generator"]
+    if task_role == "verifier" and prompt in _NATIVE_SCHEMA_VERIFIER_PROMPTS:
+        return _NATIVE_RESPONSE_SCHEMA_BUILDERS["verifier"]
+    return None
+
+
+def _response_format_for(task_role: str, prompt: str) -> dict[str, Any] | None:
+    """Return the Azure/OpenAI ``response_format`` for a role with a native schema.
+
+    Structural shape only (type/enum/required/additionalProperties) — constraints a
+    provider schema cannot express (``max_length``, counts, uniqueness, grounding,
+    cross-field rules) are never encoded here and remain enforced by the existing
+    local Pydantic validation after parsing, unchanged by this path.
+    """
+    schema_builder = _native_schema_builder_for(task_role, prompt)
+    if schema_builder is None:
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": f"{task_role}_response",
+            "schema": schema_builder(),
+            "strict": True,
+        },
+    }
 
 
 def effective_token_budget_param(model_config: ModelConfig) -> str:
@@ -120,6 +208,12 @@ def build_azure_openai_chat_completion_kwargs(
 
     if stream:
         payload["stream"] = True
+
+    response_format = _response_format_for(
+        request.route_decision.task_role, request.route_decision.prompt
+    )
+    if response_format is not None:
+        payload["response_format"] = response_format
 
     payload = {key: value for key, value in payload.items() if value is not None}
 

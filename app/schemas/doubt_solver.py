@@ -22,7 +22,9 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from practice_limits import MAX_PRACTICE_QUESTIONS, MAX_REQUESTED_PRACTICE_QUESTIONS
 from schemas.image_input import ImageInput
+from schemas.practice_limit import PracticeLimitation
 
 CanonicalLanguage = Literal["english", "hinglish", "hindi"]
 QualityStatus = Literal["checked", "passed_quality_gate", "failed_quality_gate"]
@@ -587,6 +589,20 @@ class PracticeGenerationStartedData(BaseModel):
     )
     status: Literal["GENERATING"] = "GENERATING"
     message: str = Field(min_length=1, max_length=500)
+    requested_count: int = Field(
+        ge=1,
+        le=MAX_REQUESTED_PRACTICE_QUESTIONS,
+        serialization_alias="requestedCount",
+    )
+    effective_count: int = Field(
+        ge=1,
+        le=MAX_PRACTICE_QUESTIONS,
+        serialization_alias="effectiveCount",
+    )
+    limitation: PracticeLimitation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     model_config = {"populate_by_name": True, "extra": "forbid"}
 

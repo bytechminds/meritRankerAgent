@@ -65,6 +65,9 @@ _ALLOWED_VERSIONED_TOKENS: frozenset[str] = frozenset({
     # a wire contract, not an app identifier, so it moves only when that contract
     # genuinely changes shape.
     "practice_request_intelligence_v4",
+    # Real prompt filename (prompts/practice_generation/question_verifier_v2.md) that
+    # names the schema-v2 Practice verifier wire contract, not a versioned app state.
+    "question_verifier_v2",
 })
 
 # Env-var / attribute pattern: must not appear in Python source.
