@@ -395,6 +395,8 @@ def test_orchestrated_state_has_internal_retrieval_context() -> None:
         "context_text",
         "answer",
         "final_answer",
+        "credit_error",
+        "credit_error_details",
         "conversation_context",
         "conversation_relation",
         "conversation_preparation",

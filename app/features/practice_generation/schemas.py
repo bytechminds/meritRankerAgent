@@ -80,6 +80,16 @@ class VerificationPolicy(StrEnum):
     MANDATORY = "MANDATORY"
 
 
+class RequestedPracticeConstraint(BaseModel):
+    """Accepted composition identity and its already-grounded source span."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, frozen=True, populate_by_name=True)
+
+    subject_id: str = Field(min_length=1, max_length=64, alias="subjectId")
+    topic_id: str = Field(min_length=1, max_length=128, alias="topicId")
+    source_text: str = Field(min_length=1, max_length=160, alias="sourceText")
+
+
 class PracticeGenerationRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
 
@@ -95,6 +105,7 @@ class PracticeGenerationRequest(BaseModel):
     subject: str = Field(min_length=1, max_length=64)
     topic: str | None = Field(default=None, max_length=128)
     topics: list[str] | None = Field(default=None, max_length=12)
+    trusted_constraints: tuple[RequestedPracticeConstraint, ...] = ()
     difficulty: Difficulty = Difficulty.INTERMEDIATE
     mixed_difficulty_requested: bool = False
     explicit_difficulty_requested: bool = False
@@ -224,6 +235,7 @@ class PlannerSlot(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, frozen=True)
 
     slot_id: str = Field(pattern=PRACTICE_SLOT_ID_PATTERN)
+    constraint_ref: str | None = Field(default=None, min_length=1, max_length=32)
     subject_id: str = Field(min_length=1, max_length=64)
     topic_id: str = Field(min_length=1, max_length=128)
     category_id: str = Field(min_length=1, max_length=128)
@@ -459,6 +471,7 @@ def planner_generation_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "slot_id": {"type": "string"},
+            "constraint_ref": nullable_string,
             "subject_id": {"type": "string"},
             "topic_id": {"type": "string"},
             "category_id": {"type": "string"},
@@ -477,6 +490,7 @@ def planner_generation_schema() -> dict[str, Any]:
         },
         "required": [
             "slot_id",
+            "constraint_ref",
             "subject_id",
             "topic_id",
             "category_id",
@@ -508,7 +522,10 @@ def planner_generation_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "slots": {"type": "array", "items": slot},
-            "requestedTopicEvidence": {"type": "array", "items": evidence},
+            "requestedTopicEvidence": {
+                "type": ["array", "null"],
+                "items": evidence,
+            },
         },
         "required": ["slots", "requestedTopicEvidence"],
         "additionalProperties": False,

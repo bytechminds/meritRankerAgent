@@ -148,6 +148,66 @@ def test_practice_start_can_be_deferred_until_terminal_frame_commit(
     assert ordering == ["persisted"]
 
 
+def test_practice_persistence_failure_aborts_before_the_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRACTICE_GENERATION_ENABLED", "true")
+    ordering: list[str] = []
+
+    class Launcher:
+        def launch(self, _request):
+            return PracticeLaunchResult(
+                test_id="practice-persistence-failure",
+                status="GENERATING",
+                requested_count=5,
+                accepted_count=5,
+                count_clamped=False,
+                progress_percent=0,
+                playable=False,
+                message="Your practice test is being prepared.",
+            )
+
+        def abort(self, _test_id, _code, _delivery_id=None):
+            ordering.append("aborted")
+
+    class Persistence:
+        def persist_completed_turn(self, *_args, **_kwargs):
+            raise RuntimeError("persistence unavailable")
+
+    events = list(
+        stream_doubt_solver(
+            StreamDoubtSolverInput(
+                request_id=_REQUEST_ID,
+                actor_id="user-1",
+                conversation_id="conversation-1",
+                turn_id="turn-1",
+                query="Create a 10-minute Reasoning mini mock for CAT.",
+                original_query="Create a 10-minute Reasoning mini mock for CAT.",
+                language="english",
+                exam_id="CAT",
+                classification={
+                    "subject": "reasoning",
+                    "topic": "reasoning",
+                    "intent": "practice",
+                    "difficulty": "intermediate",
+                    "retrieval_required": False,
+                },
+                classifier_confidence=0.99,
+            ),
+            adapter=_make_adapter(),
+            conversation_persistence=Persistence(),
+            practice_launcher=Launcher(),
+        )
+    )
+
+    assert ordering == ["aborted"]
+    assert events[-1].type == "error"
+    assert events[-1].metadata == {
+        "retryable": False,
+        "code": "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+    }
+
+
 def test_practice_launch_narrows_a_general_subject_through_the_shared_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -576,6 +636,8 @@ class TestNonStreamRegression:
             "context_text",
             "answer",
             "final_answer",
+            "credit_error",
+            "credit_error_details",
             "response_type",
             "practice_test_id",
             "conversation_context",

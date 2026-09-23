@@ -221,6 +221,7 @@ class TestGeminiNativeVerifierSchema:
             # this schema's previous hand-written copy before it started delegating
             # to the canonical practice_verifier_generation_schema().
             "evidence_urls",
+            "answer_explanation",
         }
         options = schema["properties"]["valid_option_ids"]
         assert options["items"]["enum"] == ["0", "1", "2", "3"]
@@ -250,6 +251,7 @@ class TestGeminiNativeVerifierSchema:
                 "decision": "ACCEPT",
                 "valid_option_ids": ["2"],
                 "reason_codes": ["SINGLE_VALID_OPTION"],
+                "answer_explanation": "Option 2 is the only valid answer.",
             }
         )
         assert result.is_approved is True

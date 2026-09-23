@@ -665,6 +665,35 @@ class TestPlannerNativeStructuredOutput:
         schema = kwargs["response_format"]["json_schema"]["schema"]
         assert "evidence_urls" in schema["required"]
 
+    def test_request_intelligence_gets_its_canonical_native_schema(
+        self, tmp_path: Path
+    ) -> None:
+        from schemas.practice_request_intelligence import PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+
+        request = self._with(
+            _make_request(tmp_path),
+            task_role="request_intelligence",
+            prompt="practice_generation/request_intelligence.md",
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert kwargs["response_format"]["type"] == "json_schema"
+        assert kwargs["response_format"]["json_schema"]["strict"] is True
+        assert (
+            kwargs["response_format"]["json_schema"]["schema"]
+            == PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+        )
+
+    def test_request_intelligence_role_with_another_prompt_gets_no_schema(
+        self, tmp_path: Path
+    ) -> None:
+        request = self._with(
+            _make_request(tmp_path),
+            task_role="request_intelligence",
+            prompt="subjects/general_generator.md",
+        )
+        kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")
+        assert "response_format" not in kwargs
+
     def test_other_roles_get_no_response_format(self, tmp_path: Path) -> None:
         request = _make_request(tmp_path)  # task_role="generator", default test prompt
         kwargs, _ = build_azure_openai_chat_completion_kwargs(request=request, deployment="dep")

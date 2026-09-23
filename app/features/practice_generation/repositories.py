@@ -328,6 +328,10 @@ class AssessmentRepository:
                 "subject": request.subject,
                 "topic": request.topic,
                 "topics": request.topics,
+                "trustedConstraints": [
+                    constraint.model_dump(mode="json", by_alias=True)
+                    for constraint in request.trusted_constraints
+                ],
                 "difficulty": request.difficulty.value,
                 "mixedDifficultyRequested": request.mixed_difficulty_requested,
                 "explicitDifficultyRequested": request.explicit_difficulty_requested,

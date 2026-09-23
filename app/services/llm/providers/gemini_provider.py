@@ -88,6 +88,14 @@ def _generator_response_schema() -> dict[str, Any]:
     return practice_generator_generation_schema()
 
 
+def _request_intelligence_response_schema() -> dict[str, Any]:
+    from schemas.practice_request_intelligence import (  # noqa: PLC0415
+        PRACTICE_REQUEST_INTELLIGENCE_SCHEMA,
+    )
+
+    return PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+
+
 # Native response schemas keyed by execution role. A role absent from this map is
 # executed as an ordinary free-text call. Keyed by role, never by model, so no
 # model-specific branch exists. "classifier" has exactly one caller (the Doubt Solver
@@ -106,6 +114,7 @@ _NATIVE_RESPONSE_SCHEMAS: dict[str, Callable[[], dict[str, Any]]] = {
     "classifier": _classifier_response_schema,
     "verifier": _verifier_response_schema,
     "generator": _generator_response_schema,
+    "request_intelligence": _request_intelligence_response_schema,
 }
 _NATIVE_SCHEMA_GENERATOR_PROMPTS = frozenset(
     {
@@ -116,6 +125,7 @@ _NATIVE_SCHEMA_GENERATOR_PROMPTS = frozenset(
     }
 )
 _NATIVE_SCHEMA_VERIFIER_PROMPTS = frozenset({"practice_generation/question_verifier_v2.md"})
+_REQUEST_INTELLIGENCE_PROMPT = "practice_generation/request_intelligence.md"
 
 
 def _active_native_schema_builder(
@@ -126,6 +136,8 @@ def _active_native_schema_builder(
     if task_role == "generator" and prompt not in _NATIVE_SCHEMA_GENERATOR_PROMPTS:
         return None
     if task_role == "verifier" and prompt not in _NATIVE_SCHEMA_VERIFIER_PROMPTS:
+        return None
+    if task_role == "request_intelligence" and prompt != _REQUEST_INTELLIGENCE_PROMPT:
         return None
     return _NATIVE_RESPONSE_SCHEMAS.get(task_role)
 

@@ -1,12 +1,13 @@
 """
 app/config.py
 -------------
-Application settings loaded from environment variables.
+Application settings loaded from environment variables and bundled policy files.
 
 Priority order (highest → lowest):
   1. Real environment variables (set by agentcore dev or shell)
   2. app/.env.local  (local secrets, gitignored)
-  3. Hardcoded defaults below
+  3. Versioned bundled policy for student business/pricing values
+  4. Hardcoded defaults below
 
 Never log secrets. Keep this module import-safe and side-effect-free
 except for the load_dotenv call at module load time.
@@ -16,10 +17,15 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from schemas.student_credits import StudentCreditPolicy
+from student_credit_policy import (
+    StudentCreditPolicyConfigurationError,
+    load_student_credit_policy,
+)
 
 # Published SSM root for the credit table identity; named here only so a
 # configuration error can tell an operator exactly where it looked.
@@ -44,7 +50,7 @@ class ConfigurationError(Exception):
 
 @dataclass(frozen=True)
 class Settings:
-    """Immutable settings snapshot.  All values come from os.environ."""
+    """Immutable settings snapshot for runtime controls and validated policy."""
 
     app_env: str
     log_level: str
@@ -116,9 +122,7 @@ class Settings:
     # Student runtime credits — authoritative wallet owned by the AI Tutor backend
     student_credit_enforcement_enabled: bool
     student_credit_dry_run: bool
-    student_credit_credits_per_usd: Decimal
-    student_credit_target_gross_margin: Decimal
-    student_credit_rounding_mode: str
+    student_credit_policy: StudentCreditPolicy | None
     dynamodb_user_credits_table: str
     dynamodb_credit_ledger_table: str
     # Context builder
@@ -329,15 +333,6 @@ def _classifier_confidence_threshold_from_env() -> float:
     return _parse_confidence_threshold(legacy)
 
 
-def _decimal_from_env(name: str, default: str) -> Decimal:
-    """Parse one monetary/rate setting. Money never uses binary floating point."""
-    raw_value = os.getenv(name, default).strip() or default
-    try:
-        return Decimal(raw_value)
-    except InvalidOperation as exc:
-        raise ConfigurationError(f"{name} must be a decimal number.") from exc
-
-
 def _credit_tables_from_ssm() -> tuple[str, str]:
     """Resolve (user_credits_table, credit_ledger_table) from the published contract."""
     from services.student_credits.resource_contract import (  # noqa: PLC0415
@@ -492,11 +487,17 @@ def get_settings() -> Settings:
         student_credit_dry_run = (
             os.getenv("STUDENT_CREDIT_DRY_RUN", "true").strip().lower() == "true"
         )
-        student_credit_credits_per_usd = _decimal_from_env("CREDITS_PER_USD", "50")
-        student_credit_target_gross_margin = _decimal_from_env("TARGET_GROSS_MARGIN", "0.40")
-        student_credit_rounding_mode = (
-            os.getenv("STUDENT_CREDIT_ROUNDING_MODE", "CEIL").strip().upper()
-        )
+        try:
+            student_credit_policy = (
+                load_student_credit_policy(
+                    enforcement_enabled=True,
+                    dry_run=student_credit_dry_run,
+                )
+                if student_credit_enforcement_enabled
+                else None
+            )
+        except StudentCreditPolicyConfigurationError as exc:
+            raise ConfigurationError(str(exc)) from exc
         dynamodb_user_credits_table = os.getenv("DYNAMODB_USER_CREDITS_TABLE", "").strip()
         dynamodb_credit_ledger_table = os.getenv("DYNAMODB_CREDIT_LEDGER_TABLE", "").strip()
         ssm_credit_tables_error = ""
@@ -518,14 +519,6 @@ def get_settings() -> Settings:
                     dynamodb_credit_ledger_table or ssm_credit_ledger
                 )
         if student_credit_enforcement_enabled:
-            if student_credit_credits_per_usd <= 0:
-                raise ConfigurationError("CREDITS_PER_USD must be greater than zero.")
-            if not 0 <= student_credit_target_gross_margin < 1:
-                raise ConfigurationError(
-                    "TARGET_GROSS_MARGIN must be at least 0 and less than 1."
-                )
-            if student_credit_rounding_mode != "CEIL":
-                raise ConfigurationError("STUDENT_CREDIT_ROUNDING_MODE must be 'CEIL'.")
             if not dynamodb_user_credits_table:
                 raise ConfigurationError(
                     "DYNAMODB_USER_CREDITS_TABLE is required when "
@@ -730,9 +723,7 @@ def get_settings() -> Settings:
             ),
             student_credit_enforcement_enabled=student_credit_enforcement_enabled,
             student_credit_dry_run=student_credit_dry_run,
-            student_credit_credits_per_usd=student_credit_credits_per_usd,
-            student_credit_target_gross_margin=student_credit_target_gross_margin,
-            student_credit_rounding_mode=student_credit_rounding_mode,
+            student_credit_policy=student_credit_policy,
             dynamodb_user_credits_table=dynamodb_user_credits_table,
             dynamodb_credit_ledger_table=dynamodb_credit_ledger_table,
             doubt_solver_max_context_chars=int(

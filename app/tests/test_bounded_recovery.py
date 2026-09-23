@@ -17,12 +17,15 @@ import services.doubt_solver.recovery_policy as recovery_module
 import services.doubt_solver.streaming_doubt_solver_service as streaming_module
 from observability.llm_usage import (
     begin_llm_usage_collection,
+    current_llm_attempt_type,
     record_llm_call,
     reset_llm_usage_collection,
 )
 from schemas.llm_usage import ProviderTokenUsage
 from services.doubt_solver.answer_correctness import CorrectnessVerification
 from services.doubt_solver.answer_diagnosis import SemanticDiagnosis
+from services.doubt_solver.answer_generation_adapter import AnswerGenerationAdapter
+from services.doubt_solver.answer_quality import GENERATION_FAILURE_MESSAGE
 from services.doubt_solver.question_integrity import ambiguous_question_message
 from services.doubt_solver.recovery_policy import (
     CANDIDATE_RECOVERY_INSTRUCTION,
@@ -33,6 +36,7 @@ from services.doubt_solver.streaming_doubt_solver_service import (
     stream_doubt_solver,
 )
 from services.llm.orchestration.errors import ProviderExecutionError
+from services.llm.orchestration.orchestrator import LlmOrchestrator, MockModelExecutor
 
 _QUERY = "Solve for x: 2x + 3 = 11."
 _ANSWER_A = "2x + 3 = 11\n\n2x = 8\n\nx = 4\n\n**Answer:** 4"
@@ -146,6 +150,58 @@ class _Adapter:
                 status="succeeded",
             )
         return self._candidates[min(len(self.generate_calls) - 1, len(self._candidates) - 1)]
+
+
+class _OrchestratorExecutor:
+    """Sequenced generator responses through the real finalization boundary."""
+
+    last_stream_finish_reason = "stop"
+
+    def __init__(self, *contents: str) -> None:
+        self._contents = list(contents)
+        self.calls: list[str] = []
+
+    def execute(self, *, route_decision: object, messages: object):  # noqa: ANN001, ANN201
+        self.calls.append(current_llm_attempt_type())
+        record_llm_call(
+            request_id="phase1-real-orchestrator",
+            role="math.generator.intermediate",
+            provider="mock",
+            model="mock",
+            deployment=None,
+            attempt_type=current_llm_attempt_type(),
+            streaming=False,
+            usage=ProviderTokenUsage(),
+            duration_ms=1,
+            status="succeeded",
+        )
+        content = self._contents[min(len(self.calls) - 1, len(self._contents) - 1)]
+        return MockModelExecutor(content=content, finish_reason="stop").execute(
+            route_decision=route_decision,
+            messages=messages,
+        )
+
+
+def _real_adapter(
+    *contents: str,
+    verifier: _Verifier,
+    diagnoser: _Diagnoser,
+) -> tuple[AnswerGenerationAdapter, _OrchestratorExecutor]:
+    executor = _OrchestratorExecutor(*contents)
+    adapter = AnswerGenerationAdapter(orchestrator=LlmOrchestrator(model_executor=executor))
+    adapter._correctness_verifier = verifier  # type: ignore[assignment]
+    adapter._semantic_diagnoser = diagnoser  # type: ignore[assignment]
+    return adapter, executor
+
+
+def _presentation_candidate(*, reason: str) -> str:
+    if reason == "display":
+        body = "\n\n".join(
+            f"Step {index}:\n\n\\[ x = {index} \\]" for index in range(1, 8)
+        )
+    else:
+        body = "\n".join(f"{index}. Solve x = {index}." for index in range(1, 10))
+    return f"{body}\n\n**Answer:** 4"
 
 
 @pytest.fixture(autouse=True)
@@ -489,6 +545,116 @@ def test_a_regenerated_candidate_that_fails_quality_is_not_delivered() -> None:
     assert events[-1].metadata["code"] == "ANSWER_QUALITY_FAILED"  # type: ignore[index]
     assert _MALFORMED not in _delivered(events)
     assert len(verifier.calls) == 1  # the malformed candidate never reaches verification
+
+
+@pytest.mark.parametrize("reason", ["display", "visible_steps"])
+def test_a_presentation_only_regenerated_candidate_reaches_the_final_verifier(
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    presentation_heavy = _presentation_candidate(reason=reason)
+    presentation_events: list[dict] = []
+    original_log_event = streaming_module.log_event
+
+    def _record_presentation_event(name: str, **kwargs: object) -> None:
+        if name == "QUALITY_PRESENTATION_ONLY_CONTINUED":
+            presentation_events.append(dict(kwargs.get("details") or {}))
+        original_log_event(name, **kwargs)
+
+    monkeypatch.setattr(streaming_module, "log_event", _record_presentation_event)
+    verifier = _Verifier(_MISMATCH, _MATCH)
+    adapter, executor = _real_adapter(
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        verifier=verifier,
+        diagnoser=_Diagnoser(_CANDIDATE_FAULT),
+    )
+
+    events = _stream(adapter)
+
+    assert events[-1].type == "complete"
+    assert _delivered(events) == presentation_heavy
+    assert verifier.calls == [presentation_heavy, presentation_heavy]
+    assert executor.calls == ["primary", "rewrite", "repair"]
+    assert GENERATION_FAILURE_MESSAGE not in _delivered(events)
+    assert presentation_events[-1] == {
+        "reason_codes": (
+            "too_many_display_math_blocks" if reason == "display" else "too_many_visible_steps"
+        ),
+        "source": "verifier_regeneration",
+    }
+    assert presentation_heavy not in str(presentation_events)
+
+
+def test_a_presentation_only_regenerated_candidate_is_not_delivered_when_rejected() -> None:
+    presentation_heavy = _presentation_candidate(reason="display")
+    verifier = _Verifier(_MISMATCH)
+    adapter, executor = _real_adapter(
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        verifier=verifier,
+        diagnoser=_Diagnoser(_CANDIDATE_FAULT),
+    )
+
+    events = _stream(adapter)
+
+    assert _terminal(events) == (
+        "error",
+        {"retryable": False, "code": "ANSWER_VERIFICATION_FAILED", "user_retryable": True},
+    )
+    assert _delivered(events) == ""
+    assert len(verifier.calls) == 2
+    assert executor.calls == ["primary", "rewrite", "repair"]
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "Check: \\( x = 8 \\div 2\n\n**Answer:** 4",
+        "**Answer:** 4\n\n**Answer:** 5",
+        "यह समाधान है।\n\n**Answer:** 4",
+        "Step 1: Rearrange the equation, then divide by the coefficient.",
+    ],
+)
+def test_a_hard_quality_regenerated_candidate_never_reaches_the_final_verifier(
+    candidate: str,
+) -> None:
+    presentation_heavy = _presentation_candidate(reason="display")
+    verifier = _Verifier(_MISMATCH, _MATCH)
+    adapter, executor = _real_adapter(
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        f"{candidate}\n<ANSWER_DONE>",
+        verifier=verifier,
+        diagnoser=_Diagnoser(_CANDIDATE_FAULT),
+    )
+
+    events = _stream(adapter)
+
+    assert events[-1].metadata["code"] == "ANSWER_QUALITY_FAILED"  # type: ignore[index]
+    assert _delivered(events) == ""
+    assert len(verifier.calls) == 1
+    assert executor.calls == ["primary", "rewrite", "repair"]
+
+
+def test_a_regenerated_presentation_only_candidate_needs_no_prior_rewrite() -> None:
+    presentation_heavy = _presentation_candidate(reason="display")
+    verifier = _Verifier(_MISMATCH, _MATCH)
+    adapter, executor = _real_adapter(
+        f"{_ANSWER_A}\n<ANSWER_DONE>",
+        f"{presentation_heavy}\n<ANSWER_DONE>",
+        verifier=verifier,
+        diagnoser=_Diagnoser(_CANDIDATE_FAULT),
+    )
+
+    events = _stream(adapter)
+
+    assert events[-1].type == "complete"
+    assert _delivered(events) == presentation_heavy
+    assert verifier.calls == [_ANSWER_A, presentation_heavy]
+    assert executor.calls == ["primary", "repair"]
 
 
 def test_a_failed_regeneration_call_is_terminal() -> None:

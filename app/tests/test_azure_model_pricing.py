@@ -118,6 +118,9 @@ def test_student_credits_for_a_realistic_azure_doubt_operation() -> None:
             credits_per_usd=Decimal("50"),
             target_gross_margin=Decimal("0.40"),
             rounding_mode="CEIL",
+            doubt_authorization_credits=5,
+            practice_min_authorization_credits=5,
+            practice_authorization_credits_per_question=1,
         ),
     )
     # 0.01012 / 0.60 * 50 = 0.84333... -> CEIL -> 1

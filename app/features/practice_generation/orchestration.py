@@ -296,6 +296,7 @@ def _request(assessment: dict[str, Any]) -> PracticeGenerationRequest:
             "subject": value.get("subject"),
             "topic": value.get("topic"),
             "topics": value.get("topics"),
+            "trusted_constraints": value.get("trustedConstraints") or (),
             "difficulty": value.get("difficulty"),
             "mixed_difficulty_requested": mixed_difficulty_requested,
             "explicit_difficulty_requested": explicit_difficulty_requested,

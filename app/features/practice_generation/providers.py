@@ -13,6 +13,7 @@ from features.practice_generation.execution_control import (
 from features.practice_generation.planning import (
     practice_generator_route_subject,
     select_planner_family,
+    trusted_constraint_references,
 )
 from features.practice_generation.request_intelligence import (
     token_id,
@@ -324,6 +325,17 @@ class RoutedPlannerProvider:
             "exam_stage": request.exam_stage,
             "exam_profile_id": request.exam_profile_id,
             "request_constraints": request.original_query[:1000],
+            "request_constraints_authority": (
+                "context_only" if request.trusted_constraints else "composition_authority"
+            ),
+            "trusted_constraints": [
+                {
+                    "constraint_ref": reference,
+                    "subject_id": constraint.subject_id,
+                    "topic_id": constraint.topic_id,
+                }
+                for reference, constraint in trusted_constraint_references(request)
+            ],
             "planner_phase": "repair" if repair_feedback is not None else "initial",
             "repair_reason": repair_feedback,
             "supported_question_types": ["mcq"],

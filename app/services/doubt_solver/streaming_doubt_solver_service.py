@@ -17,7 +17,9 @@ from features.practice_generation.planning import (
     PracticeRequestCountError,
     canonical_practice_subject,
     decide_practice_launch,
+    deterministic_test_id,
     practice_route_enabled,
+    request_idempotency_key,
     resolve_practice_freshness_requirement,
     resolve_practice_request,
     validate_practice_requested_count,
@@ -43,7 +45,6 @@ from observability import (
     emit_request_summary,
     log_event,
     record_local_preview,
-    snapshot_llm_usage_records,
     stage_span,
     update_request_summary,
     update_request_type,
@@ -117,11 +118,17 @@ from services.llm.billing import (
     OperationUsageAccumulator,
     begin_operation,
     emit_operation_billing_summary,
+    feature_for_practice_type,
 )
-from services.student_credits.errors import InsufficientStudentCreditsError
+from services.student_credits.errors import (
+    INSUFFICIENT_CREDITS_LABEL,
+    InsufficientStudentCreditsError,
+    StudentCreditLedgerConflictError,
+)
 from services.student_credits.runtime import (
     StudentCreditRuntime,
     doubt_reference_id,
+    practice_reference_id,
 )
 from tools.web_search.models import FreshEvidenceBundle
 
@@ -266,8 +273,13 @@ def _error_event(
     retryable: bool,
     label: str | None = None,
     user_retryable: bool | None = None,
+    extra_metadata: dict[str, object] | None = None,
 ) -> DoubtSolverStreamEvent:
-    metadata: dict[str, object] = {"retryable": retryable, "code": code}
+    metadata: dict[str, object] = {
+        **(extra_metadata or {}),
+        "retryable": retryable,
+        "code": code,
+    }
     if user_retryable is not None:
         metadata["user_retryable"] = user_retryable
     elif code in _USER_RETRYABLE_CODES:
@@ -278,6 +290,18 @@ def _error_event(
         stage="failed",
         label=label or "Unable to complete",
         metadata=metadata,
+    )
+
+
+def _insufficient_credits_event(
+    request_id: str, exc: InsufficientStudentCreditsError
+) -> DoubtSolverStreamEvent:
+    return _error_event(
+        request_id,
+        code=exc.reason_code,
+        retryable=False,
+        label=INSUFFICIENT_CREDITS_LABEL,
+        extra_metadata=exc.client_fields(),
     )
 
 
@@ -622,6 +646,7 @@ def _iter_stream_doubt_solver(
             )
             return
         fresh_evidence = None
+        practice_credit_reference: str | None = None
         try:
             validate_practice_requested_count(input.original_query or input.query)
         except PracticeRequestCountError as exc:
@@ -711,8 +736,33 @@ def _iter_stream_doubt_solver(
                     "source": practice_request.language_source,
                 },
             )
+            if student_credits is not None:
+                test_id = deterministic_test_id(request_idempotency_key(practice_request))
+                practice_credit_reference = practice_reference_id(
+                    user_id=input.actor_id,
+                    test_id=test_id,
+                )
+                student_credits.authorize_practice(
+                    user_id=input.actor_id,
+                    reference_id=practice_credit_reference,
+                    feature=feature_for_practice_type(practice_request.practice_type.value),
+                    effective_count=practice_request.effective_count,
+                )
             launch = practice_launcher.launch(practice_request)
+        except InsufficientStudentCreditsError as exc:
+            yield _insufficient_credits_event(request_id, exc)
+            return
         except PracticeLaunchError as exc:
+            if student_credits is not None and practice_credit_reference is not None:
+                try:
+                    student_credits.release(
+                        user_id=input.actor_id,
+                        reference_id=practice_credit_reference,
+                        feature="practice",
+                        reason=exc.code,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the launch failure contract
+                    pass
             if conversation_persistence is not None:
                 conversation_persistence.record_skip(
                     request_id=request_id,
@@ -760,11 +810,24 @@ def _iter_stream_doubt_solver(
                 response_type="practice_generation",
                 practice_test_id=launch.test_id,
             )
-            persistence_result = conversation_persistence.persist_completed_turn(
-                turn,
-                final_answer,
-                request_id=request_id,
-            )
+            try:
+                persistence_result = conversation_persistence.persist_completed_turn(
+                    turn,
+                    final_answer,
+                    request_id=request_id,
+                )
+            except Exception:  # noqa: BLE001 - no launched Practice may survive an unlinked turn
+                practice_launcher.abort(
+                    launch.test_id,
+                    "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                    request_id,
+                )
+                yield _error_event(
+                    request_id,
+                    code="PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                    retryable=False,
+                )
+                return
         history_linked = (
             persistence_result is not None
             and persistence_result.history_write_status in {"succeeded", "idempotent_replay"}
@@ -802,6 +865,19 @@ def _iter_stream_doubt_solver(
             ),
         )
         return
+
+    if student_credits is not None:
+        try:
+            student_credits.authorize_doubt(
+                user_id=input.actor_id,
+                reference_id=doubt_reference_id(
+                    user_id=input.actor_id,
+                    turn_id=input.turn_id,
+                ),
+            )
+        except InsufficientStudentCreditsError as exc:
+            yield _insufficient_credits_event(request_id, exc)
+            return
 
     event = emit_status(stage="thinking", reason_code="thinking")
     if event is not None:
@@ -1109,18 +1185,14 @@ def _iter_stream_doubt_solver(
                 logger.debug("repair_completed request_id=%s stage=verifying", request_id)
                 if _cancelled(input):
                     return
-            # After the single rewrite, an answer rejected only for presentation is
-            # still judged on correctness when the verifier runs for this request;
-            # without that verifier it fails exactly as before.
+            # The orchestration boundary keeps presentation-only text only after its
+            # bounded rewrite or verifier-recovery handoff. It remains untrusted here
+            # and is still judged on correctness before delivery.
             presentation_only_continued = (
                 not verification.is_valid
                 and is_presentation_only_failure(verification)
                 and correctness_verification_required
                 and correctness_verifier is not None
-                and any(
-                    record.attempt_type == "rewrite"
-                    for record in snapshot_llm_usage_records()
-                )
             )
             if presentation_only_continued:
                 log_event(
@@ -1297,17 +1369,25 @@ def _iter_stream_doubt_solver(
                         language=input.language,
                         policy=AnswerQualityPolicy.from_settings(settings),
                     )
-                    # The frozen presentation-only rule applies to this candidate too: a
-                    # rewrite has already run for this request, the verifier is about to
-                    # judge it, and layout alone never becomes a correctness failure.
+                    # A verifier-regenerated candidate may be presentation-only, but
+                    # remains untrusted until this loop's one final verifier decides it.
                     regenerated = True
                     presentation_only_continued = not verification.is_valid and (
                         is_presentation_only_failure(verification)
-                        and any(
-                            record.attempt_type.startswith("rewrite")
-                            for record in snapshot_llm_usage_records()
-                        )
                     )
+                    if presentation_only_continued:
+                        log_event(
+                            "QUALITY_PRESENTATION_ONLY_CONTINUED",
+                            component="doubt_solver.quality",
+                            stage="validate_quality",
+                            status="continued",
+                            details={
+                                "reason_codes": ",".join(
+                                    sorted(set(verification.reason_codes))
+                                ),
+                                "source": "verifier_regeneration",
+                            },
+                        )
                     if not verification.is_valid and not presentation_only_continued:
                         # A fresh candidate earns no trust: it faces the same gate, and its
                         # own recovery capacity is already spent.
@@ -1608,8 +1688,8 @@ def _iter_stream_doubt_solver(
                 feature="doubt",
                 operation_status="completed",
             )
-        except InsufficientStudentCreditsError:
-            yield _error_event(request_id, code="INSUFFICIENT_CREDITS", retryable=False)
+        except InsufficientStudentCreditsError as exc:
+            yield _insufficient_credits_event(request_id, exc)
             return
         except Exception as exc:  # noqa: BLE001
             # The answer is already delivered; no credit-store, pricing, or
@@ -1622,6 +1702,18 @@ def _iter_stream_doubt_solver(
                 getattr(exc, "reason_code", "STUDENT_CREDIT_UNEXPECTED_ERROR"),
                 type(exc).__name__,
             )
+            try:
+                student_credits.release(
+                    user_id=input.actor_id,
+                    reference_id=doubt_reference_id(
+                        user_id=input.actor_id,
+                        turn_id=input.turn_id,
+                    ),
+                    feature="doubt",
+                    reason="settlement_unavailable",
+                )
+            except Exception:  # noqa: BLE001
+                pass
     if post_answer_progress is not None:
         post_answer_progress.lifecycle_stage = "terminal_event_build"
     logger.debug(
@@ -1797,6 +1889,27 @@ def stream_doubt_solver(
                 )
                 return
             finally:
+                if (
+                    student_credits is not None
+                    and terminal_reason not in {"completed", "practice_generation_started"}
+                    and terminal_error_type != StudentCreditLedgerConflictError.__name__
+                ):
+                    try:
+                        student_credits.release(
+                            user_id=input.actor_id,
+                            reference_id=doubt_reference_id(
+                                user_id=input.actor_id,
+                                turn_id=input.turn_id,
+                            ),
+                            feature="doubt",
+                            reason=terminal_reason,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "student_credit_release_unavailable request_id=%s error_type=%s",
+                            input.request_id,
+                            type(exc).__name__,
+                        )
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 try:
                     cancelled = _cancelled(input)

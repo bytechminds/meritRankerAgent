@@ -519,7 +519,7 @@ routes:
 
     request_intelligence:
       default:
-        model: practice_request_intelligence
+        model: openai_gpt_5_6_terra
         prompt: practice_generation/request_intelligence.md
         temperature: 0.0
         max_tokens: 700

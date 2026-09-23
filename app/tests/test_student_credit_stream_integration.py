@@ -27,6 +27,7 @@ from tests.test_student_credits import (
     CREDIT_LEDGER_TABLE,
     USER_CREDITS_TABLE,
     FakeDynamoDBClient,
+    _policy,
 )
 
 _REQUEST_ID = "credit-stream-001"
@@ -52,6 +53,7 @@ class _Adapter:
     def __init__(self, *, answer: str = _ANSWER, input_tokens: int = 1_000_000) -> None:
         self.answer = answer
         self.input_tokens = input_tokens
+        self.calls = 0
 
     def _record(self) -> None:
         from observability.llm_usage import record_llm_call
@@ -71,10 +73,12 @@ class _Adapter:
         )
 
     def generate(self, **_: object) -> str:
+        self.calls += 1
         self._record()
         return self.answer
 
     def generate_stream(self, **_: object) -> Iterator[str]:
+        self.calls += 1
         self._record()
         yield self.answer
 
@@ -130,6 +134,9 @@ def _runtime(client: FakeDynamoDBClient, *, dry_run: bool = False) -> StudentCre
             credits_per_usd=Decimal("50"),
             target_gross_margin=Decimal("0.40"),
             rounding_mode="CEIL",
+            doubt_authorization_credits=5,
+            practice_min_authorization_credits=5,
+            practice_authorization_credits_per_question=1,
         ),
         repository=StudentCreditRepository(
             user_credits_table=USER_CREDITS_TABLE,
@@ -177,10 +184,11 @@ def test_successful_answer_settles_before_the_terminal_event() -> None:
     assert events[-1].type == "complete"
     assert events[-1].response is not None
     assert events[-1].response.answer == _ANSWER
-    # $1.00 -> 1/0.6*50 = 83.33 -> 84 credits.
-    assert client.wallets[_ACTOR_ID] == 416
+    # The student authorized five credits; the measured overage is platform cost.
+    assert client.wallets[_ACTOR_ID] == 495
     reference = doubt_reference_id(user_id=_ACTOR_ID, turn_id=_TURN_ID)
-    assert client.ledger[reference]["amount"]["N"] == "84"
+    assert client.ledger[reference]["amount"]["N"] == "5"
+    assert client.ledger[reference]["authorizationState"]["S"] == "SETTLED"
     assert client.ledger[reference]["userId"]["S"] == _ACTOR_ID
 
 
@@ -195,27 +203,35 @@ def test_settlement_uses_the_turn_identity_not_the_request_id() -> None:
     assert _REQUEST_ID not in next(iter(client.ledger))
 
 
-def test_retrying_the_same_turn_debits_once() -> None:
+def test_retrying_a_completed_turn_cannot_start_paid_work_again() -> None:
     client = FakeDynamoDBClient(wallets={_ACTOR_ID: 500})
     runtime = _runtime(client)
 
     _events(student_credits=runtime)
-    events = _events(student_credits=runtime)
+    retry_adapter = _Adapter()
+    events = _events(student_credits=runtime, adapter=retry_adapter)
 
-    assert events[-1].type == "complete"
-    assert client.wallets[_ACTOR_ID] == 416
+    assert events[-1].type == "error"
+    assert retry_adapter.calls == 0
+    assert client.wallets[_ACTOR_ID] == 495
     assert len(client.ledger) == 1
 
 
 def test_insufficient_balance_replaces_the_terminal_success_with_a_typed_error() -> None:
-    client = FakeDynamoDBClient(wallets={_ACTOR_ID: 10})
+    client = FakeDynamoDBClient(wallets={_ACTOR_ID: 4})
 
     events = _events(student_credits=_runtime(client))
 
     assert events[-1].type == "error"
-    assert events[-1].metadata == {"retryable": False, "code": "INSUFFICIENT_CREDITS"}
+    assert events[-1].metadata == {
+        "retryable": False,
+        "code": "INSUFFICIENT_CREDITS",
+        "action": "ADD_CREDITS",
+        "requiredCredits": 5,
+    }
+    assert events[-1].label == "Not enough credits to continue. Add credits and try again."
     assert not any(event.type == "complete" for event in events)
-    assert client.wallets[_ACTOR_ID] == 10
+    assert client.wallets[_ACTOR_ID] == 4
     assert client.ledger == {}
 
 
@@ -246,11 +262,12 @@ def test_unpriced_provider_call_never_debits_and_never_retracts_the_answer(
 
     assert events[-1].type == "complete"
     assert client.wallets[_ACTOR_ID] == 500
-    assert client.ledger == {}
-    assert client.transaction_calls == 0
+    reference = doubt_reference_id(user_id=_ACTOR_ID, turn_id=_TURN_ID)
+    assert client.ledger[reference]["authorizationState"]["S"] == "RELEASED"
+    assert client.transaction_calls == 2
 
 
-def test_credit_store_outage_never_retracts_a_delivered_answer() -> None:
+def test_credit_store_outage_blocks_before_generation() -> None:
     class BrokenClient(FakeDynamoDBClient):
         def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("dynamodb unavailable")
@@ -259,7 +276,7 @@ def test_credit_store_outage_never_retracts_a_delivered_answer() -> None:
 
     events = _events(student_credits=_runtime(client))
 
-    assert events[-1].type == "complete"
+    assert events[-1].type == "error"
     assert client.wallets[_ACTOR_ID] == 500
 
 
@@ -316,4 +333,52 @@ def test_admission_refusal_non_stream_shape_matches_existing_errors() -> None:
         "request_id": _REQUEST_ID,
         "mode": "doubt_solver",
         "error": "INSUFFICIENT_CREDITS",
+        "code": "INSUFFICIENT_CREDITS",
+        "retryable": False,
     }
+
+
+def test_below_minimum_wallet_is_refused_before_any_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission is the first chargeable gate: nothing paid may run once it refuses."""
+    import main
+    import observability.llm_usage as llm_usage
+
+    provider_calls: list[str] = []
+    real_record = llm_usage.record_llm_call
+
+    def _spy(**kwargs: Any):
+        provider_calls.append(str(kwargs.get("role")))
+        return real_record(**kwargs)
+
+    monkeypatch.setattr(llm_usage, "record_llm_call", _spy)
+    client = FakeDynamoDBClient(wallets={_ACTOR_ID: 4})
+    monkeypatch.setattr(
+        main,
+        "student_credit_runtime",
+        StudentCreditRuntime(
+            policy=_policy(),
+            repository=StudentCreditRepository(
+                user_credits_table=USER_CREDITS_TABLE,
+                credit_ledger_table=CREDIT_LEDGER_TABLE,
+                client=client,
+            ),
+        ),
+    )
+
+    result = main.invoke(
+        {
+            "mode": "doubt_solver",
+            "query": "What is 20% of 50?",
+            "user_id": _ACTOR_ID,
+            "conversation_id": "credit-admission-conv",
+            "turn_id": "credit-admission-turn",
+            "stream": False,
+        }
+    )
+
+    assert result["error"] == "INSUFFICIENT_CREDITS"
+    assert provider_calls == []
+    assert client.transaction_calls == 0
+    assert client.wallets[_ACTOR_ID] == 4

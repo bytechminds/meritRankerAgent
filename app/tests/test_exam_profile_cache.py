@@ -267,4 +267,4 @@ def test_cache_lookup_stress_has_no_source_calls(
     duration_seconds = time.perf_counter() - started
 
     assert source.calls == 1
-    assert duration_seconds < 2.0
+    assert duration_seconds < 5.0

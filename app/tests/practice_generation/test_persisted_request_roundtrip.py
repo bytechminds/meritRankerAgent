@@ -35,6 +35,13 @@ def _meta(**overrides: object) -> dict[str, object]:
         "difficulty": "intermediate",
         "language": "english",
         "originalQuery": STUDENT_QUERY,
+        "trustedConstraints": [
+            {
+                "subjectId": "math",
+                "topicId": "percentages",
+                "sourceText": "percentages",
+            }
+        ],
     }
     practice_request.update(overrides)
     return practice_request
@@ -54,6 +61,24 @@ def _rebuild(practice_request: dict[str, object]):
 class TestPersistedQueryRoundTrip:
     def test_persisted_query_survives_reconstruction(self) -> None:
         assert _rebuild(_meta()).original_query == STUDENT_QUERY
+
+    def test_trusted_constraints_survive_reconstruction(self) -> None:
+        request = _rebuild(_meta())
+        assert [
+            constraint.model_dump(mode="json", by_alias=True)
+            for constraint in request.trusted_constraints
+        ] == [
+            {
+                "subjectId": "math",
+                "topicId": "percentages",
+                "sourceText": "percentages",
+            }
+        ]
+
+    def test_legacy_request_without_trusted_constraints_remains_readable(self) -> None:
+        legacy = _meta()
+        legacy.pop("trustedConstraints")
+        assert _rebuild(legacy).trusted_constraints == ()
 
     def test_legacy_query_summary_is_still_honoured(self) -> None:
         """Meta written before the key was retired must keep working."""

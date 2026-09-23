@@ -143,6 +143,8 @@ def _practice_started_event() -> DoubtSolverStreamEvent:
         data=PracticeGenerationStartedData(
             practice_test_id="practice-123",
             message="Your practice test is being prepared.",
+            requested_count=5,
+            effective_count=5,
         ),
     )
 

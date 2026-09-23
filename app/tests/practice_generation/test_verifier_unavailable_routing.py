@@ -118,6 +118,7 @@ def _run(outcome: str, *, slot_count: int = 1):
     orchestrator._generator = generator
     orchestrator._verifier = verifier
     orchestrator._progress_updates = None
+    orchestrator._update_progress = lambda *_args, **_kwargs: None
 
     from features.practice_generation.generation import bucket_for_slot
 

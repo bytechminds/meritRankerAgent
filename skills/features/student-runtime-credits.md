@@ -2,188 +2,193 @@
 
 ## Purpose
 
-Charges a student's authoritative wallet for one accepted Doubt Solver answer or one delivered
-Practice assessment, based on the actual provider cost of that operation. There is no per-feature
-price: the only student pricing multiplier is the configured gross margin.
+Student credits use a temporary, server-owned maximum-charge authorization before
+chargeable Doubt or Practice work. The final debit remains the existing measured
+provider-cost calculation:
 
-## Current Status
-
-Implemented and reviewed. **Not enabled.** Real deductions are blocked until model pricing
-coverage reaches 100% (see *Pricing coverage requirement*).
-
-## Business formula
-
-```
-student_credits_to_debit =
-    CEIL( total_llm_cost_usd * CREDITS_PER_USD / (1 - TARGET_GROSS_MARGIN) )
+```text
+calculate_credits(actual measured provider cost)
 ```
 
-`total_llm_cost_usd` is the sum of the operation's priced provider calls, taken from the existing
-`OperationBillingSummary`. It deliberately **excludes** the `infra.<feature>.fixed_cost` allowance,
-so a zero-LLM operation can never produce a charge.
-
-`TARGET_GROSS_MARGIN` is a margin, not a markup: 0.40 divides by 0.60. Ceiling rounding is applied
-once, at the end, and always rounds in MeritRanker's favour.
-
-At `CREDITS_PER_USD=50`, `TARGET_GROSS_MARGIN=0.40`: $1.00 of provider cost → 84 credits.
-
-The legacy `calculated_credits` / `usd_per_credit` / `pricing_factor` values in
-`app/config/llm/model_pricing.yaml` are **shadow telemetry only** and are never read by the wallet
-path. Do not wire them into student debit.
+Authorization is not fixed-price billing. Any unused authorization is returned;
+if measured cost exceeds it, the student debit is capped at the authorization and
+the platform records the overage.
 
 ## Configuration
 
-| Variable | Default | Notes |
-|---|---|---|
-| `STUDENT_CREDIT_ENFORCEMENT_ENABLED` | `false` | Master switch. False ⇒ no runtime is built, no wallet read, no settlement. |
-| `STUDENT_CREDIT_DRY_RUN` | `true` | Observational. Calculates and logs; never writes; never refuses a student. |
-| `CREDITS_PER_USD` | `50` | Decimal, must be > 0. |
-| `TARGET_GROSS_MARGIN` | `0.40` | Decimal, `0 <= m < 1`. |
-| `STUDENT_CREDIT_ROUNDING_MODE` | `CEIL` | Only `CEIL` is accepted; any other value fails at startup. |
-| `DYNAMODB_USER_CREDITS_TABLE` | — | Required when enforcing. Injected by the CDK from SSM. |
-| `DYNAMODB_CREDIT_LEDGER_TABLE` | — | Required when enforcing. Injected by the CDK from SSM. |
+`app/config/student_credit_policy.yaml` is the single versioned authority for
+student business pricing and authorization. Its strict typed loader derives:
 
-Policy is validated only when enforcement is enabled, so an unconfigured deployment starts
-unchanged. Invalid values raise `ConfigurationError` at startup.
-
-## Modes
-
-**Enforcement off** — complete plug-out. The streaming call omits the `student_credits` keyword
-entirely, so the call is identical to the pre-credit contract. A credit-store outage cannot affect
-Doubt Solver.
-
-**Dry run** (`ENABLED=true`, `DRY_RUN=true`) — reads the wallet, calculates, emits telemetry, and
-mutates nothing. It never refuses a student, including when the credit store is unavailable; that
-case is recorded as `student_credit_admission_status=unavailable` and generation continues.
-
-**Enforcing** (`ENABLED=true`, `DRY_RUN=false`) — a missing wallet, a non-positive balance, or an
-unreadable wallet blocks generation before any provider call. The unreadable-wallet case fails
-closed by design: spend that settlement cannot recover must not start.
-
-## Wallet and ledger ownership
-
-`UserCredits` and `CreditLedger` are owned by `ai-tutor-backend` (Amplify). The runtime is a
-consumer: it reads the balance and performs one conditional transaction. It **never** creates a
-wallet row and never writes any other attribute. Purchase channels (Razorpay, Google Play, admin
-grants) only ever CREDIT; the runtime only ever DEBITs.
-
-Table identity reaches the runtime through the existing SSM contract under
-`/meritranker/agent-runtime/v1/credits/…`, published by the backend and consumed by the AgentCore
-CDK. IAM is `dynamodb:GetItem` + `dynamodb:TransactWriteItems` on those two table ARNs only.
-
-## Idempotency key
-
+```text
+credits_per_usd = usd_to_inr_business_rate / credit_value_inr
 ```
+
+The current, locked `student-credit-v1` values are `1 credit = ₹1`, 100 credits
+per USD, a 0.60 target gross margin, CEIL rounding, a 5-credit Doubt
+authorization, and Practice authorization of `max(5, effectiveCount * 5)`
+(5Q → 25, 10Q → 50, 20Q → 100, 50Q → 250). The hold is an authorization, not a
+predicted bill: settlement charges measured accepted-path usage and refunds the rest. Missing or invalid
+policy fails startup when enforcement is enabled; it is not read when
+enforcement is disabled.
+
+Only these operational controls remain environment-owned:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `STUDENT_CREDIT_ENFORCEMENT_ENABLED` | `false` | Enables the runtime boundary. |
+| `STUDENT_CREDIT_DRY_RUN` | `true` | Logs would-authorize/would-settle; no mutations or refusals. |
+
+The legacy `credits:` block in `app/config/llm/model_pricing.yaml` remains
+shadow billing telemetry and is not read by the wallet path.
+
+The AgentCore CDK entrypoint forwards the enforcement and dry-run flags to the
+runtime; enabling enforcement also injects the published credit table names and
+the corresponding least-privilege DynamoDB permission.
+
+Practice authorization is:
+
+```text
+max(PRACTICE_MIN_AUTHORIZATION_CREDITS,
+    effectiveCount * PRACTICE_AUTHORIZATION_CREDITS_PER_QUESTION)
+```
+
+`requestedCount` must never be used. The existing 50-question cap and all
+Practice planning behavior remain outside this feature.
+
+## Runtime lifecycle
+
+```text
+completed replay
+  -> no credit work
+
+new request
+  -> preflight wallet read (below the configured minimum stops before
+     image/classifier work; the minimum is the lowest configured authorization)
+  -> existing classification / Practice request normalization
+  -> atomic authorization
+  -> existing execution
+  -> measured calculate_credits()
+  -> atomic settle (release unused amount), or atomic release on failure
+```
+
+Wallets at or above the admission minimum but below the operation-specific
+authorization can incur existing classification/routing work, but cannot start
+a Doubt generator/verifier or a Practice worker/planner/generator/verifier.
+
+## DynamoDB authority
+
+`UserCredits` and `CreditLedger` remain the only storage. No GraphQL schema
+change is required: the ledger stores the private, schemaless
+`authorizationState` attribute:
+
+```text
+AUTHORIZED -> SETTLED
+AUTHORIZED -> RELEASED
+```
+
+The ledger's `amount` is the temporary authorized amount only while state is
+`AUTHORIZED`. On `SETTLED`, it is overwritten with the actual captured debit.
+On `RELEASED`, it becomes zero. Existing JSON `metadata` records authorization,
+actual calculation, capture, and released amount.
+
+### Atomic authorization
+
+One `TransactWriteItems` transaction:
+
+1. `Put CreditLedger`, `attribute_not_exists(ledgerId)`.
+2. `Update UserCredits`, `attribute_exists(userId) AND creditsBalance >= :requiredCredits`,
+   decrementing the authorization amount.
+
+The deterministic IDs are unchanged:
+
+```text
 student-credit:doubt:<user_id>:<turn_id>
 student-credit:practice:<user_id>:<test_id>
 ```
 
-`test_id` is derived from the Practice request idempotency key, so a resumed or replayed Practice
-settles against the same reference.
+Duplicate authorization reads the ledger without a second wallet decrement,
+then fails before paid work. Completed-turn replay remains owned by the existing
+replay path.
 
-`user_id` is the verified Cognito `sub`; `turn_id` is the ConversationHistory primary key and is
-reused by the client on retry. The key is the `CreditLedger` partition key, written under
-`attribute_not_exists(ledgerId)`. A repeated settlement returns `already_settled` with the recorded
-amount rather than debiting again.
+### Atomic settlement and release
 
-## Settlement transaction
+Both transitions condition the ledger on the same user, `AUTHORIZED` state, and
+the original authorization amount. Settlement sets the durable debit to:
 
-One `TransactWriteItems`:
+```text
+captured = min(actualCalculatedCredits, authorizationCredits)
+released = authorizationCredits - captured
+```
 
-1. `Put` the ledger row, `ConditionExpression: attribute_not_exists(ledgerId)`.
-2. `Update` the wallet, `ConditionExpression: attribute_exists(userId) AND creditsBalance >= :credits`,
-   `UpdateExpression: ... ADD creditsBalance :negative, version :one`.
+It refunds `released` in the same transaction. When `released` is 0 the wallet
+update must not declare the balance attribute at all: DynamoDB rejects any unused
+expression name or value with `ValidationException`, which previously failed every
+settlement whose actual cost reached its authorization. The test double enforces
+the same rule. Failure/cancellation uses the
+same conditional transaction to set `RELEASED` and refund the entire hold.
+Terminal duplicate settle/release reads are idempotent and do not change the
+wallet.
 
-A conditional atomic `ADD` is used rather than a balance/version compare-and-set so that an
-unrelated concurrent CREDIT (a purchase landing mid-generation) does not cancel a legitimate debit.
-Because the post-state is not knowable at write time, the ledger's optional `balanceAfter`
-attribute is deliberately **not** written — `amount` and `direction` are the audit values.
+## Overage safety
 
-## Practice: the chargeable path
+When `actualCalculatedCredits > authorizationCredits`, the request succeeds and
+the student is charged only `authorizationCredits`. The runtime emits the
+high-severity, non-student-facing `STUDENT_CREDIT_AUTHORIZATION_EXCEEDED` event.
+It does not retry generation, request more credits, or fail an answer/READY
+assessment because of the overage.
 
-Practice charges only the calls that produced the delivered questions. Provider usage telemetry is
-untouched — every call, including a failed one with unknown usage, stays in the operation's record
-ledger and in `AI_USAGE_SUMMARY`. A second, narrower set is maintained alongside it on the same
-`OperationUsageAccumulator` and priced by the same `calculate_operation_billing`, so student
-charging can never drift from provider pricing.
+## Path ownership
 
-Admitted to the chargeable set:
+- `app/main.py` preserves replay-before-preflight and passes the one runtime to
+  the existing Doubt graph and Practice launcher.
+- Streaming Doubt authorizes after existing classification/Practice request
+  resolution and before expensive execution. Its failure finalizer releases the
+  Doubt hold.
+- Non-stream Doubt uses the existing graph's generate and Practice-launch
+  boundaries. It returns canonical `INSUFFICIENT_CREDITS` before paid execution.
+- The existing Practice background launcher releases the deterministic Practice
+  hold for cancellation, launch failure, and every non-READY terminal state. The
+  owner is read from the assessment row's `userId`; the persisted
+  `practiceRequest` does not carry it.
+- The existing Practice orchestrator remains the sole caller that settles a
+  READY assessment's measured charge.
 
-| Work | Chargeable |
-|---|---|
-| Classifier call of the launching request | Yes — the request hands its accumulator to the Practice operation, so it is already present. |
-| Planner attempt that produced the accepted blueprint | Yes. A rejected attempt, and every attempt when the deterministic fallback produced the plan, are not. |
-| Authoring call of a wave that yielded at least one accepted question | Yes, once per wave. |
-| Authoring call of a wave whose questions were all rejected or that failed | No. |
-| Verifier call that approved a question | Yes. |
-| Verifier call that rejected a question, or that failed at the provider | No. |
+The planner, generator, verifier, recovery policy, 50Q cap, model routes,
+educator workflows, and public GraphQL schema are not modified.
 
-Per-call attribution is exact and thread-safe: `capture_llm_usage()` binds a child accumulator for
-the duration of one call, so concurrent slot groups and verifications never share billing state.
-Every captured record is forwarded to the operation accumulator afterwards.
+## UX and telemetry
 
-Settlement runs inside the existing background Practice worker, after final manifest validation and
-before `READY` is published — the student's original request carries no extra billing latency. A
-Practice that never reaches `READY` is never settled, whatever internal work it accumulated.
+Both refusal gates (admission minimum and operation hold) return the same stable
+fields, on the SSE `error` event metadata and on the non-stream response:
 
-In enforcing mode, a settlement that cannot be confirmed (insufficient balance, or the credit store
-being unreachable) fails the Practice with `PRACTICE_CREDIT_SETTLEMENT_FAILED` rather than
-publishing a financially successful state on an unconfirmed debit. Dry run always calculates and
-always continues to `READY`. An unpriced call on the accepted path blocks the debit and leaves the
-questions delivered — never a guessed charge.
+```text
+code: INSUFFICIENT_CREDITS   retryable: false   action: ADD_CREDITS
+requiredCredits: <int, when known>   availableCredits: <int, when known>
+```
 
-## Failure behaviour
+The streamed label is "Not enough credits to continue. Add credits and try
+again." Store, IAM, validation, uncertain-transaction and pricing-incomplete
+failures keep their own codes and never carry `action: ADD_CREDITS`.
 
-| Outcome | Debit |
-|---|---|
-| Accepted fresh answer | Calculated credits |
-| Auth failure, invalid request, generation failure, quality-gate failure, clarification | 0 |
-| Practice launch turn (`practice_generation_started`) | 0 — the Practice operation settles separately, once, at `READY` |
-| Replay / reconnect / zero LLM calls | 0 (guarded by `llm_call_count > 0`) |
-| Zero provider cost | 0 |
-| Unpriced model in the operation | 0, and `student_credit_pricing_incomplete` at ERROR — never guessed, never silently zero |
-| Insufficient balance at settlement | 0, typed `INSUFFICIENT_CREDITS`, wallet untouched |
-| Credit store unavailable at settlement | 0. The delivered answer is never retracted. |
+The existing `useCreditErrorHandler` and `InsufficientCreditsModal` handle
+canonical `INSUFFICIENT_CREDITS` in the Doubt/Practice request surface. No new
+modal or purchase route exists. The hook labels detected Practice requests as
+`AI_MOCK_TEST`; other Doubt requests use `AI_CHAT`.
 
-## Pricing coverage requirement
+Safe request-summary fields include preflight, authorization status and amount,
+actual calculated credits, captured/released credits, settlement status,
+overage flag, and idempotent replay flag. The only stored/logged user reference
+is the existing non-reversible hash; logged `reference_id` values hash their
+embedded user segment. An `unavailable` settlement also logs `exception_type`,
+`aws_error_code`, `transaction_cancelled` and `cancellation_reason_codes`.
 
-`tests/test_student_credit_pricing_coverage.py` asserts that every billable model an active
-production route can reach — after `model_registry_env` overlays, including provider-failure
-fallback chains — resolves to a reviewed rate. **This test is currently red and must be green
-before `STUDENT_CREDIT_DRY_RUN` is set to `false`.** An unpriced model must never become a
-zero-cost charge.
+## Validation
 
-Coverage is a property of a deployment, not of the YAML file: deployment names come from
-environment variables, so the check must run against the target environment.
+`app/tests/test_student_credits.py` proves authorization atomicity,
+same-reference execution exclusion, concurrency, effective-count policy,
+normal/zero/overage settlement, exact-once release, and dry run. Adjacent Doubt
+stream, Practice worker, configuration, telemetry, and adversarial review tests
+validate their respective boundaries.
 
-## Redis
-
-Not used and not required. DynamoDB is the sole authority for both balance and settlement. A future
-Redis layer may cache *displayed* balance only; it must never become authoritative for a debit.
-
-## Known v1 limitations
-
-- **Concurrency.** Two simultaneous operations on a thin balance may both generate. The first
-  settles; the second is refused with `INSUFFICIENT_CREDITS` after its answer has already streamed.
-  Wallet correctness is preserved; provider spend is wasted. No reservations by design.
-- **Streamed content is not retracted.** Progressive chunks may already be visible when settlement
-  fails. Only the terminal event reflects the failure.
-- **Client disconnect before the terminal event.** Generation completes but settlement never runs,
-  so the operation is not charged.
-- **Persistence precedes settlement.** If settlement then refuses, the turn is durable and a retry
-  replays it free. Under-charge only; never a double charge.
-- **Legacy doubt path is not integrated.** Settlement is wired into the orchestrated paths only;
-  `ENABLE_ORCHESTRATED_DOUBT_SOLVER=true` is therefore a financial precondition.
-- **Unmetered spend.** Bedrock Titan embeddings and web search never reach `record_llm_call` and are
-  not billed to the student.
-
-## Tests
-
-| File | Covers |
-|---|---|
-| `app/tests/test_student_credits.py` | Calculation, settlement, idempotency, concurrency, dry run, repository contract. |
-| `app/tests/test_student_credit_review.py` | Adversarial: triple settle, concurrent CREDIT during DEBIT, cross-wallet attempts, dry-run outage, formula reconciliation against exact rational arithmetic. |
-| `app/tests/test_student_credit_stream_integration.py` | Terminal ordering, plug-out, typed refusal, outage tolerance. |
-| `app/tests/test_student_credit_config.py` | Startup validation and fail-fast. |
-| `app/tests/test_student_credit_pricing_coverage.py` | The release gate. |
-| `app/tests/test_practice_credit_charging.py` | Practice chargeable-path selection, settlement, replay, boundaries. |
+Dev-only live qualification remains required before setting
+`STUDENT_CREDIT_DRY_RUN=false`. Production stays unchanged.

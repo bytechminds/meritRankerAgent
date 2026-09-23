@@ -80,6 +80,7 @@ class _NoPersistenceExpected:
 def _reset_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ANSWER_VERIFIER_ENABLED", "true")
     monkeypatch.setenv("ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS", "1")
+    monkeypatch.setenv("ANSWER_RECOVERY_ENABLED", "false")
     monkeypatch.setenv("ANSWER_REPLAY_MAX_CHUNK_CHARS", "20")
     cfg_module._settings = None
     yield

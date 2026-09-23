@@ -29,7 +29,7 @@ The four V1 planning documents are complete and implementation is done:
 | Implementation Plan (SA) | `skills/features/doubt-solver-v1-implementation-plan.md` |
 | AI Architecture Plan (AI SA) | `skills/features/doubt-solver-v1-ai-architecture-plan.md` |
 
-**Last updated:** 2026-09-18
+**Last updated:** 2026-09-21
 
 ---
 
@@ -225,8 +225,11 @@ also enables diagnosis, so recovery can never run without one.
   With recovery disabled the decision is still recorded as `RECOVERY_DECISION_SHADOW`.
 - Applies to the streamed verified path. The non-streaming graph keeps its Phase 0 behavior
   (diagnosis and shadow decision, no recovery).
-- Known bound: the fresh candidate cannot spend a presentation rewrite the request already
-  used, so a presentation-heavy regeneration fails closed with `ANSWER_QUALITY_FAILED`.
+- **Presentation-recovery handoff:** a verifier-driven regeneration carries its existing recovery
+  instruction to generator finalization. If that fresh candidate fails only presentation checks,
+  finalization retains it as `failed_quality_gate` input for the already-required final verifier;
+  it cannot spend another rewrite or candidate-recovery slot. Only MATCH makes it deliverable.
+  Any non-presentation quality failure still ends `ANSWER_QUALITY_FAILED`.
 
 ---
 

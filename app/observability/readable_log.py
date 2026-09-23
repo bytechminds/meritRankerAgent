@@ -1187,11 +1187,20 @@ def format_request_block(
             summary.credit_admission,
             summary.credit_settlement,
             summary.credit_calculated,
+            summary.credit_authorization_status,
         )
     ):
         lines.append("CREDITS")
         lines.append(_line(f"Mode: {summary.credit_mode or 'unknown'}"))
         lines.append(_line(f"Admission: {summary.credit_admission or 'not_applicable'}"))
+        lines.append(
+            _line(
+                "Authorization: "
+                + (summary.credit_authorization_status or "not_applicable")
+            )
+        )
+        if summary.credit_authorization_credits is not None:
+            lines.append(_line(f"Authorized: {summary.credit_authorization_credits}"))
         if summary.credit_balance is not None:
             lines.append(_line(f"Balance: {summary.credit_balance}"))
         lines.append(
@@ -1205,6 +1214,7 @@ def format_request_block(
             )
         )
         lines.append(_line(f"Settlement: {summary.credit_settlement or 'not_applicable'}"))
+        lines.append(_line(f"Released: {summary.credit_released_credits or 0}"))
         lines.append(_line(f"Debit: {summary.credits_debited or 0}"))
     lines.append("PERSISTENCE")
     for event in events:

@@ -1,18 +1,8 @@
-"""Authoritative DynamoDB access for the student wallet and its debit ledger.
-
-Two operations only, mirroring the reviewed backend debit precedent:
-
-* one ``GetItem`` on ``UserCredits`` for admission;
-* one ``TransactWriteItems`` that writes the deterministic ledger row and
-  decrements the wallet, or does neither.
-
-The runtime never creates a wallet row and never writes any other attribute.
-"""
+"""Authoritative DynamoDB access for the student wallet and credit ledger."""
 
 from __future__ import annotations
 
 import json
-import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,11 +15,12 @@ from services.student_credits.errors import (
     StudentCreditRepositoryError,
 )
 
-logger = logging.getLogger(__name__)
-
 LEDGER_DIRECTION_DEBIT = "DEBIT"
 LEDGER_SOURCE_FEATURE = "FEATURE"
 _LEDGER_TYPENAME = "CreditLedger"
+_AUTHORIZED = "AUTHORIZED"
+_SETTLED = "SETTLED"
+_RELEASED = "RELEASED"
 _CONDITIONAL_CHECK_FAILED = "ConditionalCheckFailed"
 _LEDGER_ITEM_INDEX = 0
 _WALLET_ITEM_INDEX = 1
@@ -53,6 +44,24 @@ def _number(value: Any) -> int | None:
 
 def _text(value: Any) -> str | None:
     return value.get("S") if isinstance(value, dict) else None
+
+
+def _metadata(item: dict[str, Any]) -> dict[str, Any]:
+    raw = _text(item.get("metadata"))
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _authorization_credits(item: dict[str, Any]) -> int:
+    configured = _metadata(item).get("authorizationCredits")
+    if isinstance(configured, int) and configured >= 0:
+        return configured
+    return _number(item.get("amount")) or 0
 
 
 class StudentCreditRepository:
@@ -95,21 +104,16 @@ class StudentCreditRepository:
         )
 
     def read_settlement(self, reference_id: str) -> int | None:
-        """Return the debited amount of an existing settlement, if any."""
-        try:
-            response = self._client.get_item(
-                TableName=self._credit_ledger_table,
-                Key={"ledgerId": {"S": reference_id}},
-                ConsistentRead=True,
-            )
-        except (BotoCoreError, ClientError) as exc:
-            raise StudentCreditRepositoryError("Student credit ledger read failed.") from exc
-        item = response.get("Item")
+        """Return a settled debit, never a temporary authorization."""
+        item = self._read_ledger(reference_id)
         if not item:
+            return None
+        state = _text(item.get("authorizationState"))
+        if state not in {None, _SETTLED}:
             return None
         return _number(item.get("amount"))
 
-    def settle(
+    def authorize(
         self,
         *,
         reference_id: str,
@@ -117,17 +121,12 @@ class StudentCreditRepository:
         credits: int,
         feature_key: str,
         metadata: dict[str, Any],
-    ) -> None:
-        """Write the ledger row and decrement the wallet atomically.
-
-        Raises:
-            StudentCreditLedgerConflictError: The reference is already settled.
-            InsufficientStudentCreditsError: Wallet missing or balance too low.
-            StudentCreditRepositoryError: The transaction could not be attempted.
-        """
+    ) -> tuple[str, int]:
+        """Atomically hold the configured maximum student charge exactly once."""
         if credits <= 0:
-            raise ValueError("settle requires a positive credit amount")
+            raise ValueError("authorize requires a positive credit amount")
         now = _now()
+        ledger_metadata = {**metadata, "authorizationCredits": credits}
         try:
             self._client.transact_write_items(
                 TransactItems=[
@@ -142,7 +141,8 @@ class StudentCreditRepository:
                                 "source": {"S": LEDGER_SOURCE_FEATURE},
                                 "featureKey": {"S": feature_key},
                                 "referenceId": {"S": reference_id},
-                                "metadata": {"S": json.dumps(metadata, sort_keys=True)},
+                                "authorizationState": {"S": _AUTHORIZED},
+                                "metadata": {"S": json.dumps(ledger_metadata, sort_keys=True)},
                                 "createdAt": {"S": now},
                                 "__typename": {"S": _LEDGER_TYPENAME},
                             },
@@ -150,66 +150,327 @@ class StudentCreditRepository:
                             "ExpressionAttributeNames": {"#ledgerId": "ledgerId"},
                         }
                     },
-                    {
-                        "Update": {
-                            "TableName": self._user_credits_table,
-                            "Key": {"userId": {"S": user_id}},
-                            "UpdateExpression": (
-                                "SET #lastReferenceId = :referenceId, #updatedAt = :updatedAt "
-                                "ADD #creditsBalance :debit, #version :one"
-                            ),
-                            "ConditionExpression": (
-                                "attribute_exists(#userId) AND #creditsBalance >= :credits"
-                            ),
-                            "ExpressionAttributeNames": {
-                                "#userId": "userId",
-                                "#creditsBalance": "creditsBalance",
-                                "#lastReferenceId": "lastReferenceId",
-                                "#updatedAt": "updatedAt",
-                                "#version": "version",
-                            },
-                            "ExpressionAttributeValues": {
-                                ":referenceId": {"S": reference_id},
-                                ":updatedAt": {"S": now},
-                                ":debit": {"N": str(-credits)},
-                                ":credits": {"N": str(credits)},
-                                ":one": {"N": "1"},
-                            },
-                        }
-                    },
+                    self._wallet_update(
+                        user_id=user_id,
+                        reference_id=reference_id,
+                        now=now,
+                        credits_delta=-credits,
+                        require_balance=credits,
+                    ),
                 ]
             )
         except ClientError as exc:
-            self._raise_for_cancellation(exc, reference_id=reference_id, credits=credits)
-            raise StudentCreditRepositoryError("Student credit settlement failed.") from exc
+            return self._recover_authorization(
+                exc,
+                reference_id=reference_id,
+                user_id=user_id,
+                feature_key=feature_key,
+                credits=credits,
+            )
+        except BotoCoreError as exc:
+            raise StudentCreditRepositoryError("Student credit authorization failed.") from exc
+        return "authorized", credits
+
+    def settle_authorization(
+        self,
+        *,
+        reference_id: str,
+        user_id: str,
+        actual_credits: int,
+        metadata: dict[str, Any],
+    ) -> tuple[str, int, int, int]:
+        """Capture a measured debit and atomically return an unused authorization."""
+        if actual_credits < 0:
+            raise ValueError("actual_credits cannot be negative")
+        item = self._require_ledger(reference_id, user_id)
+        state = _text(item.get("authorizationState"))
+        authorized = _authorization_credits(item)
+        if state is None or state == _SETTLED:
+            return "already_settled", _number(item.get("amount")) or 0, 0, authorized
+        if state == _RELEASED:
+            return "already_released", 0, 0, authorized
+        if state != _AUTHORIZED:
+            raise StudentCreditRepositoryError("Student credit ledger state is invalid.")
+
+        captured = min(actual_credits, authorized)
+        released = authorized - captured
+        now = _now()
+        settled_metadata = {
+            **_metadata(item),
+            **metadata,
+            "authorizationCredits": authorized,
+            "actualCalculatedCredits": actual_credits,
+            "capturedCredits": captured,
+            "releasedCredits": released,
+        }
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._credit_ledger_table,
+                            "Key": {"ledgerId": {"S": reference_id}},
+                            "UpdateExpression": (
+                                "SET #amount = :captured, #authorizationState = :settled, "
+                                "#metadata = :metadata, #updatedAt = :updatedAt"
+                            ),
+                            "ConditionExpression": (
+                                "#userId = :userId AND #authorizationState = :authorized "
+                                "AND #amount = :authorizedCredits"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#amount": "amount",
+                                "#authorizationState": "authorizationState",
+                                "#metadata": "metadata",
+                                "#updatedAt": "updatedAt",
+                                "#userId": "userId",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":captured": {"N": str(captured)},
+                                ":settled": {"S": _SETTLED},
+                                ":metadata": {"S": json.dumps(settled_metadata, sort_keys=True)},
+                                ":updatedAt": {"S": now},
+                                ":userId": {"S": user_id},
+                                ":authorized": {"S": _AUTHORIZED},
+                                ":authorizedCredits": {"N": str(authorized)},
+                            },
+                        }
+                    },
+                    self._wallet_update(
+                        user_id=user_id,
+                        reference_id=reference_id,
+                        now=now,
+                        credits_delta=released,
+                    ),
+                ]
+            )
+        except ClientError as exc:
+            return self._recover_terminal_transition(
+                exc,
+                reference_id=reference_id,
+                user_id=user_id,
+                authorized=authorized,
+                action="settlement",
+            )
         except BotoCoreError as exc:
             raise StudentCreditRepositoryError("Student credit settlement failed.") from exc
+        return "settled", captured, released, authorized
 
-    def _raise_for_cancellation(
+    def release_authorization(
+        self,
+        *,
+        reference_id: str,
+        user_id: str,
+        metadata: dict[str, Any],
+    ) -> tuple[str, int, int]:
+        """Return an abandoned authorization once, with no debit left behind."""
+        item = self._read_ledger(reference_id)
+        if item is None:
+            return "skipped_no_authorization", 0, 0
+        self._validate_ledger(item, user_id)
+        state = _text(item.get("authorizationState"))
+        authorized = _authorization_credits(item)
+        if state == _SETTLED or state is None:
+            return "already_settled", 0, authorized
+        if state == _RELEASED:
+            return "already_released", 0, authorized
+        if state != _AUTHORIZED:
+            raise StudentCreditRepositoryError("Student credit ledger state is invalid.")
+
+        now = _now()
+        released_metadata = {
+            **_metadata(item),
+            **metadata,
+            "authorizationCredits": authorized,
+            "capturedCredits": 0,
+            "releasedCredits": authorized,
+        }
+        try:
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Update": {
+                            "TableName": self._credit_ledger_table,
+                            "Key": {"ledgerId": {"S": reference_id}},
+                            "UpdateExpression": (
+                                "SET #amount = :zero, #authorizationState = :released, "
+                                "#metadata = :metadata, #updatedAt = :updatedAt"
+                            ),
+                            "ConditionExpression": (
+                                "#userId = :userId AND #authorizationState = :authorized "
+                                "AND #amount = :authorizedCredits"
+                            ),
+                            "ExpressionAttributeNames": {
+                                "#amount": "amount",
+                                "#authorizationState": "authorizationState",
+                                "#metadata": "metadata",
+                                "#updatedAt": "updatedAt",
+                                "#userId": "userId",
+                            },
+                            "ExpressionAttributeValues": {
+                                ":zero": {"N": "0"},
+                                ":released": {"S": _RELEASED},
+                                ":metadata": {"S": json.dumps(released_metadata, sort_keys=True)},
+                                ":updatedAt": {"S": now},
+                                ":userId": {"S": user_id},
+                                ":authorized": {"S": _AUTHORIZED},
+                                ":authorizedCredits": {"N": str(authorized)},
+                            },
+                        }
+                    },
+                    self._wallet_update(
+                        user_id=user_id,
+                        reference_id=reference_id,
+                        now=now,
+                        credits_delta=authorized,
+                    ),
+                ]
+            )
+        except ClientError as exc:
+            status, _, _, _ = self._recover_terminal_transition(
+                exc,
+                reference_id=reference_id,
+                user_id=user_id,
+                authorized=authorized,
+                action="release",
+            )
+            return status, 0, authorized
+        except BotoCoreError as exc:
+            raise StudentCreditRepositoryError("Student credit release failed.") from exc
+        return "released", authorized, authorized
+
+    def _read_ledger(self, reference_id: str) -> dict[str, Any] | None:
+        try:
+            response = self._client.get_item(
+                TableName=self._credit_ledger_table,
+                Key={"ledgerId": {"S": reference_id}},
+                ConsistentRead=True,
+            )
+        except (BotoCoreError, ClientError) as exc:
+            raise StudentCreditRepositoryError("Student credit ledger read failed.") from exc
+        item = response.get("Item")
+        return item if isinstance(item, dict) else None
+
+    def _require_ledger(self, reference_id: str, user_id: str) -> dict[str, Any]:
+        item = self._read_ledger(reference_id)
+        if item is None:
+            raise StudentCreditRepositoryError("Student credit authorization is missing.")
+        self._validate_ledger(item, user_id)
+        return item
+
+    def _validate_ledger(self, item: dict[str, Any], user_id: str) -> None:
+        if _text(item.get("userId")) != user_id:
+            raise StudentCreditLedgerConflictError(
+                "Student credit reference belongs to another user."
+            )
+
+    def _recover_authorization(
         self,
         exc: ClientError,
         *,
         reference_id: str,
+        user_id: str,
+        feature_key: str,
         credits: int,
-    ) -> None:
-        error = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
-        if error.get("Code") != "TransactionCanceledException":
-            return
-        reasons = exc.response.get("CancellationReasons") or []
-        codes = [
-            reason.get("Code") if isinstance(reason, dict) else None for reason in reasons
-        ]
-
-        def failed(index: int) -> bool:
-            return len(codes) > index and codes[index] == _CONDITIONAL_CHECK_FAILED
-
-        # The ledger condition is checked first so a duplicate settlement is
-        # reported as already-settled even when the balance has since dropped.
-        if failed(_LEDGER_ITEM_INDEX):
-            raise StudentCreditLedgerConflictError(
-                f"Student credit reference already settled: {reference_id}"
-            ) from exc
-        if failed(_WALLET_ITEM_INDEX):
+    ) -> tuple[str, int]:
+        if not self._transaction_cancelled(exc):
+            raise StudentCreditRepositoryError("Student credit authorization failed.") from exc
+        if self._transaction_item_failed(exc, _LEDGER_ITEM_INDEX):
+            item = self._require_ledger(reference_id, user_id)
+            if _text(item.get("featureKey")) != feature_key:
+                raise StudentCreditLedgerConflictError(
+                    "Student credit reference belongs to another operation."
+                ) from exc
+            state = _text(item.get("authorizationState"))
+            if state == _AUTHORIZED:
+                return "already_authorized", _authorization_credits(item)
+            if state == _SETTLED or state is None:
+                return "already_settled", _authorization_credits(item)
+            if state == _RELEASED:
+                return "already_released", _authorization_credits(item)
+            raise StudentCreditRepositoryError("Student credit ledger state is invalid.") from exc
+        if self._transaction_item_failed(exc, _WALLET_ITEM_INDEX):
             raise InsufficientStudentCreditsError(
                 f"Student wallet cannot cover {credits} credits."
             ) from exc
+        item = self._read_ledger(reference_id)
+        if item is not None:
+            self._validate_ledger(item, user_id)
+            return "already_authorized", _authorization_credits(item)
+        raise StudentCreditRepositoryError("Student credit authorization failed.") from exc
+
+    def _recover_terminal_transition(
+        self,
+        exc: ClientError,
+        *,
+        reference_id: str,
+        user_id: str,
+        authorized: int,
+        action: str,
+    ) -> tuple[str, int, int, int]:
+        if not self._transaction_cancelled(exc):
+            raise StudentCreditRepositoryError(f"Student credit {action} failed.") from exc
+        item = self._require_ledger(reference_id, user_id)
+        state = _text(item.get("authorizationState"))
+        if state is None or state == _SETTLED:
+            return "already_settled", _number(item.get("amount")) or 0, 0, authorized
+        if state == _RELEASED:
+            return "already_released", 0, 0, authorized
+        raise StudentCreditRepositoryError(f"Student credit {action} failed.") from exc
+
+    def _wallet_update(
+        self,
+        *,
+        user_id: str,
+        reference_id: str,
+        now: str,
+        credits_delta: int,
+        require_balance: int | None = None,
+    ) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            ":referenceId": {"S": reference_id},
+            ":updatedAt": {"S": now},
+            ":one": {"N": "1"},
+        }
+        update = "SET #lastReferenceId = :referenceId, #updatedAt = :updatedAt ADD #version :one"
+        if credits_delta:
+            values[":creditsDelta"] = {"N": str(credits_delta)}
+            update += ", #creditsBalance :creditsDelta"
+        condition = "attribute_exists(#userId)"
+        if require_balance is not None:
+            values[":requiredCredits"] = {"N": str(require_balance)}
+            condition += " AND #creditsBalance >= :requiredCredits"
+        names = {
+            "#userId": "userId",
+            "#lastReferenceId": "lastReferenceId",
+            "#updatedAt": "updatedAt",
+            "#version": "version",
+        }
+        # DynamoDB rejects any declared name the expressions do not use. A settlement
+        # that captures its whole authorization releases nothing, so the balance is
+        # untouched — declaring it anyway failed every such settlement validation.
+        if credits_delta or require_balance is not None:
+            names["#creditsBalance"] = "creditsBalance"
+        return {
+            "Update": {
+                "TableName": self._user_credits_table,
+                "Key": {"userId": {"S": user_id}},
+                "UpdateExpression": update,
+                "ConditionExpression": condition,
+                "ExpressionAttributeNames": names,
+                "ExpressionAttributeValues": values,
+            }
+        }
+
+    @staticmethod
+    def _transaction_cancelled(exc: ClientError) -> bool:
+        error = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
+        return error.get("Code") == "TransactionCanceledException"
+
+    @staticmethod
+    def _transaction_item_failed(exc: ClientError, index: int) -> bool:
+        reasons = exc.response.get("CancellationReasons") or []
+        if len(reasons) <= index:
+            return False
+        reason = reasons[index]
+        return isinstance(reason, dict) and reason.get("Code") == _CONDITIONAL_CHECK_FAILED

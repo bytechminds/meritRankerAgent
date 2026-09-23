@@ -35,6 +35,7 @@ from features.practice_generation.schemas import (
     PracticeLaunchDecision,
     PracticeType,
     QuestionType,
+    RequestedPracticeConstraint,
     VerificationPolicy,
 )
 from observability.events import log_event
@@ -191,6 +192,12 @@ class PracticeRequestCountError(ValueError):
     """Raised when an explicit Practice request is outside the supported range."""
 
     reason_code = "PRACTICE_REQUEST_COUNT_OUT_OF_RANGE"
+
+
+class PracticeRequestConstraintCountError(PracticeRequestCountError):
+    """Raised when one question per accepted constraint cannot fit the request."""
+
+    reason_code = "PRACTICE_REQUEST_CONSTRAINT_COUNT_INFEASIBLE"
 
 
 def practice_async_unavailable_message(language: str) -> str:
@@ -938,6 +945,11 @@ def resolve_practice_request(
                     candidate,
                     target_count=accepted_count,
                 )
+    trusted_constraints = _interpreted_constraints(intelligence)
+    if trusted_constraints and accepted_count < len(trusted_constraints):
+        raise PracticeRequestConstraintCountError(
+            PracticeRequestConstraintCountError.reason_code
+        )
     display_topic = topic or subject.replace("_", " ").title()
     title = f"{display_topic} {practice_type.value.replace('_', ' ').title()}"
     return PracticeGenerationRequest(
@@ -953,6 +965,7 @@ def resolve_practice_request(
         subject=subject,
         topic=topic,
         topics=topics,
+        trusted_constraints=trusted_constraints,
         difficulty=normalized_difficulty,
         mixed_difficulty_requested=mixed_difficulty_requested,
         explicit_difficulty_requested=explicit_difficulty_requested,
@@ -1009,6 +1022,23 @@ def _interpreted_topics(
     """Return the explicitly requested topic names, or None for a broad request."""
     names = [topic.normalized_name for topic in intelligence.topics]
     return names or None
+
+
+def _interpreted_constraints(
+    intelligence: PracticeRequestIntelligence | None,
+) -> tuple[RequestedPracticeConstraint, ...]:
+    """Keep only accepted explicit subject identities, never provider internals."""
+    if intelligence is None:
+        return ()
+    return tuple(
+        RequestedPracticeConstraint(
+            subject_id=topic.subject_id,
+            topic_id=_canonical_fallback_topic(topic.normalized_name),
+            source_text=topic.source_text,
+        )
+        for topic in intelligence.topics
+        if topic.subject_id is not None
+    )
 
 
 def _interpreted_distribution(
@@ -1276,10 +1306,14 @@ def _trusted_topic_constraints(request: PracticeGenerationRequest) -> tuple[str,
     broad label as a constraint is what silently widened a specific request into a
     subject-wide one.
     """
+    if request.trusted_constraints:
+        return tuple(constraint.topic_id for constraint in request.trusted_constraints)
     return tuple(value for value in (request.topics or ()) if value.strip())
 
 
 def _requested_topic_ids(request: PracticeGenerationRequest) -> tuple[str, ...]:
+    if request.trusted_constraints:
+        return tuple(constraint.topic_id for constraint in request.trusted_constraints)
     if request.topics:
         # An explicitly requested topic set is already separated, so it is used as
         # given rather than re-split out of a single delimited label.
@@ -1300,6 +1334,50 @@ def _requested_topic_ids(request: PracticeGenerationRequest) -> tuple[str, ...]:
     if not topics:
         raise ValueError("PRACTICE_FALLBACK_TOPIC_INVALID")
     return topics
+
+
+def _trusted_subject_by_topic(request: PracticeGenerationRequest) -> dict[str, str]:
+    return {
+        constraint.topic_id: constraint.subject_id
+        for constraint in request.trusted_constraints
+    }
+
+
+def trusted_constraint_references(
+    request: PracticeGenerationRequest,
+) -> tuple[tuple[str, RequestedPracticeConstraint], ...]:
+    """Return request-scoped, deterministic identities for trusted constraints."""
+    references = tuple(
+        (f"tc-{index:03d}", constraint)
+        for index, constraint in enumerate(request.trusted_constraints, start=1)
+    )
+    identities = {
+        (constraint.subject_id, constraint.topic_id)
+        for _reference, constraint in references
+    }
+    if len(identities) != len(references):
+        raise ValueError("PRACTICE_TRUSTED_CONSTRAINT_DUPLICATE")
+    return references
+
+
+def _validate_trusted_slot_composition(
+    blueprint: PracticeBlueprint,
+    request: PracticeGenerationRequest,
+) -> None:
+    references = dict(trusted_constraint_references(request))
+    referenced: set[str] = set()
+    for slot in blueprint.slots:
+        reference = slot.constraint_ref
+        constraint = references.get(reference or "")
+        if constraint is None:
+            raise ValueError("PLANNER_SLOT_CONSTRAINT_REF_INVALID")
+        referenced.add(reference)
+        if slot.subject_id != constraint.subject_id:
+            raise ValueError("PLANNER_SLOT_SUBJECT_MISMATCH")
+        if slot.topic_id != constraint.topic_id:
+            raise ValueError("PLANNER_SLOT_TOPIC_MISMATCH")
+    if request.accepted_count >= len(references) and referenced != set(references):
+        raise ValueError("PLANNER_SLOT_CONSTRAINT_COVERAGE_INVALID")
 
 
 def _verification_policy(
@@ -1363,6 +1441,8 @@ def apply_system_bucket_policy(
             else None
         )
         requested_subject = request.subject.casefold().replace("-", "_").replace(" ", "_")
+        trusted_constraints = bool(request.trusted_constraints)
+        trusted_subjects = _trusted_subject_by_topic(request)
         requested_topics = set(_requested_topic_ids(request))
         planned_topics = {slot.topic_id for slot in blueprint.slots}
         # Feasibility-aware coverage, not weaker coverage. One slot carries one
@@ -1370,7 +1450,9 @@ def apply_system_bucket_policy(
         # all; demanding it rejected every such blueprint outright. Above the
         # boundary the original requirement is unchanged; below it the plan must
         # still draw only from the requested topics, so no topic is ever invented.
-        if request.accepted_count >= len(requested_topics):
+        if trusted_constraints:
+            _validate_trusted_slot_composition(blueprint, request)
+        elif request.accepted_count >= len(requested_topics):
             # The classifier may answer one broad label for a request that named
             # several specific topics; requiring that label as a slot topic would
             # erase the student's composition. Grounded evidence is what replaces it:
@@ -1389,7 +1471,15 @@ def apply_system_bucket_policy(
             if slot.question_type is not QuestionType.MCQ:
                 raise ValueError("PLAYER_UNSUPPORTED_QUESTION_TYPE")
             if (
-                requested_subject not in {"general", "other"}
+                not trusted_constraints
+                and slot.topic_id in trusted_subjects
+                and slot.subject_id != trusted_subjects[slot.topic_id]
+            ):
+                raise ValueError("PLANNER_SLOT_SUBJECT_MISMATCH")
+            if (
+                not trusted_constraints
+                and not trusted_subjects
+                and requested_subject not in {"general", "other"}
                 and slot.subject_id != requested_subject
             ):
                 raise ValueError("PLANNER_SLOT_SUBJECT_MISMATCH")
@@ -1419,7 +1509,9 @@ def apply_system_bucket_policy(
 def deterministic_blueprint(
     request: PracticeGenerationRequest,
 ) -> PracticeBlueprint:
+    trusted_references = trusted_constraint_references(request)
     topics = _requested_topic_ids(request)
+    trusted_subjects = _trusted_subject_by_topic(request)
     question_type = QuestionType.MCQ
     exam_ids = (
         [request.exam_id.strip().upper().replace("-", "_").replace(" ", "_")]
@@ -1435,9 +1527,28 @@ def deterministic_blueprint(
         slots=[
             PlannerSlot(
                 slot_id=f"slot-{index:03d}",
-                subject_id=request.subject,
-                topic_id=topics[(index - 1) % len(topics)],
-                category_id=topics[(index - 1) % len(topics)],
+                constraint_ref=(
+                    trusted_references[(index - 1) % len(trusted_references)][0]
+                    if trusted_references
+                    else None
+                ),
+                subject_id=(
+                    trusted_references[(index - 1) % len(trusted_references)][1].subject_id
+                    if trusted_references
+                    else trusted_subjects.get(
+                        topics[(index - 1) % len(topics)], request.subject
+                    )
+                ),
+                topic_id=(
+                    trusted_references[(index - 1) % len(trusted_references)][1].topic_id
+                    if trusted_references
+                    else topics[(index - 1) % len(topics)]
+                ),
+                category_id=(
+                    trusted_references[(index - 1) % len(trusted_references)][1].topic_id
+                    if trusted_references
+                    else topics[(index - 1) % len(topics)]
+                ),
                 difficulty=slot_difficulties[index - 1],
                 complexity=_slot_complexity(slot_difficulties[index - 1]),
                 exam_ids=exam_ids,
@@ -1445,7 +1556,11 @@ def deterministic_blueprint(
                 target_skill=f"solve_{topics[(index - 1) % len(topics)]}",
                 variation_hint=f"variant_{index:03d}",
                 generator_route_hint=_generator_route_hint(
-                    request.subject,
+                    (
+                        trusted_references[(index - 1) % len(trusted_references)][1].subject_id
+                        if trusted_references
+                        else request.subject
+                    ),
                     slot_difficulties[index - 1],
                 ),
                 generation_group_hint=min(request.accepted_count, 5),
@@ -1460,6 +1575,11 @@ def parse_blueprint(raw: str, request: PracticeGenerationRequest) -> PracticeBlu
     payload = json.loads(raw)
     if "blueprint" in payload:
         payload = payload["blueprint"]
+    if request.trusted_constraints:
+        # Source evidence was validated before this immutable request was created.
+        # Planner-provided evidence is therefore neither accepted nor needed here.
+        payload = dict(payload)
+        payload["requestedTopicEvidence"] = []
     payload["schema_version"] = "2"
     payload["practice_type"] = request.practice_type.value
     payload["accepted_count"] = request.accepted_count

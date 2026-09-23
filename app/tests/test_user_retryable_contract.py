@@ -131,6 +131,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ANSWER_VERIFIER_ENABLED", "true")
     monkeypatch.setenv("ANSWER_VERIFIER_MAX_REPAIR_ATTEMPTS", "1")
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
+    monkeypatch.setenv("ANSWER_RECOVERY_ENABLED", "false")
     cfg_module._settings = None
     monkeypatch.setattr(
         streaming_module,

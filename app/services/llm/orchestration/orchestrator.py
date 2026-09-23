@@ -290,6 +290,7 @@ class LlmOrchestrator:
         messages: list[LlmMessage],
         continuation_used: bool,
         continuation_attempts: int,
+        allow_presentation_only_verification_handoff: bool,
     ) -> FinalAnswerResult:
         """Validate, optionally rewrite, sanitize, and strip completion marker."""
         rewrite_used = False
@@ -349,6 +350,7 @@ class LlmOrchestrator:
             and quality_policy.rewrite_enabled
             and quality_policy.max_rewrite_attempts >= 1
             and continuation_attempts == 0
+            and not allow_presentation_only_verification_handoff
             and max(count_generator_calls(), 1) < 2
         ):
             rewrite_used = True
@@ -470,9 +472,10 @@ class LlmOrchestrator:
             language=route_request.language,
             policy=quality_policy,
         )
-        if not final_quality.is_valid and not (
-            rewrite_used and is_presentation_only_failure(final_quality)
-        ):
+        presentation_only_retention_allowed = is_presentation_only_failure(final_quality) and (
+            rewrite_used or allow_presentation_only_verification_handoff
+        )
+        if not final_quality.is_valid and not presentation_only_retention_allowed:
             # A rejected answer must never travel on as the authoritative content.
             # Language non-compliance already substituted here; every other final
             # rejection reason used to keep the model text, so callers that read
@@ -482,8 +485,9 @@ class LlmOrchestrator:
             # rewrite_required, and with validation disabled is_valid == compliance.
             #
             # The one exception keeps the text of an answer that still fails only
-            # on presentation after its rewrite. It stays failed_quality_gate, so
-            # only a caller that runs the correctness verifier may continue it.
+            # on presentation after its rewrite or verifier-recovery handoff. It
+            # stays failed_quality_gate, so only a caller that runs the correctness
+            # verifier may continue it.
             final_content = generation_failure_message(route_request.language)
         return build_final_answer_result(
             content=final_content,
@@ -1001,6 +1005,7 @@ class LlmOrchestrator:
                     messages=messages,
                     continuation_used=continuation_used,
                     continuation_attempts=continuation_attempts,
+                    allow_presentation_only_verification_handoff=recovery_instruction is not None,
                 )
                 final_content = final_answer.content
             else:

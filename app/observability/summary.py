@@ -51,7 +51,14 @@ class RequestExecutionSummary:
     credit_mode: str | None = None
     credit_admission: str | None = None
     credit_balance: int | None = None
+    credit_preflight: str | None = None
+    credit_authorization_status: str | None = None
+    credit_authorization_credits: int | None = None
     credit_calculated: int | None = None
+    credit_captured_credits: int | None = None
+    credit_released_credits: int | None = None
+    credit_authorization_exceeded: bool | None = None
+    credit_idempotent_replay: bool | None = None
     credit_settlement: str | None = None
     credits_debited: int | None = None
     terminal_status: Literal["completed", "clarification", "failed", "cancelled"] | None = None

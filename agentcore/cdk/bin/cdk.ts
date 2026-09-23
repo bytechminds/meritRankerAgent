@@ -59,6 +59,11 @@ function runtimeEnvironment(target: AwsDeploymentTarget): Record<string, string>
       true
     ),
     ENABLE_REAL_LLM: booleanEnvironment('ENABLE_REAL_LLM', true),
+    STUDENT_CREDIT_ENFORCEMENT_ENABLED: booleanEnvironment(
+      'STUDENT_CREDIT_ENFORCEMENT_ENABLED',
+      false
+    ),
+    STUDENT_CREDIT_DRY_RUN: booleanEnvironment('STUDENT_CREDIT_DRY_RUN', true),
     PRACTICE_RESOURCE_PARAMETER_ROOT:
       process.env.PRACTICE_RESOURCE_PARAMETER_ROOT?.trim() ||
       '/meritranker/agent-runtime/v1/practice',

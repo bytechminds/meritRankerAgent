@@ -75,6 +75,7 @@ from services.llm.billing import (
 )
 from services.llm.orchestration.orchestrator import LlmOrchestrator
 from services.student_credits import StudentCreditRuntime
+from services.student_credits.runtime import practice_reference_id
 
 logger = logging.getLogger(__name__)
 
@@ -164,11 +165,13 @@ class AgentCorePracticeAsyncLauncher:
         executor: Executor | None = None,
         recovery_stale_seconds: int = 120,
         max_wall_time_seconds: int = 900,
+        student_credits: StudentCreditRuntime | None = None,
     ) -> None:
         self._task_tracker = task_tracker
         self._assessments = assessments
         self._progress = progress
         self._graph_runner = graph_runner
+        self._student_credits = student_credits
         self._recovery_stale_seconds = min(max(recovery_stale_seconds, 30), 3_600)
         self._execution_lease_seconds = min(
             max(self._recovery_stale_seconds, 300),
@@ -506,6 +509,7 @@ class AgentCorePracticeAsyncLauncher:
             self._executor.submit(self._run_tracked, task_id, test_id, execution_id)
         except Exception as exc:
             self._mark_failed(test_id, "PRACTICE_ASYNC_TASK_START_FAILED")
+            self._release_student_credits(test_id, "PRACTICE_ASYNC_TASK_START_FAILED")
             self._finalize_billing(test_id, "failed")
             self._execution_registry.unregister(execution_id)
             release_execution = getattr(self._progress, "release_execution", None)
@@ -548,6 +552,7 @@ class AgentCorePracticeAsyncLauncher:
                 self._closing_test_ids.discard(test_id)
         if task_id is not None:
             self._finalize_billing(test_id, "failed")
+            self._release_student_credits(test_id, code)
             self._task_tracker.complete_async_task(task_id)
             if execution_id is not None:
                 release_execution = getattr(self._progress, "release_execution", None)
@@ -703,6 +708,11 @@ class AgentCorePracticeAsyncLauncher:
                 emit_operation_billing_summary(operation_status=business_status.casefold())
             finally:
                 self._finish_execution(test_id, execution_id)
+            if business_status != "READY":
+                self._release_student_credits(
+                    test_id,
+                    terminal_reason or business_status,
+                )
             try:
                 self._execution_registry.unregister(execution_id)
                 self._discard_active(test_id)
@@ -882,6 +892,41 @@ class AgentCorePracticeAsyncLauncher:
             level=logging.ERROR,
         )
 
+    def _release_student_credits(self, test_id: str, reason: str) -> None:
+        if self._student_credits is None:
+            return
+        try:
+            assessment = self._assessments.get(test_id) or {}
+            request = _meta(assessment).get("practiceRequest")
+            if not isinstance(request, dict):
+                return
+            # The owner lives on the assessment row, as `_request()` reads it; the
+            # persisted request never carries it, so reading it there skipped every
+            # release and left the student's authorization held indefinitely.
+            user_id = str(assessment.get("userId") or "")
+            practice_type = str(request.get("practiceType") or "")
+            if not user_id or not practice_type:
+                logger.error(
+                    "practice credit release skipped test_id=%s owner_present=%s "
+                    "practice_type_present=%s",
+                    test_id,
+                    bool(user_id),
+                    bool(practice_type),
+                )
+                return
+            self._student_credits.release(
+                user_id=user_id,
+                reference_id=practice_reference_id(user_id=user_id, test_id=test_id),
+                feature=feature_for_practice_type(practice_type),
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "practice credit release unavailable test_id=%s error_type=%s",
+                test_id,
+                type(exc).__name__,
+            )
+
     def _discard_active(self, test_id: str) -> None:
         with self._active_lock:
             self._active_test_ids.discard(test_id)
@@ -1023,4 +1068,5 @@ def build_practice_async_launcher(
         graph_runner=PracticeGraphRunner(orchestrator),
         recovery_stale_seconds=config.recovery_stale_seconds,
         max_wall_time_seconds=config.max_wall_time_seconds,
+        student_credits=student_credits,
     )

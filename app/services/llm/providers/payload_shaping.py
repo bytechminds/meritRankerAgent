@@ -47,6 +47,14 @@ def _verifier_schema_builder() -> dict[str, Any]:
     return practice_verifier_generation_schema()
 
 
+def _request_intelligence_schema_builder() -> dict[str, Any]:
+    from schemas.practice_request_intelligence import (  # noqa: PLC0415
+        PRACTICE_REQUEST_INTELLIGENCE_SCHEMA,
+    )
+
+    return PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+
+
 # Gated by the exact prompt path Practice's own _execute() passes, never by task_role
 # or intent alone. Both are shared with Doubt Solver: "generator"/"verifier" also serve
 # answer_generation_adapter.py's free-text answers and answer_correctness.py's/
@@ -68,12 +76,14 @@ _NATIVE_SCHEMA_GENERATOR_PROMPTS = frozenset(
     }
 )
 _NATIVE_SCHEMA_VERIFIER_PROMPTS = frozenset({"practice_generation/question_verifier_v2.md"})
+_REQUEST_INTELLIGENCE_PROMPT = "practice_generation/request_intelligence.md"
 _PLANNER_PROMPT_PREFIX = "practice_generation/planners/"
 
 _NATIVE_RESPONSE_SCHEMA_BUILDERS: dict[str, Callable[[], dict[str, Any]]] = {
     "planner": _planner_schema_builder,
     "generator": _generator_schema_builder,
     "verifier": _verifier_schema_builder,
+    "request_intelligence": _request_intelligence_schema_builder,
 }
 
 
@@ -86,6 +96,8 @@ def _native_schema_builder_for(
         return _NATIVE_RESPONSE_SCHEMA_BUILDERS["generator"]
     if task_role == "verifier" and prompt in _NATIVE_SCHEMA_VERIFIER_PROMPTS:
         return _NATIVE_RESPONSE_SCHEMA_BUILDERS["verifier"]
+    if task_role == "request_intelligence" and prompt == _REQUEST_INTELLIGENCE_PROMPT:
+        return _NATIVE_RESPONSE_SCHEMA_BUILDERS["request_intelligence"]
     return None
 
 

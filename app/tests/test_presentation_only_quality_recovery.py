@@ -197,6 +197,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
     monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
     monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+    monkeypatch.setenv("ANSWER_RECOVERY_ENABLED", "false")
     cfg_module._settings = None
     monkeypatch.setattr(
         streaming_module,
@@ -298,15 +299,6 @@ def test_hard_quality_defects_keep_terminal_quality_failure_without_verification
     assert events[-1].metadata["code"] == "ANSWER_QUALITY_FAILED"
     assert not any(event.type in {"chunk", "complete"} for event in events)
     assert not any(name == "QUALITY_PRESENTATION_ONLY_CONTINUED" for name, _ in logged_events)
-
-
-def test_presentation_only_without_a_prior_rewrite_is_unchanged() -> None:
-    adapter = _AdapterAfterRewrite(DISPLAY_BLOCKS_ONLY, _MATCH, rewrite=False)
-
-    events = _stream(adapter)
-
-    assert adapter.correctness_verifier.calls == 0
-    assert events[-1].metadata["code"] == "ANSWER_QUALITY_FAILED"
 
 
 def test_presentation_only_does_not_continue_where_no_verifier_runs() -> None:
@@ -424,6 +416,20 @@ def test_orchestrator_does_not_retain_presentation_only_content_without_a_rewrit
     assert len(calls) == 1
     assert result.final_answer.quality_status == "failed_quality_gate"
     assert result.final_answer.content != DISPLAY_BLOCKS_ONLY
+
+
+def test_verification_handoff_retains_only_presentation_text_without_usage_telemetry(
+) -> None:
+    handoff, handoff_calls = _orchestrator(DISPLAY_BLOCKS_ONLY + "\n<ANSWER_DONE>")
+    handoff_result = handoff.generate(
+        route_request=_GENERATOR_REQUEST,
+        query=_QUERY,
+        recovery_instruction="Regenerate the candidate independently.",
+    )
+
+    assert handoff_calls == [3]
+    assert handoff_result.final_answer.content == DISPLAY_BLOCKS_ONLY
+    assert handoff_result.final_answer.quality_status == "failed_quality_gate"
 
 
 # ---------------------------------------------------------------------------

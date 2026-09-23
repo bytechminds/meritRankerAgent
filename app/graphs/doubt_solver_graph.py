@@ -41,8 +41,10 @@ from features.practice_generation.planning import (
     PracticeRequestCountError,
     canonical_practice_subject,
     decide_practice_launch,
+    deterministic_test_id,
     practice_async_unavailable_message,
     practice_route_enabled,
+    request_idempotency_key,
     required_fresh_evidence_count,
     resolve_practice_freshness_requirement,
     resolve_practice_request,
@@ -92,8 +94,15 @@ from services.doubt_solver.recovery_policy import (
     shadow_verification_recovery,
 )
 from services.dynamodb_service import DynamoDbConfigurationError, DynamoDbServiceError
+from services.llm.billing import feature_for_practice_type
 from services.query_classifier_service import classify_query
 from services.question_record_service import fetch_question_records_by_ids
+from services.student_credits.errors import InsufficientStudentCreditsError
+from services.student_credits.runtime import (
+    StudentCreditRuntime,
+    doubt_reference_id,
+    practice_reference_id,
+)
 from tools.web_search.models import FreshEvidenceBundle
 
 logger = logging.getLogger(__name__)
@@ -682,6 +691,8 @@ class OrchestratedDoubtSolverState(TypedDict):
     query_classification: dict | None
     source_modality: str
     fresh_evidence: dict | None
+    credit_error: str | None
+    credit_error_details: dict[str, object] | None
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1120,7 @@ def build_orchestrated_doubt_solver_graph(
     conversation_understanding=None,
     practice_launcher: Callable[[PracticeGenerationRequest], PracticeLaunchResult] | None = None,
     practice_request_interpreter: PracticeRequestInterpreter | None = None,
+    student_credits: StudentCreditRuntime | None = None,
 ):
     """Construct and compile the lean Orchestrated Doubt Solver StateGraph.
 
@@ -1287,6 +1299,20 @@ def build_orchestrated_doubt_solver_graph(
                 quality_status="failed_quality_gate",
             )
             return {"answer": answer, "final_answer": final_answer.model_dump()}
+        if student_credits is not None:
+            try:
+                student_credits.authorize_doubt(
+                    user_id=state["actor_id"],
+                    reference_id=doubt_reference_id(
+                        user_id=state["actor_id"],
+                        turn_id=state["turn_id"],
+                    ),
+                )
+            except InsufficientStudentCreditsError as exc:
+                return {
+                    "credit_error": exc.reason_code,
+                    "credit_error_details": exc.client_fields(),
+                }
         try:
             generation_kwargs = {
                 "request_id": state["request_id"],
@@ -1491,6 +1517,7 @@ def build_orchestrated_doubt_solver_graph(
     def _practice_launch_node(state: OrchestratedDoubtSolverState) -> dict:
         if practice_launcher is not None:
             classification = state.get("classification") or {}
+            practice_credit_reference: str | None = None
             try:
                 freshness_requirement = resolve_practice_freshness_requirement(
                     state.get("original_query") or state["query"],
@@ -1538,8 +1565,35 @@ def build_orchestrated_doubt_solver_graph(
                         "source": request.language_source,
                     },
                 )
+                if student_credits is not None:
+                    test_id = deterministic_test_id(request_idempotency_key(request))
+                    practice_credit_reference = practice_reference_id(
+                        user_id=state["actor_id"],
+                        test_id=test_id,
+                    )
+                    student_credits.authorize_practice(
+                        user_id=state["actor_id"],
+                        reference_id=practice_credit_reference,
+                        feature=feature_for_practice_type(request.practice_type.value),
+                        effective_count=request.effective_count,
+                    )
                 launch = practice_launcher(request)
+            except InsufficientStudentCreditsError as exc:
+                return {
+                    "credit_error": exc.reason_code,
+                    "credit_error_details": exc.client_fields(),
+                }
             except (PracticeLaunchError, PracticeRequestCountError):
+                if student_credits is not None and practice_credit_reference is not None:
+                    try:
+                        student_credits.release(
+                            user_id=state["actor_id"],
+                            reference_id=practice_credit_reference,
+                            feature="practice",
+                            reason="practice_launch_failed",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 message = "Practice generation could not be started. Please try again."
                 final = build_final_answer_result(
                     content=message,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from config import get_settings
-from schemas.student_credits import StudentCreditPolicy
 from services.aws_client_factory import get_dynamodb_client
 from services.student_credits.repository import StudentCreditRepository
 from services.student_credits.runtime import StudentCreditRuntime
@@ -18,13 +17,9 @@ def build_student_credit_runtime() -> StudentCreditRuntime | None:
     settings = get_settings()
     if not settings.student_credit_enforcement_enabled:
         return None
-    policy = StudentCreditPolicy(
-        enforcement_enabled=True,
-        dry_run=settings.student_credit_dry_run,
-        credits_per_usd=settings.student_credit_credits_per_usd,
-        target_gross_margin=settings.student_credit_target_gross_margin,
-        rounding_mode=settings.student_credit_rounding_mode,  # type: ignore[arg-type]
-    )
+    policy = settings.student_credit_policy
+    if policy is None:
+        raise RuntimeError("Student credit policy was not loaded while enforcement is enabled.")
     repository = StudentCreditRepository(
         user_credits_table=settings.dynamodb_user_credits_table,
         credit_ledger_table=settings.dynamodb_credit_ledger_table,

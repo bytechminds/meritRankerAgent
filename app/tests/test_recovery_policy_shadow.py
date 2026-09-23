@@ -587,6 +587,8 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ANSWER_DELIVERY_POLICY", "always_verified")
     monkeypatch.setenv("ANSWER_QUALITY_VALIDATION_ENABLED", "true")
     monkeypatch.setenv("ANSWER_QUALITY_REWRITE_ENABLED", "true")
+    monkeypatch.setenv("ANSWER_RECOVERY_ENABLED", "false")
+    monkeypatch.setenv("ANSWER_DIAGNOSIS_SHADOW_ENABLED", "false")
     cfg_module._settings = None
     monkeypatch.setattr(
         streaming_module,

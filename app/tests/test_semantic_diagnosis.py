@@ -402,7 +402,8 @@ def _shadow(adapter: object) -> SemanticDiagnosis | None:
 def test_the_diagnosis_is_off_by_default(
     monkeypatch: pytest.MonkeyPatch, _reset_settings: None
 ) -> None:
-    monkeypatch.delenv("ANSWER_DIAGNOSIS_SHADOW_ENABLED", raising=False)
+    monkeypatch.setenv("ANSWER_DIAGNOSIS_SHADOW_ENABLED", "false")
+    monkeypatch.setenv("ANSWER_RECOVERY_ENABLED", "false")
     adapter = _Adapter(SemanticDiagnosis("CANDIDATE", "WRONG_FINAL_ANSWER", True))
 
     assert _shadow(adapter) is None

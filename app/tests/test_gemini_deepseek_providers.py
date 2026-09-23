@@ -25,7 +25,10 @@ from services.llm.providers.errors import (
     LlmProviderExecutionError,
     LlmProviderResponseError,
 )
-from services.llm.providers.gemini_provider import GeminiProviderAdapter
+from services.llm.providers.gemini_provider import (
+    GeminiProviderAdapter,
+    _active_native_schema_builder,
+)
 from services.llm.providers.openai_compatible_adapter import (
     DeepSeekProviderAdapter,
     classify_gemini_error,
@@ -184,6 +187,25 @@ class TestGeminiDeepSeekConfigDefaults:
 
 
 class TestGeminiAdapterExecution:
+    def test_request_intelligence_uses_the_canonical_native_schema(self, tmp_path: Path) -> None:
+        from schemas.practice_request_intelligence import PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+
+        route = _route_decision(model="gemini_flash_text").model_copy(
+            update={
+                "task_role": "request_intelligence",
+                "prompt": "practice_generation/request_intelligence.md",
+            }
+        )
+        request = _make_request(tmp_path, _GEMINI_YAML, route)
+        schema_builder = _active_native_schema_builder(request)
+        assert schema_builder is not None
+        assert schema_builder() == PRACTICE_REQUEST_INTELLIGENCE_SCHEMA
+
+        other_prompt = request.model_copy(
+            update={"route_decision": route.model_copy(update={"prompt": "other.md"})}
+        )
+        assert _active_native_schema_builder(other_prompt) is None
+
     def test_classifier_uses_native_structured_output_schema(self) -> None:
         captured: dict[str, object] = {}
 

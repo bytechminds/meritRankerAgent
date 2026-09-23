@@ -3,7 +3,7 @@
 The model interprets what the student explicitly asked for; deterministic code
 validates the interpretation and every downstream distribution decision. The
 static JSON Schema below is the exact grammar handed to the provider, so it is
-versioned (``practice_request_intelligence_v4``) and never generated per request.
+versioned (``practice_request_intelligence_v5``) and never generated per request.
 
 Topics are grounded by opaque token id, not by text the model retypes and not by
 numeric range arithmetic. The model is given the query already split into deterministic
@@ -39,11 +39,16 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PRACTICE_REQUEST_INTELLIGENCE_SCHEMA_NAME = "practice_request_intelligence_v4"
+PRACTICE_REQUEST_INTELLIGENCE_SCHEMA_NAME = "practice_request_intelligence_v5"
 
 InterpretationStatus = Literal["RESOLVED", "BROAD", "AMBIGUOUS"]
 DifficultyMode = Literal["UNSPECIFIED", "SINGLE", "MIXED", "CUSTOM"]
 InterpretedDifficulty = Literal["BASIC", "INTERMEDIATE", "ADVANCED"]
+InterpretedSubject = Literal[
+    "math", "reasoning", "science", "history", "geography", "english",
+    "physics", "chemistry", "biology", "computer_science", "economics",
+    "polity", "general", "other",
+]
 
 
 class InterpretedTopic(BaseModel):
@@ -58,6 +63,9 @@ class InterpretedTopic(BaseModel):
 
     token_ids: list[str] = Field(alias="tokenIds")
     normalized_name: str = Field(alias="normalizedName")
+    # Required and nullable on the v5 wire grammar: explicit subject families carry
+    # their canonical identity; a topic-only phrase intentionally has no invented one.
+    subject_id: InterpretedSubject | None = Field(default=None, alias="subjectId")
     source_text: str = Field(default="", exclude=True)
 
 
@@ -153,10 +161,10 @@ _DISTRIBUTION_SCHEMA: dict[str, Any] = _closed(
 # is what makes the invalid combinations unrepresentable.
 _DIFFICULTY_SCHEMA: dict[str, Any] = {
     "anyOf": [
-        _closed({"mode": {"const": "UNSPECIFIED"}}, ["mode"]),
+        _closed({"mode": {"type": "string", "const": "UNSPECIFIED"}}, ["mode"]),
         _closed(
             {
-                "mode": {"const": "SINGLE"},
+                "mode": {"type": "string", "const": "SINGLE"},
                 "level": {
                     "type": "string",
                     "enum": ["BASIC", "INTERMEDIATE", "ADVANCED"],
@@ -164,9 +172,12 @@ _DIFFICULTY_SCHEMA: dict[str, Any] = {
             },
             ["mode", "level"],
         ),
-        _closed({"mode": {"const": "MIXED"}}, ["mode"]),
+        _closed({"mode": {"type": "string", "const": "MIXED"}}, ["mode"]),
         _closed(
-            {"mode": {"const": "CUSTOM"}, "distribution": _DISTRIBUTION_SCHEMA},
+            {
+                "mode": {"type": "string", "const": "CUSTOM"},
+                "distribution": _DISTRIBUTION_SCHEMA,
+            },
             ["mode", "distribution"],
         ),
     ]
@@ -185,8 +196,17 @@ PRACTICE_REQUEST_INTELLIGENCE_SCHEMA: dict[str, Any] = _closed(
                 {
                     "tokenIds": {"type": "array", "items": {"type": "string"}},
                     "normalizedName": {"type": "string"},
+                    "subjectId": {
+                        "type": ["string", "null"],
+                        "enum": [
+                            "math", "reasoning", "science", "history", "geography",
+                            "english", "physics", "chemistry", "biology",
+                            "computer_science", "economics", "polity", "general", "other",
+                            None,
+                        ],
+                    },
                 },
-                ["tokenIds", "normalizedName"],
+                ["tokenIds", "normalizedName", "subjectId"],
             ),
         },
         "difficulty": _DIFFICULTY_SCHEMA,

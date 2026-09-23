@@ -5,10 +5,17 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+import yaml
 
 import config as config_module
+import student_credit_policy as policy_module
 from config import ConfigurationError, get_settings
 from services.student_credits.bootstrap import build_student_credit_runtime
+from student_credit_policy import (
+    DEFAULT_STUDENT_CREDIT_POLICY_PATH,
+    StudentCreditPolicyConfigurationError,
+    load_student_credit_policy,
+)
 
 
 def _enable(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
@@ -32,56 +39,133 @@ def test_defaults_disable_enforcement_and_build_no_runtime(
     assert build_student_credit_runtime() is None
 
 
-def test_disabled_enforcement_ignores_invalid_policy(
+def test_disabled_enforcement_does_not_load_credit_policy(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """An unconfigured deployment must keep starting exactly as before."""
     monkeypatch.setenv("STUDENT_CREDIT_ENFORCEMENT_ENABLED", "false")
-    monkeypatch.setenv("CREDITS_PER_USD", "0")
-    monkeypatch.setenv("TARGET_GROSS_MARGIN", "5")
+    monkeypatch.setattr(
+        policy_module,
+        "DEFAULT_STUDENT_CREDIT_POLICY_PATH",
+        tmp_path / "missing-student-credit-policy.yaml",
+    )
     config_module._settings = None
 
-    assert get_settings().student_credit_enforcement_enabled is False
+    settings = get_settings()
+    assert settings.student_credit_enforcement_enabled is False
+    assert settings.student_credit_policy is None
     assert build_student_credit_runtime() is None
 
 
-def test_enabled_enforcement_parses_the_documented_defaults(
+def test_enabled_enforcement_loads_the_versioned_business_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Asserts the documented dry-run default, so an ambient .env value must not leak in.
+    monkeypatch.delenv("STUDENT_CREDIT_DRY_RUN", raising=False)
     _enable(monkeypatch)
     settings = get_settings()
+    policy = settings.student_credit_policy
 
-    assert settings.student_credit_credits_per_usd == Decimal("50")
-    assert settings.student_credit_target_gross_margin == Decimal("0.40")
-    assert settings.student_credit_rounding_mode == "CEIL"
+    assert policy is not None
+    assert policy.credits_per_usd == Decimal("100")
+    assert policy.target_gross_margin == Decimal("0.60")
+    assert policy.rounding_mode == "CEIL"
     assert settings.student_credit_dry_run is True
+    assert policy.doubt_authorization_credits == 5
+    assert policy.practice_min_authorization_credits == 5
+    assert policy.practice_authorization_credits_per_question == 5
 
     runtime = build_student_credit_runtime()
     assert runtime is not None
+    assert runtime.policy == policy
     assert runtime.policy.dry_run is True
-    assert runtime.policy.margin_divisor == Decimal("0.60")
+    assert runtime.policy.margin_divisor == Decimal("0.40")
 
 
 @pytest.mark.parametrize(
-    ("variable", "value", "message"),
+    ("section", "key", "value"),
     [
-        ("CREDITS_PER_USD", "0", "CREDITS_PER_USD must be greater than zero."),
-        ("CREDITS_PER_USD", "-1", "CREDITS_PER_USD must be greater than zero."),
-        ("CREDITS_PER_USD", "abc", "CREDITS_PER_USD must be a decimal number."),
-        ("TARGET_GROSS_MARGIN", "1", "TARGET_GROSS_MARGIN must be at least 0"),
-        ("TARGET_GROSS_MARGIN", "1.5", "TARGET_GROSS_MARGIN must be at least 0"),
-        ("TARGET_GROSS_MARGIN", "-0.1", "TARGET_GROSS_MARGIN must be at least 0"),
-        ("TARGET_GROSS_MARGIN", "x", "TARGET_GROSS_MARGIN must be a decimal number."),
-        ("STUDENT_CREDIT_ROUNDING_MODE", "FLOOR", "must be 'CEIL'"),
+        ("pricing", "target_gross_margin", "1"),
+        ("currency", "usd_to_inr_business_rate", "0"),
+        ("currency", "credit_value_inr", "0"),
+        ("pricing", "rounding_mode", "FLOOR"),
+        ("authorization", "doubt_min_credits", 0),
+        ("authorization", "practice_min_credits", 0),
+        ("authorization", "practice_credits_per_question", 0),
     ],
 )
-def test_invalid_policy_fails_fast(
-    monkeypatch: pytest.MonkeyPatch, variable: str, value: str, message: str
+def test_invalid_versioned_policy_fails_strict_validation(
+    tmp_path,
+    section: str,
+    key: str,
+    value: str | int,
 ) -> None:
-    _enable(monkeypatch, **{variable: value})
+    raw = yaml.safe_load(DEFAULT_STUDENT_CREDIT_POLICY_PATH.read_text(encoding="utf-8"))
+    raw[section][key] = value
+    path = tmp_path / "student_credit_policy.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
-    with pytest.raises(ConfigurationError, match=message):
+    with pytest.raises(StudentCreditPolicyConfigurationError, match="Invalid"):
+        load_student_credit_policy(
+            enforcement_enabled=True,
+            dry_run=True,
+            path=path,
+        )
+
+
+def test_versioned_policy_rejects_an_unknown_version_or_field(tmp_path) -> None:
+    raw = yaml.safe_load(DEFAULT_STUDENT_CREDIT_POLICY_PATH.read_text(encoding="utf-8"))
+    raw["policy_version"] = "student-credit-v2"
+    raw["unexpected"] = True
+    path = tmp_path / "student_credit_policy.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    with pytest.raises(StudentCreditPolicyConfigurationError, match="Invalid"):
+        load_student_credit_policy(
+            enforcement_enabled=True,
+            dry_run=True,
+            path=path,
+        )
+
+
+def test_enabled_enforcement_fails_safely_when_policy_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        policy_module,
+        "DEFAULT_STUDENT_CREDIT_POLICY_PATH",
+        tmp_path / "missing-student-credit-policy.yaml",
+    )
+    _enable(monkeypatch)
+
+    with pytest.raises(ConfigurationError, match="Unable to load student credit policy"):
         get_settings()
+
+
+def test_business_policy_environment_values_do_not_override_the_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(
+        monkeypatch,
+        CREDITS_PER_USD="1",
+        TARGET_GROSS_MARGIN="0",
+        STUDENT_CREDIT_ROUNDING_MODE="FLOOR",
+        STUDENT_CREDIT_DOUBT_AUTHORIZATION_CREDITS="1",
+        STUDENT_CREDIT_PRACTICE_MIN_AUTHORIZATION_CREDITS="1",
+        STUDENT_CREDIT_PRACTICE_AUTHORIZATION_CREDITS_PER_QUESTION="99",
+    )
+
+    policy = get_settings().student_credit_policy
+
+    assert policy is not None
+    assert policy.credits_per_usd == Decimal("100")
+    assert policy.target_gross_margin == Decimal("0.60")
+    assert policy.rounding_mode == "CEIL"
+    assert policy.doubt_authorization_credits == 5
+    assert policy.practice_min_authorization_credits == 5
+    assert policy.practice_authorization_credits_per_question == 5
 
 
 @pytest.mark.parametrize(
@@ -183,12 +267,6 @@ def test_dry_run_still_requires_resolvable_table_identity(
 
     with pytest.raises(ConfigurationError, match="DYNAMODB_USER_CREDITS_TABLE is required"):
         get_settings()
-
-
-def test_margin_boundary_zero_is_valid(monkeypatch: pytest.MonkeyPatch) -> None:
-    _enable(monkeypatch, TARGET_GROSS_MARGIN="0")
-
-    assert get_settings().student_credit_target_gross_margin == Decimal("0")
 
 
 def test_real_debit_requires_dry_run_to_be_turned_off(

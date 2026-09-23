@@ -580,6 +580,18 @@ class TestUnusableInterpretations:
         assert request.topics is None
         assert request.difficulty_distribution is None
 
+    def test_conflicting_explicit_totals_are_ambiguous(self) -> None:
+        query = "Create 10 questions, actually make it 20 questions from Geography"
+        intelligence = parse_request_intelligence(
+            _response(status="AMBIGUOUS", topics=(), count=None),
+            query=query,
+            explicit_count=None,
+        )
+
+        assert intelligence.interpretation_status == "AMBIGUOUS"
+        assert intelligence.requested_count is None
+        assert intelligence.topics == []
+
     def test_count_disagreement_with_the_deterministic_authority_is_rejected(self) -> None:
         with pytest.raises(RequestIntelligenceError) as exc_info:
             parse_request_intelligence(
@@ -668,6 +680,134 @@ class TestLanguageFixtures:
 
 
 class TestExistingBehaviourPreserved:
+    def test_broad_status_is_only_valid_without_explicit_composition(self) -> None:
+        query = "Give me 50 Geography questions"
+        intelligence = parse_request_intelligence(
+            _response(status="BROAD", count=50), query=query, explicit_count=50
+        )
+        assert intelligence.interpretation_status == "BROAD"
+        assert intelligence.topics == []
+
+    def test_multi_subject_composition_is_resolved_and_grounded(self) -> None:
+        query = "Give me 50 Geography and Polity questions"
+        intelligence = parse_request_intelligence(
+            _response(
+                status="RESOLVED",
+                count=50,
+                query=query,
+                raw_topics=[
+                    {**_span(query, "Geography", "Geography"), "subjectId": "geography"},
+                    {**_span(query, "Polity", "Polity"), "subjectId": "polity"},
+                ],
+            ),
+            query=query,
+            explicit_count=50,
+        )
+        assert [(item.normalized_name, item.subject_id) for item in intelligence.topics] == [
+            ("Geography", "geography"),
+            ("Polity", "polity"),
+        ]
+
+    def test_subject_with_topics_and_multi_topic_same_subject_are_resolved(self) -> None:
+        subject_query = "50 Polity questions on Parliament and Fundamental Rights"
+        topics_query = "20 Percentage and Ratio questions"
+        assert parse_request_intelligence(
+            _response(
+                status="RESOLVED",
+                count=50,
+                query=subject_query,
+                topics=(("Parliament", "Parliament"), ("Fundamental Rights", "Fundamental Rights")),
+            ),
+            query=subject_query,
+            explicit_count=50,
+        ).interpretation_status == "RESOLVED"
+        assert parse_request_intelligence(
+            _response(
+                status="RESOLVED",
+                count=20,
+                query=topics_query,
+                topics=(("Percentage", "Percentage"), ("Ratio", "Ratio")),
+            ),
+            query=topics_query,
+            explicit_count=20,
+        ).interpretation_status == "RESOLVED"
+
+    def test_ungrounded_subject_identity_fails_even_on_a_duplicate_topic(self) -> None:
+        query = "Create 10 questions from Geography"
+        payload = json.loads(
+            _response(count=10, topics=(("Geography", "Geography"),), query=query)
+        )
+        payload["topics"].append({**payload["topics"][0], "subjectId": "economics"})
+        with pytest.raises(RequestIntelligenceError, match="SUBJECT_UNGROUNDED"):
+            parse_request_intelligence(
+                json.dumps(payload), query=query, explicit_count=10
+            )
+
+    def test_explicit_multi_subjects_preserve_per_constraint_routing(self) -> None:
+        query = "Create 50 questions from Geography, Polity, History, Science and Economy"
+        subject_ids = {
+            "Geography": "geography",
+            "Polity": "polity",
+            "History": "history",
+            "Science": "science",
+            "Economy": "economics",
+        }
+        payload = json.loads(
+            _response(
+                count=50,
+                query=query,
+                topics=tuple((name, name) for name in subject_ids),
+            )
+        )
+        for item in payload["topics"]:
+            item["subjectId"] = subject_ids[item["normalizedName"]]
+        request = _resolve(
+            query,
+            _RecordingInterpreter(json.dumps(payload)),
+            subject="general",
+            topic=None,
+        )
+
+        assert [
+            (item.topic_id, item.subject_id, item.source_text)
+            for item in request.trusted_constraints
+        ] == [
+            ("geography", "geography", "Geography"),
+            ("polity", "polity", "Polity"),
+            ("history", "history", "History"),
+            ("science", "science", "Science"),
+            ("economy", "economics", "Economy"),
+        ]
+        blueprint = deterministic_blueprint(request)
+        assert {slot.subject_id for slot in blueprint.slots} == set(subject_ids.values())
+        assert {
+            (slot.topic_id, slot.subject_id) for slot in blueprint.slots
+        } == set((item.topic_id, item.subject_id) for item in request.trusted_constraints)
+
+    def test_exact_hindi_subject_labels_are_grounded(self) -> None:
+        query = "भूगोल, राजनीति, इतिहास, विज्ञान और अर्थशास्त्र से 50 प्रश्न बनाइए।"
+        subject_ids = {
+            "भूगोल": "geography",
+            "राजनीति": "polity",
+            "इतिहास": "history",
+            "विज्ञान": "science",
+            "अर्थशास्त्र": "economics",
+        }
+        intelligence = parse_request_intelligence(
+            _response(
+                count=50,
+                query=query,
+                raw_topics=[
+                    {**_span(query, name, name), "subjectId": subject_id}
+                    for name, subject_id in subject_ids.items()
+                ],
+            ),
+            query=query,
+            explicit_count=50,
+        )
+
+        assert [topic.subject_id for topic in intelligence.topics] == list(subject_ids.values())
+
     def test_planner_regression_without_any_interpretation(self) -> None:
         """The deterministic planner behaves exactly as before when no model runs."""
         request = _resolve("Create 12 questions with mixed difficulty", None, topic="Algebra")
@@ -745,7 +885,7 @@ class TestStaticSchemaAndRoute:
             is False
         )
 
-    def test_route_resolves_to_the_configured_bedrock_model(self) -> None:
+    def test_route_resolves_to_the_qualified_terra_model(self) -> None:
         registry = LlmConfigRegistry()
         route = registry.get_route("general", "request_intelligence", "default")
 
@@ -754,11 +894,14 @@ class TestStaticSchemaAndRoute:
         assert route.fallback == []
         model = registry.get_model(route.model)
         assert model is not None
-        assert model.provider == "bedrock"
-        assert model.model_id == "zai.glm-4.7-flash"
-        assert model.allowed_task_roles == ["request_intelligence"]
-        # No fallback alias: an unavailable interpreter must cost nothing extra.
-        assert model.fallback_models == []
+        assert model.provider == "azure_openai"
+        assert model.deployment == "gpt-5.6-terra"
+        # Its existing Azure fallback is generator/verifier-only, so the normal
+        # role gate retains deterministic recovery for an unavailable interpreter.
+        assert model.fallback_models == ["azure_deepseek_v4_pro"]
+        fallback = registry.get_model(model.fallback_models[0])
+        assert fallback is not None
+        assert fallback.allowed_task_roles == ["generator", "verifier"]
 
     def test_prompt_never_asks_the_model_to_emit_json_itself(self) -> None:
         text = (
@@ -843,7 +986,7 @@ def _solve_state() -> dict:
 class TestDifficultyContract:
     def test_schema_name_is_versioned(self) -> None:
         assert PRACTICE_REQUEST_INTELLIGENCE_SCHEMA_NAME == (
-            "practice_request_intelligence_v4"
+            "practice_request_intelligence_v5"
         )
 
     def test_difficulty_is_a_closed_anyof_branch_per_mode(self) -> None:
@@ -853,6 +996,7 @@ class TestDifficultyContract:
         assert modes == {"UNSPECIFIED", "SINGLE", "MIXED", "CUSTOM"}
         for branch in branches:
             assert branch["additionalProperties"] is False
+            assert branch["properties"]["mode"]["type"] == "string"
 
     def test_only_single_carries_a_level_and_only_custom_a_distribution(self) -> None:
         branches = {

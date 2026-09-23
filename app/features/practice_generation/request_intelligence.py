@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import unicodedata
 from collections.abc import Sequence
 from typing import NamedTuple, Protocol
@@ -38,11 +37,32 @@ logger = logging.getLogger(__name__)
 # Practice topic contract bound.
 MAX_INTERPRETED_TOPICS = 12
 
-_NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
-
 # Intra-word characters that must not end a token. Everything else that is neither
 # alphanumeric nor a combining mark separates tokens.
 _TOKEN_JOINERS = frozenset("&'’-_/")
+
+_EXPLICIT_SUBJECT_NAMES = {
+    "biology": "biology",
+    "chemistry": "chemistry",
+    "computer science": "computer_science",
+    "economics": "economics",
+    "economy": "economics",
+    "english": "english",
+    "geography": "geography",
+    "history": "history",
+    "math": "math",
+    "mathematics": "math",
+    "physics": "physics",
+    "polity": "polity",
+    "reasoning": "reasoning",
+    "science": "science",
+    "general science": "science",
+    "अर्थशास्त्र": "economics",
+    "इतिहास": "history",
+    "भूगोल": "geography",
+    "राजनीति": "polity",
+    "विज्ञान": "science",
+}
 
 
 class QueryToken(NamedTuple):
@@ -149,7 +169,13 @@ def _comparable(value: str) -> str:
     "Profit & Loss" and "Profit and Loss" are one constraint here too.
     """
     folded = unicodedata.normalize("NFKC", value).casefold().replace("&", " and ")
-    return " ".join(_NON_WORD.sub(" ", folded).split())
+    normalized = "".join(
+        character
+        if character.isalnum() or unicodedata.category(character)[0] == "M"
+        else " "
+        for character in folded
+    )
+    return " ".join(normalized.split())
 
 
 def _resolve_selection(
@@ -179,6 +205,28 @@ def _resolve_selection(
     return indexes
 
 
+def _subject_from_exact_selection(
+    tokens: tuple[QueryToken, ...],
+    indexes: Sequence[int],
+) -> str | None:
+    """Return one explicit subject named inside an already-grounded selection.
+
+    The model selected these exact contiguous query tokens; this function only checks
+    their contiguous subspans against the existing canonical subject vocabulary. It
+    therefore accepts ``Indian Geography`` as geography without guessing from a
+    paraphrase, while a selection that names two different subjects remains invalid.
+    """
+    subjects = {
+        subject
+        for start in range(len(indexes))
+        for end in range(start + 1, len(indexes) + 1)
+        if (subject := _EXPLICIT_SUBJECT_NAMES.get(
+            _comparable(" ".join(tokens[index].text for index in indexes[start:end]))
+        )) is not None
+    }
+    return next(iter(subjects)) if len(subjects) == 1 else None
+
+
 def _validate_topics(
     intelligence: PracticeRequestIntelligence,
     *,
@@ -205,6 +253,9 @@ def _validate_topics(
         if not _comparable(topic.normalized_name):
             raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_TOPIC_NAME_EMPTY")
         selection = tuple(indexes)
+        expected_subject = _subject_from_exact_selection(tokens, indexes)
+        if topic.subject_id is not None and topic.subject_id != expected_subject:
+            raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_SUBJECT_UNGROUNDED")
         if selection in seen_selections:
             continue
         # An exact repeat is one constraint stated twice; a partial overlap is two

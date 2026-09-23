@@ -150,6 +150,7 @@ def _run(generator, verifier, *, slot_count: int = 1):
     orchestrator._verifier = verifier
     orchestrator._progress_updates = None
     orchestrator._student_credits = None
+    orchestrator._update_progress = lambda *_args, **_kwargs: None
     context = _SlotGenerationContext(
         test_id="test-1", request=request, blueprint=blueprint,
         group=GenerationGroup(

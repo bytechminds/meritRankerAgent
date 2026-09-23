@@ -2,11 +2,53 @@
 
 ## Purpose and status
 
+## Request Intelligence structured composition (2026-09-22)
+
+Free-text Practice requests now enter the existing `RoutedRequestIntelligenceProvider`
+at the orchestrated composition root. Request Intelligence schema v5 is the single
+canonical source for Bedrock, Azure/OpenAI, and Gemini native structured output. Its
+per-topic nullable `subjectId` preserves an explicitly grounded canonical subject
+family without promoting classifier hints or raw provider internals to authority.
+Only deterministically validated identities become `trusted_constraints`; each carries
+its reconstructed verbatim source span. The private `practiceRequest` persists that
+accepted tuple as `trustedConstraints` and orchestration restores it before planning.
+The ordered persisted tuple derives request-scoped internal references (`tc-001`,
+`tc-002`, …). A trusted planner receives only each reference plus its accepted
+subject/topic identities; it does not receive source spans as composition evidence.
+Each trusted schema-v2 slot must reference one known constraint and match its subject
+and topic exactly. Every accepted constraint must be represented when the count can
+cover it. Planner-provided `requestedTopicEvidence` is ignored on this trusted path;
+legacy requests with no trusted constraints retain the existing fail-closed evidence
+grounding behavior. Deterministic fallback uses the same trusted references directly.
+
+The Request Intelligence subject check recognizes an existing explicit subject label
+inside an already-selected exact token span (for example, `Indian Geography` contains
+the existing `geography` label). It accepts only one unambiguous canonical subject;
+it adds no fuzzy matching or downstream aliases. A trusted request with fewer accepted
+questions than distinct accepted constraints fails early with
+`PRACTICE_REQUEST_CONSTRAINT_COUNT_INFEASIBLE` rather than letting a planner drop a
+constraint. Structured caller topics/counts still bypass interpretation.
+
+The route is `openai_gpt_5_6_terra` (`gpt-5.6-terra`). In the completed 22-case
+real-provider screen, Terra had 22/22 exact schema/semantic outcomes and zero
+provider fallbacks (p95 3,279 ms, estimated USD 0.0348632); GLM had 13/22 and Luna
+19/22, while Gemini had an observed provider-unavailable fallback.
+
+On 2026-09-22, aggregate-only Dev qualification with student-credit enforcement
+disabled for the process reached `READY 5/5`, `READY 10/10`, `READY 20/20`, and
+`READY 50/50` for the exact Indian-Geography/Polity/History/Science/Economy incident.
+The 50Q run finished in 108,586 ms (25 generated, 25 reused, all 50 verified; no
+repair or replacement). The earlier Geography/Polity/History/Science/Economy wording
+also reached `READY 50/50` in 59,193 ms (3 generated, 47 reused). A direct factual
+planner probe accepted all five trusted identities before the configured provider
+timed out; the completed lifecycle did not surface
+`PRACTICE_PLANNER_SEMANTIC_FALLBACK_UNSAFE`. No retry limit, provider configuration,
+generator, verifier, credit, or Doubt Solver behavior changed.
+
 PracticeGenerationGraph creates one-question practice, quizzes, topic/sectional tests, and full
-mocks using the existing MeritRanker AgentCore Python application. The feature is in progress:
-tracked background execution, IAM-signed AppSync progress publication, and local deterministic
-validation are implemented; Sandbox live generation remains `[NOT VERIFIED]` until the controlled
-live gate completes.
+mocks using the existing MeritRanker AgentCore Python application. The trusted-composition path
+has completed its controlled Dev live gate above; unrelated model, credit, and subject-specific
+qualification gates retain their separately documented status.
 
 As of 2026-09-20, the workspace carries a **Dev-qualified, Practice-only** Terra route for default
 and intermediate Math authoring. It is not approved for production deployment or student-credit

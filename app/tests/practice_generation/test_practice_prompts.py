@@ -15,7 +15,11 @@ from features.practice_generation.providers import (
     RoutedQuestionGenerator,
     RoutedQuestionVerifier,
 )
-from features.practice_generation.schemas import GeneratedQuestion, GenerationGroup
+from features.practice_generation.schemas import (
+    GeneratedQuestion,
+    GenerationGroup,
+    RequestedPracticeConstraint,
+)
 from retrieval.pattern_intelligence import PatternGenerationContext
 from services.llm.orchestration.orchestrator import LlmOrchestrator, MockModelExecutor
 from services.llm.orchestration.prompt_resolver import PromptResolver
@@ -43,7 +47,7 @@ def test_nested_practice_prompt_loads_within_budget(prompt_path: str) -> None:
     ("subject", "role_text", "prompt_name"),
     [
         ("math", "Quant or Reasoning", "quant_reasoning.md"),
-        ("english", "English assessment", "english.md"),
+        ("english", "English blueprint", "english.md"),
         ("history", "static factual-subject", "factual.md"),
     ],
 )
@@ -80,9 +84,11 @@ def test_planner_receives_subject_family_prompt_only(
     assert "# Shared contract" in system
     assert role_text in system
     assert executor.last_route_decision.prompt.endswith(prompt_name)
-    assert 'Return exactly `{"slots":[...]}`' in system
+    assert "Return one JSON object" in system
     assert "Generate only the assigned questions" not in system
     assert "Independently verify" not in system
+    assert "`constraint_ref`" in system
+    assert "constraint_ref=null" in system
 
 
 def test_planner_repair_payload_is_explicit_and_prompt_instructs_correction() -> None:
@@ -99,6 +105,18 @@ def test_planner_repair_payload_is_explicit_and_prompt_instructs_correction() ->
         language="english",
         exam_id="CAT",
         exam_stage=None,
+    )
+
+    request = request.model_copy(
+        update={
+            "trusted_constraints": (
+                RequestedPracticeConstraint(
+                    subject_id="math",
+                    topic_id="algebra",
+                    source_text="algebra",
+                ),
+            )
+        }
     )
 
     RoutedPlannerProvider(LlmOrchestrator(model_executor=executor)).plan(
@@ -126,6 +144,7 @@ def test_planner_repair_payload_is_explicit_and_prompt_instructs_correction() ->
             "types=value_error;schema=PracticeBlueprint"
         ),
         "request_constraints": "Create five algebra questions",
+        "request_constraints_authority": "context_only",
         "required_slot_ids": [
             "slot-001",
             "slot-002",
@@ -137,6 +156,9 @@ def test_planner_repair_payload_is_explicit_and_prompt_instructs_correction() ->
         "subject": "math",
         "supported_question_types": ["mcq"],
         "topic": "algebra",
+        "trusted_constraints": [
+            {"constraint_ref": "tc-001", "subject_id": "math", "topic_id": "algebra"}
+        ],
     }
 
 

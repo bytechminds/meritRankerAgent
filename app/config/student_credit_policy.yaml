@@ -1,0 +1,15 @@
+policy_version: "student-credit-v1"
+
+currency:
+  display_currency: "INR"
+  credit_value_inr: "1.00"
+  usd_to_inr_business_rate: "100.00"
+
+pricing:
+  target_gross_margin: "0.60"
+  rounding_mode: "CEIL"
+
+authorization:
+  doubt_min_credits: 5
+  practice_min_credits: 5
+  practice_credits_per_question: 5

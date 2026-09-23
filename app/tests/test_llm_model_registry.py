@@ -16,13 +16,15 @@ class TestModelRegistryEnvOverrides:
         assert reg.model_map["openai_gpt_4_1"].deployment == "gpt-4.1"
         assert reg.model_map["openai_gpt_4_1_mini"].deployment == "gpt-4.1-mini"
 
-    def test_gpt_54_aliases_blank_when_env_unset(self, monkeypatch: pytest.MonkeyPatch):
+    def test_gpt_54_aliases_use_registered_defaults_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_4", raising=False)
         monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI", raising=False)
         reset_registry()
         reg = LlmConfigRegistry()
-        assert reg.model_map["openai_gpt_5_4"].deployment == ""
-        assert reg.model_map["openai_gpt_5_4_mini"].deployment == ""
+        assert reg.model_map["openai_gpt_5_4"].deployment == "gpt-5.4"
+        assert reg.model_map["openai_gpt_5_4_mini"].deployment == "gpt-5.4-mini"
 
     def test_gpt_54_aliases_use_env_when_set(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_4", "my-gpt54-deploy")
@@ -122,16 +124,18 @@ class TestModelRegistryEnvOverrides:
         assert "math_intermediate_generator" in active
         reg.validate_real_mode_deployments()
 
-    def test_active_blank_gpt54_route_would_fail_validation(self, monkeypatch):
+    def test_active_blank_gpt54_route_would_fail_validation(self):
         """If a route pointed at openai_gpt_5_4 with blank deployment, preflight fails.
 
-        The deployment is blanked explicitly so this safety property holds
-        regardless of what the ambient environment configures.
+        The registry entry is blanked directly so this safety property remains
+        independent of the registered deployment default.
         """
-        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_GPT_5_4", "")
-        reset_registry()
         reg = LlmConfigRegistry()
         from schemas.llm_routing import ResolvedRouteEntry
+
+        reg._model_map["openai_gpt_5_4"] = reg.model_map["openai_gpt_5_4"].model_copy(
+            update={"deployment": ""}
+        )
 
         reg._route_map[("test", "classifier", "default")] = ResolvedRouteEntry(
             model="openai_gpt_5_4",

@@ -36,6 +36,7 @@ from starlette.responses import Response, StreamingResponse
 from config import ConfigurationError, get_settings
 from features.practice_generation.agentcore_async import build_practice_async_launcher
 from features.practice_generation.planning import decide_practice_launch
+from features.practice_generation.providers import RoutedRequestIntelligenceProvider
 from features.practice_generation.schemas import PracticeControlRequest
 from graphs.demo_graph import build_demo_graph
 from graphs.doubt_solver_graph import (
@@ -123,8 +124,10 @@ from services.llm.billing import (
 from services.llm.runtime_factory import build_model_executor
 from services.student_credits.bootstrap import build_student_credit_runtime
 from services.student_credits.errors import (
+    INSUFFICIENT_CREDITS_LABEL,
     InsufficientStudentCreditsError,
     StudentCreditError,
+    StudentCreditLedgerConflictError,
 )
 from services.student_credits.runtime import doubt_reference_id
 
@@ -268,10 +271,7 @@ if settings.enable_orchestrated_doubt_solver:
         llm_orchestrator=_orchestrator,
         student_credits=student_credit_runtime,
     )
-    # Bypassed on the Practice path: the >20 deterministic router hands large requests
-    # straight to the existing intelligence planner, so no separate interpretation call
-    # runs ahead of it. The provider and its route stay in the repo, unwired.
-    practice_request_interpreter = None
+    practice_request_interpreter = RoutedRequestIntelligenceProvider(_orchestrator)
     orchestrated_doubt_solver_graph = build_orchestrated_doubt_solver_graph(
         _adapter,
         conversation_persistence=conversation_persistence,
@@ -281,6 +281,7 @@ if settings.enable_orchestrated_doubt_solver:
             practice_async_launcher.launch if practice_async_launcher is not None else None
         ),
         practice_request_interpreter=practice_request_interpreter,
+        student_credits=student_credit_runtime,
     )
     logger.info(
         "Orchestrated graph built  enable_real_llm=%s",
@@ -367,8 +368,15 @@ def _student_credit_refusal(
     request_id: str,
     reason_code: str,
     stream: bool,
+    details: dict[str, object] | None = None,
 ):
-    """Refuse chargeable generation before any provider call is made."""
+    """Refuse chargeable generation before any provider call is made.
+
+    ``details`` carries the safe insufficient-credit fields (action and known
+    amounts). A technical credit failure passes none, so it can never be read by
+    a client as a request to add credits.
+    """
+    fields = {**(details or {}), "code": reason_code, "retryable": False}
     if stream:
         cancellation = StreamCancellation()
         return StreamingResponse(
@@ -379,8 +387,12 @@ def _student_credit_refusal(
                             type="error",
                             request_id=request_id,
                             stage="failed",
-                            label="Unable to complete",
-                            metadata={"retryable": False, "code": reason_code},
+                            label=(
+                                INSUFFICIENT_CREDITS_LABEL
+                                if reason_code == InsufficientStudentCreditsError.reason_code
+                                else "Unable to complete"
+                            ),
+                            metadata=fields,
                         ),
                     )
                 ),
@@ -394,6 +406,7 @@ def _student_credit_refusal(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     return {
+        **fields,
         "success": False,
         "request_id": request_id,
         "mode": "doubt_solver",
@@ -713,6 +726,11 @@ def invoke(payload: dict) -> dict | Response:
                         request_id=request_id,
                         reason_code=exc.reason_code,
                         stream=ds_request.stream,
+                        details=(
+                            exc.client_fields()
+                            if isinstance(exc, InsufficientStudentCreditsError)
+                            else None
+                        ),
                     )
                 else:
                     # Reuses the wallet's own rule; None means the balance was
@@ -721,7 +739,7 @@ def invoke(payload: dict) -> dict | Response:
                         "unavailable"
                         if admitted_wallet is None
                         else "allowed"
-                        if admitted_wallet.can_start_chargeable_work
+                        if student_credit_runtime.admits(admitted_wallet)
                         else "blocked"
                     )
                     credit_mode = (
@@ -1026,6 +1044,7 @@ def invoke(payload: dict) -> dict | Response:
                         else None
                     ),
                     "source_modality": source_modality,
+                    "credit_error": None,
                 }
                 generation_started = time.monotonic()
                 try:
@@ -1034,6 +1053,22 @@ def invoke(payload: dict) -> dict | Response:
                             orchestrated_input
                         )
                 except Exception as exc:
+                    if (
+                        student_credit_runtime is not None
+                        and not isinstance(exc, StudentCreditLedgerConflictError)
+                    ):
+                        try:
+                            student_credit_runtime.release(
+                                user_id=actor_id,
+                                reference_id=doubt_reference_id(
+                                    user_id=actor_id,
+                                    turn_id=ds_request.turn_id,
+                                ),
+                                feature="doubt",
+                                reason="generation_failed",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     log_event(
                         "generation_failed",
                         component="doubt_solver.generator",
@@ -1045,6 +1080,13 @@ def invoke(payload: dict) -> dict | Response:
                         level=logging.ERROR,
                     )
                     raise
+                if orchestrated_result.get("credit_error"):
+                    return _student_credit_refusal(
+                        request_id=request_id,
+                        reason_code=str(orchestrated_result["credit_error"]),
+                        stream=False,
+                        details=orchestrated_result.get("credit_error_details"),
+                    )
                 final_answer = orchestrated_result.get("final_answer") or {}
                 authoritative_answer = final_answer.get("content") or ""
                 accepted = final_answer.get("quality_status") in {
@@ -1081,6 +1123,19 @@ def invoke(payload: dict) -> dict | Response:
                     repair_attempted=bool(final_answer.get("was_regenerated")),
                 )
                 if not accepted:
+                    if student_credit_runtime is not None:
+                        try:
+                            student_credit_runtime.release(
+                                user_id=actor_id,
+                                reference_id=doubt_reference_id(
+                                    user_id=actor_id,
+                                    turn_id=ds_request.turn_id,
+                                ),
+                                feature="doubt",
+                                reason="quality_gate_failed",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     log_event(
                         "generation_failed",
                         component="doubt_solver.generator",
@@ -1103,15 +1158,44 @@ def invoke(payload: dict) -> dict | Response:
                     "request_id=%s  generation_path=orchestrated_non_stream — invoke succeeded",
                     request_id,
                 )
-                persistence_result = _persist_completed_result(
-                    request=ds_request,
-                    actor_id=actor_id,
-                    original_query=original_query,
-                    result=orchestrated_result,
-                    request_id=request_id,
-                )
                 response_type = orchestrated_result.get("response_type")
                 practice_test_id = orchestrated_result.get("practice_test_id")
+                try:
+                    persistence_result = _persist_completed_result(
+                        request=ds_request,
+                        actor_id=actor_id,
+                        original_query=original_query,
+                        result=orchestrated_result,
+                        request_id=request_id,
+                    )
+                except Exception:  # noqa: BLE001 - cleanup must cover post-launch failures
+                    if (
+                        response_type == "practice_generation"
+                        and practice_test_id
+                        and practice_async_launcher is not None
+                    ):
+                        try:
+                            practice_async_launcher.abort(
+                                practice_test_id,
+                                "PRACTICE_CONVERSATION_LINKAGE_FAILED",
+                                request_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    elif student_credit_runtime is not None:
+                        try:
+                            student_credit_runtime.release(
+                                user_id=actor_id,
+                                reference_id=doubt_reference_id(
+                                    user_id=actor_id,
+                                    turn_id=ds_request.turn_id,
+                                ),
+                                feature="doubt",
+                                reason="persistence_failed",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    raise
                 if (
                     response_type == "practice_generation"
                     and practice_test_id
@@ -1149,12 +1233,6 @@ def invoke(payload: dict) -> dict | Response:
                             feature="doubt",
                             operation_status="completed",
                         )
-                    except InsufficientStudentCreditsError as exc:
-                        return _student_credit_refusal(
-                            request_id=request_id,
-                            reason_code=exc.reason_code,
-                            stream=False,
-                        )
                     except Exception as exc:  # noqa: BLE001
                         # An accepted answer is never retracted by a credit
                         # failure. Nothing is charged and the reason is logged.
@@ -1167,6 +1245,18 @@ def invoke(payload: dict) -> dict | Response:
                             ),
                             type(exc).__name__,
                         )
+                        try:
+                            student_credit_runtime.release(
+                                user_id=actor_id,
+                                reference_id=doubt_reference_id(
+                                    user_id=actor_id,
+                                    turn_id=ds_request.turn_id,
+                                ),
+                                feature="doubt",
+                                reason="settlement_unavailable",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                 response = {
                     "schema_version": "1",
                     "status": "completed" if accepted else "failed",

@@ -34,7 +34,12 @@ from features.practice_generation.repositories import (
     estimate_dynamodb_item_size,
 )
 from features.practice_generation.resource_validation import IndexProjection
-from features.practice_generation.schemas import Difficulty, GeneratedQuestion, PlannerSlot
+from features.practice_generation.schemas import (
+    Difficulty,
+    GeneratedQuestion,
+    PlannerSlot,
+    RequestedPracticeConstraint,
+)
 
 _SERIALIZER = TypeSerializer()
 _DESERIALIZER = TypeDeserializer()
@@ -162,8 +167,36 @@ def test_assessment_creation_uses_existing_model_and_conditional_idempotency() -
     assert "querySummary" not in item["meta"]["practiceRequest"]
     assert "examProfileId" not in item["meta"]
     assert item["meta"]["practiceRequest"]["examProfileId"] == "cat_management_pre"
+    assert item["meta"]["practiceRequest"]["trustedConstraints"] == []
     assert item["assessmentMode"] == "PRACTICE"
     assert item["examProfileId"] == "cat_management_pre"
+
+
+def test_assessment_creation_persists_grounded_trusted_constraints() -> None:
+    client = RecordingClient()
+    repository = AssessmentRepository(client, table_name="MockTestQuiz-table")
+    request = _request().model_copy(
+        update={
+            "trusted_constraints": (
+                RequestedPracticeConstraint(
+                    subject_id="geography",
+                    topic_id="geography",
+                    source_text="Geography",
+                ),
+            )
+        }
+    )
+
+    item, duplicate = repository.create_or_get("test-1", request)
+
+    assert duplicate is False
+    assert item["meta"]["practiceRequest"]["trustedConstraints"] == [
+        {
+            "subjectId": "geography",
+            "topicId": "geography",
+            "sourceText": "Geography",
+        }
+    ]
 
 
 def test_generated_question_is_assessment_owned_and_conditionally_linked() -> None:

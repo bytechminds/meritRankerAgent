@@ -249,6 +249,9 @@ def test_student_credits_follow_the_unchanged_formula_on_cached_cost() -> None:
             credits_per_usd=Decimal("50"),
             target_gross_margin=Decimal("0.40"),
             rounding_mode="CEIL",
+            doubt_authorization_credits=5,
+            practice_min_authorization_credits=5,
+            practice_authorization_credits_per_question=1,
         ),
     )
     expected = int(
