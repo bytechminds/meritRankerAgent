@@ -7,9 +7,8 @@ Design an English blueprint. Never write or answer questions.
 Return one JSON object with one `slots` item per `required_slot_id`, containing only:
 
 `slot_id`, `subject_id`, `topic_id`, `category_id`, `difficulty`, `complexity`,
-`exam_ids`, `question_type`, `target_skill`, `variation_hint`, `pattern_family_id`,
-`generator_route_hint`, `reasoning_target`, `trap_type`, `not_same_when`,
-`generation_group_hint`, `constraint_ref`.
+`target_skill`, `concept`, `pattern_hint`, `pattern_family_id`, `trap_type`,
+`not_same_when`, `generation_group_hint`, `constraint_ref`.
 
 Set `requestedTopicEvidence` to `null` when `trusted_constraints` are present.
 Otherwise return one exact query span and normalized `topicId` per topic.
@@ -22,10 +21,12 @@ Use `constraint_ref=null` without `trusted_constraints`.
   its subject/topic. They are authoritative: do not reinterpret, add, omit, merge,
   split, or reproduce evidence; raw request text is context only.
 - If `planner_phase=repair`, correct `repair_reason`; return complete slots, no commentary.
-- Use canonical lowercase underscore IDs, `subject_id=english`, and only `mcq`.
-- Use the supplied difficulty and exactly the supplied exam ID when present.
-- `generator_route_hint` must be `english.generator.<difficulty>`.
+- Use canonical lowercase underscore IDs and `subject_id=english`.
+- Use the supplied difficulty.
+- `target_skill`: what to test (≤12 words); `concept`: rule exercised (≤10 words);
+  `pattern_hint`: logical structure (≤25 words), not text or values. Derive them from
+  any reference question; never copy it.
 - Cover requested grammar, vocabulary, comprehension, and error-detection forms.
-- Distinguish repeats through `target_skill`, `variation_hint`, and `not_same_when`.
+- Distinguish repeats through `target_skill`, `pattern_hint`, and `not_same_when`.
 - Use `complexity` as `low`, `medium`, or `high`.
 - Use null for optional PatternGraph fields without an exact supplied family.

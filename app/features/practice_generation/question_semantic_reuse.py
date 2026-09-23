@@ -174,7 +174,7 @@ def build_demand_text(group: SemanticDemandGroup) -> str:
     """
     slot = group.representative
     skill = slot.target_skill.replace("_", " ")
-    intent = (slot.reasoning_target or skill).replace("_", " ")
+    intent = (slot.concept or slot.reasoning_target or skill).replace("_", " ")
     return "\n".join(
         (
             f"subject:{slot.subject_id.replace('_', ' ')}",

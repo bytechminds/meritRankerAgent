@@ -7,9 +7,8 @@ Design a static factual-subject blueprint. Never write questions.
 Return one JSON object with one `slots` item per `required_slot_id`, containing only:
 
 `slot_id`, `subject_id`, `topic_id`, `category_id`, `difficulty`, `complexity`,
-`exam_ids`, `question_type`, `target_skill`, `variation_hint`, `pattern_family_id`,
-`generator_route_hint`, `reasoning_target`, `trap_type`, `not_same_when`,
-`generation_group_hint`, `constraint_ref`.
+`target_skill`, `concept`, `pattern_hint`, `pattern_family_id`, `trap_type`,
+`not_same_when`, `generation_group_hint`, `constraint_ref`.
 
 Set `requestedTopicEvidence` to `null` when `trusted_constraints` are present;
 otherwise return one exact query span and normalized `topicId` per topic.
@@ -22,12 +21,13 @@ Use `constraint_ref=null` without `trusted_constraints`.
   its subject/topic. They are authoritative: do not reinterpret, add, omit, merge,
   split, or reproduce evidence; raw request text is context only.
 - If `planner_phase=repair`, correct `repair_reason`; return complete slots only.
-- Use canonical lowercase underscore IDs and only `mcq`.
-- Use the supplied subject and difficulty. Use exactly the supplied exam ID when present.
+- Use canonical lowercase underscore IDs and the supplied difficulty and
+  subject (for `general`/`other`, each topic's family).
+- `target_skill`: what to test (≤12 words); `concept`: rule exercised (≤10 words);
+  `pattern_hint`: logical structure (≤25 words), not text or values. Derive them from
+  any reference question; never copy it.
 - Each supplied `topic` must be some slot's `topic_id`.
-- `generator_route_hint` must be `general.generator.<difficulty>`.
 - Provide target-exam breadth and distinct facts/forms; do not create unsupported
-  current-affairs slots. Distinguish repeats through `target_skill`, `variation_hint`,
-  and `not_same_when`.
+  current-affairs slots. Distinguish repeats via `pattern_hint` and `not_same_when`.
 - Use `complexity` as `low`, `medium`, or `high`.
 - Use null for optional PatternGraph fields without an exact supplied family.

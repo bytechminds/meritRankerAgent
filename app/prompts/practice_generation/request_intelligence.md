@@ -30,12 +30,12 @@ Do not invent exam weightage.
     Never mark multi-subject composition `BROAD`, merge it into `general`, or omit
     an explicitly named subject. A subject named alongside narrower topics remains
     its own entry. Keep a phrase whole only when it names one concept.
-12. For an explicitly named canonical subject family, set that topic's `subjectId`.
-    For a topic-only phrase, set `subjectId` to null. Never infer a family from the
-    classifier hint or add a subject absent from the grounded source tokens.
-    Select only the subject/topic tokens — never surrounding request words or the
-    question count. For example, Percentage, Ratio & Proportion, Parliament, and
-    Fundamental Rights are topic-only phrases and have `subjectId: null`.
+12. A named topic narrower than a subject (Percentage, Parliament, Modern Indian
+    History) is a topic entry, never `BROAD`. Set each topic's `subjectId` to the
+    family that owns it by meaning: Percentage → `math`, Syllogism → `reasoning`,
+    Indian Constitution → `polity`; null only when no family fits. Never infer a
+    family from the classifier hint alone. Select only the subject/topic tokens —
+    never surrounding request words or the question count.
 
 # Fields
 
@@ -45,7 +45,7 @@ Do not invent exam weightage.
 - `topics`: one entry per explicitly requested topic. `tokenIds` lists the ids of
   the consecutive `query_tokens` holding the student's wording for it, in the order
   they appear; `normalizedName` is the corrected, conventional name for those tokens;
-  `subjectId` is the canonical subject family when it is explicitly grounded, else null.
+  `subjectId` is the subject family that owns the topic, else null.
 - `difficulty.mode`: `SINGLE` when exactly one level is requested, `MIXED` when a
   mixture or several levels are requested, `CUSTOM` when per-level counts are
   stated, `UNSPECIFIED` when no difficulty was requested.

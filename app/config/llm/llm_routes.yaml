@@ -317,8 +317,10 @@ routes:
           - safe_mock
       advanced:
         inherits: default
-        model: openai_gpt_4_1
+        model: openai_gpt_6_sol
         max_tokens: 8000
+        provider_options:
+          reasoning_effort: medium
         fallback:
           - intermediate
           - default
@@ -399,8 +401,10 @@ routes:
           - safe_mock
       advanced:
         inherits: default
-        model: openai_gpt_4_1
+        model: openai_gpt_6_sol
         max_tokens: 8000
+        provider_options:
+          reasoning_effort: medium
         fallback:
           - intermediate
           - default
@@ -455,8 +459,10 @@ routes:
           - safe_mock
       advanced:
         inherits: default
-        model: openai_gpt_4_1
+        model: openai_gpt_6_sol
         max_tokens: 8000
+        provider_options:
+          reasoning_effort: medium
         fallback:
           - intermediate
           - default

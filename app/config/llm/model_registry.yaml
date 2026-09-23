@@ -78,6 +78,22 @@ models:
     fallback_models:
       - azure_deepseek_v4_pro
 
+  openai_gpt_6_sol:
+    description: >-
+      Azure GPT-6 Sol. Deployment from AZURE_OPENAI_DEPLOYMENT_GPT_6_SOL
+      (default gpt-6-sol). Primary for the Practice advanced planner routes only;
+      effort is supplied per route through provider_options.
+    provider: azure_openai
+    provider_profile: azure_foundry_v1
+    deployment: gpt-6-sol
+    supports_reasoning: true
+    reasoning_effort: medium
+    supported_reasoning_efforts: [medium, high]
+    token_budget_param: max_completion_tokens
+    supports_temperature: false
+    model_hard_max_output_tokens: 8000
+    timeout_seconds: 60
+
   openai_gpt_5_mini:
     description: >-
       Azure GPT-5 Mini. Deployment from AZURE_OPENAI_DEPLOYMENT_5_MINI

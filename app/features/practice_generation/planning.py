@@ -1580,6 +1580,26 @@ def parse_blueprint(raw: str, request: PracticeGenerationRequest) -> PracticeBlu
         # Planner-provided evidence is therefore neither accepted nor needed here.
         payload = dict(payload)
         payload["requestedTopicEvidence"] = []
+    # Server-owned slot fields are not planner output: the route hint is recomputed by
+    # apply_system_bucket_policy and the exam is the one the request supplied.
+    exam_ids = (
+        [request.exam_id.strip().upper().replace("-", "_").replace(" ", "_")]
+        if request.exam_id
+        else []
+    )
+    if isinstance(payload.get("slots"), list):
+        payload["slots"] = [
+            {
+                "exam_ids": exam_ids,
+                "generator_route_hint": (
+                    f"{slot.get('subject_id')}.generator.{slot.get('difficulty')}"
+                ),
+                **slot,
+            }
+            if isinstance(slot, dict)
+            else slot
+            for slot in payload["slots"]
+        ]
     payload["schema_version"] = "2"
     payload["practice_type"] = request.practice_type.value
     payload["accepted_count"] = request.accepted_count
@@ -1628,7 +1648,12 @@ def select_planning_mode(
     if request.accepted_count <= 2:
         return "DETERMINISTIC", "EXISTING_DETERMINISTIC_RULE"
     # 3. A structured topic list is trusted composition; nothing needs interpreting.
-    if _trusted_topic_constraints(request):
+    # A similar-question request still does: only the planner can derive the
+    # reference question's pattern.
+    if (
+        _trusted_topic_constraints(request)
+        and request.practice_type is not PracticeType.SIMILAR_QUESTION
+    ):
         return "DETERMINISTIC", "TRUSTED_TOPIC_CONSTRAINTS"
     if _quick_practice_is_deterministic(request):
         # 4. The deterministic plan can only draw topics from the classifier label.

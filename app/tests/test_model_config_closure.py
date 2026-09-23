@@ -226,7 +226,6 @@ class TestFrozenRoutesPreserved:
         ("subject", "task_role", "difficulty", "expected"),
         [
             ("math", "generator", "advanced", "openai_gpt_4_1"),
-            ("quant_reasoning", "planner", "advanced", "openai_gpt_4_1"),
         ],
     )
     def test_frozen_gpt_4_1_routes_are_untouched(

@@ -35,7 +35,7 @@ feature reads the model. It therefore holds no provider and no feature imports.
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -44,11 +44,15 @@ PRACTICE_REQUEST_INTELLIGENCE_SCHEMA_NAME = "practice_request_intelligence_v5"
 InterpretationStatus = Literal["RESOLVED", "BROAD", "AMBIGUOUS"]
 DifficultyMode = Literal["UNSPECIFIED", "SINGLE", "MIXED", "CUSTOM"]
 InterpretedDifficulty = Literal["BASIC", "INTERMEDIATE", "ADVANCED"]
-InterpretedSubject = Literal[
+# The one canonical set of Practice subject route families. A family is an execution
+# identity: it selects the generator and Answer Authority route that owns a question.
+# The models choose the family; topic, target, concept and pattern stay free text.
+PracticeSubjectFamily = Literal[
     "math", "reasoning", "science", "history", "geography", "english",
     "physics", "chemistry", "biology", "computer_science", "economics",
     "polity", "general", "other",
 ]
+PRACTICE_SUBJECT_FAMILIES: tuple[str, ...] = get_args(PracticeSubjectFamily)
 
 
 class InterpretedTopic(BaseModel):
@@ -63,9 +67,9 @@ class InterpretedTopic(BaseModel):
 
     token_ids: list[str] = Field(alias="tokenIds")
     normalized_name: str = Field(alias="normalizedName")
-    # Required and nullable on the v5 wire grammar: explicit subject families carry
-    # their canonical identity; a topic-only phrase intentionally has no invented one.
-    subject_id: InterpretedSubject | None = Field(default=None, alias="subjectId")
+    # Required and nullable on the v5 wire grammar: the model assigns the route family
+    # that owns the topic, or null when no family fits.
+    subject_id: PracticeSubjectFamily | None = Field(default=None, alias="subjectId")
     source_text: str = Field(default="", exclude=True)
 
 
@@ -198,12 +202,7 @@ PRACTICE_REQUEST_INTELLIGENCE_SCHEMA: dict[str, Any] = _closed(
                     "normalizedName": {"type": "string"},
                     "subjectId": {
                         "type": ["string", "null"],
-                        "enum": [
-                            "math", "reasoning", "science", "history", "geography",
-                            "english", "physics", "chemistry", "biology",
-                            "computer_science", "economics", "polity", "general", "other",
-                            None,
-                        ],
+                        "enum": [*PRACTICE_SUBJECT_FAMILIES, None],
                     },
                 },
                 ["tokenIds", "normalizedName", "subjectId"],

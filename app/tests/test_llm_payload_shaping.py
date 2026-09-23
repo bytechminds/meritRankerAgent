@@ -803,7 +803,12 @@ class TestPlannerNativeStructuredOutput:
         slot_props = set(schema["properties"]["slots"]["items"]["properties"])
         evidence_props = set(schema["properties"]["requestedTopicEvidence"]["items"]["properties"])
         slot_model = PracticeBlueprint.model_fields["slots"].annotation.__args__[0]
-        assert slot_props == set(slot_model.model_fields)
+        # Server-owned fields and pre-concept/pattern_hint fields are never planner output.
+        not_planner_output = {
+            "exam_ids", "question_type", "generator_route_hint",
+            "variation_hint", "reasoning_target",
+        }
+        assert slot_props == set(slot_model.model_fields) - not_planner_output
         assert evidence_props == {"source_text", "topic_id"} or evidence_props == {
             "sourceText",
             "topicId",

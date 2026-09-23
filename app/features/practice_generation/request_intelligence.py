@@ -41,29 +41,6 @@ MAX_INTERPRETED_TOPICS = 12
 # alphanumeric nor a combining mark separates tokens.
 _TOKEN_JOINERS = frozenset("&'’-_/")
 
-_EXPLICIT_SUBJECT_NAMES = {
-    "biology": "biology",
-    "chemistry": "chemistry",
-    "computer science": "computer_science",
-    "economics": "economics",
-    "economy": "economics",
-    "english": "english",
-    "geography": "geography",
-    "history": "history",
-    "math": "math",
-    "mathematics": "math",
-    "physics": "physics",
-    "polity": "polity",
-    "reasoning": "reasoning",
-    "science": "science",
-    "general science": "science",
-    "अर्थशास्त्र": "economics",
-    "इतिहास": "history",
-    "भूगोल": "geography",
-    "राजनीति": "polity",
-    "विज्ञान": "science",
-}
-
 
 class QueryToken(NamedTuple):
     """One deterministic token and its exact bounds in the original query."""
@@ -205,28 +182,6 @@ def _resolve_selection(
     return indexes
 
 
-def _subject_from_exact_selection(
-    tokens: tuple[QueryToken, ...],
-    indexes: Sequence[int],
-) -> str | None:
-    """Return one explicit subject named inside an already-grounded selection.
-
-    The model selected these exact contiguous query tokens; this function only checks
-    their contiguous subspans against the existing canonical subject vocabulary. It
-    therefore accepts ``Indian Geography`` as geography without guessing from a
-    paraphrase, while a selection that names two different subjects remains invalid.
-    """
-    subjects = {
-        subject
-        for start in range(len(indexes))
-        for end in range(start + 1, len(indexes) + 1)
-        if (subject := _EXPLICIT_SUBJECT_NAMES.get(
-            _comparable(" ".join(tokens[index].text for index in indexes[start:end]))
-        )) is not None
-    }
-    return next(iter(subjects)) if len(subjects) == 1 else None
-
-
 def _validate_topics(
     intelligence: PracticeRequestIntelligence,
     *,
@@ -247,25 +202,25 @@ def _validate_topics(
 
     resolved: list = []
     seen_names: set[str] = set()
-    seen_selections: set[tuple[int, ...]] = set()
+    seen_selections: dict[tuple[int, ...], str | None] = {}
     for topic in topics:
         indexes = _resolve_selection(topic, token_count=len(tokens))
         if not _comparable(topic.normalized_name):
             raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_TOPIC_NAME_EMPTY")
         selection = tuple(indexes)
-        expected_subject = _subject_from_exact_selection(tokens, indexes)
-        if topic.subject_id is not None and topic.subject_id != expected_subject:
-            raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_SUBJECT_UNGROUNDED")
+        # An exact repeat is one constraint stated twice unless it names another
+        # family; that, like a partial overlap, is two readings of the same words,
+        # which is contradictory rather than redundant.
         if selection in seen_selections:
+            if seen_selections[selection] != topic.subject_id:
+                raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_TOPIC_SPAN_OVERLAP")
             continue
-        # An exact repeat is one constraint stated twice; a partial overlap is two
-        # readings of the same words, which is contradictory rather than redundant.
         if any(not set(selection).isdisjoint(other) for other in seen_selections):
             raise RequestIntelligenceError("PRACTICE_INTELLIGENCE_TOPIC_SPAN_OVERLAP")
         key = _comparable(topic.normalized_name)
         if key in seen_names:
             continue
-        seen_selections.add(selection)
+        seen_selections[selection] = topic.subject_id
         seen_names.add(key)
         resolved.append(
             topic.model_copy(

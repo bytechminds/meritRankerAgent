@@ -150,6 +150,18 @@ models:
   # prices.azure.com meters "V4 Pro Inp/Outp/cached glbl" are $0.00174 /
   # $0.00348 / $0.000145 per 1K tokens. Data Zone meters are not offered in
   # southindia. No separate reasoning-token rate is published.
+  # Azure Global Standard, short-context tier, supplied by the project owner on
+  # 2026-09-23 (Azure retail meters for gpt-6-sol were not yet published). Deployment
+  # proven paygo at the default tier in South India (azureai-fe-offer-type=paygo,
+  # x-ms-region=South India, service_tier=default). The $2.50 cache-write rate is not
+  # modelled; the runtime issues no explicit cache writes. Reasoning tokens are part of
+  # output tokens, with no separate rate.
+  - provider: azure_openai
+    model_or_deployment: gpt-6-sol
+    input_cost_per_million_tokens: 2.00
+    output_cost_per_million_tokens: 10.00
+    cached_input_cost_per_million_tokens: 0.20
+    effective_from: "2026-09-23"
   - provider: azure_openai
     model_or_deployment: DeepSeek-V4-Pro
     input_cost_per_million_tokens: 1.74
@@ -186,6 +198,7 @@ model_alias_profiles:
   openai_o4_mini: { provider: azure_openai, model_or_deployment: o4-mini, rate_status: available }
   openai_o3: { provider: azure_openai, model_or_deployment: o3, rate_status: available }
   openai_gpt_5_6_terra: { provider: azure_openai, model_or_deployment: gpt-5.6-terra, rate_status: available }
+  openai_gpt_6_sol: { provider: azure_openai, model_or_deployment: gpt-6-sol, rate_status: available }
   azure_deepseek_v4_pro: { provider: azure_openai, model_or_deployment: DeepSeek-V4-Pro, rate_status: available }
   deepseek_v4pro: { provider: azure_openai, model_or_deployment: DeepSeek-V4-Pro, rate_status: available }
   reasoning_basic_generator: { provider: azure_openai, model_or_deployment: gpt-4.1-mini, rate_status: available }

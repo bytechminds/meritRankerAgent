@@ -367,7 +367,7 @@ def test_disabled_feature_ignores_invalid_tuning_configuration(
         (
             "english",
             "advanced",
-            "openai_gpt_4_1",
+            "openai_gpt_6_sol",
             "practice_generation/planners/english.md",
             8000,
         ),

@@ -732,13 +732,13 @@ class TestExistingBehaviourPreserved:
             explicit_count=20,
         ).interpretation_status == "RESOLVED"
 
-    def test_ungrounded_subject_identity_fails_even_on_a_duplicate_topic(self) -> None:
+    def test_repeated_selection_with_another_family_is_contradictory(self) -> None:
         query = "Create 10 questions from Geography"
         payload = json.loads(
             _response(count=10, topics=(("Geography", "Geography"),), query=query)
         )
         payload["topics"].append({**payload["topics"][0], "subjectId": "economics"})
-        with pytest.raises(RequestIntelligenceError, match="SUBJECT_UNGROUNDED"):
+        with pytest.raises(RequestIntelligenceError, match="TOPIC_SPAN_OVERLAP"):
             parse_request_intelligence(
                 json.dumps(payload), query=query, explicit_count=10
             )

@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from features.practice_generation.schemas import PracticeType
+from schemas.practice_request_intelligence import PRACTICE_SUBJECT_FAMILIES
 
 _CANONICAL_ID = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 _CANONICAL_EXAM_ID = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
@@ -18,24 +19,7 @@ _SUBJECT_ALIASES = {
     "verbal reasoning": "reasoning",
     "english grammar": "english",
 }
-_SUPPORTED_SUBJECTS = frozenset(
-    {
-        "math",
-        "reasoning",
-        "science",
-        "history",
-        "geography",
-        "english",
-        "physics",
-        "chemistry",
-        "biology",
-        "computer_science",
-        "economics",
-        "polity",
-        "general",
-        "other",
-    }
-)
+_SUPPORTED_SUBJECTS = frozenset(PRACTICE_SUBJECT_FAMILIES)
 _TOPIC_ALIASES = {
     "time work": "time_and_work",
     "time and work": "time_and_work",

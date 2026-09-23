@@ -61,7 +61,7 @@ Pattern runtime, and receive either:
   the page size (`_MAX_QUESTIONS_PER_PATTERN`): that is a page ceiling, not a guaranteed yield, so
   twelve Patterns holding one eligible question each are all probed rather than four. A
   compatibility group may legitimately hold every slot in the assessment — the blueprint's
-  distinctness signature includes `variation_hint`, which the compatibility key excludes — so any
+  distinctness signature includes `pattern_hint` (legacy `variation_hint`), which the compatibility key excludes — so any
   fixed or predicted probe ceiling would silently force safe reuse into generation. DynamoDB
   cannot serve several GSI partitions in one call (`BatchGetItem` resolves table primary keys
   only), so bounded per-Pattern probing is retained rather than inventing a new data layer.

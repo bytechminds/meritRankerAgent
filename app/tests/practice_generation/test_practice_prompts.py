@@ -40,7 +40,7 @@ PROMPT_PATHS = (
 @pytest.mark.parametrize("prompt_path", PROMPT_PATHS)
 def test_nested_practice_prompt_loads_within_budget(prompt_path: str) -> None:
     content = (PromptResolver()._prompt_root / f"{prompt_path}.md").read_text(encoding="utf-8")
-    assert 100 < len(content) < 1_700
+    assert 100 < len(content) < 1_800
 
 
 @pytest.mark.parametrize(
@@ -171,8 +171,8 @@ def test_composed_prompt_estimate_remains_compact() -> None:
         role = (prompt_root / f"{role_path}.md").read_text(encoding="utf-8")
         combined = f"{shared}\n\n{role}"
         estimated_tokens = (len(combined) + 3) // 4
-        assert len(combined) < 2_500
-        assert estimated_tokens < 625  # the 2_500-char bound expressed in tokens
+        assert len(combined) < 2_600
+        assert estimated_tokens < 650  # the 2_600-char bound expressed in tokens
 
 
 def test_v2_authority_rejects_inconsistent_premises_before_formula_application() -> None:

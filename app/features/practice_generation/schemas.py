@@ -15,6 +15,7 @@ from practice_limits import (
 )
 from schemas.doubt_solver import CanonicalLanguage, normalize_question_language
 from schemas.practice_limit import PracticeLimitation
+from schemas.practice_request_intelligence import PRACTICE_SUBJECT_FAMILIES
 from services.llm.orchestration.prompt_budget import PromptInputBudget
 from tools.web_search.models import FreshEvidenceBundle
 
@@ -190,23 +191,7 @@ class DemandBucket(BaseModel):
     @classmethod
     def _validate_subject(cls, value: str) -> str:
         normalized = value.casefold().replace(" ", "_").replace("-", "_")
-        allowed = {
-            "math",
-            "reasoning",
-            "science",
-            "history",
-            "geography",
-            "english",
-            "physics",
-            "chemistry",
-            "biology",
-            "computer_science",
-            "economics",
-            "polity",
-            "general",
-            "other",
-        }
-        if normalized not in allowed:
+        if normalized not in PRACTICE_SUBJECT_FAMILIES:
             raise ValueError("unsupported demand-bucket subject")
         return normalized
 
@@ -244,7 +229,12 @@ class PlannerSlot(BaseModel):
     exam_ids: list[str] = Field(default_factory=list, max_length=8)
     question_type: QuestionType = QuestionType.MCQ
     target_skill: str = Field(min_length=1, max_length=160)
-    variation_hint: str = Field(min_length=1, max_length=160)
+    # Planner semantic intent for the generator. Planner output carries ``concept`` and
+    # ``pattern_hint``; ``variation_hint``/``reasoning_target`` remain only so blueprints
+    # persisted before them still load.
+    concept: str | None = Field(default=None, min_length=1, max_length=160)
+    pattern_hint: str | None = Field(default=None, min_length=1, max_length=240)
+    variation_hint: str | None = Field(default=None, min_length=1, max_length=160)
     pattern_family_id: str | None = Field(default=None, max_length=160)
     generator_route_hint: str = Field(min_length=1, max_length=160)
     reasoning_target: str | None = Field(default=None, max_length=240)
@@ -266,22 +256,7 @@ class PlannerSlot(BaseModel):
     @field_validator("subject_id")
     @classmethod
     def _supported_subject(cls, value: str) -> str:
-        if value not in {
-            "math",
-            "reasoning",
-            "science",
-            "history",
-            "geography",
-            "english",
-            "physics",
-            "chemistry",
-            "biology",
-            "computer_science",
-            "economics",
-            "polity",
-            "general",
-            "other",
-        }:
+        if value not in PRACTICE_SUBJECT_FAMILIES:
             raise ValueError("unsupported planner-slot subject")
         return value
 
@@ -396,6 +371,8 @@ class PracticeBlueprint(BaseModel):
                     "question_intent": (
                         f"Assess {first.target_skill.replace('_', ' ')} with "
                         f"{first.variation_hint.replace('_', ' ')} variation."
+                        if first.variation_hint
+                        else f"Assess {first.target_skill.replace('_', ' ')}."
                     ),
                     "excluded_variants": list(first.not_same_when),
                     "verification_policy": VerificationPolicy.NONE.value,
@@ -424,7 +401,7 @@ class PracticeBlueprint(BaseModel):
                     slot.complexity,
                     slot.question_type,
                     slot.target_skill.casefold(),
-                    slot.variation_hint.casefold(),
+                    (slot.pattern_hint or slot.variation_hint or "").casefold(),
                 )
                 for slot in self.slots
             ]
@@ -472,18 +449,15 @@ def planner_generation_schema() -> dict[str, Any]:
         "properties": {
             "slot_id": {"type": "string"},
             "constraint_ref": nullable_string,
-            "subject_id": {"type": "string"},
+            "subject_id": {"type": "string", "enum": list(PRACTICE_SUBJECT_FAMILIES)},
             "topic_id": {"type": "string"},
             "category_id": {"type": "string"},
             "difficulty": {"type": "string", "enum": [value.value for value in Difficulty]},
             "complexity": {"type": "string", "enum": [value.value for value in Complexity]},
-            "exam_ids": {"type": "array", "items": {"type": "string"}},
-            "question_type": {"type": "string", "enum": [QuestionType.MCQ.value]},
             "target_skill": {"type": "string"},
-            "variation_hint": {"type": "string"},
+            "concept": {"type": "string"},
+            "pattern_hint": {"type": "string"},
             "pattern_family_id": nullable_string,
-            "generator_route_hint": {"type": "string"},
-            "reasoning_target": nullable_string,
             "trap_type": nullable_string,
             "not_same_when": {"type": "array", "items": {"type": "string"}},
             "generation_group_hint": {"type": ["integer", "null"]},
@@ -496,13 +470,10 @@ def planner_generation_schema() -> dict[str, Any]:
             "category_id",
             "difficulty",
             "complexity",
-            "exam_ids",
-            "question_type",
             "target_skill",
-            "variation_hint",
+            "concept",
+            "pattern_hint",
             "pattern_family_id",
-            "generator_route_hint",
-            "reasoning_target",
             "trap_type",
             "not_same_when",
             "generation_group_hint",

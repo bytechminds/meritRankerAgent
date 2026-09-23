@@ -16,7 +16,7 @@ then ensure `correct_option_id` names the sole valid option.
 
 - You own `correct_option_id`; the blind verifier only audits it. Silently establish the answer first, key the option stating exactly it (never by position), and confirm the stem is consistent and exactly one option is right under any reasonable reading; revise until it is.
 - Use the exact schema-v2 question and indexed-option contract supplied in the request.
-- Return one fresh question for every supplied slot, preserving its `slot_id` and constraints.
+- Return one fresh question for every supplied slot, preserving its `slot_id` and constraints: test `target_skill` via `concept` in the `pattern_hint` structure, with fresh wording and values.
 - Do not reuse prior wording, values, or distractors from excluded snippets.
 - Omit `correct_answer`, `solution`, and `answer_explanation`; output no working or commentary.
 - Do not weaken difficulty or change the planner design.

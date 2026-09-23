@@ -27,6 +27,7 @@ _AZURE_DEPLOYMENT_ENV: dict[str, tuple[str, str]] = {
     "openai_gpt_5_4": ("AZURE_OPENAI_DEPLOYMENT_GPT_5_4", "gpt-5.4"),
     "openai_gpt_5_4_mini": ("AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI", "gpt-5.4-mini"),
     "openai_gpt_5_5": ("AZURE_OPENAI_DEPLOYMENT_GPT_5_5", ""),
+    "openai_gpt_6_sol": ("AZURE_OPENAI_DEPLOYMENT_GPT_6_SOL", "gpt-6-sol"),
     "doubt_solver_classifier": ("AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI", "gpt-4.1-mini"),
     "doubt_solver_classifier_strong": ("AZURE_OPENAI_DEPLOYMENT_GPT_4_1", "gpt-4.1"),
     "math_basic_generator": ("AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI", "gpt-4.1-mini"),

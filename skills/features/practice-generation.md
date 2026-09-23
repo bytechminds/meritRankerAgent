@@ -2,13 +2,42 @@
 
 ## Purpose and status
 
+## Planner semantic contract (2026-09-23)
+
+Models own subject/topic meaning; deterministic code validates structure only.
+
+- `PRACTICE_SUBJECT_FAMILIES` (`schemas/practice_request_intelligence.py`) is the one
+  route-family definition. A family is an execution identity: it selects the generator
+  and Answer Authority route. Request Intelligence `subjectId`, the planner `subject_id`
+  strict-schema enum, `PlannerSlot`/`DemandBucket` validation and exact-reuse
+  normalization all read it. Unknown families are never rerouted to `general`.
+- Request Intelligence assigns every named topic its family by meaning (Indian
+  Constitution → `polity`, Percentage → `math`). The former static subject vocabulary
+  and `PRACTICE_INTELLIGENCE_SUBJECT_UNGROUNDED` are removed. Incident 2026-09-23: the
+  40Q Indian Constitution / math arithmetic / reasoning / general science request lost
+  all trusted constraints to that vocabulary, then failed closed.
+- Planner slot intent is compact free text: `target_skill` (what to test), `concept`
+  (rule exercised) and `pattern_hint` (logical structure, never question text). These
+  replace `variation_hint`/`reasoning_target` on the planner wire; both stay optional on
+  `PlannerSlot` so persisted blueprints load. `exam_ids`, `question_type` and
+  `generator_route_hint` are server-owned and filled by `parse_blueprint`.
+- The generator receives each slot unchanged and its prompts (v2, factual, regenerator)
+  instruct it to test the target via the concept in the pattern's structure with fresh
+  wording and values. A reference question written in the request reaches the planner
+  through `request_constraints`; `SIMILAR_QUESTION` always uses the planner so its
+  pattern can be derived, even with trusted constraints.
+- The advanced planner routes (`factual`, `quant_reasoning`, `english`) use
+  `openai_gpt_6_sol` (`gpt-6-sol`, `reasoning_effort: medium`, 8000
+  `max_completion_tokens`, 60 s timeout, no model-level fallback). Pricing: $2.00 input /
+  $0.20 cached / $10.00 output per 1M tokens (Azure Global Standard, owner-supplied).
+
 ## Request Intelligence structured composition (2026-09-22)
 
 Free-text Practice requests now enter the existing `RoutedRequestIntelligenceProvider`
 at the orchestrated composition root. Request Intelligence schema v5 is the single
 canonical source for Bedrock, Azure/OpenAI, and Gemini native structured output. Its
-per-topic nullable `subjectId` preserves an explicitly grounded canonical subject
-family without promoting classifier hints or raw provider internals to authority.
+per-topic nullable `subjectId` is the route family the model assigns by meaning
+(see the planner semantic contract below), never promoted from classifier hints.
 Only deterministically validated identities become `trusted_constraints`; each carries
 its reconstructed verbatim source span. The private `practiceRequest` persists that
 accepted tuple as `trustedConstraints` and orchestration restores it before planning.
@@ -21,10 +50,9 @@ cover it. Planner-provided `requestedTopicEvidence` is ignored on this trusted p
 legacy requests with no trusted constraints retain the existing fail-closed evidence
 grounding behavior. Deterministic fallback uses the same trusted references directly.
 
-The Request Intelligence subject check recognizes an existing explicit subject label
-inside an already-selected exact token span (for example, `Indian Geography` contains
-the existing `geography` label). It accepts only one unambiguous canonical subject;
-it adds no fuzzy matching or downstream aliases. A trusted request with fewer accepted
+Request Intelligence validation is structural only: token ids exist, are ordered and
+contiguous, spans do not overlap, and an exact repeated span may not name a second
+family. No source-code vocabulary judges whether a family fits a topic. A trusted request with fewer accepted
 questions than distinct accepted constraints fails early with
 `PRACTICE_REQUEST_CONSTRAINT_COUNT_INFEASIBLE` rather than letting a planner drop a
 constraint. Structured caller topics/counts still bypass interpretation.

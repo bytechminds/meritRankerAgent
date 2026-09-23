@@ -15,7 +15,7 @@ Generate one independently playable MCQ for each assigned immutable planner slot
 - Use exactly the keys shown, `schema_version:"2"`, `question_type:"mcq"`, four options with IDs `"0"`–`"3"`, and the supplied subject/topic/difficulty IDs.
 - Omit `correct_answer`, `solution`, and `answer_explanation`; output no working or commentary.
 - Use supplied `language` for every student-visible value.
-- Meet slot constraints/exclusions; never copy excluded text.
+- Meet slot constraints/exclusions: test `target_skill` via `concept` in the `pattern_hint` structure, with fresh wording and values; never copy excluded text.
 - Pattern guidance controls method only; never copy source facts, answers, or solutions.
 - With `fresh_evidence`, use only this slot's `evidence_by_slot` facts; never another slot or model memory. Omit unsupported slots.
 

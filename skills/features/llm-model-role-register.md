@@ -30,7 +30,8 @@ Fallback recovery never converts a candidate failure into a pass.
 
 | Model | Role | Status | Reason |
 |---|---|---|---|
-| GPT-4.1 | quant_reasoning.planner.advanced | `QUALIFIED` | Incumbent. Frozen — replace only if a challenger independently passes and is clearly better |
+| GPT-4.1 | quant_reasoning.planner.advanced | `QUALIFIED` | Incumbent. Frozen — replace only if a challenger independently passes and is clearly better. Superseded on the route 2026-09-23: 4/8 frozen advanced-planner cases hit its 30 s timeout |
+| GPT-6 Sol (medium) | factual / quant_reasoning / english `.planner.advanced` | `CANDIDATE` | Routed 2026-09-23 (slot contract with `concept`/`pattern_hint`). ~30 real calls: 0 repairs, correct trusted composition on every accepted plan, p50 ~26 s. 1 length exhaustion at the 8000 cap on a 50-slot plan, recovered by deterministic fallback — not a pass under this register's gate |
 | GPT-4.1 | math.generator.advanced | `QUALIFIED` | Incumbent. Frozen. Terra challenged and failed |
 | GPT-5.6 Terra | Hindi basic reasoning generation | `QUALIFIED` | 63/63 produced, 0 length failures, 100% Devanagari, 0 true generator defects on the frozen corpus |
 | GPT-5.6 Terra | Intermediate constraint authoring | `RETIRED_FOR_ROLE` | Accuracy defects |

@@ -29,7 +29,7 @@ FACTUAL_SUBJECTS = [
     "science", "history", "geography", "physics", "chemistry",
     "biology", "computer_science", "economics", "polity",
 ]
-COMPOSED_BUDGET = 2_500
+COMPOSED_BUDGET = 2_600
 PER_FILE_BUDGET = 1_700
 
 
@@ -187,5 +187,6 @@ class TestFactualPromptSemanticInvariants:
         assert "Use supplied `language` for every student-visible value." in text
         assert "Omit `correct_answer`, `solution`, and `answer_explanation`" in text
         # Re-pinned for the Practice reliability contract (author owns the key,
-        # silent self-check); the factual prompt still must not move this file.
-        assert len(text) == 1675
+        # silent self-check) and the planner slot-intent rule; the factual prompt
+        # still must not move this file.
+        assert len(text) == 1773
