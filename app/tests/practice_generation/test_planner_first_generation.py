@@ -952,7 +952,7 @@ def test_approved_slot_is_preserved_when_group_siblings_exhaust(
 
     orchestrator.generate_wave("test-v2", ["g1"])
 
-    assert generator.waves == [0, 2]
+    assert generator.waves == [0, 1, 2]
     assert set(orchestrator._questions.linked) == {"question-slot-001"}
     assert assessments.item["meta"]["readyCount"] == 1
     assert assessments.item["meta"]["readyQuestionCount"] == 1
@@ -964,7 +964,7 @@ def test_approved_slot_is_preserved_when_group_siblings_exhaust(
     assert manifest_events[-1]["details"]["readyCount"] == 1
 
 
-def test_approved_siblings_remain_unchanged_when_only_one_slot_is_replaced() -> None:
+def test_approved_siblings_remain_unchanged_when_only_one_slot_is_repaired() -> None:
     class TwoApprovedThenReplacementVerifier:
         def __init__(self) -> None:
             self.calls_by_slot: dict[str, int] = {}
@@ -1000,7 +1000,7 @@ def test_approved_siblings_remain_unchanged_when_only_one_slot_is_replaced() -> 
 
     orchestrator.generate_wave("test-v2", ["g1"])
 
-    assert generator.waves == [0, 2]
+    assert generator.waves == [0, 1]
     assert assessments.item["meta"]["generationGroups"]["g1"]["state"] == "COMPLETED"
     assert set(orchestrator._questions.linked) == {
         "question-slot-001",
@@ -1009,4 +1009,4 @@ def test_approved_siblings_remain_unchanged_when_only_one_slot_is_replaced() -> 
     }
     assert orchestrator._questions.linked["question-slot-001"]["question"].startswith("Wave 0")
     assert orchestrator._questions.linked["question-slot-002"]["question"].startswith("Wave 0")
-    assert orchestrator._questions.linked["question-slot-003"]["question"].startswith("Wave 2")
+    assert orchestrator._questions.linked["question-slot-003"]["question"].startswith("Wave 1")

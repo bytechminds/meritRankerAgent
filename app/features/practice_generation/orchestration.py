@@ -160,6 +160,11 @@ class _SlotGenerationOutcome:
     cancelled: bool = False
 
 
+# Groups that no longer need work. FAILED is reachable with a GENERATING parent only
+# through bounded content exhaustion; every other group failure stops the parent.
+_SETTLED_GROUP_STATES = frozenset({"COMPLETED", "FAILED"})
+
+
 class _RecoveryDisposition(StrEnum):
     """Bounded next-step classification for a rejected schema-v2 candidate."""
 
@@ -178,10 +183,12 @@ def _classify_recovery_disposition(
     """Choose the existing bounded recovery path without accepting untrusted output.
 
     Provider and authority failures are classified by their existing exception branches
-    before this function is reached. The one safe semantic correction is a verifier
-    ``ACCEPT`` that establishes exactly one valid option while disagreeing with the
-    author's declared option id. Every other semantic rejection needs a fresh item
-    or an existing terminal failure path.
+    before this function is reached. A verifier ``ACCEPT`` that establishes exactly one
+    valid option while disagreeing with the author's declared option id is corrected in
+    place. ``NO_VALID_OPTION`` gets one semantic repair of the same candidate, which the
+    Authority re-verifies blind; if that fails the slot takes the one fresh
+    replacement. Every other semantic rejection needs a fresh item or an existing
+    terminal failure path.
     """
     if verification is None:
         return _RecoveryDisposition.TECHNICAL_FAILURE
@@ -192,6 +199,14 @@ def _classify_recovery_disposition(
         and verification.decision is VerificationDecision.ACCEPT
         and gate_reason == "AUTHOR_AUTHORITY_MISMATCH"
         and len(verification.valid_option_ids) == 1
+    ):
+        return _RecoveryDisposition.REPAIRABLE_EXISTING_CANDIDATE
+    # Empty valid options also accompany other rejections (ambiguity, unsupported
+    # facts, language); only the Authority's own NO_VALID_OPTION is repaired.
+    if (
+        binding_valid
+        and gate_reason == "NO_VALID_OPTION"
+        and "NO_VALID_OPTION" in verification.reason_codes
     ):
         return _RecoveryDisposition.REPAIRABLE_EXISTING_CANDIDATE
     if (
@@ -2015,6 +2030,9 @@ class PracticeGenerationOrchestrator:
         repair_candidates: dict[str, GeneratedQuestion] = {}
         repair_reasons: dict[str, tuple[str, ...]] = {}
         replacement_slot_ids: set[str] = set()
+        # The initial candidate of each slot sent to repair; the fresh wave must
+        # exclude it as well as the repaired candidate.
+        repair_origin_identities: dict[str, str] = {}
         reasons: list[str] = []
         excluded = set(context.excluded_texts)
         route_id = ""
@@ -2053,14 +2071,10 @@ class PracticeGenerationOrchestrator:
                     "slot_ids": [slot.slot_id for slot in wave_slots],
                 }
             )
+            # Workers are immutable: parent progress is published only by the
+            # coordinator's serial commit. A worker publish raced its peer's lease
+            # renewal and failed the Practice with ASSESSMENT_CONCURRENT_UPDATE.
             if replacement_wave == 1:
-                self._update_progress(
-                    context.test_id,
-                    context.request,
-                    meta_updates={
-                        "progressMessageKey": "PRACTICE_GENERATION_REFINING",
-                    },
-                )
                 emit_practice_event(
                     "question_repair_started",
                     test_id=context.test_id,
@@ -2072,13 +2086,6 @@ class PracticeGenerationOrchestrator:
                     },
                 )
             elif replacement_wave == 2:
-                self._update_progress(
-                    context.test_id,
-                    context.request,
-                    meta_updates={
-                        "progressMessageKey": "PRACTICE_GENERATION_REFINING",
-                    },
-                )
                 emit_practice_event(
                     "question_replacement_started",
                     test_id=context.test_id,
@@ -2475,6 +2482,13 @@ class PracticeGenerationOrchestrator:
                             if combined_reason_codes
                             else "VERIFIER_REJECTED"
                         ),
+                        # The gate code leads reasonCode; the Authority's own code is
+                        # what decides repair versus replacement.
+                        "authorityReasonCode": (
+                            verification.reason_codes[0]
+                            if verification.reason_codes
+                            else None
+                        ),
                     },
                 )
                 recovery_disposition = _classify_recovery_disposition(
@@ -2501,6 +2515,18 @@ class PracticeGenerationOrchestrator:
                         for slot_id in replacement_slot_ids
                         if slot_id in repair_candidates
                     )
+                    repair_origin_identities.update(
+                        (
+                            slot_id,
+                            normalize_question_identity(
+                                repair_candidates[slot_id].question,
+                                repair_candidates[slot_id].options,
+                            ),
+                        )
+                        for slot_id in pending
+                        if slot_id not in replacement_slot_ids
+                        and slot_id in repair_candidates
+                    )
                 if replacement_wave == 1:
                     failed_repair_slot_ids = {
                         slot.slot_id for slot in wave_slots if slot.slot_id in pending
@@ -2512,6 +2538,11 @@ class PracticeGenerationOrchestrator:
                         )
                         for slot_id in failed_repair_slot_ids
                         if slot_id in repair_candidates
+                    )
+                    excluded.update(
+                        repair_origin_identities[slot_id]
+                        for slot_id in failed_repair_slot_ids
+                        if slot_id in repair_origin_identities
                     )
                     replacement_slot_ids.update(failed_repair_slot_ids)
                     if failed_repair_slot_ids:
@@ -2528,9 +2559,9 @@ class PracticeGenerationOrchestrator:
                                 "slotIds": ",".join(sorted(failed_repair_slot_ids)),
                             },
                         )
-                # Only an authority-approved single-option key mismatch can repair the
-                # existing candidate. All other semantic rejections advance directly
-                # to the final fresh replacement. Either path must move forward:
+                # An authority-approved single-option key mismatch or NO_VALID_OPTION
+                # repairs the existing candidate. All other semantic rejections advance
+                # directly to the final fresh replacement. Either path must move forward:
                 # pinning a rejected replacement at wave two previously looped
                 # indefinitely instead of exhausting the bounded budget.
                 if replacement_wave == 0:
@@ -2888,6 +2919,23 @@ class PracticeGenerationOrchestrator:
                     "lastCompletedStage": "SLOT_GROUP_FAILED_AFTER_COMMIT",
                 },
             )
+            if terminal_reason_code == "GENERATION_DEFICIT_EXHAUSTED":
+                # A slot that exhausted its content budget fails only its group; the
+                # other groups still run, and _finalize fails the parent once when no
+                # executable group remains.
+                emit_practice_event(
+                    "DEFICIT_CALCULATED",
+                    test_id=test_id,
+                    status="recalculated",
+                    details={
+                        "reusedCount": int(meta.get("reusedCount") or 0),
+                        "acceptedCount": len(existing_slot_ids),
+                        "deficitCount": len(unresolved),
+                        "groupId": outcome.context.group.group_id,
+                        "reasonCode": terminal_reason_code,
+                    },
+                )
+                return True
             self._mark_failed(
                 test_id,
                 terminal_reason_code,
@@ -2920,7 +2968,7 @@ class PracticeGenerationOrchestrator:
             return
         groups = _meta(assessment).get("generationGroups")
         if isinstance(groups, dict) and any(
-            str(group.get("state")) not in {"COMPLETED"}
+            str(group.get("state")) not in _SETTLED_GROUP_STATES
             for group in groups.values()
             if isinstance(group, dict)
         ):
@@ -2941,9 +2989,22 @@ class PracticeGenerationOrchestrator:
         meta = _meta(assessment)
         groups = meta.get("generationGroups")
         if isinstance(groups, dict) and any(
-            not isinstance(group, dict) or group.get("state") != "COMPLETED"
+            not isinstance(group, dict) or group.get("state") not in _SETTLED_GROUP_STATES
             for group in groups.values()
         ):
+            return
+        if isinstance(groups, dict) and any(
+            group.get("state") == "FAILED" for group in groups.values()
+        ):
+            # Every executable group has settled and a content deficit remains: fail
+            # once, after republishing the authoritative manifest, keeping every
+            # verified question already linked and promoted.
+            self._update_progress(
+                test_id,
+                request,
+                meta_updates={"lastCompletedStage": "GENERATION_DEFICIT_AGGREGATED"},
+            )
+            self._mark_failed(test_id, "GENERATION_DEFICIT_EXHAUSTED")
             return
         ready_count = int(meta.get("readyQuestionCount") or 0)
         failed_count = int(meta.get("failedCount") or 0)

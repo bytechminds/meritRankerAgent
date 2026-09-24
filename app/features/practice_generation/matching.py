@@ -84,8 +84,13 @@ def build_reuse_bucket_key(
 
 
 def build_slot_reuse_bucket_key(slot: PlannerSlot, *, language: str) -> str | None:
-    """Build the exact sparse-index key for one canonical planner slot."""
-    category = normalize_category(slot.category_id)
+    """Build the exact sparse-index key for one canonical planner slot.
+
+    The category segment is the slot's subject family, as for schema-v1 buckets. The
+    planner's ``category_id`` is per-run variety, not identity: equivalent retries
+    choose different values, so keying on it stranded verified inventory.
+    """
+    category = normalize_subject(slot.subject_id)
     topic = normalize_topic(slot.topic_id)
     normalized_language = normalize_language(language)
     if category is None or topic is None or normalized_language is None:
@@ -556,7 +561,6 @@ def _candidate_matches_slot(
     if (
         normalize_subject(candidate.subject) != expected.subject
         or normalize_topic(candidate.topic) != expected.topic
-        or normalize_category(candidate.category) != expected.category
         or normalize_difficulty(candidate.difficulty) != expected.difficulty
         or normalize_language(candidate.language) != expected.language
         or candidate.question_type != slot.question_type.value

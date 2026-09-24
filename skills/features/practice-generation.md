@@ -165,6 +165,33 @@ authority-key correction rules below prove it is safe, and every repaired or rep
 parsed, validated, and independently reverified. The recovery budget remains exactly one initial
 generation, one repair, and one final fresh replacement per unresolved slot.
 
+Since 2026-09-24 a bound rejection whose Authority reason is `NO_VALID_OPTION` takes the repair
+wave on the same candidate before any replacement. The repair receives the failed candidate,
+the slot intent and reason codes only, never the Authority's solution, so the blind
+re-verification stays independent. If the repair is rejected, the one fresh replacement excludes
+both the initial and repaired candidates. Other empty-option rejections (ambiguity,
+contradictory data, unsupported facts, language) keep the direct replacement path.
+`QUESTION_VERIFICATION_RESULT` carries `authorityReasonCode` beside the leading gate code.
+
+Parallel slot workers never write the parent assessment. Entering repair or replacement once
+published progress from the worker; a peer's execution-lease renewal moved `updatedAt` in between,
+so the publish failed optimistic concurrency and ended the Practice with
+`ASSESSMENT_CONCURRENT_UPDATE` (2026-09-24). Workers now only run the bounded lifecycle and return
+an outcome; the coordinator serially commits questions, promotion, group state and progress.
+
+A group whose slot exhausts initial + repair + fresh regeneration (`GENERATION_DEFICIT_EXHAUSTED`)
+fails only that group (2026-09-24): its verified questions are committed and promoted, the other
+groups keep running, and `_finalize` fails the parent once, after republishing the authoritative
+manifest, when no group is `PENDING`/`RUNNING`. Unresolved slots are those with
+`slotReadyCounts == 0`. Provider-replacement, verifier-unavailable, structural-generator and
+terminal-rejection failures still stop the parent immediately. The scheduler finalizes when every
+group is `COMPLETED` or `FAILED`.
+
+Practice advanced Math authoring routes to `practice_math.generator.advanced` (GPT-6 Sol, medium
+effort, 3600 completion tokens) through `practice_generator_route_subject`, like Terra on
+default/intermediate. Initial, repair and fresh attempts share that route. The shared
+`math.generator.advanced` (GPT-4.1) still serves Doubt Solver and is unchanged (2026-09-24).
+
 A bound schema-v2 `AUTHOR_AUTHORITY_MISMATCH` with `ACCEPT` and exactly one valid indexed option
 is corrected locally only when the change is key-only: its canonical option ID occurs exactly once,
 the derived answer can be synchronized, and the candidate has no authored explanation or solution.
@@ -552,6 +579,16 @@ a destructive migration.
 generation groups, deficits, and the authoritative `readyQuestionIds`/`readyCount` manifest.
 `QuestionBank` exact reuse uses the sparse `getByReuseBucket` GSI with the canonical
 category/topic/question-type/language partition key and a `v1#<difficulty>#` sort-key prefix.
+For schema-v2 slots the category segment is the subject route family (as for schema-v1 buckets),
+not the planner's `category_id`, which is per-run variety and stranded verified inventory on
+equivalent retries (2026-09-24). Rows promoted before then keep their old key and are not
+reached by the new lookup. `scripts/backfill_question_bank_reuse_keys.py` (dry-run by default,
+`--apply --table <configured table>`) rewrites only `reuseBucketKey`, from each row's own stored
+subject/topic/type/language, and only for rows that pass the reuse gate with a solution; it is
+conditional on the old key and idempotent. Dev on 2026-09-24: 2,020 rows, 1,017 migrated, 228
+already current, 775 left untouched because they have no stored solution.
+`QUESTION_BANK_PROMOTION` reports each promotion as `CREATED`, `ALREADY_EXISTS`, `SKIPPED` or
+`FAILED`; a failure stays non-fatal to the assessment.
 Repository pagination remains bounded and query-only. Unknown aliases, incompatible category,
 exam or PatternFamily metadata, and low or malformed declared candidate confidence fail closed to
 fresh generation; no scan, `contains`, fuzzy, or semantic fallback is introduced by this slice.
@@ -892,8 +929,8 @@ and the coordinator commits their results sequentially.
   slots form adaptive homogeneous groups capped at Basic 5, Intermediate 4, Advanced 2, and
   complex Advanced Reasoning 1. Up to two immutable generation contexts execute concurrently;
   only the coordinator conditionally persists verified results. Deterministic validation precedes
-  a question/slot-bound independent verifier. `REPAIRABLE` receives one repair wave,
-  `REGENERATE` skips directly to replacement, and a final replacement is the last content attempt;
+  a question/slot-bound independent verifier. `REPAIRABLE` and Authority `NO_VALID_OPTION`
+  receive one repair wave, other `REGENERATE` skips directly to replacement, and a final replacement is the last content attempt;
   provider failures never enter content repair. Finalization requires exact slot coverage and
   `INDEPENDENT_MODEL_V2` evidence. A one-shot stale recovery uses the existing AppSync progress
   mutation with `expectedUpdatedAt` CAS, retains accepted slots, and fails on a second interruption.

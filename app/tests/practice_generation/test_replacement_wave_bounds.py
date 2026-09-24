@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 from features.practice_generation.config import PracticeGenerationConfig
+from features.practice_generation.matching import normalize_question_identity
 from features.practice_generation.orchestration import (
     PracticeGenerationOrchestrator,
     _SlotGenerationContext,
@@ -259,7 +260,7 @@ def test_one_exhausting_slot_leaves_the_other_accepted_questions_intact() -> Non
     assert outcome.unresolved_slot_ids == ("slot-002",)
 
 
-def test_mixed_semantic_recovery_corrects_authority_key_and_replaces_rejection() -> None:
+def test_mixed_semantic_recovery_corrects_authority_key_and_repairs_no_valid_option() -> None:
     class _MixedRecoveryVerifier:
         def __init__(self) -> None:
             self.calls_by_slot: dict[str, int] = {}
@@ -302,7 +303,7 @@ def test_mixed_semantic_recovery_corrects_authority_key_and_replaces_rejection()
 
     assert generator.slot_ids_by_wave == [
         (0, ("slot-001", "slot-002")),
-        (2, ("slot-002",)),
+        (1, ("slot-002",)),
     ]
     assert sorted(item.slot.slot_id for item in outcome.accepted) == [
         "slot-001",
@@ -345,7 +346,7 @@ def test_no_slot_group_ever_exceeds_three_generation_attempts() -> None:
 # --- 8. the exhausted group reaches a deterministic terminal state -----------
 
 
-def test_an_exhausted_group_fails_the_assessment_instead_of_staying_generating() -> None:
+def test_an_exhausted_group_fails_only_its_group_and_lets_generation_continue() -> None:
     outcome = _run(_DistinctGenerator(), _Verifier(reject_first=99))
     committed: dict[str, object] = {}
 
@@ -386,8 +387,10 @@ def test_an_exhausted_group_fails_the_assessment_instead_of_staying_generating()
 
     proceed = orchestrator._commit_slot_outcome(outcome)
 
-    assert proceed is False, "an exhausted group must not let generation continue"
-    assert committed["reason"] == "GENERATION_DEFICIT_EXHAUSTED"
+    assert proceed is True, "other independent groups must still run"
+    assert "reason" not in committed, "the parent is failed once, at finalization"
+    group = committed["meta"]["generationGroups"]["slot-group-001"]
+    assert (group["state"], group["errorCode"]) == ("FAILED", "GENERATION_DEFICIT_EXHAUSTED")
 
 
 class _AmbiguityVerifier:
@@ -418,3 +421,139 @@ def test_an_ambiguous_verdict_matching_the_author_key_is_never_accepted() -> Non
     assert outcome.accepted == ()
     assert outcome.unresolved_slot_ids == ("slot-001",)
     assert generator.waves == [0, 2]
+
+
+# --- NO_VALID_OPTION: one semantic repair, then one fresh replacement ----------
+
+
+class _RecordingGenerator(_DistinctGenerator):
+    def __init__(self, **kwargs) -> None:  # noqa: ANN003
+        super().__init__(**kwargs)
+        self.excluded_by_wave: dict[int, tuple[str, ...]] = {}
+        self.repair_context_by_wave: dict[int, dict] = {}
+
+    def generate_slots(self, *, request, bucket, group, slots, **kwargs):  # noqa: ANN001
+        wave = int(kwargs.get("replacement_wave", 0))
+        self.excluded_by_wave[wave] = tuple(kwargs.get("exclude_normalized_texts", ()))
+        self.repair_context_by_wave[wave] = {
+            "candidates": dict(kwargs.get("repair_candidates_by_slot") or {}),
+            "reasons": dict(kwargs.get("repair_reason_codes_by_slot") or {}),
+        }
+        return super().generate_slots(
+            request=request, bucket=bucket, group=group, slots=slots, **kwargs
+        )
+
+
+class _NoValidOptionVerifier:
+    """The Authority finds no valid option in the first N candidates it sees."""
+
+    def __init__(self, *, reject_first: int) -> None:
+        self._reject_first = reject_first
+        self.verified_questions: list[str] = []
+
+    def verify_slot(self, *, request, bucket, slot, question):  # noqa: ANN001
+        del request, bucket
+        self.verified_questions.append(question.question)
+        if len(self.verified_questions) <= self._reject_first:
+            return VerificationResult(
+                schema_version="2",
+                generation_item_id=question.generation_item_id,
+                slot_id=slot.slot_id,
+                decision=VerificationDecision.REGENERATE,
+                valid_option_ids=[],
+                reason_codes=["NO_VALID_OPTION"],
+            )
+        return VerificationResult(
+            schema_version="2",
+            generation_item_id=question.generation_item_id,
+            slot_id=slot.slot_id,
+            decision=VerificationDecision.ACCEPT,
+            valid_option_ids=[question.correct_option_id],
+            answer_explanation="The independently selected option is correct.",
+            reason_codes=["MATCH"],
+        )
+
+
+def test_no_valid_option_is_repaired_and_the_repair_is_reverified() -> None:
+    generator = _RecordingGenerator()
+    verifier = _NoValidOptionVerifier(reject_first=1)
+
+    outcome = _run(generator, verifier)
+
+    assert generator.waves == [0, 1]
+    assert [text.split(":")[0] for text in verifier.verified_questions] == [
+        "Attempt 1",
+        "Attempt 2",
+    ]
+    assert outcome.accepted[0].question.question.startswith("Attempt 2")
+    repair = generator.repair_context_by_wave[1]
+    assert repair["candidates"]["slot-001"].question.startswith("Attempt 1")
+    assert repair["reasons"]["slot-001"] == ("NO_VALID_OPTION", "NO_VALID_OPTION")
+
+
+def test_failed_repair_takes_one_fresh_replacement_excluding_both_candidates() -> None:
+    generator = _RecordingGenerator()
+    verifier = _NoValidOptionVerifier(reject_first=2)
+
+    outcome = _run(generator, verifier)
+
+    assert generator.waves == [0, 1, 2]
+    assert len(verifier.verified_questions) == 3
+    assert outcome.accepted[0].question.question.startswith("Attempt 3")
+    excluded = set(generator.excluded_by_wave[2])
+    for failed in verifier.verified_questions[:2]:
+        assert any(
+            normalize_question_identity(failed).split("|")[0] in value for value in excluded
+        )
+
+
+def test_all_three_no_valid_option_attempts_end_bounded_without_a_fourth() -> None:
+    generator = _RecordingGenerator()
+    verifier = _NoValidOptionVerifier(reject_first=99)
+
+    outcome = _run(generator, verifier)
+
+    assert generator.waves == [0, 1, 2]
+    assert len(verifier.verified_questions) == 3
+    assert outcome.accepted == ()
+    assert outcome.unresolved_slot_ids == ("slot-001",)
+    assert outcome.terminal_rejection is False
+    assert outcome.reason_codes[0] == "NO_VALID_OPTION"
+
+
+def test_empty_valid_options_without_authority_no_valid_option_still_skip_repair() -> None:
+    class _AmbiguousVerifier(_NoValidOptionVerifier):
+        def verify_slot(self, *, request, bucket, slot, question):  # noqa: ANN001
+            result = super().verify_slot(
+                request=request, bucket=bucket, slot=slot, question=question
+            )
+            if result.decision is VerificationDecision.REGENERATE:
+                return result.model_copy(update={"reason_codes": ["AMBIGUOUS"]})
+            return result
+
+    generator = _RecordingGenerator()
+
+    _run(generator, _AmbiguousVerifier(reject_first=1))
+
+    assert generator.waves == [0, 2]
+
+
+def test_rejection_event_reports_the_authority_code_that_chose_the_path(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    import features.practice_generation.orchestration as orchestration_module
+
+    events: list[dict] = []
+    monkeypatch.setattr(
+        orchestration_module,
+        "emit_practice_event",
+        lambda name, **kwargs: events.append({"name": name, **kwargs.get("details", {})}),
+    )
+
+    _run(_RecordingGenerator(), _NoValidOptionVerifier(reject_first=1))
+
+    rejected = [e for e in events if e["name"] == "QUESTION_VERIFICATION_RESULT"
+                and e.get("reasonCode") != "VERIFIER_APPROVED"]
+    assert rejected[0]["reasonCode"] == "NO_VALID_OPTION"
+    assert rejected[0]["authorityReasonCode"] == "NO_VALID_OPTION"
+    assert rejected[0]["replacementWave"] == 0

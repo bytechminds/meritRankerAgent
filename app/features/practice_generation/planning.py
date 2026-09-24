@@ -1153,13 +1153,13 @@ def practice_generator_route_subject(subject: str, difficulty: Difficulty | str)
     """Project a Practice slot onto its scoped generator route subject.
 
     ``practice_math`` is an internal route distinction, not a student-facing
-    subject. It confines the qualified Terra promotion to Practice Math's
-    default/intermediate authoring path while preserving the shared Math routes
-    used by Doubt Solver, basic Practice, and advanced Practice.
+    subject. It confines the qualified Terra (default/intermediate) and GPT-6 Sol
+    (advanced) promotions to Practice Math authoring while preserving the shared
+    Math routes used by Doubt Solver and basic Practice.
     """
     normalized = normalize_practice_subject(subject) or "general"
     difficulty_value = difficulty.value if isinstance(difficulty, Difficulty) else difficulty
-    if normalized == "math" and difficulty_value in {"default", "intermediate"}:
+    if normalized == "math" and difficulty_value in {"default", "intermediate", "advanced"}:
         return "practice_math"
     # All non-promoted subjects stay on the existing resolver path. In particular,
     # Science/Polity/etc. must reach the resolver's factual-family aliases rather

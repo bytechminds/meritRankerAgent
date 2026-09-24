@@ -1634,7 +1634,23 @@ class QuestionRepository:
         """
         reuse_bucket_key = build_slot_reuse_bucket_key(slot, language=language)
         difficulty_prefix = build_reuse_difficulty_prefix(slot.difficulty.value)
+
+        def promotion_event(outcome: str, qb_id: str | None = None) -> None:
+            emit_practice_event(
+                "QUESTION_BANK_PROMOTION",
+                test_id=test_id,
+                status=outcome.casefold(),
+                details={
+                    "slotId": slot.slot_id,
+                    "outcome": outcome,
+                    "qbId": qb_id,
+                    "reuseBucketKey": reuse_bucket_key,
+                },
+                level=logging.WARNING if outcome in {"SKIPPED", "FAILED"} else None,
+            )
+
         if not reuse_bucket_key or not difficulty_prefix:
+            promotion_event("SKIPPED")
             return None
         qb_id = build_question_bank_id(
             subject=slot.subject_id,
@@ -1647,6 +1663,7 @@ class QuestionRepository:
             correct_answer=question.correct_answer,
         )
         if qb_id is None:
+            promotion_event("SKIPPED")
             return None
         pattern_linked = bool(pattern_id and pattern_version_hash)
         timestamp = _now()
@@ -1705,6 +1722,7 @@ class QuestionRepository:
         # uses, so the writer cannot drift from recomputation.
         version_hash = question_bank_version_hash_from_item(item)
         if version_hash is None:
+            promotion_event("SKIPPED", qb_id)
             return None
         item["versionHash"] = version_hash
         try:
@@ -1713,9 +1731,11 @@ class QuestionRepository:
                 Item=_item(item),
                 ConditionExpression="attribute_not_exists(qbId)",
             )
+            promotion_event("CREATED", qb_id)
             return qb_id
         except ClientError as exc:
             if _is_conditional_failure(exc):
+                promotion_event("ALREADY_EXISTS", qb_id)
                 if pattern_linked:
                     self.attach_verified_pattern_link_if_absent(
                         test_id=test_id,
@@ -1724,6 +1744,7 @@ class QuestionRepository:
                         pattern_version_hash=str(pattern_version_hash),
                     )
                 return qb_id
+            promotion_event("FAILED", qb_id)
             raise PracticeRepositoryError("QUESTION_BANK_PATTERN_LINK_FAILED") from exc
 
     def attach_verified_pattern_link_if_absent(

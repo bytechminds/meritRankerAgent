@@ -1277,6 +1277,56 @@ def test_pattern_less_promoted_row_is_accepted_by_existing_reuse_gates() -> None
     assert candidate.pattern_family_id is None
 
 
+def test_promoted_row_is_reachable_from_a_retry_slot_with_another_planner_category() -> None:
+    client = RecordingClient()
+    _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    stored = _plain(client.put_calls[0]["Item"])
+    retry = _promotion_slot().model_copy(update={"category_id": "linear_equations"})
+
+    assert stored["reuseBucketKey"] == build_slot_reuse_bucket_key(retry, language="english")
+    assert stored["reuseSortKey"].startswith(
+        build_reuse_difficulty_prefix(retry.difficulty.value)
+    )
+    candidate = reusable_question_from_item(stored, requested_language="english")
+    assert candidate is not None
+    assert _candidate_matches_slot(candidate, retry, requested_language="english")
+
+
+@pytest.mark.parametrize(
+    ("update", "language"),
+    [
+        ({"difficulty": Difficulty.ADVANCED}, "english"),
+        ({"topic_id": "geometry"}, "english"),
+        ({"subject_id": "reasoning"}, "english"),
+        ({"exam_ids": ["SSC_CGL"]}, "english"),
+        ({}, "hindi"),
+    ],
+)
+def test_promoted_row_is_never_served_to_an_incompatible_slot(
+    update: dict[str, Any], language: str
+) -> None:
+    client = RecordingClient()
+    _promotion_repository(client).persist_verified_question(
+        test_id="test-1",
+        question=_promotion_question(),
+        slot=_promotion_slot(),
+        language="english",
+    )
+    stored = _plain(client.put_calls[0]["Item"])
+    other = _promotion_slot().model_copy(update=update)
+
+    candidate = reusable_question_from_item(stored, requested_language=language)
+
+    assert candidate is None or not _candidate_matches_slot(
+        candidate, other, requested_language=language
+    )
+
+
 def test_question_identity_is_stable_across_retry_and_pattern_attachment() -> None:
     first_client = RecordingClient()
     retry_client = RecordingClient()
@@ -2072,8 +2122,8 @@ def test_reuse_bucket_partitions_on_the_planner_topic_label() -> None:
     second_run = _bucket("percentage_discount")
 
     assert first_run != second_run
-    assert first_run == "v1#profit_and_loss#profit_and_loss#mcq#english"
-    assert second_run == "v1#percentage_discount#percentage_discount#mcq#english"
+    assert first_run == "v1#math#profit_and_loss#mcq#english"
+    assert second_run == "v1#math#percentage_discount#mcq#english"
 
 
 def test_identical_topic_labels_share_one_reuse_bucket() -> None:

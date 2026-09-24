@@ -1128,7 +1128,7 @@ def test_schema_v2_reasoning_cat_fallback_reaches_generation_started_with_backen
     )
     assert {
         build_slot_reuse_bucket_key(slot, language=request.language) for slot in slots
-    } == {"v1#seating_arrangements#seating_arrangements#mcq#english"}
+    } == {"v1#reasoning#seating_arrangements#mcq#english"}
     assert {build_reuse_difficulty_prefix(slot.difficulty.value) for slot in slots} == {
         "v1#medium#"
     }

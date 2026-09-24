@@ -118,14 +118,16 @@ class TestRoutes:
         assert route.model == model
         assert route.provider_options == {}
 
-    def test_only_the_three_advanced_planner_routes_use_gpt_6_sol(self) -> None:
+    def test_gpt_6_sol_owns_only_advanced_planners_and_practice_advanced_math(self) -> None:
         registry = LlmConfigRegistry()
 
         routed = {
             key for key, route in registry._route_map.items() if route.model == ALIAS
         }
 
-        assert routed == {(family, "planner", "advanced") for family in MIGRATED_FAMILIES}
+        assert routed == {(family, "planner", "advanced") for family in MIGRATED_FAMILIES} | {
+            ("practice_math", "generator", "advanced")
+        }
         assert registry.get_route("general", "planner", "advanced").model == "openai_gpt_4_1"
 
 
@@ -244,3 +246,38 @@ class TestProviderFailureFallback:
         assert len(result.blueprint.slots) == 40
         assert {slot.topic_id for slot in result.blueprint.slots} == {"geography", "polity"}
         assert provider.attempts == [(ALIAS, {"reasoning_effort": "medium"})]
+
+
+class TestPracticeAdvancedMathRoute:
+    def test_practice_advanced_math_uses_gpt_6_sol_and_doubt_solver_keeps_gpt_4_1(self) -> None:
+        from features.practice_generation.planning import practice_generator_route_subject
+        from services.doubt_solver.answer_generation_adapter import (
+            resolve_generator_route_subject,
+        )
+
+        def generator(subject: str, difficulty: str):
+            return resolve_route(
+                RouteRequest(
+                    request_id="r", subject=subject, task_role="generator",
+                    difficulty=difficulty, intent="practice", language="english",
+                )
+            )
+
+        practice = generator(practice_generator_route_subject("math", "advanced"), "advanced")
+        doubt_subject = resolve_generator_route_subject(
+            subject="math", intent="solve", web_search_reason=None
+        )
+        doubt = generator(doubt_subject, "advanced")
+
+        assert (practice.route_id, practice.model) == (
+            "practice_math.generator.advanced", ALIAS
+        )
+        assert practice.provider_options == {"reasoning_effort": "medium"}
+        assert practice.max_tokens == 3600
+        assert (doubt.route_id, doubt.model) == ("math.generator.advanced", "openai_gpt_4_1")
+        assert generator(practice_generator_route_subject("math", "basic"), "basic").model == (
+            "math_basic_generator"
+        )
+        assert generator(
+            practice_generator_route_subject("math", "intermediate"), "intermediate"
+        ).model == "openai_gpt_5_6_terra"

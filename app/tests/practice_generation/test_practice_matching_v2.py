@@ -64,6 +64,7 @@ def _candidate(
     question_id: str,
     *,
     category: str = "work_efficiency",
+    topic: str = "time_and_work",
     exam_ids: tuple[str, ...] = ("SSC_CGL",),
     pattern_family_id: str | None = None,
     confidence: float | None = 0.97,
@@ -75,7 +76,7 @@ def _candidate(
         correct_answer="1/4",
         solution="Add the two individual work rates.",
         subject="math",
-        topic="time_and_work",
+        topic=topic,
         difficulty="medium",
         question_type="mcq",
         language="english",
@@ -101,11 +102,14 @@ def test_approved_topic_aliases_resolve_but_unknown_alias_does_not() -> None:
     assert normalize_exam("invented exam") is None
 
 
-def test_slot_reuse_key_uses_category_not_subject_and_difficulty_prefix() -> None:
+def test_slot_reuse_key_uses_subject_family_not_planner_category() -> None:
     slot = _slot("slot-001")
     assert build_slot_reuse_bucket_key(slot, language="english") == (
-        "v1#work_efficiency#time_and_work#mcq#english"
+        "v1#math#time_and_work#mcq#english"
     )
+    assert build_slot_reuse_bucket_key(
+        _slot("slot-001", category="worker_scheduling"), language="english"
+    ) == build_slot_reuse_bucket_key(slot, language="english")
     assert build_reuse_difficulty_prefix(slot.difficulty.value) == "v1#medium#"
 
 
@@ -127,14 +131,14 @@ def test_exact_slot_matching_is_one_to_one_and_deterministic() -> None:
     assert sum(match.deficit for match in matches) == 0
 
 
-def test_category_exam_pattern_and_confidence_constraints_fail_closed() -> None:
+def test_topic_exam_pattern_and_confidence_constraints_fail_closed() -> None:
     blueprint = _blueprint(
         _slot("slot-001", pattern_family_id="combined_work_rate"),
     )
     candidates = [
         _candidate(
-            "wrong-category",
-            category="worker_scheduling",
+            "wrong-topic",
+            topic="pipes_and_cisterns",
             pattern_family_id="combined_work_rate",
         ),
         _candidate("missing-exam", exam_ids=(), pattern_family_id="combined_work_rate"),

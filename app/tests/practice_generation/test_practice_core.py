@@ -759,8 +759,8 @@ def test_mixed_deterministic_fallback_uses_slot_specific_routes() -> None:
         assert {slot.difficulty for slot in group_slots} == {bucket.difficulty}
         assert {slot.generator_route_hint for slot in group_slots} == {
             (
-                "practice_math.generator.intermediate"
-                if bucket.difficulty is Difficulty.INTERMEDIATE
+                f"practice_math.generator.{bucket.difficulty.value}"
+                if bucket.difficulty in {Difficulty.INTERMEDIATE, Difficulty.ADVANCED}
                 else f"math.generator.{bucket.difficulty.value}"
             )
         }
@@ -787,7 +787,8 @@ def test_intermediate_math_route_hint_is_canonicalized_on_blueprint_reload() -> 
 
 def test_practice_math_route_projection_preserves_factual_subject_aliases() -> None:
     assert practice_generator_route_subject("math", Difficulty.INTERMEDIATE) == "practice_math"
-    assert practice_generator_route_subject("math", Difficulty.ADVANCED) == "math"
+    assert practice_generator_route_subject("math", Difficulty.ADVANCED) == "practice_math"
+    assert practice_generator_route_subject("math", Difficulty.BASIC) == "math"
     assert practice_generator_route_subject("science", Difficulty.INTERMEDIATE) == "science"
     assert practice_generator_route_subject("polity", Difficulty.INTERMEDIATE) == "polity"
 

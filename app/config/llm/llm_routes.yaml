@@ -149,6 +149,24 @@ routes:
           - general_default
           - safe_mock
 
+      # Practice advanced-Math authoring only. On the frozen 105-slot corpus GPT-4.1
+      # exhausted 35 slots; GPT-6 Sol at medium effort authored 55/55 first pass with
+      # 0/14 false approvals. Doubt Solver keeps math.generator.advanced on GPT-4.1.
+      advanced:
+        inherits: default
+        model: openai_gpt_6_sol
+        overlays:
+          - levels/advanced.md
+        temperature: 0.15
+        max_tokens: 3600
+        provider_options:
+          reasoning_effort: medium
+        fallback:
+          - intermediate
+          - default
+          - general_default
+          - safe_mock
+
   reasoning:
     verifier:
       default:

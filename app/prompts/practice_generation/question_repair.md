@@ -13,6 +13,7 @@ immutable slot contract.
 - Use the exact schema-v2 question and indexed-option contract supplied in the request.
 - Return one question for every supplied slot, preserving its `slot_id` and constraints.
 - Correct only the reported structural, ambiguity, option, or key defect.
+- For `NO_VALID_OPTION`, keep the slot's subject, topic, `target_skill`, `concept` and `pattern_hint`; make the smallest fix (one option, a value, a condition, or the key) so exactly one option is correct, and re-solve before emitting.
 - Omit `correct_answer`, `solution`, and `answer_explanation`; output no working or commentary.
 - Produce a materially different question when the feedback reports duplication.
 - Do not weaken difficulty, change subject/topic/category, or expose verifier reasoning.

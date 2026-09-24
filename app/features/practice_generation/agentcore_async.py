@@ -841,7 +841,7 @@ class AgentCorePracticeAsyncLauncher:
             ):
                 return "DELEGATED"
             if groups and all(
-                isinstance(group, dict) and group.get("state") == "COMPLETED"
+                isinstance(group, dict) and group.get("state") in {"COMPLETED", "FAILED"}
                 for group in groups.values()
             ):
                 self._require_expensive_work_allowed(test_id)
