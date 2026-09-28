@@ -4,7 +4,7 @@ import {
   type AgentCoreProjectSpec,
   type AgentCoreMcpSpec,
 } from '@aws/agentcore-cdk';
-import { CfnOutput, Stack, aws_bedrockagentcore, type StackProps } from 'aws-cdk-lib';
+import { ArnFormat, CfnOutput, Stack, aws_bedrockagentcore, type StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { StringParameter } from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
@@ -75,6 +75,13 @@ export interface AgentCoreStackProps extends StackProps {
   credentials?: Record<string, { credentialProviderArn: string; clientSecretArn?: string }>;
   /** Explicit non-secret environment values supplied by the deployment target. */
   runtimeEnvironment?: Readonly<Record<string, string>>;
+  /** Prod-only identity: runtime name, provider secret, and the published `prod` qualifier. */
+  productionRuntime?: {
+    runtimeName: string;
+    providerSecretName: string;
+    /** Present only once the `prod` endpoint exists. */
+    qualifier?: string;
+  };
 }
 
 /**
@@ -90,7 +97,7 @@ export class AgentCoreStack extends Stack {
   constructor(scope: Construct, id: string, props: AgentCoreStackProps) {
     super(scope, id, props);
 
-    const { spec, deploymentEnvironment, mcpSpec, credentials, runtimeEnvironment = {} } = props;
+    const { spec, deploymentEnvironment, mcpSpec, credentials, runtimeEnvironment = {}, productionRuntime } = props;
     const practiceEnabled = runtimeEnvironment.PRACTICE_GENERATION_ENABLED === 'true';
     const patternIntelligenceEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_ENABLED === 'true';
     const patternReuseEnabled = runtimeEnvironment.PATTERN_INTELLIGENCE_REUSE_ENABLED === 'true';
@@ -257,6 +264,9 @@ export class AgentCoreStack extends Stack {
     const practiceEndpoint = runtimeEnvironment.APPSYNC_GRAPHQL_ENDPOINT;
     if (practiceEnabled && !practiceEndpoint) {
       throw new Error('APPSYNC_GRAPHQL_ENDPOINT is required when practice generation is enabled');
+    }
+    if (productionRuntime && this.application.environments.size !== 1) {
+      throw new Error('The production runtime contract publishes exactly one runtime identity');
     }
     for (const environment of this.application.environments.values()) {
       const runtimeResource = environment.runtime.node.findChild('Resource');
@@ -485,6 +495,41 @@ export class AgentCoreStack extends Stack {
             })
           );
         }
+      }
+    }
+
+    if (productionRuntime) {
+      const environment = [...this.application.environments.values()][0];
+      const runtimeResource = environment.runtime.node.findChild('Resource') as aws_bedrockagentcore.CfnRuntime;
+      runtimeResource.addPropertyOverride('AgentRuntimeName', productionRuntime.runtimeName);
+      environment.runtime.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [
+            this.formatArn({
+              service: 'secretsmanager',
+              resource: 'secret',
+              resourceName: `${productionRuntime.providerSecretName}-??????`,
+              arnFormat: ArnFormat.COLON_RESOURCE_NAME,
+            }),
+          ],
+        })
+      );
+      // Non-secret identity consumed by the separate backend's server-side proxy.
+      const runtimeContractRoot = '/meritranker/agent-runtime/v1/runtime';
+      new StringParameter(this, 'ProductionRuntimeArnParameter', {
+        parameterName: `${runtimeContractRoot}/arn`,
+        stringValue: environment.runtime.runtimeArn,
+      });
+      new StringParameter(this, 'ProductionRuntimeRegionParameter', {
+        parameterName: `${runtimeContractRoot}/region`,
+        stringValue: this.region,
+      });
+      if (productionRuntime.qualifier) {
+        new StringParameter(this, 'ProductionRuntimeQualifierParameter', {
+          parameterName: `${runtimeContractRoot}/qualifier`,
+          stringValue: productionRuntime.qualifier,
+        });
       }
     }
 

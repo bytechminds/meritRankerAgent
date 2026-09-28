@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import { AgentCoreStack } from '../lib/cdk-stack';
 import { prepareRuntimeSources } from '../lib/runtime-source';
+import {
+  DEPLOY_TARGET_SELECTOR_ENV,
+  PROD_QUALIFIER,
+  PROD_TARGET_NAME,
+  loadProdTargetConfig,
+  selectDeploymentTargets,
+  withProdEndpoint,
+} from '../lib/prod-target';
 import { ConfigIO, type AwsDeploymentTarget } from '@aws/agentcore-cdk';
 import { App, type Environment } from 'aws-cdk-lib';
 import * as path from 'path';
@@ -77,7 +85,10 @@ async function main() {
 
   const spec = await configIO.readProjectSpec();
   const deploymentSpec = prepareRuntimeSources(spec, configRoot);
-  const targets = await configIO.readAWSDeploymentTargets();
+  const targets = selectDeploymentTargets(
+    await configIO.readAWSDeploymentTargets(),
+    process.env[DEPLOY_TARGET_SELECTOR_ENV]
+  );
 
   // Extract MCP configuration from project spec.
   // Gateway fields are stored in agentcore.json but may not yet be on the
@@ -120,12 +131,25 @@ async function main() {
       | Record<string, { credentialProviderArn: string; clientSecretArn?: string }>
       | undefined;
 
+    // Prod takes every runtime value from committed prod-target.json; Dev keeps
+    // its existing shell-derived environment unchanged.
+    const prod = target.name === PROD_TARGET_NAME ? loadProdTargetConfig(configRoot, target) : undefined;
+
     new AgentCoreStack(app, stackName, {
-      spec: deploymentSpec,
+      spec: prod ? withProdEndpoint(deploymentSpec, prod.promotedVersion) : deploymentSpec,
       deploymentEnvironment: target.name,
       mcpSpec,
       credentials,
-      runtimeEnvironment: runtimeEnvironment(target),
+      runtimeEnvironment: prod ? prod.runtimeEnvironment : runtimeEnvironment(target),
+      ...(prod
+        ? {
+            productionRuntime: {
+              runtimeName: prod.runtimeName,
+              providerSecretName: prod.providerSecretName,
+              ...(prod.promotedVersion !== null ? { qualifier: PROD_QUALIFIER } : {}),
+            },
+          }
+        : {}),
       env,
       description: `AgentCore stack for ${spec.name} deployed to ${target.name} (${target.region})`,
       tags: {

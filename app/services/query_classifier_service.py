@@ -178,12 +178,14 @@ def _get_classifier_orchestrator() -> object:
     from services.llm.providers.provider_factory import (  # noqa: PLC0415
         ProviderAdapterFactory,
     )
-    from services.secrets.env_secret_resolver import EnvSecretResolver  # noqa: PLC0415
     from services.secrets.provider_credentials import (  # noqa: PLC0415
         ProviderCredentialResolver,
     )
+    from services.secrets.secrets_manager_secret_resolver import (  # noqa: PLC0415
+        get_runtime_secret_resolver,
+    )
 
-    _secret_resolver = EnvSecretResolver()
+    _secret_resolver = get_runtime_secret_resolver()
     _credential_resolver = ProviderCredentialResolver(secret_resolver=_secret_resolver)
     _adapter_executor = ProviderAdapterExecutor(
         credential_resolver=_credential_resolver,

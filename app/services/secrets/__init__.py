@@ -14,9 +14,12 @@ Public API:
     SecretNotFoundError             — secret not found or blank
     SecretResolverUnsupportedError  — operation deferred (credential_ref, Secrets Manager)
 
-Deferred (not implemented in Part 5):
+Production backend (selected by PROVIDER_CREDENTIALS_SECRET_ID):
 
-    SecretsManagerSecretResolver    — [DEFER] AWS Secrets Manager backend
+    SecretsManagerSecretResolver    — services.secrets.secrets_manager_secret_resolver
+
+Deferred:
+
     AgentCoreIdentitySecretResolver — [DEFER] AgentCore Identity backend
 """
 

@@ -12,11 +12,13 @@ const EXCLUDED_DIRECTORIES = new Set([
   'tests',
 ]);
 
-function isDeployableSource(sourceRoot: string, sourcePath: string): boolean {
+export function isDeployableSource(sourceRoot: string, sourcePath: string): boolean {
   const relative = path.relative(sourceRoot, sourcePath);
   if (!relative) return true;
   const segments = relative.split(path.sep);
   if (segments.some(segment => EXCLUDED_DIRECTORIES.has(segment))) return false;
+  // Local diagnostic logs (app/.logs/**) never ship in any runtime package.
+  if (segments[0] === '.logs') return false;
   const name = path.basename(sourcePath);
   if (name === '.env' || name.startsWith('.env.')) return false;
   if (name.endsWith('.log') || name.endsWith('.pyc')) return false;

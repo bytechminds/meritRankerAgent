@@ -675,6 +675,18 @@ class LlmConfigRegistry:
             aliases.add(route.model)
         return aliases
 
+    def active_route_provider_profiles(self) -> dict[str, ProviderProfile]:
+        """Provider profiles used by the same active routes validated below."""
+        profiles: dict[str, ProviderProfile] = {}
+        for alias in self._active_route_model_aliases():
+            model_cfg = self._model_map.get(alias)
+            if model_cfg is None:
+                continue
+            profile = self._provider_profile_map.get(model_cfg.provider_profile)
+            if profile is not None:
+                profiles[model_cfg.provider_profile] = profile
+        return profiles
+
     def validate_real_mode_deployments(self) -> None:
         """Raise if any *active-route* Azure model has empty/placeholder deployment.
 

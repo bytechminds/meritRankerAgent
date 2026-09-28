@@ -1,0 +1,33 @@
+{
+  "runtimeName": "meritRankerTutor_runtime_prod",
+  "providerSecretName": "meritranker/agent-runtime/prod/providers",
+  "requiredSecretKeys": [
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_API_KEY",
+    "TAVILY_API_KEY"
+  ],
+  "promotedVersion": null,
+  "runtimeEnvironment": {
+    "APP_ENV": "production",
+    "ENABLE_REAL_LLM": "true",
+    "ENABLE_ORCHESTRATED_DOUBT_SOLVER": "true",
+    "PRACTICE_GENERATION_ENABLED": "true",
+    "PRACTICE_QUESTION_BANK_PROMOTION_ENABLED": "true",
+    "PATTERN_INTELLIGENCE_ENABLED": "false",
+    "PATTERN_INTELLIGENCE_REUSE_ENABLED": "false",
+    "PRACTICE_PATTERN_CONTEXT_ENABLED": "false",
+    "STUDENT_CREDIT_ENFORCEMENT_ENABLED": "true",
+    "STUDENT_CREDIT_DRY_RUN": "true",
+    "WEB_SEARCH_ENABLED": "true",
+    "IMAGE_CLASSIFIER_ENABLED": "true",
+    "ANSWER_RECOVERY_ENABLED": "true",
+    "AZURE_OPENAI_DEPLOYMENT_GPT_4_1": "gpt-4.1",
+    "AZURE_OPENAI_DEPLOYMENT_GPT_4_1_MINI": "gpt-4.1-mini",
+    "AZURE_OPENAI_DEPLOYMENT_GPT_5_4_MINI": "gpt-5.4-mini",
+    "AZURE_OPENAI_DEPLOYMENT_GPT_6_SOL": "gpt-6-sol",
+    "APPSYNC_GRAPHQL_ENDPOINT": "https://REPLACE_ME.appsync-api.ap-south-1.amazonaws.com/graphql",
+    "PRACTICE_RESOURCE_PARAMETER_ROOT": "/meritranker/agent-runtime/v1/practice"
+  }
+}

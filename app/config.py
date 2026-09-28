@@ -242,6 +242,28 @@ _settings: Settings | None = None
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 
 
+def _settings_time_provider_secret(name: str) -> str:
+    """Read a credential consumed at Settings build through the runtime secret resolver.
+
+    Without PROVIDER_CREDENTIALS_SECRET_ID this is ``os.getenv(name, "")``; with it,
+    the production secret is authoritative and the ENV name stays the key.
+    """
+    from services.secrets.errors import (  # noqa: PLC0415
+        SecretNotFoundError,
+        SecretResolverError,
+    )
+    from services.secrets.secrets_manager_secret_resolver import (  # noqa: PLC0415
+        get_runtime_secret_resolver,
+    )
+
+    try:
+        return get_runtime_secret_resolver().get_secret(name)
+    except SecretNotFoundError:
+        return os.getenv(name, "")
+    except SecretResolverError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
 def _resolve_log_level(app_env: str) -> str:
     """Return the validated application log level with a production INFO floor."""
     configured = (
@@ -419,7 +441,7 @@ def get_settings() -> Settings:
         image_classifier_model = os.getenv(
             "IMAGE_CLASSIFIER_MODEL", "gemini-3.1-flash-lite"
         ).strip()
-        image_classifier_api_key = os.getenv("GOOGLE_GEMINI_API_KEY", "").strip()
+        image_classifier_api_key = _settings_time_provider_secret("GOOGLE_GEMINI_API_KEY").strip()
         if image_classifier_enabled:
             image_classifier_timeout_ms = int(
                 os.getenv("IMAGE_CLASSIFIER_TIMEOUT_MS", "15000")
@@ -751,7 +773,7 @@ def get_settings() -> Settings:
             context_max_retrieval_tags=int(os.getenv("CONTEXT_MAX_RETRIEVAL_TAGS", "10")),
             web_search_enabled=os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true",
             web_search_provider=os.getenv("WEB_SEARCH_PROVIDER", "tavily"),
-            tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
+            tavily_api_key=_settings_time_provider_secret("TAVILY_API_KEY"),
             web_search_timeout_seconds=float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "8")),
             web_search_max_results=int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5")),
             web_search_max_context_chars=int(os.getenv("WEB_SEARCH_MAX_CONTEXT_CHARS", "2500")),

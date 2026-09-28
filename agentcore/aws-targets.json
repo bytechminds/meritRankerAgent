@@ -4,5 +4,11 @@
     "description": "MeritRanker non-production deployment",
     "account": "661012794182",
     "region": "ap-south-1"
+  },
+  {
+    "name": "Prod",
+    "description": "MeritRanker production deployment",
+    "account": "000000000000",
+    "region": "ap-south-1"
   }
 ]

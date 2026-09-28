@@ -78,6 +78,11 @@ def get_ssm_client(region_name: str | None = None) -> Any:
     return _get_or_create_client("ssm", region_name)
 
 
+def get_secretsmanager_client(region_name: str | None = None) -> Any:
+    """Return a cached ``secretsmanager`` client."""
+    return _get_or_create_client("secretsmanager", region_name)
+
+
 def get_bedrock_agentcore_client(region_name: str | None = None) -> Any:
     """Return a cached ``bedrock-agentcore`` control-plane data client."""
     cache_key = f"bedrock-agentcore-conversation::{region_name or '__default__'}"
